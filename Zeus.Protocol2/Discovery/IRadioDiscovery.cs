@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Zeus — OpenHPSDR Protocol-1 / Protocol-2 client.
+// Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
+//                         Christian Suarez (N9WAR), and contributors.
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the
+// Free Software Foundation, either version 2 of the License, or (at your
+// option) any later version. See the LICENSE file at the root of this
+// repository for the full text, or https://www.gnu.org/licenses/.
+//
+// Zeus is an independent reimplementation in .NET — not a fork. Its
+// Protocol-1 / Protocol-2 framing, WDSP integration, meter pipelines, and
+// TX behaviour were informed by studying the Thetis project
+// (https://github.com/ramdor/Thetis), the authoritative reference
+// implementation in the OpenHPSDR ecosystem. Zeus gratefully acknowledges
+// the Thetis contributors whose work made this possible:
+//
+//   Richard Samphire (MW0LGE), Warren Pratt (NR0V),
+//   Laurence Barker (G8NJJ),   Rick Koch (N1GP),
+//   Bryan Rambo (W4WMT),       Chris Codella (W2PA),
+//   Doug Wigley (W5WC),        FlexRadio Systems,
+//   Richard Allen (W5SD),      Joe Torrey (WD5Y),
+//   Andrew Mansfield (M0YGG),  Reid Campbell (MI0BOT),
+//   Sigi Jetzlsperger (DH1KLM).
+//
+// Thetis itself continues the GPL-governed lineage of FlexRadio PowerSDR
+// and the OpenHPSDR (TAPR/OpenHPSDR) ecosystem; that lineage is preserved
+// here. See ATTRIBUTIONS.md at the repository root for the full provenance
+// statement and per-component attribution.
+//
+// Protocol-2 / PureSignal / Saturn-class behaviour was additionally informed
+// by pihpsdr (https://github.com/dl1ycf/pihpsdr), maintained by Christoph
+// Wüllen (DL1YCF); and by DeskHPSDR
+// (https://github.com/dl1bz/deskhpsdr), maintained by Heiko (DL1BZ).
+// Both are GPL-2.0-or-later.
+//
+// WDSP — loaded by Zeus via P/Invoke — is Copyright (C) Warren Pratt
+// (NR0V), distributed under GPL v2 or later.
+//
+// Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
+// License for details.
+
+using System.Net;
+
+namespace Zeus.Protocol2.Discovery;
+
+public interface IRadioDiscovery
+{
+    Task<IReadOnlyList<DiscoveredRadio>> DiscoverAsync(TimeSpan timeout, CancellationToken ct = default);
+
+    /// <summary>
+    /// Targeted <em>unicast</em> discovery probe to a single radio IP. Unlike
+    /// <see cref="DiscoverAsync"/> this does not broadcast — it asks one radio
+    /// "are you there, and are you busy?" and returns the parsed reply (whose
+    /// <see cref="DiscoveryDetails.Busy"/> flag is set when another controller
+    /// already owns the radio), or <c>null</c> if the radio did not answer
+    /// within <paramref name="timeout"/>.
+    ///
+    /// <para>Used as a pre-connect ownership check: connecting Zeus as a SECOND
+    /// master to a radio another controller is already driving (e.g. a
+    /// co-located saturn-go / p2app stack, or another Zeus/Thetis client) makes
+    /// the two controllers fight over the band/antenna/T-R relay matrix, which
+    /// chatters the relays and can brown out the radio. Honour Busy and refuse
+    /// before opening the relay-bearing high-priority stream.</para>
+    /// </summary>
+    Task<DiscoveredRadio?> ProbeAsync(IPAddress radioIp, TimeSpan timeout, CancellationToken ct = default);
+
+    /// <summary>
+    /// Targeted unicast discovery probe to an explicit endpoint. The normal
+    /// radio path uses UDP 1024; tests and embedded appliance setups may route
+    /// the same P2 probe through a configured endpoint.
+    /// </summary>
+    Task<DiscoveredRadio?> ProbeEndpointAsync(
+        IPEndPoint radioEndpoint,
+        TimeSpan timeout,
+        CancellationToken ct = default);
+}

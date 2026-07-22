@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Authors>Douglas J. Cerrato (KB2UKA)</Authors>
+    <Description>Cross-process shared-memory audio ring protocol for Zeus products.</Description>
+  </PropertyGroup>
+
+</Project>

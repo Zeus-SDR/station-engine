@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Zeus — OpenHPSDR Protocol-1 / Protocol-2 client.
+// Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
+//                         Christian Suarez (N9WAR), and contributors.
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the
+// Free Software Foundation, either version 2 of the License, or (at your
+// option) any later version. See the LICENSE file at the root of this
+// repository for the full text, or https://www.gnu.org/licenses/.
+//
+// Zeus is an independent reimplementation in .NET — not a fork. Its
+// Protocol-1 / Protocol-2 framing, WDSP integration, meter pipelines, and
+// TX behaviour were informed by studying the Thetis project
+// (https://github.com/ramdor/Thetis), the authoritative reference
+// implementation in the OpenHPSDR ecosystem. Zeus gratefully acknowledges
+// the Thetis contributors whose work made this possible:
+//
+//   Richard Samphire (MW0LGE), Warren Pratt (NR0V),
+//   Laurence Barker (G8NJJ),   Rick Koch (N1GP),
+//   Bryan Rambo (W4WMT),       Chris Codella (W2PA),
+//   Doug Wigley (W5WC),        FlexRadio Systems,
+//   Richard Allen (W5SD),      Joe Torrey (WD5Y),
+//   Andrew Mansfield (M0YGG),  Reid Campbell (MI0BOT),
+//   Sigi Jetzlsperger (DH1KLM).
+//
+// Thetis itself continues the GPL-governed lineage of FlexRadio PowerSDR
+// and the OpenHPSDR (TAPR/OpenHPSDR) ecosystem; that lineage is preserved
+// here. See ATTRIBUTIONS.md at the repository root for the full provenance
+// statement and per-component attribution.
+//
+// Protocol-2 / PureSignal / Saturn-class behaviour was additionally informed
+// by pihpsdr (https://github.com/dl1ycf/pihpsdr), maintained by Christoph
+// Wüllen (DL1YCF); and by DeskHPSDR
+// (https://github.com/dl1bz/deskhpsdr), maintained by Heiko (DL1BZ).
+// Both are GPL-2.0-or-later.
+//
+// WDSP — loaded by Zeus via P/Invoke — is Copyright (C) Warren Pratt
+// (NR0V), distributed under GPL v2 or later.
+//
+// Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
+// License for details.
+
+using Zeus.Contracts;
+
+namespace Zeus.Dsp;
+
+public enum DisplayPixout : byte
+{
+    Panadapter = 0,
+    Waterfall = 1,
+}
+
+/// <summary>Outcome of <see cref="IDspEngine.LoadNr3Model"/>.</summary>
+public enum Nr3ModelLoadResult
+{
+    /// <summary>NR3 isn't supported by the loaded engine (libwdsp built with
+    /// WDSP_WITH_NR3=OFF, or the Synthetic engine). No model was loaded.</summary>
+    Unavailable,
+    /// <summary>The model was intentionally cleared (null/empty path) — NR3 is
+    /// inert until a model is loaded. This is a success, not a failure.</summary>
+    Cleared,
+    /// <summary>A model file loaded successfully (verified via RNNRmodelLoaded
+    /// when the export is present; assumed on older libwdsp that lacks it).</summary>
+    Loaded,
+    /// <summary>A model file was requested but failed to parse/instantiate —
+    /// e.g. it isn't a compatible RNNoise DNNw weights file. NR3 stays inert.</summary>
+    LoadFailed,
+}
+
+public readonly record struct IqFrame(ReadOnlyMemory<double> InterleavedIq, int SampleRateHz);
+
+public interface IDspEngine : IDisposable
+{
+    int OpenChannel(int sampleRateHz, int pixelWidth);
+    void CloseChannel(int channelId);
+    void FeedIq(int channelId, ReadOnlySpan<double> interleavedIqSamples);
+    void SetMode(int channelId, RxMode mode);
+    void SetFilter(int channelId, int lowHz, int highHz);
+    void SetVfoHz(int channelId, long vfoHz);
+
+    /// <summary>
+    /// CTUN frequency shift — moves the IF by <paramref name="shiftHz"/>
+    /// before demodulation so the bandpass filter sees the tuned signal at
+    /// baseband while the radio's hardware NCO stays put. Pass 0 to disable
+    /// the shift stage (legacy behaviour). Mirrors Thetis radio.cs:1419-1420
+    /// (the WDSP <c>SetRXAShiftFreq</c> + <c>RXANBPSetShiftFrequency</c>
+    /// pair). Issue #427.
+    /// </summary>
+    void SetCtunShift(int channelId, int shiftHz);
+    void SetAgcTop(int channelId, double topDb);
+
+    /// <summary>
+    /// Set the AGC threshold ("knee") in dBm (WDSP <c>SetRXAAGCThresh</c>) — the
+    /// signal-relative level below which the AGC applies increasing gain up to
+    /// the <see cref="SetAgcTop"/> cap. The engine supplies the FFT size + sample
+    /// rate WDSP needs for the dBm conversion; the caller passes the value in
+    /// WDSP's dBm scale (per-board meter-offset conversion happens upstream).
+    /// No-op on Synthetic.
+    /// </summary>
+    void SetAgcThresh(int channelId, double threshDbm);
+
+    /// <summary>
+    /// Read back the AGC max-gain ("top") in dB. After a threshold change WDSP
+    /// recomputes the top; this exposes it for display mirroring. Returns the
+    /// last set top on Synthetic.
+    /// </summary>
+    double GetAgcTop(int channelId);
+
+    /// <summary>
+    /// Read the current AGC threshold ("knee") in dBm (WDSP scale). Used to
+    /// capture WDSP's per-mode default knee before the operator first overrides
+    /// it, so disengaging the knee can restore that default. 0 on Synthetic.
+    /// </summary>
+    double GetAgcThresh(int channelId);
+
+    /// <summary>Apply the AGC mode + custom/fixed params (Thetis parity §4).
+    /// Drives SetRXAAGCMode/Slope/Hang/Decay/HangThreshold (and SetRXAAGCFixed
+    /// in Fixed mode). The AGC max-gain ("top") is NOT touched here — it keeps
+    /// its own <see cref="SetAgcTop"/> path. Canned modes push their preset
+    /// hang/decay/threshold; Custom uses the cfg values (falling back to the
+    /// Med baseline for any null). No-op on Synthetic.</summary>
+    void SetAgc(int channelId, AgcConfig cfg);
+
+    /// <summary>Apply the RX fixed-squelch config (Thetis parity §5). A single
+    /// mode-aware control: the engine routes run + mapped threshold to the WDSP
+    /// squelch stage matching the channel's current RX mode (SSB/CW → SSQL,
+    /// AM/SAM → AMSQ, FM → FMSQ) and forces the other two stages off when
+    /// <see cref="SquelchConfig.Adaptive"/> is false. Adaptive squelch is
+    /// applied by the server audio pipeline, so WDSP's fixed stages are kept
+    /// off in that mode. Tau/max-tail use Thetis defaults set at channel open.
+    /// Re-asserted on every mode change so a fresh stage picks up the
+    /// operator's squelch. No-op on Synthetic.</summary>
+    void SetSquelch(int channelId, SquelchConfig cfg);
+
+    /// <summary>Apply the TX leveling config (Thetis parity §6.1-6.3). Drives
+    /// the ALC (SetTXAALCMaxGain/Decay — the ALC run state is left ON and is
+    /// never touched here; disabling it silences the SSB modulator), the Leveler
+    /// (SetTXALevelerSt run flag + SetTXALevelerDecay), and the Compressor/CPDR
+    /// (SetTXACompressorRun + SetTXACompressorGain). The Leveler max-gain
+    /// ("top") is NOT touched here — it keeps its own
+    /// <see cref="SetTxLevelerMaxGain"/> path. The engine remembers
+    /// cfg.LevelerEnabled so the TUN / two-tone restore re-arms the Leveler to
+    /// the operator's setting rather than hardcoding it on. No-op on
+    /// Synthetic.</summary>
+    void SetTxLeveling(int channelId, TxLevelingConfig cfg);
+
+    /// <summary>Apply the TX phase rotator (Thetis DSP→CFC→PhaseRot parity).
+    /// Drives WDSP's TXA PHROT all-pass stage: run flag, corner frequency,
+    /// stage count, and explicit microphone polarity reverse. Reverse is kept
+    /// independent from the run flag because Thetis allows phase reversal even
+    /// when phase rotation itself is disabled. AutoMode enables WDSP's live
+    /// corner-frequency optimizer. No-op on Synthetic.</summary>
+    void SetTxPhaseRotator(int channelId, TxPhaseRotatorConfig cfg);
+
+    /// <summary>Restart WDSP's TXA PHROT auto-optimizer from its default corner
+    /// frequency. No-op when no TX channel is open or on Synthetic.</summary>
+    void ResetTxPhaseRotatorAuto(int channelId);
+
+    /// <summary>Read display-ready TXA PHROT waveform-asymmetry telemetry. The
+    /// engine converts WDSP's linear envelope peaks to dB and native ratios to
+    /// percent. Returns null when no TX channel is open or on Synthetic.</summary>
+    TxPhaseRotatorAsymmetry? GetTxPhaseRotatorAsymmetry(int channelId);
+
+    /// <summary>
+    /// Briefly tighten the RX display's averaging time-constant after a
+    /// retune so the spectrum settles at the new frequency in ~100 ms
+    /// instead of melting over ~300-400 ms (issue #597; Thetis parity —
+    /// display.cs fast-attacks its averaging after a center change). RX
+    /// display channel ONLY: the TX and PS-feedback analyzers keep their
+    /// own configured tau (TxAvgTauSec) untouched, so tuning while keyed
+    /// never disturbs the TX trace or the PureSignal monitor. Restoring
+    /// (<paramref name="fast"/> = false) re-applies the RX channel's
+    /// configured default tau. No-op on Synthetic.
+    /// </summary>
+    void SetRxDisplayFastAttack(int channelId, bool fast);
+
+    /// <summary>Set the RX master AF gain in dB. Drives WDSP's
+    /// <c>SetRXAPanelGain1</c> (linear) after a dB→linear conversion. 0 dB
+    /// equals the engine's open-time default (linear 1.0). No-op on
+    /// Synthetic.</summary>
+    void SetRxAfGainDb(int channelId, double db);
+
+    void SetNoiseReduction(int channelId, NrConfig cfg);
+
+    /// <summary>Load (or, with a null/empty path, clear) the process-global
+    /// RNNoise (NR3) model shared by every RNNR channel. The result distinguishes
+    /// a model that actually loaded from one that failed to parse/instantiate, so
+    /// the caller can reject a bad upload instead of silently leaving NR3 inert.
+    /// <see cref="Nr3ModelLoadResult.Unavailable"/> when the loaded libwdsp lacks
+    /// NR3 support (built with WDSP_WITH_NR3=OFF, or the Synthetic engine).</summary>
+    Nr3ModelLoadResult LoadNr3Model(string? modelFilePath);
+
+    /// <summary>
+    /// Replace the full manual-notch (MNF) set applied to the RX audio. Notch
+    /// centre/width are absolute RF Hz; the engine rewrites the WDSP notch
+    /// database and re-applies it across channel reopens. The list is global to
+    /// the RX path (not per-channel) — matching the operator's mental model of
+    /// "these frequencies are notched".
+    /// </summary>
+    void SetNotches(IReadOnlyList<NotchDto> notches);
+
+    /// <summary>
+    /// Update the absolute tuned (LO) frequency the WDSP notch database uses to
+    /// position notches, so they hold their RF position across a retune.
+    /// </summary>
+    void SetNotchTuneFrequencyHz(double loHz);
+
+    void SetZoom(int channelId, int level);
+    int ReadAudio(int channelId, Span<float> output);
+
+    bool TryGetDisplayPixels(int channelId, DisplayPixout which, Span<float> dbOut);
+
+    /// <summary>TX panadapter / waterfall pixels in dBm, sourced from a
+    /// dedicated WDSP analyzer fed with the post-CFIR TX IQ. Returns false
+    /// when TXA is not open or no fresh FFT is ready. The TX analyzer is
+    /// configured to display the same frequency span as the RXA analyzer
+    /// (via bin clipping) so the panadapter axis does not move on MOX —
+    /// see issue #81. No-op on Synthetic.</summary>
+    bool TryGetTxDisplayPixels(DisplayPixout which, Span<float> dbOut);
+
+    /// <summary>Reconfigure the TX display analyzer (and the PS-feedback
+    /// analyzer, which shares the TX display span). <paramref name="fftSize"/>
+    /// is the analyzer FFT size (power of two); <paramref name="windowType"/>
+    /// is the WDSP <c>win_type</c>; <paramref name="avgTauSec"/> is the visual
+    /// log-recursive smoothing time-constant in seconds. Pure display — does
+    /// NOT change the transmitted audio, drive, or PA. Out-of-range values are
+    /// clamped/ignored by the implementation. No-op on Synthetic and when TXA
+    /// is not open.</summary>
+    void ConfigureTxDisplayAnalyzer(int fftSize, int windowType, double avgTauSec);
+
+    /// <summary>Clear RX/TX analyzer pixel and averaging buffers after a TX/RX
+    /// display-source transition. Mirrors Thetis's ResetPixelBuffers-on-MOX
+    /// behavior. No-op on Synthetic.</summary>
+    void ResetDisplayPixelBuffers();
+
+    /// <summary>PureSignal-feedback panadapter / waterfall pixels in dBm,
+    /// sourced from a separate WDSP analyzer fed with the post-PA loopback
+    /// IQ pumped through <see cref="FeedPsFeedbackBlock"/>. Returns false
+    /// when PS isn't armed (analyzer slot closed), TXA isn't open, or no
+    /// fresh FFT is ready. Caller is expected to also check that PS has
+    /// converged (info[14]==1) before showing this trace — pre-correction
+    /// the loopback shows the real PA splatter. See issue #121.
+    /// No-op on Synthetic.</summary>
+    bool TryGetPsFeedbackDisplayPixels(DisplayPixout which, Span<float> dbOut);
+
+    /// <summary>Open the TXA channel. Idempotent — calling twice returns the existing id.
+    /// Must be called after at least one OpenChannel(RXA). For Synthetic, returns -1 and is a no-op.
+    /// <paramref name="outputRateHz"/> picks the TXA profile: 48000 for P1 (48k in/out, CFIR off),
+    /// 192000 for P2 (48k mic / 96k dsp / 192k out, CFIR on). Defaults to P1 for tests and
+    /// bring-up code that doesn't care.</summary>
+    int OpenTxChannel(int outputRateHz = 48_000);
+
+    /// <summary>Flip MOX. When on: SetChannelState(RXA,0,1) then SetChannelState(TXA,1,0).
+    /// When off: SetChannelState(TXA,0,1) then SetChannelState(RXA,1,0). For Synthetic, no-op.
+    /// If OpenTxChannel has not been called (no TXA), this is a no-op.</summary>
+    void SetMox(bool moxOn);
+
+    /// <summary>Raw RXA signal-strength meter in dBm (Thetis rxaMeterType.RXA_S_AV, idx 1).
+    /// Returns a frozen −140 dBm from the synthetic engine. Safe to call from the
+    /// pipeline tick; WDSP's meter struct is lock-guarded internally. The caller
+    /// applies the per-board S-meter calibration offset because the DSP engine
+    /// does not know the effective hardware variant.</summary>
+    double GetRxaSignalDbm(int channelId);
+
+    /// <summary>RXA per-stage readings (signal peak/avg, ADC peak/avg, AGC
+    /// gain, AGC envelope peak/avg) sampled from the WDSP metering ring in a
+    /// single pass. Returns <see cref="RxStageMeters.Silent"/> on the
+    /// synthetic engine or when the channel is closed. Cal offset is NOT
+    /// applied here — caller (DspPipelineService) decides whether to add the
+    /// per-board offset before broadcasting, so unit tests can assert raw
+    /// WDSP output. Safe to call from the pipeline tick.</summary>
+    RxStageMeters GetRxStageMeters(int channelId);
+
+    /// <summary>Set TXA modulator mode (USB/LSB/FM/AM/...). Calls
+    /// SetTXAMode internally on WdspDspEngine; no-op for Synthetic and when no
+    /// TXA is open.</summary>
+    void SetTxMode(RxMode mode);
+
+    /// <summary>Zeus-level digital TX mode is active (DIGU/DIGL/FreeDV): gate
+    /// the TX CFC master + phase rotator run flags off while preserving
+    /// operator-configured settings. No-op for Synthetic and when no TXA is
+    /// open.</summary>
+    void SetTxDigitalBypass(bool bypass);
+
+    /// <summary>Set TXA bandpass (SetTXABandpassFreqs). <paramref name="lowHz"/>
+    /// / <paramref name="highHz"/> are signed Hz around baseband — LSB-style
+    /// passbands are negative, DSB/AM/FM symmetric. No-op for Synthetic and
+    /// when TXA is not open.</summary>
+    void SetTxFilter(int lowHz, int highHz);
+
+    /// <summary>Set the RXA bandpass shoulder steepness / "rectangularity"
+    /// (issue #871) by mapping the <see cref="BandpassWindow"/> preset to a WDSP
+    /// FIR tap count (<c>SetRXABandpassNC</c>) — more taps = sharper skirt. The
+    /// preset name is retained for wire/persistence compatibility. No-op on
+    /// Synthetic.</summary>
+    void SetRxBandpassWindow(int channelId, BandpassWindow window);
+
+    /// <summary>Set the TXA bandpass shoulder steepness / "rectangularity"
+    /// (issue #871) via the FIR tap count (<c>SetTXABandpassNC</c>). Independent
+    /// of <see cref="SetRxBandpassWindow"/>. No-op on Synthetic and when TXA is
+    /// not open.</summary>
+    void SetTxBandpassWindow(BandpassWindow window);
+
+    /// <summary>Process one WDSP-sized block of mic audio through TXA and return
+    /// the modulated IQ. <paramref name="micMono"/> must contain exactly
+    /// <see cref="TxBlockSamples"/> float samples (48 kHz mono). <paramref name="iqInterleaved"/>
+    /// receives 2 × <see cref="TxOutputSamples"/> floats ([I0, Q0, I1, Q1, …]).
+    /// For P1 the TXA output rate equals 48 kHz so input count == output count;
+    /// for P2 the TXA upsamples to 192 kHz so output count == 4 × input count.
+    /// Returns the number of IQ complex samples produced (0 if TXA not open, MOX
+    /// off, or the engine does not implement TX processing like Synthetic).</summary>
+    int ProcessTxBlock(ReadOnlySpan<float> micMono, Span<float> iqInterleaved);
+
+    /// <summary>WDSP TXA mic-input block size in mono samples. Mic ingest buffers
+    /// accumulate this many samples before calling ProcessTxBlock.</summary>
+    int TxBlockSamples { get; }
+
+    /// <summary>WDSP TXA IQ-output block size in complex samples. Equals
+    /// <see cref="TxBlockSamples"/> for P1 (48 kHz out); for P2 the TXA upsamples
+    /// 48k → 192k so this is 4 × <see cref="TxBlockSamples"/>.</summary>
+    int TxOutputSamples { get; }
+
+    /// <summary>Set TXA mic-side linear gain (Thetis audio.cs:218-224 wires the
+    /// mic-gain dB slider via <c>SetTXAPanelGain1(TXA, 10^(db/20))</c>).
+    /// <paramref name="linearGain"/> is already linear. No-op on Synthetic
+    /// and when TXA is not open.</summary>
+    void SetTxPanelGain(double linearGain);
+
+    /// <summary>Set the TXA Leveler maximum-gain ceiling in dB. Calls
+    /// <c>SetTXALevelerTop</c> (wcpAGC.c:648), which WDSP converts internally
+    /// to a linear cap via <c>pow(10, maxgainDb/20)</c>. Caller is
+    /// responsible for range-clamping; this method passes the value through.
+    /// No-op on Synthetic and when TXA is not open.</summary>
+    void SetTxLevelerMaxGain(double maxGainDb);
+
+    /// <summary>Start or stop the TXA internal-tune post-generator tone
+    /// (Thetis console.cs:18648 `chkTUN_CheckedChanged`). When on, TXA emits
+    /// a steady unmodulated carrier regardless of mic input. When off, the
+    /// post-generator is disabled and normal mic-driven TX resumes.</summary>
+    void SetTxTune(bool on);
+
+    /// <summary>Latest per-stage TXA peak meters sampled from the last
+    /// ProcessTxBlock call. Returns <see cref="TxStageMeters.Silent"/> when
+    /// TXA is not open or MOX is off (no fresh samples). Safe to poll
+    /// concurrently with ProcessTxBlock — the engine publishes via an
+    /// atomic snapshot so the reader sees a consistent set.</summary>
+    TxStageMeters GetTxStageMeters();
+
+    /// <summary>Two-tone test generator. Replaces mic input with summed tones
+    /// at <paramref name="freq1"/>/<paramref name="freq2"/> while armed.
+    /// Standard PureSignal calibration excitation but useful standalone.
+    /// Mutually exclusive with TUN (both share the WDSP PostGen stage).
+    /// Protocol-agnostic. No-op on Synthetic.</summary>
+    void SetTwoTone(bool on, double freq1, double freq2, double mag);
+
+    // ----------------- PureSignal predistortion (TXA-side) -----------------
+    // PS lives inside the TXA channel (txa[ch].calcc.p, txa[ch].iqc.p0/p1
+    // allocated by create_txa). The setters here drive the WDSP state
+    // machine; FeedPsFeedbackBlock pumps paired TX-modulator + RX-coupler
+    // IQ into pscc. Synthetic implements all of these as no-ops; meters
+    // return PsStageMeters.Silent.
+
+    /// <summary>Master arm. true → SetPSRunCal(1) and SetPSControl mode-on
+    /// (auto vs single is set via <see cref="SetPsControl"/>). false →
+    /// pihpsdr's "7× zero-pscc → SetPSRunCal(0) → SetPSControl reset"
+    /// shutdown sequence so the iqc stage doesn't latch a stale curve.
+    /// </summary>
+    void SetPsEnabled(bool enabled);
+
+    /// <summary>Tell calcc whether radio MOX is actually asserted. This is
+    /// deliberately separate from <see cref="SetMox"/> so callers can bring
+    /// TXA up before wire MOX, then start PureSignal's MOX delay timer only
+    /// after the hardware keying edge.</summary>
+    void SetPsMox(bool moxOn);
+
+    /// <summary>Cal-mode select. <paramref name="autoCal"/> = continuous
+    /// adaptation; <paramref name="singleCal"/> = one-shot collect-then-stay.
+    /// At most one of the two should be true; if both, single takes
+    /// precedence (one-shot then auto). Calls <c>SetPSControl</c> directly.
+    /// </summary>
+    void SetPsControl(bool autoCal, bool singleCal);
+
+    /// <summary>Freeze (true) or resume (false) PureSignal calibration without
+    /// disturbing the applied correction. true → <c>SetPSRunCal(0)</c>: calcc's
+    /// pscc state machine stops cycling/re-fitting, but the iqc predistorter
+    /// keeps applying its current coefficients (SetPSRunCal does NOT trigger the
+    /// iqc turn-off ramp). false → <c>SetPSRunCal(1)</c> resumes. Used to "catch
+    /// and hold" a converged automode correction so it stops flickering and the
+    /// signal holds (matches single-cal/LSTAYON behaviour without re-collecting).
+    /// </summary>
+    void SetPsHold(bool hold);
+
+    /// <summary>Apply timing + hardware-peak settings as a batch.</summary>
+    void SetPsAdvanced(double moxDelaySec, double loopDelaySec,
+                      double ampDelayNs, double hwPeak);
+
+    /// <summary>Set just the hardware-peak. Called from RadioService at
+    /// connect time once the protocol/board is known so the right value
+    /// (P1=0.4072, P2 G2=0.6121, P2 ANAN-7000=0.2899) lands before the
+    /// operator arms PS.</summary>
+    void SetPsHwPeak(double hwPeak);
+
+    /// <summary>Push one paired TX-mod-IQ + RX-feedback-IQ block into the
+    /// WDSP <c>psccF</c> entry. Block size must match the value pihpsdr
+    /// uses (1024 complex samples at 192 kHz). Caller owns the buffers; the
+    /// engine copies internally before handing to the native side.</summary>
+    void FeedPsFeedbackBlock(ReadOnlySpan<float> txI, ReadOnlySpan<float> txQ,
+                             ReadOnlySpan<float> rxI, ReadOnlySpan<float> rxQ);
+
+    /// <summary>Latest PureSignal stage readings (GetPSInfo + GetPSMaxTX).
+    /// Returns <see cref="PsStageMeters.Silent"/> when PS isn't armed or
+    /// the engine has no TXA. Safe to poll concurrently.</summary>
+    PsStageMeters GetPsStageMeters();
+
+    /// <summary>Reset PS state — calls <c>SetPSControl(1,0,0,0)</c>. Useful
+    /// after an aborted calibration or when changing radios.</summary>
+    void ResetPs();
+
+    /// <summary>Save the current PS correction curve to disk (ints/spi must
+    /// be 16/256 — WDSP refuses other shapes per Thetis PSForm.cs:865).
+    /// </summary>
+    void SavePsCorrection(string path);
+
+    /// <summary>Restore a previously-saved correction curve. Equivalent to
+    /// PSForm's "Restore-and-go" with <c>SetPSControl(0,0,0,1)</c>.</summary>
+    void RestorePsCorrection(string path);
+
+    // ----------------- CFC (Continuous Frequency Compressor) ---------------
+    // Multi-band frequency-domain compressor (xcfcomp) — issue #123. The
+    // stage already lives in xtxa between xeqp and xbandpass; this seam just
+    // pushes parameters and toggles run flags. Synthetic engine validates
+    // and no-ops; the WDSP engine pushes the profile arrays + scalar
+    // parameters under the TXA lock and flips Run last so a partial config
+    // never lands in the live audio path.
+
+    /// <summary>Apply a CFC profile: per-band frequencies/compression/post-gains
+    /// plus scalar pre-comp/pre-EQ/post-EQ-run/master-run toggles. The
+    /// <c>cfg.Bands</c> array must have exactly 10 entries (matches pihpsdr
+    /// classic-mode shape; the panel layout depends on it). No-op when no TXA
+    /// is open or on Synthetic.</summary>
+    void SetCfcConfig(CfcConfig cfg);
+
+    // ----------------- TX Monitor (preview path, issue #106 follow-up) ----
+    // Lets the operator hear the post-bandpass / post-CFIR TX audio on a local
+    // audio sink — with or without keying — so they can dial in the
+    // EQ, leveler, and bandwidth profile pre-RF. Implemented in the WDSP
+    // engine as a private RXA channel that demodulates the on-air IQ back to
+    // 48 kHz mono audio. Synthetic no-ops; ReadTxMonitorAudio returns 0.
+
+    /// <summary>Operator toggle for the TX-monitor preview path. When true,
+    /// the engine starts demodulating the post-CFIR TX IQ and exposes the
+    /// resulting mono audio via <see cref="ReadTxMonitorAudio"/>. When false,
+    /// stops feeding the monitor channel; subsequent ReadTxMonitorAudio calls
+    /// return 0 once the ring drains. Idempotent and cheap to call repeatedly.
+    /// No-op on Synthetic.</summary>
+    void SetTxMonitorEnabled(bool enabled);
+
+    /// <summary>Drain demodulated TX-monitor audio. Same shape as
+    /// <see cref="ReadAudio"/> — returns the number of mono float32 samples
+    /// written into <paramref name="output"/>. Returns 0 when monitor is off,
+    /// when the channel hasn't been opened yet, or when no samples are queued.
+    /// Synthetic returns 0 unconditionally.</summary>
+    int ReadTxMonitorAudio(Span<float> output);
+
+    /// <summary>Volatile read of the operator's monitor request flag. Used by
+    /// the audio-broadcast pipeline to decide whether to substitute monitor
+    /// audio for the RX AudioFrame. Reflects the toggle, not whether the
+    /// monitor channel is fully spun up. Synthetic returns false.</summary>
+    bool IsTxMonitorOn { get; }
+}

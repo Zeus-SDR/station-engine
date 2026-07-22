@@ -1,0 +1,16 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">0.15.1</VersionPrefix>
+    <VersionSuffix Condition="'$(VersionSuffix)' == '' AND '$(GITHUB_REF_TYPE)' != 'tag'">dev</VersionSuffix>
+    <Version Condition="'$(VersionSuffix)' != ''">$(VersionPrefix)-$(VersionSuffix)</Version>
+    <Version Condition="'$(VersionSuffix)' == ''">$(VersionPrefix)</Version>
+    <AssemblyVersion>$(VersionPrefix).0</AssemblyVersion>
+    <FileVersion>$(VersionPrefix).0</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,66 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="LiteDB" Version="5.0.20" />
+    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="System.Net.Http.Json" />
+    <Using Include="Microsoft.AspNetCore.Builder" />
+    <Using Include="Microsoft.AspNetCore.Hosting" />
+    <Using Include="Microsoft.AspNetCore.Http" />
+    <Using Include="Microsoft.AspNetCore.Routing" />
+    <Using Include="Microsoft.Extensions.Configuration" />
+    <Using Include="Microsoft.Extensions.DependencyInjection" />
+    <Using Include="Microsoft.Extensions.Hosting" />
+    <Using Include="Microsoft.Extensions.Logging" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Station.AudioRing\Station.AudioRing.csproj" />
+    <ProjectReference Include="..\Station.AudioIpc.Spike\Station.AudioIpc.Spike.csproj" />
+    <ProjectReference Include="..\Zeus.Contracts\Zeus.Contracts.csproj" />
+    <ProjectReference Include="..\Zeus.Protocol1\Zeus.Protocol1.csproj" />
+    <ProjectReference Include="..\Zeus.Protocol2\Zeus.Protocol2.csproj" />
+    <ProjectReference Include="..\Zeus.Dsp\Zeus.Dsp.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Zeus.Server.Hosting" />
+    <InternalsVisibleTo Include="StationEngine" />
+    <InternalsVisibleTo Include="Zeus.Contracts.Tests" />
+    <InternalsVisibleTo Include="Zeus.Plugins.Host.Tests" />
+    <InternalsVisibleTo Include="Zeus.Server.Tests" />
+    <InternalsVisibleTo Include="Zeus.VirtualRadio" />
+  </ItemGroup>
+
+  <!-- WDSP NR2 EMNR fopen()s these by bare relative name (native/wdsp/emnr.c:215,397).
+       Keep them with the engine assembly so standalone consumers receive the
+       same output-root files as the product host. -->
+  <ItemGroup>
+    <Content Include="wdsp-data\zetaHat.bin" Link="zetaHat.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="wdsp-data\calculus" Link="calculus" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Bundled default NR3 (RNNoise) model resolved from AppContext.BaseDirectory. -->
+  <ItemGroup>
+    <Content Include="nr3-data\rnnoise-default.bin" Link="rnnoise-default.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Shipped band-plan JSON. Plain Microsoft.NET.Sdk (not Web SDK) doesn't
+       include JSON under project root by default, so use explicit Include. -->
+  <ItemGroup>
+    <Content Include="BandPlans\**\*.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

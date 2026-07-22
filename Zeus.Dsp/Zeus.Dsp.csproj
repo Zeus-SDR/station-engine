@@ -1,0 +1,38 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Zeus.Contracts\Zeus.Contracts.csproj" />
+    <InternalsVisibleTo Include="Zeus.Dsp.Tests" />
+    <InternalsVisibleTo Include="Zeus.Server.Hosting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="runtimes/**/*.dylib" Pack="true" PackagePath="runtimes/">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </None>
+    <!-- *.so* (not *.so) so SONAME-versioned bundled deps like
+         libfftw3.so.3 / libfftw3f.so.3 are picked up alongside libwdsp.so. -->
+    <None Include="runtimes/**/*.so*" Pack="true" PackagePath="runtimes/">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </None>
+    <None Include="runtimes/**/*.dll" Pack="true" PackagePath="runtimes/">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Zeus — OpenHPSDR Protocol-1 / Protocol-2 client.
+// Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
+//                         Christian Suarez (N9WAR), and contributors.
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the
+// Free Software Foundation, either version 2 of the License, or (at your
+// option) any later version. See the LICENSE file at the root of this
+// repository for the full text, or https://www.gnu.org/licenses/.
+//
+// Zeus is an independent reimplementation in .NET — not a fork. Its
+// Protocol-1 / Protocol-2 framing, WDSP integration, meter pipelines, and
+// TX behaviour were informed by studying the Thetis project
+// (https://github.com/ramdor/Thetis), the authoritative reference
+// implementation in the OpenHPSDR ecosystem. Zeus gratefully acknowledges
+// the Thetis contributors whose work made this possible:
+//
+//   Richard Samphire (MW0LGE), Warren Pratt (NR0V),
+//   Laurence Barker (G8NJJ),   Rick Koch (N1GP),
+//   Bryan Rambo (W4WMT),       Chris Codella (W2PA),
+//   Doug Wigley (W5WC),        FlexRadio Systems,
+//   Richard Allen (W5SD),      Joe Torrey (WD5Y),
+//   Andrew Mansfield (M0YGG),  Reid Campbell (MI0BOT),
+//   Sigi Jetzlsperger (DH1KLM).
+//
+// Thetis itself continues the GPL-governed lineage of FlexRadio PowerSDR
+// and the OpenHPSDR (TAPR/OpenHPSDR) ecosystem; that lineage is preserved
+// here. See ATTRIBUTIONS.md at the repository root for the full provenance
+// statement and per-component attribution.
+//
+// Protocol-2 / PureSignal / Saturn-class behaviour was additionally informed
+// by pihpsdr (https://github.com/dl1ycf/pihpsdr), maintained by Christoph
+// Wüllen (DL1YCF); and by DeskHPSDR
+// (https://github.com/dl1bz/deskhpsdr), maintained by Heiko (DL1BZ).
+// Both are GPL-2.0-or-later.
+//
+// WDSP — loaded by Zeus via P/Invoke — is Copyright (C) Warren Pratt
+// (NR0V), distributed under GPL v2 or later.
+//
+// Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
+// License for details.
+
+using System.Net;
+using System.Threading.Channels;
+using Zeus.Contracts;
+using Zeus.Protocol1.Discovery;
+
+namespace Zeus.Protocol1;
+
+/// <summary>
+/// Surface of the Protocol-1 streaming client. One instance per radio.
+/// Not thread-safe for Connect/Start/Stop/Disconnect (single-writer UI model).
+/// Mutation setters are thread-safe.
+/// </summary>
+public interface IProtocol1Client : IDisposable
+{
+    /// <summary>Bind the local UDP socket and remember the radio endpoint.</summary>
+    Task ConnectAsync(IPEndPoint radioEndpoint, CancellationToken ct);
+
+    /// <summary>Send Metis start, spin up the RX + TX loops, begin IQ streaming.</summary>
+    Task StartAsync(StreamConfig config, CancellationToken ct);
+
+    /// <summary>Send Metis stop, join the RX thread, drain the socket.</summary>
+    Task StopAsync(CancellationToken ct);
+
+    /// <summary>Release the socket. Idempotent.</summary>
+    Task DisconnectAsync(CancellationToken ct);
+
+    ChannelReader<IqFrame> IqFrames { get; }
+
+    /// <summary>Monotonic count of UDP sequence gaps observed since Start.</summary>
+    long DroppedFrames { get; }
+
+    /// <summary>Monotonic count of valid RX packets parsed since Start.</summary>
+    long TotalFrames { get; }
+
+    void SetVfoAHz(long hz);
+    void SetSampleRate(HpsdrSampleRate rate);
+    void SetPreamp(bool on);
+    /// <summary>
+    /// Enable/disable the LT2208 ADC dither and digital-output randomizer
+    /// (Config-frame C3 bits 3/4). No-op on the wire for HL2 (gated in
+    /// <c>ControlFrame.WriteConfigPayload</c>). Mirrors the Protocol-2
+    /// <c>Protocol2Client.SetAdcDitherRandom</c> shape.
+    /// </summary>
+    void SetAdcDitherRandom(bool ditherEnabled, bool randomEnabled);
+    void SetAttenuator(HpsdrAtten atten);
+    void SetAntennaRx(HpsdrAntenna ant);
+    /// <summary>
+    /// Select the TX antenna relay (ANT1/2/3) — Config-frame C4[1:0], external-
+    /// port parity audit (GAP-P1-1). Deferred while keyed and applied on the
+    /// unkey edge (no hot-switching the Alex matrix under power). Honoured on the
+    /// wire only for P1 boards with full Alex TX relays (ANAN-100D/200D); clamped
+    /// to ANT1 elsewhere by <c>ControlFrame.EncodeTxAntennaC4Bits</c>.
+    /// </summary>
+    void SetAntennaTx(HpsdrAntenna ant);
+
+    /// <summary>
+    /// Flip the outgoing C&amp;C MOX bit (C0 LSB on every register). Read from
+    /// the internal CcState snapshot on the TX thread, so every register
+    /// emitted after this call carries the updated bit until cleared.
+    /// </summary>
+    void SetMox(bool on);
+
+    /// <summary>
+    /// UI-level TX drive, 0..100 (values outside clamp). Mapped to the 0..255
+    /// raw HPSDR drive byte (C0=0x12, C1) inside SnapshotState via
+    /// <c>raw = percent * 255 / 100</c>, matching the Protocol-1
+    /// <c>transmitter-&gt;drive_level</c> range.
+    /// </summary>
+    void SetDrive(int percent);
+
+    /// <summary>
+    /// Push a fully-computed raw drive byte (0..255), overriding the percent
+    /// path. RadioService uses this when PA calibration converts target watts
+    /// → drive byte via the per-band gain lookup.
+    /// </summary>
+    void SetDriveByte(byte value);
+
+    /// <summary>
+    /// User-configured Open-Collector pin masks (7 bits each). OR'd with the
+    /// board's auto-filter output. <paramref name="txMask"/> is asserted when
+    /// MOX is on; <paramref name="rxMask"/> otherwise. <paramref name="tuneMask"/>
+    /// is asserted on top of TX only while TUN is active.
+    /// </summary>
+    void SetOcMasks(byte txMask, byte rxMask, byte tuneMask);
+
+    /// <summary>
+    /// Latch the TUN flag used by the OC-mask composition path (issue #1325).
+    /// On Protocol 1 the wire MOX bit rises for both TUN and regular TX; this
+    /// separate flag lets ControlFrame OR in the OcTune mask only during TUN
+    /// so extra bits (amplifier bypass, external tuner start) don't leak onto
+    /// voice / CW / digital transmissions. Called from RadioService's
+    /// TunActiveChanged pipeline right after <see cref="SetMox"/>.
+    /// </summary>
+    void SetTune(bool on);
+
+    /// <summary>
+    /// Raised once from the RX loop when consecutive receive timeouts exhaust the
+    /// <c>ConsecutiveTimeoutsBeforeGiveUp</c> threshold — the radio has stopped
+    /// sending. Fires at most once per <see cref="StartAsync"/> / <see cref="StopAsync"/>
+    /// cycle and is NOT raised on a clean <see cref="StopAsync"/> call. Handlers run
+    /// synchronously on the RX thread; use <c>Task.Run</c> for any async work to
+    /// avoid blocking the thread or deadlocking on <see cref="StopAsync"/>.
+    /// </summary>
+    event Action? Disconnected;
+
+    /// <summary>
+    /// Raised from the RX loop whenever a successfully parsed EP6 packet carried
+    /// a C&amp;C echo on an AIN-bearing address (addresses 1/2/3 → C0 bytes
+    /// 0x08/0x10/0x18). Fire-and-forget — handlers run synchronously on the RX
+    /// thread and must not block.
+    /// </summary>
+    event Action<TelemetryReading>? TelemetryReceived;
+
+    /// <summary>
+    /// Raised once per successfully parsed EP6 packet with the OR-aggregated
+    /// ADC overload flags from the echoed C&amp;C word. Fires at the packet rate
+    /// (~1.2 kHz at 192 kSps); downstream is responsible for any throttling.
+    /// Handlers run synchronously on the RX thread and must not block.
+    /// </summary>
+    event Action<AdcOverloadStatus>? AdcOverloadObserved;
+
+    /// <summary>
+    /// Raised on a level change of the hardware-PTT echo bit (C0[0]) coming
+    /// back from the radio. On HL2 the gateware ORs in the rear KEY tip and
+    /// the external PTT line, so this rises whenever the operator keys the
+    /// radio directly without going through the host. It ALSO rises as a
+    /// loopback of any host-issued <see cref="SetMox(bool)"/>, so consumers
+    /// must check the host's current MOX/TUN state to disambiguate.
+    /// Edge-triggered: handler is called once per change. Fires on the RX
+    /// thread; handlers must not block.
+    /// </summary>
+    event Action<bool>? HardwarePttChanged;
+
+    /// <summary>
+    /// Latest hardware-PTT echo level. Volatile; safe to read from any
+    /// thread. Updated from the RX loop on every received EP6 packet.
+    /// </summary>
+    bool HardwarePtt { get; }
+
+    /// <summary>
+    /// Edge-triggered CW key-down from the gateware's shaped keyer output
+    /// (C0[2] / cw_key_status) — toggles per dit/dah, distinct from the
+    /// held <see cref="HardwarePttChanged"/> (C0[0] / ptt_resp). Drives the
+    /// local CW sidetone. Fires on the RX thread; handlers must not block.
+    /// (zeus-cl2)
+    /// </summary>
+    event Action<bool>? CwKeyDownChanged;
+
+    /// <summary>Latest CW key-down level (C0[2]). Volatile; any thread.</summary>
+    bool CwKeyDown { get; }
+
+    /// <summary>
+    /// Select the radio's wire-level board family. Affects the extended
+    /// attenuator byte layout (HL2 vs bare HPSDR) and the N2ADR filter-board
+    /// OC pin encoding. Defaults to <see cref="HpsdrBoardKind.HermesLite2"/>.
+    /// </summary>
+    void SetBoardKind(HpsdrBoardKind board);
+
+    /// <summary>
+    /// Current board kind as latched via <see cref="SetBoardKind"/>. Defaults
+    /// to <see cref="HpsdrBoardKind.HermesLite2"/> when discovery did not
+    /// supply one.
+    /// </summary>
+    HpsdrBoardKind BoardKind { get; }
+
+    /// <summary>
+    /// Toggle the HL2 + N2ADR 7-relay filter board. When on, C2 bits [7:1]
+    /// carry the per-band OC pin mask from <see cref="N2adrBands"/>.
+    /// Defaults to <c>false</c> (bare HL2, no filter board).
+    /// </summary>
+    void SetHasN2adr(bool hasN2adr);
+
+    /// <summary>
+    /// Hermes-Lite 2 Band Volts PWM enable. C3 bit 3 of the Config frame is
+    /// the same bit legacy HPSDR boards used for LT2208 ADC dither, which
+    /// HL2's AD9866 doesn't need. Per
+    /// <c>docs/references/protocol-1/hermes-lite2-protocol.md</c> line 39
+    /// (<c>| 0x00 | [11] | Fan or Band Volts PWM (0=Fan, 1=Band Volts) |</c>),
+    /// HL2 reuses this bit as the Band Volts PWM enable on the FAN
+    /// connector — when set, the gateware emits a per-band-tagged PWM
+    /// voltage so an external amplifier (e.g. Xiegu XPA125B) can
+    /// auto-band-switch. mi0bot's HL2-specific Thetis fork exposes this in
+    /// its UI as "Band Volts". Defaults to <c>false</c>; persisted per-
+    /// radio via <c>PreferredRadioStore</c> and honoured on HL2 only.
+    /// </summary>
+    bool EnableHl2BandVolts { get; set; }
+
+    /// <summary>
+    /// Arm or disarm PureSignal predistortion on the wire. HL2-only effect:
+    /// flips bit 22 of register 0x0a (= C2 bit 6 of the C0=0x14 frame), adds
+    /// the Predistortion (0x2b) register to the rotation, and asks the
+    /// gateware for 2 receivers so the EP6 packet layout switches to the
+    /// 2-DDC paired form (DDC0 + DDC1, with DDC1 carrying feedback ADC
+    /// samples during MOX). On non-HL2 boards this stores the flag for
+    /// state-tracking only — the wire stays untouched. Issue #172.
+    /// </summary>
+    void SetPsEnabled(bool on);
+
+    /// <summary>
+    /// Arm or disarm PureSignal, routing through the HermesC10 (ANAN-G2E, P1)
+    /// safe stop/drain/restart transition when the stream is live (#1302 —
+    /// the P1 receiver count must NEVER change on a live stream: the classic-
+    /// Hermes gateware applies it mid-frame and permanently sync-shifts the
+    /// EP6 byte stream). Idempotent: no transition and no wire traffic when
+    /// the client is already in the requested mode, so the reconnect resync
+    /// path is a no-op after connect-while-armed. On HL2 / other boards, or
+    /// before <see cref="StartAsync"/>, degrades to the plain flag store of
+    /// <see cref="SetPsEnabled"/>. This is the ONLY correct way to change the
+    /// PS arm state on a live HermesC10 connection.
+    /// </summary>
+    Task SetPsEnabledAsync(bool on, CancellationToken ct = default);
+
+    /// <summary>
+    /// Current PS arm state, as set by <see cref="SetPsEnabled"/>. Read by
+    /// DspPipelineService to gate the P1 PS feedback pump.
+    /// </summary>
+    bool PsEnabled { get; }
+
+    /// <summary>
+    /// Fires (at most once per stall, on the RX thread) when PS is armed on a
+    /// HermesC10 P1 stream and zero 4-DDC packets have parsed for ~2 s while
+    /// datagrams are still arriving — the misframed-stream fingerprint of
+    /// issue #1302. The subscriber (RadioService) auto-disarms PS through the
+    /// normal StateDto flow. Handlers must not block.
+    /// </summary>
+    event Action? PsFeedbackStalled;
+
+    /// <summary>Monotonic count of PS-armed 4-DDC EP6 packets that failed the
+    /// sync/framing parse since Start (#1302 observability).</summary>
+    long Ps4DdcSyncFailCount { get; }
+
+    /// <summary>Monotonic count of complete paired PS feedback blocks delivered
+    /// to the DSP sink or feedback channel. A changing value proves that the
+    /// keyed P1 feedback path is flowing; it says nothing about signal level.</summary>
+    long PsFeedbackBlocksDelivered { get; }
+
+    /// <summary>Last sampled keyed two-DDC feedback levels, retained across
+    /// unkey so post-transmit diagnostics can report what reached the client.</summary>
+    PsFeedbackObservation? LastPsFeedbackObservation { get; }
+
+    /// <summary>
+    /// Push the latest WDSP <c>calcc</c> predistortion subindex/value to
+    /// register 0x2b. Subindex (0..255) lands in C1; value (clamped to
+    /// 0..15) lands in C2 [3:0]. Per the HL2 protocol doc, value bits
+    /// [19:16] = C2 [3:0], NOT [23:20] / C2 [7:4] (PR #119 regression).
+    /// </summary>
+    void SetPsPredistortion(byte value, byte subindex);
+
+    /// <summary>
+    /// HL2 TX-side step attenuator (AD9866 TX PGA) target in dB, range
+    /// -28..+31. Used by <c>PsAutoAttenuateService</c> to bring the PS
+    /// feedback envelope into calcc's [128, 181] convergence window. Out-of-
+    /// range values are clamped to the bounds. Honoured only on HL2 during
+    /// MOX with PS enabled; <see cref="ControlFrame.WriteAttenuatorPayload"/>
+    /// overrides C4 with the mi0bot networkproto1.c:1086-1088 / console.cs:
+    /// 10947-10948 wire encoding (<c>(31 - db) | 0x40</c>). Non-HL2 boards
+    /// store the flag for state-tracking only — the wire stays untouched.
+    /// </summary>
+    void SetHl2TxStepAttenuationDb(int db);
+
+    /// <summary>
+    /// Current HL2 TX-side step attenuation in dB — the value last written
+    /// via <see cref="SetHl2TxStepAttenuationDb"/>. Returns 0 when untouched
+    /// (the radio's power-on default), never the internal int.MinValue
+    /// sentinel. Read by <c>PsAutoAttenuateService</c> on a PS-arm edge so
+    /// the dance baselines its model to ground truth instead of assuming 0,
+    /// which would desync from the radio's sticky ATTOnTX value.
+    /// </summary>
+    int Hl2TxStepAttenuationDb { get; }
+
+    /// <summary>
+    /// HermesC10 (ANAN-G2E, P1) TX-time ADC attenuation target in dB, range
+    /// 0..31 (out-of-range values are clamped). Written to the gateware's
+    /// <c>atten_on_Tx</c> register — C3[4:0] of the LnaTxGainStable (wire
+    /// 0x1c = register 0x0e) frame, muxed onto the step attenuator only while
+    /// FPGA_PTT — which protects the relay-routed PS feedback tap from
+    /// clipping the ADC while keyed. The register is only scheduled by the
+    /// PS-armed rotation, and the payload writer branches on HermesC10, so no
+    /// other board's wire bytes change. Until this is called the writer emits
+    /// 31, the silicon reset default — never an unrequested 0 dB. Distinct
+    /// from <see cref="SetHl2TxStepAttenuationDb"/> (AD9866 TX PGA, -28..+31,
+    /// different register).
+    /// </summary>
+    void SetPsTxAttenOnTxDb(int db);
+
+    /// <summary>
+    /// Current HermesC10 atten_on_Tx value in dB — the value last written via
+    /// <see cref="SetPsTxAttenOnTxDb"/>, or 31 (the silicon reset default,
+    /// which the payload writer also emits while unset) when nothing has been
+    /// pushed yet. Read by <c>PsAutoAttenuateService</c> on a PS-arm edge so
+    /// the dance baselines its model to ground truth instead of assuming 0 —
+    /// mirrors <see cref="Hl2TxStepAttenuationDb"/>.
+    /// </summary>
+    int PsTxAttenOnTxDb { get; }
+
+    /// <summary>
+    /// Push the on-board CW keyer config to C&amp;C register 0x0B: speed in
+    /// WPM (clamped to the 6-bit 0..60 gateware field) and the keyer mode
+    /// (straight / iambic A / iambic B). Sent via the register round-robin
+    /// so it self-heals on packet loss. The gateware ignores speed in
+    /// straight mode. See zeus-bks.
+    /// </summary>
+    void SetCwKeyerConfig(int wpm, CwKeyerMode mode);
+
+    /// <summary>
+    /// Set the TX audio front-end (external-audio-jacks re-port). Global
+    /// per-radio. <paramref name="micBoost"/> / <paramref name="micLineIn"/>
+    /// ride the 0x12 codec frame on Hermes-class boards; <paramref name="micTrs"/>
+    /// / <paramref name="micBias"/> / <paramref name="lineInGain"/> (0..31) ride
+    /// the 0x14 frame on HL2 via read-modify-write (PureSignal bit + C4 step-att
+    /// preserved). Per-board gating lives in <see cref="ControlFrame"/>, so a
+    /// value for the wrong board is ignored on the wire. All-zero/false is the
+    /// default and is byte-identical to today. mic_bias defaults OFF
+    /// (floating-connector PTT-hang guard).
+    /// </summary>
+    void SetAudioFrontEnd(bool micBoost, bool micLineIn, bool micTrs, bool micBias, int lineInGain);
+
+    /// <summary>
+    /// Set the HL2 4-bit user GPIO mask (user_dig_out → C3[3:0] of the 0x14
+    /// frame; external-ports plan, Phase 5 / external-port parity audit). Low
+    /// nibble only; HL2-only on the wire. RadioService gates this behind the
+    /// HasHl2UserGpio capability so it never reaches a non-HL2 board.
+    /// </summary>
+    void SetUserDigOut(int mask);
+
+    /// <summary>
+    /// 1024-sample paired feedback blocks decoded from the EP6 stream when
+    /// PS is armed. TX side comes from the in-flight TX-IQ ring (the
+    /// samples we just wrote to the wire); RX side is DDC1, the dedicated
+    /// feedback-ADC path. Single reader (the DspPipelineService PS pump).
+    /// </summary>
+    ChannelReader<PsFeedbackFrame> PsFeedbackFrames { get; }
+
+    /// <summary>
+    /// Diagnostic: monotonic count of PS-armed paired EP6 packets the RX
+    /// loop has decoded since Start. Surfaces "is the radio actually
+    /// emitting paired DDC0/DDC1 frames after PS arm?" — a value that
+    /// stays at 0 after arming is the canonical "PS armed but no
+    /// feedback samples reached the engine" symptom.
+    /// </summary>
+    long PsPairedPacketCount { get; }
+
+    /// <summary>
+    /// Register a synchronous sink to receive decoded RX frames directly on
+    /// the RX OS thread, bypassing the <see cref="IqFrames"/> /
+    /// <see cref="PsFeedbackFrames"/> channels. Call BEFORE
+    /// <see cref="StartAsync"/> for stable lifetime semantics; a runtime swap
+    /// uses <see cref="System.Threading.Interlocked.Exchange{T}(ref T, T)"/>
+    /// internally and is safe but not race-free against an in-flight frame
+    /// (the previous sink may receive one more callback after the call
+    /// returns).
+    ///
+    /// While a non-null sink is attached, the RX loop calls the sink methods
+    /// INSTEAD of writing to the public channels. With no sink attached, the
+    /// channel-write path remains the only producer (preserves existing
+    /// test-side consumers).
+    ///
+    /// See <see cref="IRxPacketSink"/> for the full threading contract.
+    /// </summary>
+    void AttachRxSink(IRxPacketSink sink);
+
+    /// <summary>
+    /// Detach the currently attached RX sink. After this returns, the
+    /// channel-write path is the only producer. Safe to call from any thread;
+    /// at most one further callback may complete on the detached sink before
+    /// the change is observed.
+    /// </summary>
+    void DetachRxSink();
+
+    /// <summary>
+    /// Attach the codec radio-mic / line-in handler (issue #992). While set, the
+    /// RX loop calls the handler synchronously with the 126 int16 mic samples
+    /// embedded in every standard EP6 packet (offsets 6..7 of each 8-byte sample
+    /// group). The samples are always 48 kHz at the radio's codec; at higher IQ
+    /// rates the gateware duplicates each sample N = rate/48 kHz times, so the
+    /// handler is responsible for decimating to 48 kHz. The handler runs on the
+    /// RX thread and must not block; the span is valid only for the call. Until
+    /// this is set, mic extraction is skipped entirely (no added per-packet cost
+    /// for radios in Host mode). Used by <c>DspPipelineService</c> to relay the
+    /// codec input (mic jack / line-in jack) into the TX audio chain when a
+    /// radio audio source is armed.
+    /// </summary>
+    void AttachRadioMicHandler(P1MicSampleHandler handler);
+
+    /// <summary>Detach the codec radio-mic handler; reverts to no extraction.</summary>
+    void DetachRadioMicHandler();
+}
+
+/// <summary>
+/// Synchronous handler for one EP6 packet's worth of codec mic / line-in
+/// samples (issue #992). The radio's codec digitises whichever input is
+/// selected (mic jack on RadioMic, line-in jack on RadioLineIn) and embeds the
+/// 16-bit samples in the same EP6 frame as the IQ stream. <paramref name="samples"/>
+/// carries the raw int16 mic samples in USB-frame order; the codec rate is
+/// fixed at 48 kHz, so at IQ rates above 48 kHz consecutive samples are
+/// duplicates and the handler must decimate by <c>iqRateHz / 48000</c>.
+/// </summary>
+public delegate void P1MicSampleHandler(ReadOnlySpan<short> samples, int iqRateHz);

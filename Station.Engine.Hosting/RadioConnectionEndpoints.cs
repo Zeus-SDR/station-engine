@@ -1,0 +1,486 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Douglas J. Cerrato (KB2UKA) and contributors.
+
+using System.Net;
+using Zeus.Contracts;
+using Zeus.Dsp.Wdsp;
+using Zeus.Protocol1;
+using Zeus.Protocol1.Discovery;
+using P1Radio = Zeus.Protocol1.Discovery.DiscoveredRadio;
+using P2Discovery = Zeus.Protocol2.Discovery.IRadioDiscovery;
+using P2Radio = Zeus.Protocol2.Discovery.DiscoveredRadio;
+
+namespace Zeus.Server;
+
+internal sealed record ReclaimRadioRequest(string? Endpoint, string? Protocol);
+
+/// <summary>Maps engine-owned radio discovery and P1/P2 lifecycle routes.</summary>
+public static class RadioConnectionEndpoints
+{
+    public static IEndpointRouteBuilder MapRadioConnectionEndpoints(
+        this IEndpointRouteBuilder endpoints)
+    {
+        ArgumentNullException.ThrowIfNull(endpoints);
+        var log = endpoints.ServiceProvider
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("Zeus.Server.RadioConnectionEndpoints");
+
+        endpoints.MapGet("/api/radios", async (
+            IRadioDiscovery p1Discovery,
+            P2Discovery p2Discovery,
+            IRadioDiscoveryExtension extension,
+            HttpContext ctx) =>
+        {
+            var timeout = TimeSpan.FromMilliseconds(1500);
+            var p1Task = p1Discovery.DiscoverAsync(timeout, ctx.RequestAborted);
+            var p2Task = p2Discovery.DiscoverAsync(timeout, ctx.RequestAborted);
+            var extensionTask = extension.ExtendAsync(p1Task, p2Task, ctx.RequestAborted);
+            await Task.WhenAll(p1Task, p2Task, extensionTask).ConfigureAwait(false);
+
+            var additions = extensionTask.Result.Protocol2Details;
+            var p1Infos = p1Task.Result.Select(MapP1);
+            var p2Infos = p2Task.Result.Select(r => MapP2(
+                r,
+                additions.TryGetValue(r.Ip, out var details) ? details : null));
+            return p1Infos
+                .Concat(p2Infos)
+                .Concat(extensionTask.Result.AdditionalRadios)
+                .ToArray();
+        });
+
+        // Take over a Busy radio. Discovery reports status 0x03 when another
+        // client owns the radio; the UI normally disables Connect for those.
+        // This sends a protocol stop to the radio so it drops the current owner,
+        // freeing it for an immediate connect. Outward-facing and deliberate —
+        // the Connect panel gates it behind an explicit operator confirmation,
+        // because it can kick another (possibly transmitting) operator off.
+        endpoints.MapPost("/api/radios/reclaim", async (
+            ReclaimRadioRequest req,
+            RadioReclaimService reclaim,
+            HttpContext ctx) =>
+        {
+            if (!TryParseIpEndpoint(req.Endpoint ?? string.Empty, out var ipEndpoint))
+                return Results.BadRequest(new { error = $"Invalid endpoint '{req.Endpoint}'." });
+
+            var isP2 = string.Equals(req.Protocol, "P2", StringComparison.OrdinalIgnoreCase);
+            log.LogInformation(
+                "api.radios.reclaim ip={Ip} protocol={Proto}",
+                ipEndpoint.Address,
+                isP2 ? "P2" : "P1");
+
+            await reclaim.ReclaimAsync(ipEndpoint.Address, isP2, ctx.RequestAborted)
+                .ConfigureAwait(false);
+            return Results.Ok(new { freed = true });
+        });
+
+        endpoints.MapPost("/api/connect", async (
+            ConnectRequest req,
+            RadioService radio,
+            WdspWisdomInitializer wisdom,
+            IRadioDiscovery p1Discovery,
+            HttpContext ctx) =>
+        {
+            log.LogInformation(
+                "api.connect endpoint={Ep} rate={Rate} preamp={Pre} atten={Atten}",
+                req.Endpoint,
+                req.SampleRate,
+                req.PreampOn,
+                req.Atten);
+
+            // WDSPwisdom must finish before OpenChannel, otherwise FFTW runs its slow
+            // per-size planner on the pipeline thread and RX packets pile up until
+            // the radio drops. The UI keeps Connect disabled during build; this is
+            // the server-side guard for non-UI callers (curl, older clients).
+            if (wisdom.Phase != WisdomPhase.Ready)
+                return Results.Json(
+                    new { error = "DSP is preparing FFTW plans — try again in a moment." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+
+            if (!TryValidateSampleRate(req.SampleRate, out var rateErr))
+                return Results.BadRequest(new { error = rateErr });
+            if (req.Atten is int a && !TryValidateAttenDb(a, out var attenErr))
+                return Results.BadRequest(new { error = attenErr });
+
+            if (req.PreampOn is bool preamp) radio.SetPreamp(preamp);
+            if (req.Atten is int atten) radio.SetAttenuator(new HpsdrAtten(atten));
+
+            // Plumb the discovered board byte through so RadioService can
+            // set the real board kind on the Protocol1Client rather than
+            // defaulting to HermesLite2 for every P1 connection — issue #294.
+            var boardKind = req.BoardId is byte bid
+                ? MapBoardByteP1(bid)
+                : HpsdrBoardKind.Unknown;
+
+            // Best-effort firmware capture for the "Report a problem" diagnostic
+            // snapshot. A short discovery broadcast (the radio isn't connected
+            // yet, so it answers) lets us match the code-version byte for this
+            // endpoint. Fail-open: any failure leaves firmware null and never
+            // blocks the connect — the diagnostic just shows "unknown".
+            string? firmware = null;
+            if (TryParseIpEndpoint(req.Endpoint, out var firmwareEndpoint))
+            {
+                try
+                {
+                    var found = await p1Discovery.DiscoverAsync(
+                        TimeSpan.FromMilliseconds(400),
+                        ctx.RequestAborted).ConfigureAwait(false);
+                    var probe = found.FirstOrDefault(d => d.Ip.Equals(firmwareEndpoint.Address));
+                    firmware = probe?.FirmwareString;
+                    if (!req.Force && probe?.Details.Busy == true)
+                    {
+                        log.LogWarning(
+                            "api.connect REFUSED — P1 radio {Ip} reports BUSY (another controller owns it)",
+                            firmwareEndpoint.Address);
+                        return Results.Json(
+                            new
+                            {
+                                error =
+                                    "This radio is already in use by another controller. Use Reclaim to take exclusive control, then connect again.",
+                                busy = true,
+                                reclaimable = true,
+                            },
+                            statusCode: StatusCodes.Status409Conflict);
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    log.LogWarning(
+                        ex,
+                        "api.connect firmware probe failed — diagnostic firmware will be 'unknown'");
+                }
+            }
+
+            try
+            {
+                var state = await radio.ConnectAsync(
+                    req.Endpoint,
+                    req.SampleRate,
+                    ctx.RequestAborted,
+                    boardKind,
+                    firmware).ConfigureAwait(false);
+                return Results.Ok(state);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        endpoints.MapPost("/api/connect/p2", async (
+            ConnectRequest req,
+            DspPipelineService dsp,
+            RadioService radio,
+            WdspWisdomInitializer wisdom,
+            P2Discovery p2Discovery,
+            HttpContext ctx) =>
+        {
+            log.LogInformation(
+                "api.connect.p2 endpoint={Ep} rate={Rate} force={Force}",
+                req.Endpoint,
+                req.SampleRate,
+                req.Force);
+
+            if (wisdom.Phase != WisdomPhase.Ready)
+                return Results.Json(
+                    new { error = "DSP is preparing FFTW plans — try again in a moment." },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+
+            if (!TryParseIpEndpoint(req.Endpoint, out var ipEndpoint))
+                return Results.BadRequest(new { error = $"Invalid endpoint '{req.Endpoint}'." });
+
+            var currentState = radio.Snapshot();
+            if (string.Equals(
+                    currentState.ConnectedProtocol,
+                    "P2",
+                    StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(currentState.Endpoint)
+                && TryParseIpEndpoint(currentState.Endpoint, out var currentEndpoint)
+                && currentEndpoint.Address.Equals(ipEndpoint.Address))
+            {
+                return Results.Ok(new
+                {
+                    protocol = "P2",
+                    endpoint = currentState.Endpoint ?? req.Endpoint,
+                    sampleRateKhz = Math.Max(1, currentState.SampleRate / 1000),
+                    alreadyConnected = true,
+                });
+            }
+
+            // HARDWARE-SAFETY GUARD (relay chatter / PSU brown-out).
+            // Before opening the relay-bearing high-priority stream, unicast-probe
+            // the radio and refuse to connect if it reports Busy — i.e. another
+            // controller (a co-located saturn-go / p2app stack, or another
+            // Zeus/Thetis client) is already driving it. Two masters publishing
+            // DIFFERENT band/antenna/ALEX-relay selections make the FPGA flip the
+            // BPF/LPF/T-R relay matrix every packet; the relay inrush can brown
+            // out a shared PSU and reboot the host (observed 2026-06-23 on a
+            // co-located CM5 Saturn all-in-one). A single Zeus master is fine —
+            // the danger requires a second, disagreeing controller. The operator
+            // takes over deliberately via Reclaim, which stops the other owner
+            // and re-connects with force=true. The probe fails OPEN: a radio that
+            // doesn't answer the probe is NOT blocked, so this never strands a
+            // legitimate connect. The probe must NOT weaken the co-located
+            // ephemeral-port bind — it only reads discovery, it doesn't touch the
+            // connect socket.
+            // Probe result is reused after the busy-gate to capture the
+            // firmware version for the diagnostics snapshot — null on a forced
+            // connect, which deliberately skips the probe.
+            P2Radio? probe = null;
+            if (!req.Force)
+            {
+                try
+                {
+                    probe = await p2Discovery.ProbeAsync(
+                        ipEndpoint.Address,
+                        TimeSpan.FromMilliseconds(700),
+                        ctx.RequestAborted).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    log.LogWarning(ex, "api.connect.p2 busy-probe failed — allowing connect");
+                }
+
+                if (probe?.Details.Busy == true)
+                {
+                    log.LogWarning(
+                        "api.connect.p2 REFUSED — radio {Ip} reports BUSY (another controller owns it); refusing second-master connect",
+                        ipEndpoint.Address);
+                    return Results.Json(
+                        new
+                        {
+                            error =
+                                "This radio is already in use by another controller. Connecting Zeus as a " +
+                                "second master would make the band/antenna/T-R relays chatter and can brown " +
+                                "out the radio. Stop the other controller (e.g. saturn-go / another client), " +
+                                "or use Reclaim to take exclusive control, then connect again.",
+                            busy = true,
+                            reclaimable = true,
+                        },
+                        statusCode: StatusCodes.Status409Conflict);
+                }
+            }
+
+            var rateKhz = req.SampleRate switch
+            {
+                48_000 => 48,
+                96_000 => 96,
+                192_000 => 192,
+                384_000 => 384,
+                768_000 => 768,      // P2 only (ANAN G2)
+                1_536_000 => 1536,   // P2 only (ANAN G2)
+                _ => 192,
+            };
+
+            // Plumb the discovered board byte through so RadioService can
+            // surface the real board kind instead of defaulting to OrionMkII
+            // for every P2 connection (issue #171 — Brick2 is Hermes/0x01 on P2).
+            var boardKind = req.BoardId is byte b
+                ? MapBoardByteP2(b)
+                : HpsdrBoardKind.Unknown;
+
+            try
+            {
+                // Firmware version for the "Report a problem" diagnostic snapshot.
+                rateKhz = await dsp.ConnectP2Async(
+                    ipEndpoint,
+                    rateKhz,
+                    numAdc: 2,
+                    ctx.RequestAborted,
+                    boardKind,
+                    probe?.FirmwareString).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    protocol = "P2",
+                    endpoint = req.Endpoint,
+                    sampleRateKhz = rateKhz,
+                });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "api.connect.p2 failed");
+                return Results.Problem(ex.Message, statusCode: 500);
+            }
+        });
+
+        endpoints.MapPost("/api/disconnect/p2", async (
+            DspPipelineService dsp,
+            HttpContext ctx) =>
+        {
+            log.LogInformation("api.disconnect.p2");
+            await dsp.DisconnectP2Async(ctx.RequestAborted).ConfigureAwait(false);
+            return Results.Ok(new { status = "disconnected" });
+        });
+
+        endpoints.MapPost("/api/disconnect", async (
+            RadioService radio,
+            IExternalRadioSidecar sidecar,
+            DspPipelineService dsp,
+            HttpContext ctx) =>
+        {
+            log.LogInformation("api.disconnect");
+            if (radio.IsProtocol3Active)
+            {
+                await sidecar.DisconnectAsync(ctx.RequestAborted).ConfigureAwait(false);
+                radio.MarkProtocol3Disconnected();
+                dsp.DisconnectP3TxEngine();
+                return Results.Ok(radio.Snapshot());
+            }
+            if (radio.IsProtocol2Active)
+            {
+                await dsp.DisconnectP2Async(ctx.RequestAborted).ConfigureAwait(false);
+                return Results.Ok(radio.Snapshot());
+            }
+            return Results.Ok(await radio.DisconnectAsync(ctx.RequestAborted).ConfigureAwait(false));
+        });
+
+        return endpoints;
+    }
+
+    private static RadioInfo MapP1(P1Radio radio) => new(
+        MacAddress: radio.Mac.ToString(),
+        IpAddress: radio.Ip.ToString(),
+        BoardId: radio.Board.ToString(),
+        FirmwareVersion: radio.FirmwareString,
+        Busy: radio.Details.Busy,
+        Details: BuildP1Details(radio));
+
+    private static RadioInfo MapP2(
+        P2Radio radio,
+        IReadOnlyDictionary<string, string>? additionalDetails)
+    {
+        var details = BuildP2Details(radio);
+        if (additionalDetails is not null)
+        {
+            foreach (var entry in additionalDetails)
+                details[entry.Key] = entry.Value;
+        }
+        return new RadioInfo(
+            MacAddress: radio.Mac.ToString(),
+            IpAddress: radio.Ip.ToString(),
+            BoardId: radio.Board.ToString(),
+            FirmwareVersion: radio.FirmwareString,
+            Busy: radio.Details.Busy,
+            Details: details);
+    }
+
+    private static IReadOnlyDictionary<string, string> BuildP1Details(P1Radio radio)
+    {
+        var details = new Dictionary<string, string>
+        {
+            ["protocol"] = "P1",
+            ["rawBoardId"] = $"0x{radio.Details.RawBoardId:X2}",
+            ["firmwareCode"] = radio.FirmwareVersion.ToString(),
+            ["gatewareBuild"] = radio.Details.GatewareBuild.ToString(),
+            ["rawReplyHex"] = Convert.ToHexString(radio.Details.RawReply),
+        };
+        if (radio.Details.FixedIpEnabled) details["fixedIpEnabled"] = "true";
+        if (radio.Details.FixedIpOverridesDhcp) details["fixedIpOverridesDhcp"] = "true";
+        if (radio.Details.MacAddressModified) details["macAddressModified"] = "true";
+        if (radio.Details.FixedIpAddress is { } ip) details["fixedIpAddress"] = ip.ToString();
+        if (radio.Details.HermesLite2MinorVersion is { } minor)
+            details["hl2MinorVersion"] = minor.ToString();
+        return details;
+    }
+
+    private static Dictionary<string, string> BuildP2Details(P2Radio radio)
+    {
+        var details = new Dictionary<string, string>
+        {
+            ["protocol"] = "P2",
+            ["rawBoardId"] = $"0x{radio.Details.RawBoardId:X2}",
+            ["firmwareCode"] = radio.FirmwareVersion.ToString(),
+            ["protocolSupported"] = radio.Details.ProtocolSupported.ToString(),
+            ["numReceivers"] = radio.Details.NumReceivers.ToString(),
+            ["mercuryVersion0"] = radio.Details.MercuryVersion0.ToString(),
+            ["mercuryVersion1"] = radio.Details.MercuryVersion1.ToString(),
+            ["mercuryVersion2"] = radio.Details.MercuryVersion2.ToString(),
+            ["mercuryVersion3"] = radio.Details.MercuryVersion3.ToString(),
+            ["pennyVersion"] = radio.Details.PennyVersion.ToString(),
+            ["metisVersion"] = radio.Details.MetisVersion.ToString(),
+            ["rawReplyHex"] = Convert.ToHexString(radio.Details.RawReply),
+        };
+        if (radio.Details.BetaVersion != 0)
+            details["betaVersion"] = radio.Details.BetaVersion.ToString();
+        return details;
+    }
+
+    private static bool TryParseIpEndpoint(string raw, out IPEndPoint endpoint)
+    {
+        endpoint = null!;
+        var separator = raw.LastIndexOf(':');
+        var host = separator > 0 ? raw[..separator] : raw;
+        var port = 1024;
+        if (separator > 0 && int.TryParse(raw[(separator + 1)..], out var parsedPort))
+            port = parsedPort;
+        if (!IPAddress.TryParse(host, out var ip)) return false;
+        endpoint = new IPEndPoint(ip, port);
+        return true;
+    }
+
+    // Connect-time projection of the discovered board byte → kind. Protocol 1
+    // and Protocol 2 use DIFFERENT wire numbering for the dual-ADC family
+    // (Angelia/Orion/OrionMkII), so they MUST use separate maps that mirror
+    // Zeus.Protocol1/Protocol2 Discovery.ReplyParser respectively. Reusing one
+    // table for both was the connect-time half of issue #780 (a P2 ANAN-200D,
+    // byte 0x04, was projected through the P1 table as Angelia/100D).
+    // Do NOT merge these two.
+    private static HpsdrBoardKind MapBoardByteP1(byte raw) => raw switch
+    {
+        0x00 => HpsdrBoardKind.Metis,
+        0x01 => HpsdrBoardKind.Hermes,
+        0x02 => HpsdrBoardKind.HermesII,
+        0x04 => HpsdrBoardKind.Angelia,      // ANAN-100D (P1 wire)
+        0x05 => HpsdrBoardKind.Orion,        // ANAN-200D (P1 wire)
+        0x06 => HpsdrBoardKind.HermesLite2,
+        0x0A => HpsdrBoardKind.OrionMkII,
+        0x14 => HpsdrBoardKind.HermesC10,
+        _ => HpsdrBoardKind.Unknown,
+    };
+
+    private static HpsdrBoardKind MapBoardByteP2(byte raw) => raw switch
+    {
+        0x00 => HpsdrBoardKind.Metis,        // Atlas
+        0x01 => HpsdrBoardKind.Hermes,
+        0x02 => HpsdrBoardKind.HermesII,
+        0x03 => HpsdrBoardKind.Angelia,      // ANAN-100D (P2 wire)
+        0x04 => HpsdrBoardKind.Orion,        // ANAN-200D (P2 wire — issue #780)
+        0x05 => HpsdrBoardKind.OrionMkII,    // ANAN-7000DLE / 8000DLE (P2 wire)
+        0x06 => HpsdrBoardKind.HermesLite2,
+        0x0A => HpsdrBoardKind.OrionMkII,    // Saturn / ANAN-G2
+        0x14 => HpsdrBoardKind.HermesC10,    // ANAN-G2E
+        _ => HpsdrBoardKind.Unknown,
+    };
+
+    private static bool TryValidateSampleRate(int rate, out string error)
+    {
+        if (rate is 48_000 or 96_000 or 192_000 or 384_000 or 768_000 or 1_536_000)
+        {
+            error = string.Empty;
+            return true;
+        }
+        error =
+            $"sampleRate must be one of {{48000, 96000, 192000, 384000, 768000, 1536000}}, got {rate}.";
+        return false;
+    }
+
+    private static bool TryValidateAttenDb(int db, out string error)
+    {
+        if (db >= HpsdrAtten.MinDb && db <= HpsdrAtten.MaxDb)
+        {
+            error = string.Empty;
+            return true;
+        }
+        error = $"atten must be in {HpsdrAtten.MinDb}..{HpsdrAtten.MaxDb} dB, got {db}.";
+        return false;
+    }
+}

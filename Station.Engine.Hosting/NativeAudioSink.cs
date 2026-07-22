@@ -1,0 +1,920 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Zeus — OpenHPSDR Protocol-1 / Protocol-2 client.
+// Copyright (C) 2026 Douglas J. Cerrato (KB2UKA), Christian Suarez (N9WAR), and contributors.
+//
+// Desktop-mode RX audio sink: drains demodulated audio (mono float32 48 kHz,
+// produced by DspPipelineService) directly into the selected OS playback
+// device via miniaudio. The WebSocket fan-out is skipped entirely in this
+// mode — the SPA's audio-decoder is opted out by Phase 2c.
+//
+// RxAfGainDb is already applied upstream in WDSP via SetRXAPanelGain1 before
+// the AudioFrame is produced, so this sink does NOT add any software gain
+// stage. The operator's volume slider drives the level for free.
+
+using System.Threading;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Zeus.Contracts;
+
+namespace Zeus.Server;
+
+/// <summary>
+/// <see cref="IRxAudioSink"/> implementation that pushes RX audio straight
+/// to the selected OS playback device via miniaudio. Used in desktop mode
+/// (<see cref="ZeusHostMode.Desktop"/>) in place of
+/// <see cref="WebSocketAudioSink"/>.
+///
+/// <para>Data flow:</para>
+/// <list type="number">
+/// <item>DSP tick thread calls <see cref="Publish"/> with a mono float32
+/// 48 kHz <see cref="AudioFrame"/> (~1024 samples / frame, ~46 Hz).</item>
+/// <item><see cref="Publish"/> copies the samples into an in-process SPSC
+/// float ring. The frame's underlying buffer is owned by the DSP service
+/// and may be reused by the next tick, so we must NOT keep a reference.</item>
+/// <item>The miniaudio playback thread calls <see cref="OnPlaybackData"/>
+/// asking for N frames of stereo float32 (at whatever rate the device
+/// negotiated). The callback drains the ring, duplicates each mono sample
+/// to L=R, and writes silence + bumps an underrun counter while the ring is
+/// rebuffering.</item>
+/// </list>
+///
+/// <para>Sample rate: miniaudio negotiates the device rate at open time and
+/// the device runs at whatever rate the OS gave us; if that's not 48 kHz,
+/// miniaudio's internal resampler (configured to linear in the native shim)
+/// converts on our behalf when we ask for the device rate via
+/// <c>preferSampleRate=48000</c>. We declare we want 48 kHz, miniaudio
+/// honours it where possible and resamples behind the scenes otherwise.
+/// Either way the playback callback receives buffers at the device's actual
+/// rate — and that's exactly what we fill.</para>
+///
+/// <para>Channels: miniaudio negotiates the device channel count; we ask
+/// for stereo (2) but accept whatever it gives. The callback handles any
+/// channel count by either passing mono straight through, duplicating
+/// L=R for stereo, or replicating across all channels for surround setups.</para>
+///
+/// <para>Underrun policy: when the ring starts empty or falls below one
+/// callback, we hold queued fragments until roughly 20 ms are buffered again
+/// instead of splicing a short RX tail into silence. A 5-second timer logs
+/// the silence count + resets it; persistent underruns mean either ring
+/// sizing is too small or the DSP thread is starved.</para>
+/// </summary>
+internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHostedService, IDisposable
+{
+    private const int FrameRateHz = 48_000;
+
+    // ~1 s @ 48 kHz mono = 49152 samples ≈ 192 KB. Power of two for the
+    // bitmask wrap. Even with the playback thread running ~10 ms periods,
+    // anything past ~50 ms is just bounded slack to absorb DSP-tick
+    // jitter.
+    private const int RingCapacity = 65_536;
+
+    // Floor for the prebuffer cushion: hold ~120 ms before starting/resuming
+    // playback, and refill to this depth after every (re)buffer.
+    //
+    // Why 120 ms and why adaptive (#742): the producer is the DSP RX tick, which
+    // publishes audio in BURSTS gated to ~33 ms (MaybeTickInline) on the RX
+    // packet thread — the same thread that also runs the squelch/leveler/plugin
+    // chain and the panadapter/waterfall work. The consumer is the miniaudio
+    // device callback draining steadily every device period. Between bursts the
+    // consumer drains with no production, so the ring must hold at least one
+    // inter-tick gap; any tick delayed by GC / CPU load / scheduler latency
+    // drains further. The old 60 ms (2880) was only ~2 tick intervals — a single
+    // delayed tick left too little margin and the callback short-read a silence
+    // tail (heard as crackle): a G2 report showed ~4.6% of callbacks short-read
+    // (222k silence samples) while the DSP side was provably healthy.
+    //
+    // 120 ms ≈ 3.6 tick intervals — absorbs a stalled tick with headroom. The
+    // EFFECTIVE target is also made adaptive at runtime to the negotiated device
+    // period (see OnPlaybackData): miniaudio may ignore our 480-frame request and
+    // hand us a larger callback, in which case the cushion grows to ≥ 4 callbacks
+    // so a big-period default device can't outrun a thin fixed cushion. Pure
+    // latency-vs-robustness trade — managed only, identical on every platform.
+    // (History: 20 ms underran badly, 60 ms underran under load — both #733/#742.)
+    private const int PlaybackPrebufferSamples = 5760;
+
+    // Keep selected/default playback opens bounded for the same reason as native
+    // mic capture: stale OS audio endpoints must not block desktop startup.
+    private static readonly TimeSpan DeviceOpenTimeout = TimeSpan.FromSeconds(5);
+
+    // Effective prebuffer cushion actually in force — max(floor, 4×callbackFrames),
+    // recomputed per callback once the device's real period is known. Reported in
+    // diagnostics so a report shows the cushion that was active.
+    private volatile int _effectivePrebufferSamples = PlaybackPrebufferSamples;
+
+    // ~250 ms @ 48 kHz mono = 12000 samples ≈ 48 KB. Power of two for the
+    // mask wrap. The preview path is sourced from mic capture (one block
+    // every 20 ms — 960 samples) so the buffer never needs to hold more
+    // than a few hundred ms of slack. A small ring is preferred: on a MOX
+    // rising edge, AudioPluginBridge stops pushing into this ring and the
+    // tail drains in <300 ms so the operator doesn't keep hearing the
+    // pre-MOX tail of their own voice after keying.
+    private const int PreviewRingCapacity = 16_384;
+
+    private readonly ILogger<NativeAudioSink> _log;
+    private readonly bool _outputEnabled;
+    private readonly AudioDeviceSettingsStore? _deviceSettings;
+    // Shared operator-mute flag (issue #1252). Owned by the DI container;
+    // SetMuted writes here, so every RX sink subscribed to the same state
+    // silences in lock-step. Null in the legacy test ctor — we fall back to
+    // a private instance so the sink still works standalone in tests.
+    private readonly RxAudioMuteState _muteState;
+    private readonly Action _muteChangedHandler;
+    // Service-provider-based lookup for TxService, used to subscribe to
+    // TxActiveChanged in StartAsync. NativeAudioSink can NOT take TxService
+    // as a constructor dep directly: DspPipelineService depends on
+    // IRxAudioSink (us), TxService depends on DspPipelineService, so a
+    // direct ctor-time dependency creates a DI cycle. Resolving TxService
+    // lazily inside StartAsync breaks the cycle — by the time the hosted-
+    // service start phase fires, all singletons in the cycle exist.
+    private readonly IServiceProvider? _services;
+    private readonly FloatSpscRing _ring = new(RingCapacity);
+    private readonly FloatSpscRing _previewRing = new(PreviewRingCapacity);
+    private readonly object _deviceSync = new();
+
+    // Resolved on Start, kept so Stop can detach the handler cleanly.
+    // Null when no TxService was available (legacy test ctor or
+    // pre-construction failure).
+    private TxService? _tx;
+    private Action<bool>? _txActiveHandler;
+
+    private MiniAudioOutput? _output;
+    private string? _activeOutputDeviceId;
+    private volatile bool _shutdown;
+    private volatile bool _intentionalStop;
+    private int _deviceGeneration;
+    private int _recoveryEpoch;
+    private int _recoveryScheduled;
+    private readonly CancellationTokenSource _recoveryCancellation = new();
+    private readonly CancellationToken _recoveryToken;
+    private bool _disposed;
+
+    private volatile bool _rebuffering = true;
+
+    // Local side-channel enable flag. Audio Suite preview now uses the full
+    // TX Monitor path; this ring remains available for desktop-only local
+    // playback sources such as WAV monitor playback. Read on the miniaudio
+    // capture worker thread inside PublishPreview and on the playback worker
+    // thread inside OnPlaybackData. Volatile is sufficient: a stale read
+    // across a toggle just means one extra (or one missing) block, inaudible.
+    private volatile bool _previewEnabled;
+
+    public bool IsMuted => _muteState.IsMuted;
+    public bool IsEnabled => _previewEnabled;
+    public bool OutputEnabled => _outputEnabled;
+    public string? ConfiguredOutputDeviceId => _deviceSettings?.Get().OutputDeviceId;
+    public string? ActiveOutputDeviceId => _activeOutputDeviceId;
+    public bool OutputOpen => _output is not null;
+
+    /// <summary>Snapshot of native-output health: cumulative underrun/overrun
+    /// sample counts (the RX crackle, issue #733), rebuffer events, and the
+    /// live ring depth vs the prebuffer cushion. Relaxed reads — safe from any
+    /// thread, exact-enough for telemetry.</summary>
+    public Diagnostics GetDiagnostics()
+    {
+        bool outputOpen;
+        int outputSampleRateHz;
+        int outputChannels;
+        string? configuredOutputDeviceId;
+        string? activeOutputDeviceId;
+
+        lock (_deviceSync)
+        {
+            outputOpen = _output is not null;
+            outputSampleRateHz = _output is null ? 0 : checked((int)_output.SampleRate);
+            outputChannels = _output is null ? 0 : checked((int)_output.Channels);
+            configuredOutputDeviceId = ConfiguredOutputDeviceId;
+            activeOutputDeviceId = _activeOutputDeviceId;
+        }
+
+        return new(
+            OutputEnabled: _outputEnabled,
+            UnderrunSamplesTotal: Interlocked.Read(ref _underrunSamplesTotal),
+            OverrunSamplesTotal: Interlocked.Read(ref _overrunSamplesTotal),
+            RebufferEvents: Interlocked.Read(ref _rebufferEvents),
+            RingDepthSamples: _ring.Count,
+            RingCapacitySamples: RingCapacity,
+            PrebufferSamples: _effectivePrebufferSamples,
+            SampleRateHz: FrameRateHz,
+            Rebuffering: _rebuffering,
+            OutputOpen: outputOpen,
+            ConfiguredOutputDeviceId: configuredOutputDeviceId,
+            ActiveOutputDeviceId: activeOutputDeviceId,
+            OutputSampleRateHz: outputSampleRateHz,
+            OutputChannels: outputChannels,
+            TotalSamplesIn: Interlocked.Read(ref _totalSamplesIn),
+            TotalSamplesOut: Interlocked.Read(ref _totalSamplesOut),
+            PreviewEnabled: _previewEnabled,
+            PreviewRingDepthSamples: _previewRing.Count,
+            PreviewRingCapacitySamples: PreviewRingCapacity,
+            PreviewSamplesIn: Interlocked.Read(ref _previewSamplesIn),
+            PreviewSamplesOut: Interlocked.Read(ref _previewSamplesOut),
+            DroppedFormatSamplesTotal: Interlocked.Read(ref _droppedFormatSamplesTotal),
+            DroppedMutedSamplesTotal: Interlocked.Read(ref _droppedMutedSamplesTotal),
+            LastInputSampleRateHz: Volatile.Read(ref _lastInputSampleRateHz),
+            LastInputChannels: Volatile.Read(ref _lastInputChannels));
+    }
+
+    public readonly record struct Diagnostics(
+        bool OutputEnabled,
+        long UnderrunSamplesTotal,
+        long OverrunSamplesTotal,
+        long RebufferEvents,
+        int RingDepthSamples,
+        int RingCapacitySamples,
+        int PrebufferSamples,
+        int SampleRateHz,
+        bool Rebuffering,
+        bool OutputOpen,
+        string? ConfiguredOutputDeviceId,
+        string? ActiveOutputDeviceId,
+        int OutputSampleRateHz,
+        int OutputChannels,
+        long TotalSamplesIn,
+        long TotalSamplesOut,
+        bool PreviewEnabled,
+        int PreviewRingDepthSamples,
+        int PreviewRingCapacitySamples,
+        long PreviewSamplesIn,
+        long PreviewSamplesOut,
+        long DroppedFormatSamplesTotal,
+        long DroppedMutedSamplesTotal,
+        int LastInputSampleRateHz,
+        int LastInputChannels);
+
+    public void SetMuted(bool muted) => _muteState.SetMuted(muted);
+
+    private void OnMuteChanged()
+    {
+        // Drain the playback ring on the rising edge so unmute doesn't
+        // replay ~1 s of stale audio. Falling edge is a no-op: an empty ring
+        // just rebuffers naturally from the next DSP tick.
+        if (!_muteState.IsMuted) return;
+        _ring.Clear();
+        _rebuffering = true;
+    }
+
+    public void SetEnabled(bool enabled)
+    {
+        _previewEnabled = _outputEnabled && enabled;
+        // Drain the preview ring on disable so re-enabling doesn't
+        // replay the tail of the prior preview session.
+        if (!enabled) _previewRing.Clear();
+        _log.LogInformation(
+            "audio.native.rx preview {State}",
+            _previewEnabled ? "enabled" : "disabled");
+    }
+
+    public void PublishPreview(ReadOnlySpan<float> monoSamples, int sampleRate)
+    {
+        // No-op when preview is off — keeps the realtime path on the
+        // mic capture thread cheap (one volatile read + return) when the
+        // operator hasn't engaged the feature.
+        if (!_previewEnabled) return;
+        if (sampleRate != FrameRateHz) return;   // defence in depth — mic is always 48 kHz
+        if (_muteState.IsMuted) return;           // RX mute also silences preview
+
+        int written = _previewRing.Write(monoSamples);
+        Interlocked.Add(ref _previewSamplesIn, written);
+        // Preview overruns are not interesting enough to track — the
+        // mic-capture cadence (960 samples / 20 ms) means the worst case
+        // is ~250 ms of stale preview dropped if the playback thread
+        // stalls, which is inaudible.
+    }
+
+    // Diagnostics — accessed from the audio worker thread; volatile / interlocked
+    // suffices since they're write-only there and read-only on the timer thread.
+    private long _underrunSamples;
+    private long _overrunSamples;
+    private long _totalSamplesIn;
+    private long _totalSamplesOut;
+    private long _previewSamplesIn;
+    private long _previewSamplesOut;
+    private long _droppedFormatSamplesTotal;
+    private long _droppedMutedSamplesTotal;
+    private int _lastInputSampleRateHz;
+    private int _lastInputChannels;
+    // Cumulative (never reset by the 5 s log) — surfaced via GetDiagnostics()
+    // so output-buffer underruns (the RX crackle, issue #733) are measurable
+    // from /api/audio/native rather than only by log-diving.
+    private long _underrunSamplesTotal;
+    private long _overrunSamplesTotal;
+    private long _rebufferEvents;
+    private DateTime _lastLogUtc = DateTime.UtcNow;
+
+    public NativeAudioSink(
+        ILogger<NativeAudioSink> log,
+        AudioDeviceSettingsStore? deviceSettings = null,
+        IServiceProvider? services = null,
+        RxAudioMuteState? muteState = null,
+        bool outputEnabled = true)
+    {
+        _log = log;
+        _outputEnabled = outputEnabled;
+        _deviceSettings = deviceSettings;
+        _services = services;
+        _muteState = muteState ?? new RxAudioMuteState();
+        _muteChangedHandler = OnMuteChanged;
+        _muteState.Changed += _muteChangedHandler;
+        _recoveryToken = _recoveryCancellation.Token;
+    }
+
+    /// <summary>
+    /// Hosted-service hook: open the miniaudio playback device. Failures are
+    /// logged at warning level and the sink degrades to a no-op (every frame
+    /// is dropped silently) so the rest of the host still comes up — the
+    /// operator gets logs but not a crash if their audio subsystem is
+    /// uncooperative.
+    /// </summary>
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (!_outputEnabled)
+        {
+            _log.LogInformation("audio.native.rx output disabled by host configuration");
+            return Task.CompletedTask;
+        }
+        var thread = new Thread(() =>
+        {
+            lock (_deviceSync)
+            {
+                if (_shutdown || _output != null) return;
+                OpenOutputLocked(ConfiguredOutputDeviceId);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "zeus-output-start",
+        };
+        thread.Start();
+
+        // Subscribe to TX-active edges so we can drain the ring on TX transitions.
+        // The radio sample clock and the WASAPI playback clock drift relative
+        // to each other (the radio runs slightly faster than the soundcard on
+        // most Windows systems), so the ring slowly accumulates a backlog
+        // over a multi-minute session. Without this hook the operator hears
+        // up to ~1.3 sec of stale RX audio after pressing MOX or TUNE before
+        // the buffer drains to silence. macOS / Linux see this too in
+        // principle but their audio backends drift much less and the ring
+        // stays at near-zero steady-state depth, so the clear is a no-op
+        // there. See issue #403 for the original symptom report and the
+        // diagnostic write-up.
+        _tx = _services?.GetService(typeof(TxService)) as TxService;
+        if (_tx is not null)
+        {
+            _txActiveHandler = OnTxActiveChanged;
+            _tx.TxActiveChanged += _txActiveHandler;
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Hosted-service hook: stop the playback device. Idempotent.</summary>
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        if (_tx is not null && _txActiveHandler is not null)
+        {
+            _tx.TxActiveChanged -= _txActiveHandler;
+            _txActiveHandler = null;
+        }
+        lock (_deviceSync)
+        {
+            _shutdown = true;
+            _intentionalStop = true;
+            Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Increment(ref _deviceGeneration);
+            _recoveryCancellation.Cancel();
+            try { _output?.Stop(); }
+            catch (Exception ex) { _log.LogWarning(ex, "audio.native.rx stop threw"); }
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task SetOutputDeviceAsync(string? deviceId, CancellationToken cancellationToken = default)
+    {
+        string? normalized = NormalizeDeviceId(deviceId);
+        _deviceSettings?.SetOutputDeviceId(normalized);
+        if (!_outputEnabled) return Task.CompletedTask;
+
+        lock (_deviceSync)
+        {
+            _intentionalStop = true;
+            Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Increment(ref _deviceGeneration);
+            try
+            {
+                CloseOutputLocked(dispose: true);
+                ResetForDeviceOpen();
+                OpenOutputLocked(normalized);
+            }
+            finally
+            {
+                _intentionalStop = false;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void OpenOutputLocked(string? requestedDeviceId)
+    {
+        var selected = !string.IsNullOrWhiteSpace(requestedDeviceId);
+        var output = OpenOutputTimeboxed(requestedDeviceId, out var failure);
+        if (output != null)
+        {
+            AdoptOutputLocked(output, requestedDeviceId);
+            return;
+        }
+
+        LogOpenGaveUp(selected ? "selected" : "default", failure);
+        if (!selected)
+        {
+            _log.LogWarning("audio.native.rx RX audio output disabled (no usable playback device)");
+            return;
+        }
+
+        var fallback = OpenOutputTimeboxed(null, out var fallbackFailure);
+        if (fallback != null)
+        {
+            AdoptOutputLocked(fallback, null);
+            return;
+        }
+
+        LogOpenGaveUp("default fallback", fallbackFailure);
+        _log.LogWarning("audio.native.rx RX audio output disabled (no usable playback device)");
+    }
+
+    private MiniAudioOutput? OpenOutputTimeboxed(string? requestedDeviceId, out Exception? failure) =>
+        TimeboxedNativeOpen.Run(
+            () =>
+            {
+                MiniAudioOutput? output = null;
+                try
+                {
+                    output = CreateOutput(requestedDeviceId);
+                    output.Start();
+                    return output;
+                }
+                catch
+                {
+                    if (output != null)
+                    {
+                        // A failed open is an intentional teardown. Invalidate
+                        // this wrapper's callback generation before Stop so a
+                        // synchronous or delayed stopped notification cannot
+                        // start the device-stop recovery loop.
+                        Interlocked.Increment(ref _deviceGeneration);
+                        try { output.Stop(); } catch { /* best effort */ }
+                        output.Dispose();
+                    }
+                    throw;
+                }
+            },
+            output =>
+            {
+                Interlocked.Increment(ref _deviceGeneration);
+                try { output.Stop(); } catch { /* best effort */ }
+                output.Dispose();
+            },
+            DeviceOpenTimeout,
+            out failure);
+
+    private void AdoptOutputLocked(MiniAudioOutput output, string? requestedDeviceId)
+    {
+        _output = output;
+        _activeOutputDeviceId = NormalizeDeviceId(requestedDeviceId);
+        _log.LogInformation(
+            "audio.native.rx open device={Device} rate={Rate}Hz channels={Channels} version={Version}",
+            _activeOutputDeviceId is null ? "default" : "selected",
+            output.SampleRate, output.Channels, MiniAudioInterop.Version());
+    }
+
+    private void LogOpenGaveUp(string which, Exception? failure)
+    {
+        if (failure != null)
+        {
+            _log.LogWarning(failure, "audio.native.rx {Which} output open failed", which);
+            return;
+        }
+
+        _log.LogWarning(
+            "audio.native.rx {Which} output open timed out after {Timeout:0.#}s; not blocking host startup",
+            which, DeviceOpenTimeout.TotalSeconds);
+    }
+
+    private MiniAudioOutput CreateOutput(string? deviceId)
+    {
+        int generation = Interlocked.Increment(ref _deviceGeneration);
+        return new(
+            onFrames: OnPlaybackData,
+            onNotify: kind => OnDeviceNotification(kind, generation),
+            deviceIdHex: NormalizeDeviceId(deviceId),
+            preferSampleRate: FrameRateHz,
+            preferChannels: 2,
+            periodFrames: 480,
+            periods: 2);
+    }
+
+    private void ResetForDeviceOpen()
+    {
+        _ring.Clear();
+        _previewRing.Clear();
+        _rebuffering = true;
+    }
+
+    private void CloseOutputLocked(bool dispose)
+    {
+        try { _output?.Stop(); }
+        catch (Exception ex) { _log.LogWarning(ex, "audio.native.rx stop threw"); }
+        if (dispose)
+        {
+            try { _output?.Dispose(); }
+            catch (Exception ex) { _log.LogWarning(ex, "audio.native.rx dispose threw"); }
+        }
+        _output = null;
+        _activeOutputDeviceId = null;
+    }
+
+    /// <summary>
+    /// TxService.TxActiveChanged subscriber. On either TX-active edge
+    /// (engaging or releasing via MOX, TUN, or TwoTone) drains the RX audio
+    /// ring and forces the playback callback through its normal prebuffer
+    /// path. TX start should silence any accumulated RX backlog; TX release
+    /// should discard queued transition samples so receive resumes from a
+    /// fresh RX cushion instead of playing a stale tail.
+    /// </summary>
+    internal void OnTxActiveChanged(bool txActive)
+    {
+        _ring.Clear();
+        _rebuffering = true;
+    }
+
+    // Test surface — lets unit tests assert the ring's drain behaviour
+    // without reaching into private state via reflection. Read on any
+    // thread; matches FloatSpscRing.Count's relaxed-reader contract
+    // (best-effort snapshot, may be off by one in a race window).
+    internal int CurrentRingDepth => _ring.Count;
+
+    internal void RenderPlaybackForTest(Span<float> output, uint frameCount, uint channels) =>
+        OnPlaybackData(output, frameCount, channels);
+
+    public void Publish(in AudioFrame frame)
+    {
+        if (!_outputEnabled) return;
+        var frameSamples = frame.Samples.Length;
+        Volatile.Write(ref _lastInputSampleRateHz, checked((int)frame.SampleRateHz));
+        Volatile.Write(ref _lastInputChannels, frame.Channels);
+
+        // Muted at the door: don't enqueue and let the ring drain to silence
+        // on the playback callback's underrun path. Cheaper than gating in
+        // the audio worker thread and avoids any sample-rate / channel-count
+        // negotiation with the producer.
+        if (_muteState.IsMuted)
+        {
+            Interlocked.Add(ref _droppedMutedSamplesTotal, frameSamples);
+            return;
+        }
+
+        // The DSP tick produces mono float32 @ 48 kHz. We assert the format
+        // softly: anything else is logged and dropped rather than corrupting
+        // the ring. (The format is set in DspPipelineService.AudioOutputRateHz
+        // and the AudioFrame ctor; this is defence in depth.)
+        if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz)
+        {
+            Interlocked.Add(ref _droppedFormatSamplesTotal, frameSamples);
+            // Don't spam — these fire at frame rate. Log first occurrence
+            // only by ANDing against a never-set flag once dropped.
+            return;
+        }
+
+        var src = frame.Samples.Span;
+        int written = _ring.Write(src);
+        if (written < src.Length)
+        {
+            int dropped = src.Length - written;
+            Interlocked.Add(ref _overrunSamples, dropped);
+            Interlocked.Add(ref _overrunSamplesTotal, dropped);
+        }
+        Interlocked.Add(ref _totalSamplesIn, src.Length);
+
+        MaybeLog();
+    }
+
+    // Mute-EXEMPT publish: byte-for-byte identical to Publish EXCEPT it omits the
+    // RX master-mute early-return. DspPipelineService routes only operator-requested
+    // local monitor audio here (Recorder playback and TX Monitor preview), and only
+    // while the operator is muted. Real RX audio is never handed to this method; it
+    // stays on Publish, which the master mute still drops. Shares the same playback
+    // ring and overrun/throughput accounting as Publish so diagnostics stay coherent.
+    public void PublishExempt(in AudioFrame frame)
+    {
+        if (!_outputEnabled) return;
+        if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz)
+            return;
+
+        var src = frame.Samples.Span;
+        int written = _ring.Write(src);
+        if (written < src.Length)
+        {
+            int dropped = src.Length - written;
+            Interlocked.Add(ref _overrunSamples, dropped);
+            Interlocked.Add(ref _overrunSamplesTotal, dropped);
+        }
+        Interlocked.Add(ref _totalSamplesIn, src.Length);
+
+        MaybeLog();
+    }
+
+    // Effective prebuffer/refill cushion for a device callback of
+    // <paramref name="totalFrames"/> frames: the larger of the 120 ms floor and
+    // four callbacks deep, capped to leave one callback of ring headroom (a
+    // target ≥ capacity would wedge rebuffering forever). #742.
+    internal static int ComputePrebufferTarget(int totalFrames)
+    {
+        if (totalFrames <= 0) return PlaybackPrebufferSamples;
+        int desired = Math.Max(PlaybackPrebufferSamples, totalFrames * 4);
+        // Keep one callback of ring headroom; a target >= capacity would wedge
+        // rebuffering forever. For an absurd period (> half the ring) just
+        // degrade to whatever headroom remains rather than throw.
+        int ceiling = Math.Max(1, RingCapacity - totalFrames);
+        return Math.Min(desired, ceiling);
+    }
+
+    private void OnPlaybackData(Span<float> output, uint frameCount, uint channels)
+    {
+        // miniaudio's buffer is interleaved float32 sized frameCount * channels.
+        // We hold mono samples in the ring; expand to N channels by replication.
+        int totalFrames = (int)frameCount;
+        int channelsI = (int)channels;
+
+        // Read up to `totalFrames` mono samples from the ring into a small
+        // scratch buffer (stack-allocated when small enough). The miniaudio
+        // worker thread is the only consumer; stack alloc is safe.
+        Span<float> mono = totalFrames <= 4096
+            ? stackalloc float[totalFrames]
+            : new float[totalFrames];
+
+        // Size the cushion to the LARGER of the 120 ms floor and 4× this device's
+        // actual callback (the negotiated period may exceed our 480-frame
+        // request). #742.
+        int prebufferTarget = ComputePrebufferTarget(totalFrames);
+        _effectivePrebufferSamples = prebufferTarget;
+
+        // Elastic-buffer latency cap (issue: P3 sidecar over-delivery). The
+        // producer can flood the ring — a burst backlog drained from the P3
+        // audio poll, or the radio sample clock running slightly faster than
+        // the soundcard — and once full the ring PINS near capacity, adding up
+        // to ~1.3 s of playback latency (measured) plus overrun drops. Nothing
+        // brought it back down between rebuffers. Here the consumer trims the
+        // oldest excess down to the cushion whenever the depth exceeds ~2×,
+        // bounding latency to the cushion while leaving hysteresis so steady
+        // state never trims. One O(1) skip corrects a flood or a drift step;
+        // the discarded samples are tallied as overruns. Protocol-agnostic —
+        // P2 keeps the ring near-empty so this never fires there.
+        if (!_rebuffering)
+        {
+            int latencyCeiling = Math.Min(prebufferTarget * 2, RingCapacity - totalFrames);
+            if (_ring.Count > latencyCeiling)
+            {
+                int trimmed = _ring.Skip(_ring.Count - prebufferTarget);
+                Interlocked.Add(ref _overrunSamples, trimmed);
+                Interlocked.Add(ref _overrunSamplesTotal, trimmed);
+            }
+        }
+
+        bool rxSilence = false;
+        int queued = _ring.Count;
+        if (_rebuffering)
+        {
+            if (queued >= prebufferTarget)
+            {
+                _rebuffering = false;
+            }
+            else
+            {
+                rxSilence = true;
+            }
+        }
+        else if (queued < totalFrames)
+        {
+            _rebuffering = true;
+            rxSilence = true;
+            Interlocked.Increment(ref _rebufferEvents);
+        }
+
+        if (rxSilence)
+        {
+            mono.Clear();
+            Interlocked.Add(ref _underrunSamples, totalFrames);
+            Interlocked.Add(ref _underrunSamplesTotal, totalFrames);
+        }
+        else
+        {
+            int read = _ring.Read(mono);
+            if (read < totalFrames)
+            {
+                // Defensive race fallback: clear on mute/TX can discard the
+                // ring between Count and Read.
+                mono[read..].Clear();
+                _rebuffering = true;
+                int shortfall = totalFrames - read;
+                Interlocked.Add(ref _underrunSamples, shortfall);
+                Interlocked.Add(ref _underrunSamplesTotal, shortfall);
+            }
+        }
+
+        // Local side-channel mixing: when enabled, sum published mono monitor
+        // samples into the RX mono buffer BEFORE channel expansion. We use a
+        // second stack-alloc'd scratch span so we don't touch the side-channel
+        // ring on the common disabled path. Underrun is benign — the operator
+        // just hears silence for that gap, which is what they expect when the
+        // publisher isn't producing.
+        bool mixedPreview = false;
+        if (_previewEnabled)
+        {
+            Span<float> aud = totalFrames <= 4096
+                ? stackalloc float[totalFrames]
+                : new float[totalFrames];
+            int audRead = _previewRing.Read(aud);
+            // Sum the preview slice into mono. If the preview ring
+            // underran we still sum the bytes we got and leave the
+            // rest of mono unchanged (RX continues underneath).
+            for (int i = 0; i < audRead; i++) mono[i] += aud[i];
+            if (audRead > 0) Interlocked.Add(ref _previewSamplesOut, audRead);
+            mixedPreview = audRead > 0;
+        }
+
+        if (mixedPreview)
+            DspPipelineService.LimitRxAudioBuffer(mono);
+
+        // Expand mono → output channels. channels==1 is the trivial path.
+        if (channelsI == 1)
+        {
+            mono.CopyTo(output);
+        }
+        else
+        {
+            // Interleaved write: out[i*ch + c] = mono[i] for c in 0..ch.
+            int outIdx = 0;
+            for (int i = 0; i < totalFrames; i++)
+            {
+                float s = mono[i];
+                for (int c = 0; c < channelsI; c++)
+                {
+                    output[outIdx++] = s;
+                }
+            }
+        }
+
+        Interlocked.Add(ref _totalSamplesOut, totalFrames);
+    }
+
+    private void OnDeviceNotification(int kind, int generation)
+    {
+        // 1=started, 2=stopped, 3=rerouted, 4=interruption_began,
+        // 5=interruption_ended, 6=unlocked.
+        // miniaudio reroutes automatically on default-device change (headphone
+        // hotplug, BT switch) so no re-init is required — the SAMPLE RATE and
+        // channel count may shift, but the data callback keeps firing.
+        string label = kind switch
+        {
+            1 => "started",
+            2 => "stopped",
+            3 => "rerouted (default device changed)",
+            4 => "interruption_began",
+            5 => "interruption_ended",
+            6 => "unlocked",
+            _ => $"kind={kind}",
+        };
+        _log.LogInformation("audio.native.rx event {Event}", label);
+        if (kind == 2) ScheduleRecovery(generation);
+    }
+
+    private void ScheduleRecovery(int stoppedGeneration)
+    {
+        if (!DeviceStopRecovery.ShouldSchedule(
+                _shutdown,
+                _intentionalStop,
+                stoppedGeneration,
+                Volatile.Read(ref _deviceGeneration))) return;
+        if (Interlocked.CompareExchange(ref _recoveryScheduled, 1, 0) != 0) return;
+
+        int recoveryEpoch = Volatile.Read(ref _recoveryEpoch);
+        // Device selection can change between the first lock-free check and
+        // winning the single-flight flag. Revalidate after capturing its
+        // epoch so a stale callback can never reopen the newly selected route.
+        if (!DeviceStopRecovery.ShouldSchedule(
+                _shutdown,
+                _intentionalStop,
+                stoppedGeneration,
+                Volatile.Read(ref _deviceGeneration)))
+        {
+            Interlocked.Exchange(ref _recoveryScheduled, 0);
+            return;
+        }
+        _ = Task.Run(async () =>
+        {
+            string? configuredDeviceId = null;
+            string configuredDeviceLabel = "default";
+            try
+            {
+                configuredDeviceId = NormalizeDeviceId(ConfiguredOutputDeviceId);
+                configuredDeviceLabel = configuredDeviceId ?? "default";
+                bool abandoned = false;
+                var result = await DeviceStopRecovery.RunAsync(
+                    static (delay, ct) => Task.Delay(delay, ct),
+                    (attempt, ct) =>
+                    {
+                        lock (_deviceSync)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            if (_shutdown || _intentionalStop || recoveryEpoch != Volatile.Read(ref _recoveryEpoch))
+                            {
+                                abandoned = true;
+                                return Task.FromResult(true);
+                            }
+
+                            _log.LogWarning(
+                                "audio.native.rx device-stop recovery attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
+                                attempt, configuredDeviceLabel);
+                            _intentionalStop = true;
+                            try
+                            {
+                                Interlocked.Increment(ref _deviceGeneration);
+                                CloseOutputLocked(dispose: true);
+                                ResetForDeviceOpen();
+                                OpenOutputLocked(configuredDeviceId);
+                                bool recovered = _output is not null;
+                                if (recovered)
+                                    _log.LogInformation(
+                                        "audio.native.rx device-stop recovery succeeded attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
+                                        attempt, configuredDeviceLabel);
+                                return Task.FromResult(recovered);
+                            }
+                            finally
+                            {
+                                _intentionalStop = false;
+                            }
+                        }
+                    },
+                    _recoveryToken).ConfigureAwait(false);
+
+                if (!abandoned && result == DeviceRecoveryResult.GaveUp)
+                    _log.LogError(
+                        "audio.native.rx device-stop recovery gave up after 3 attempts configuredDeviceId={ConfiguredDeviceId}",
+                        configuredDeviceLabel);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(
+                    ex,
+                    "audio.native.rx device-stop recovery worker failed configuredDeviceId={ConfiguredDeviceId}",
+                    configuredDeviceLabel);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _recoveryScheduled, 0);
+            }
+        });
+    }
+
+    private void MaybeLog()
+    {
+        // Cheap throttle — only the producer thread reads/writes _lastLogUtc.
+        var now = DateTime.UtcNow;
+        if (now - _lastLogUtc < TimeSpan.FromSeconds(5)) return;
+        _lastLogUtc = now;
+
+        long inS = Interlocked.Read(ref _totalSamplesIn);
+        long outS = Interlocked.Read(ref _totalSamplesOut);
+        long under = Interlocked.Exchange(ref _underrunSamples, 0);
+        long over = Interlocked.Exchange(ref _overrunSamples, 0);
+        // Only log when there's something to flag — otherwise stay quiet
+        // on the happy path so dev logs don't fill up.
+        if (under == 0 && over == 0) return;
+        _log.LogInformation(
+            "audio.native.rx stats in={InS} out={OutS} underrun={Under} overrun={Over}",
+            inS, outS, under, over);
+    }
+
+    private static string? NormalizeDeviceId(string? deviceId)
+    {
+        var trimmed = deviceId?.Trim();
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _muteState.Changed -= _muteChangedHandler;
+        lock (_deviceSync)
+        {
+            _shutdown = true;
+            _intentionalStop = true;
+            Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Increment(ref _deviceGeneration);
+            _recoveryCancellation.Cancel();
+            CloseOutputLocked(dispose: true);
+        }
+        _recoveryCancellation.Dispose();
+    }
+}
