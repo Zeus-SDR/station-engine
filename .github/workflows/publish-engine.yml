@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Publish engine
+
+# Publishes the StationEngine binary to the channel the Zeus Link launcher pulls
+# from: downloads.zeussdr.com/engine-<channel>/latest.json + the SHA-256-pinned
+# per-platform zips it names.
+#
+#   - push to `develop`      → auto-publish the `engine-dev` channel (the merge
+#                              IS the publish; installed dev Zeus Links pick it
+#                              up on next launch).
+#   - manual dispatch (dev)   → same, forced without a new merge.
+#   - manual dispatch (stable)→ publish `engine-stable`. Run from `main` after a
+#                              release so the public channel only ever carries
+#                              engine built from released code.
+#
+# The launcher deserializes latest.json with deny_unknown_fields; tools/engine-
+# manifest.mjs emits exactly the schema it expects. Dev/stable objects live under
+# separate prefixes and never cross.
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel to publish (dev = internal testers, stable = public release)'
+        type: choice
+        options: [dev, stable]
+        default: dev
+
+permissions:
+  contents: read
+
+concurrency:
+  # Don't let two publishes of the same channel race on the mutable latest.json.
+  group: publish-engine-${{ github.event.inputs.channel || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  DOWNLOAD_BASE_URL: https://downloads.zeussdr.com
+  R2_BUCKET: zeussdr-downloads
+  # Every object under engine-<channel>/ is overwritten in place (latest.json
+  # always, versioned zips whenever a dev version repeats), so the edge must not
+  # serve the domain's default one-year immutable cache.
+  R2_CACHE_CONTROL: "public, max-age=60, must-revalidate"
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  resolve:
+    name: Resolve channel + version
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.r.outputs.channel }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: r
+        run: |
+          set -euo pipefail
+          CHANNEL="${{ github.event.inputs.channel || 'dev' }}"
+          case "$CHANNEL" in
+            dev|stable) ;;
+            *) echo "::error::channel must be dev or stable, got '$CHANNEL'"; exit 1 ;;
+          esac
+          PREFIX=$(sed -n 's:.*<VersionPrefix[^>]*>\([^<]*\)</VersionPrefix>.*:\1:p' Directory.Build.props | head -1)
+          PREFIX="${PREFIX:-0.0.0}"
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          DATE=$(date -u +%Y%m%d)
+          if [ "$CHANNEL" = "stable" ]; then
+            # Public release: clean MAJOR.MINOR.PATCH from Directory.Build.props.
+            VERSION="$PREFIX"
+          else
+            # Rolling dev channel: monotonic, traceable to the exact commit.
+            VERSION="${PREFIX}-dev.${DATE}.${SHORT_SHA}"
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved channel=$CHANNEL version=$VERSION"
+
+  build:
+    name: Build engine (${{ matrix.rid }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # RID → the rust-triple string the launcher's current_target() matches.
+          # Only targets that have committed natives AND a launcher target ship.
+          - { rid: win-x64,     target: x86_64-pc-windows-msvc,     executable: StationEngine.exe }
+          - { rid: osx-arm64,   target: aarch64-apple-darwin,       executable: StationEngine }
+          - { rid: linux-x64,   target: x86_64-unknown-linux-gnu,   executable: StationEngine }
+          - { rid: linux-arm64, target: aarch64-unknown-linux-gnu,  executable: StationEngine }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish self-contained (${{ matrix.rid }})
+        # Cross-published from the ubuntu runner for every RID — .NET pulls the
+        # target runtime pack, and the committed Zeus.Dsp/runtimes/<rid> natives
+        # ride along. -p:Version wins over Directory.Build.props so the binary's
+        # self-reported version matches the manifest.
+        run: |
+          set -euo pipefail
+          dotnet publish StationEngine/StationEngine.csproj \
+            -c Release -r ${{ matrix.rid }} --self-contained \
+            -p:Version=${{ needs.resolve.outputs.version }} \
+            -o "publish/${{ matrix.target }}"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          exe="publish/${{ matrix.target }}/${{ matrix.executable }}"
+          test -f "$exe" || { echo "::error::expected executable missing: $exe"; exit 1; }
+          mkdir -p staged
+          # Zip the publish dir CONTENTS so the executable sits at the archive
+          # root — that is what the launcher's `executable` field points at.
+          ( cd "publish/${{ matrix.target }}" \
+            && zip -qr "$GITHUB_WORKSPACE/staged/StationEngine-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.zip" . )
+          ls -l staged
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: staged/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish to R2 (engine-${{ needs.resolve.outputs.channel }})
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    env:
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check Cloudflare credentials
+        id: creds
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] || [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            if [ "${GITHUB_REPOSITORY}" = "Zeus-SDR/station-engine" ]; then
+              echo "::error::CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN secrets are not configured on the canonical repo."
+              exit 1
+            fi
+            echo "Cloudflare secrets absent — skipping R2 publish (fork). Engine zips remain as workflow artifacts."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download engine artifacts
+        if: steps.creds.outputs.available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage + generate manifest
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          find artifacts -name '*.zip' -exec cp {} upload/ \;
+          echo "Staged:"; ls -l upload
+          node tools/engine-manifest.mjs \
+            --version "$VERSION" \
+            --base-url "${DOWNLOAD_BASE_URL}/engine-${CHANNEL}" \
+            --out upload/latest.json \
+            --artifact target=x86_64-pc-windows-msvc,file=upload/StationEngine-${VERSION}-x86_64-pc-windows-msvc.zip,executable=StationEngine.exe,archive=zip \
+            --artifact target=aarch64-apple-darwin,file=upload/StationEngine-${VERSION}-aarch64-apple-darwin.zip,executable=StationEngine,archive=zip \
+            --artifact target=x86_64-unknown-linux-gnu,file=upload/StationEngine-${VERSION}-x86_64-unknown-linux-gnu.zip,executable=StationEngine,archive=zip \
+            --artifact target=aarch64-unknown-linux-gnu,file=upload/StationEngine-${VERSION}-aarch64-unknown-linux-gnu.zip,executable=StationEngine,archive=zip
+
+      - name: Upload to R2
+        if: steps.creds.outputs.available == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          prefix="engine-${CHANNEL}"
+          # Versioned zips first, then latest.json — the live manifest must never
+          # name an artifact that has not landed yet, and a mid-loop failure
+          # leaves the previous latest.json consistent with the previous zips.
+          for f in upload/StationEngine-*.zip; do
+            echo "Uploading ${prefix}/$(basename "$f")"
+            npx --yes wrangler@4.103.0 r2 object put "${R2_BUCKET}/${prefix}/$(basename "$f")" \
+              --file "$f" --content-type application/zip \
+              --cache-control "${R2_CACHE_CONTROL}" --remote
+          done
+          npx --yes wrangler@4.103.0 r2 object put "${R2_BUCKET}/${prefix}/latest.json" \
+            --file upload/latest.json --content-type application/json \
+            --cache-control "${R2_CACHE_CONTROL}" --remote
+
+      - name: Verify published manifest + engine hash
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          prefix="engine-${CHANNEL}"
+          curl -fsSL "${DOWNLOAD_BASE_URL}/${prefix}/latest.json" -o live.json
+          echo "Live manifest:"; cat live.json
+          # The published manifest must match what we generated...
+          diff <(jq -S . upload/latest.json) <(jq -S . live.json)
+          # ...and the launcher will refuse any artifact whose bytes don't match
+          # its advertised hash, so prove one end-to-end before declaring success.
+          url=$(node -e "console.log(require('./live.json').artifacts.find(a=>a.target==='x86_64-unknown-linux-gnu').url)")
+          exp=$(node -e "console.log(require('./live.json').artifacts.find(a=>a.target==='x86_64-unknown-linux-gnu').sha256)")
+          act=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          if [ "$act" != "$exp" ]; then
+            echo "::error::published engine hash ${act} != manifest ${exp}"; exit 1
+          fi
+          echo "Published and verified engine ${VERSION} to ${prefix}."
