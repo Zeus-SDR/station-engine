@@ -69,6 +69,8 @@ internal enum MicBlockSource
     Tci,
     /// <summary>WAV-recording playback to the air. Operator-explicit override.</summary>
     Wav,
+    /// <summary>Out-of-process product-plugin TX injection lease.</summary>
+    ProductPlugin,
 }
 
 /// <summary>
@@ -141,7 +143,10 @@ public sealed class TxAudioIngest : IDisposable
     private const int FreeDvTxTailGuardMs = 160;        // post-drain FIFO flush hold
     private const int VoiceTailIngressSettleMs = 40;    // allow final browser/WS mic frame to arrive
     private const int RogerBeepDurationMs = 180;
-    private const int RogerBeepTransportDrainTimeoutMs = 350;
+    private const int RogerBeepDspFlushCeilingMs = 200;
+    private const int RogerBeepFlushSilentBlocks = 2;
+    private const float RogerBeepFlushIqThreshold = 0.001f; // -60 dBFS
+    private const int RogerBeepTransportDrainTimeoutMs = 500;
     private const int RogerBeepTailGuardMs = 120;
     private const double RogerBeepFrequencyHz = 1000.0;
     private const float RogerBeepMagnitude = 0.60f;
@@ -259,14 +264,16 @@ public sealed class TxAudioIngest : IDisposable
         StreamingHub hub,
         ILogger<TxAudioIngest> log,
         IAudioModemPort? audioModem = null,
-        IProductTxAudioPort? productAudio = null)
+        IProductTxAudioPort? productAudio = null,
+        ProductPluginAudioPort? productPluginAudio = null)
         : this(ring, () => pipeline.CurrentEngine, () => tx.IsMoxOn, hub, log,
                forwardP2: iq => pipeline.ForwardTxIqToP2(iq.Span),
                drainTxTransport: pipeline.DrainTxIqTransportTail,
                txOwnedByTuneDriver: () => !tx.IsMicIqProducerAllowed,
                preKeyOpenAtTicks: () => tx.PreKeyOpenAtTicks,
                audioModem: audioModem,
-               productAudio: productAudio)
+               productAudio: productAudio,
+               productPluginAudio: productPluginAudio)
     {
     }
 
@@ -288,13 +295,15 @@ public sealed class TxAudioIngest : IDisposable
         Func<long>? preKeyOpenAtTicks = null,
         Func<long>? stopwatchTicks = null,
         IAudioModemPort? audioModem = null,
-        IProductTxAudioPort? productAudio = null)
+        IProductTxAudioPort? productAudio = null,
+        ProductPluginAudioPort? productPluginAudio = null)
     {
         _ring = ring;
         _engineProvider = engineProvider;
         _isMoxOn = isMoxOn;
         _audioModem = audioModem ?? new NullAudioModemPort();
         _productAudio = productAudio ?? new NullProductTxAudioPort();
+        _productPluginAudio = productPluginAudio;
         _forwardP2 = forwardP2;
         _drainTxTransport = drainTxTransport;
         _onWdspConsumed = onWdspConsumed;
@@ -305,6 +314,8 @@ public sealed class TxAudioIngest : IDisposable
         _log = log;
         _handler = OnMicPcmBytesFromBrowserMic;
         _hub.MicPcmReceived += _handler;
+        _productPluginAudio?.ConfigureTxSink(OnProductPluginTxAudio);
+        _productPluginAudio?.ConfigureTxActiveSink(SetProductPluginInjectionActive);
     }
 
     /// <summary>
@@ -550,8 +561,11 @@ public sealed class TxAudioIngest : IDisposable
         if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
         lock (_sync) { _accumulatorFill = 0; }
         bool emitted = false;
+        bool bypassApplied = false;
         try
         {
+            bypassApplied = true;
+            engine.SetTxRogerBeepBypass(true);
             int totalSamples = Math.Max(1, TxRateHz * RogerBeepDurationMs / 1000);
             double phase = 0.0;
             double phaseStep = 2.0 * Math.PI * RogerBeepFrequencyHz / TxRateHz;
@@ -560,6 +574,7 @@ public sealed class TxAudioIngest : IDisposable
             long deadline = System.Diagnostics.Stopwatch.GetTimestamp();
             int sampleIndex = 0;
             int blocks = 0;
+            int flushBlocks = 0;
             float micPeak = 0f;
             float iqPeak = 0f;
 
@@ -599,24 +614,60 @@ public sealed class TxAudioIngest : IDisposable
 
                 sampleIndex += active;
                 deadline += periodTicks;
-                long remaining = deadline - System.Diagnostics.Stopwatch.GetTimestamp();
-                if (remaining > 0)
-                {
-                    int ms = (int)(remaining * 1000 / freq);
-                    if (ms > 0) Thread.Sleep(ms);
-                }
-                else
+                if (!SleepToBlockDeadline(deadline, freq))
                 {
                     deadline = System.Diagnostics.Stopwatch.GetTimestamp();
                 }
             }
 
+            Array.Clear(_tailMic, 0, blockSize);
+            int maxFlushBlocks = Math.Max(
+                1,
+                TxRateHz * RogerBeepDspFlushCeilingMs / 1000 / blockSize);
+            int silentBlocks = 0;
+            for (int b = 0; b < maxFlushBlocks; b++)
+            {
+                int produced = engine.ProcessTxBlock(
+                    new ReadOnlySpan<float>(_tailMic, 0, blockSize),
+                    new Span<float>(_tailIq, 0, 2 * iqOut));
+                float blockPeak = 0f;
+                if (produced > 0)
+                {
+                    var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
+                    for (int i = 0; i < iqSpan.Length; i++)
+                    {
+                        float sampleAbs = iqSpan[i];
+                        if (sampleAbs < 0) sampleAbs = -sampleAbs;
+                        if (sampleAbs > blockPeak) blockPeak = sampleAbs;
+                        if (sampleAbs > iqPeak) iqPeak = sampleAbs;
+                    }
+                    _ring.Write(iqSpan);
+                    _forwardP2?.Invoke(new ReadOnlyMemory<float>(_tailIq, 0, 2 * produced));
+                    emitted = true;
+                    blocks++;
+                }
+
+                flushBlocks++;
+                silentBlocks = blockPeak <= RogerBeepFlushIqThreshold
+                    ? silentBlocks + 1
+                    : 0;
+                deadline += periodTicks;
+                if (!SleepToBlockDeadline(deadline, freq))
+                {
+                    deadline = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
+                if (silentBlocks >= RogerBeepFlushSilentBlocks) break;
+            }
+            bool dspFlushed = silentBlocks >= RogerBeepFlushSilentBlocks;
+
             bool transportDrained = _drainTxTransport?.Invoke(
                 TimeSpan.FromMilliseconds(RogerBeepTransportDrainTimeoutMs)) ?? true;
             Thread.Sleep(RogerBeepTailGuardMs);
             _log.LogInformation(
-                "tx.rogerBeep.tail dropping PTT: blocks={Blocks} durationMs={Duration} freqHz={Freq:F0} micPeak={MicPeak:F4} iqPeak={IqPeak:F4} transportDrained={TransportDrained} guardMs={Guard}",
-                blocks, RogerBeepDurationMs, RogerBeepFrequencyHz, micPeak, iqPeak, transportDrained, RogerBeepTailGuardMs);
+                "tx.rogerBeep.tail dropping PTT: blocks={Blocks} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} flushCeilingMs={FlushCeiling} durationMs={Duration} freqHz={Freq:F0} micPeak={MicPeak:F4} iqPeak={IqPeak:F4} transportDrained={TransportDrained} transportBudgetMs={TransportBudget} guardMs={Guard}",
+                blocks, flushBlocks, dspFlushed, RogerBeepDspFlushCeilingMs,
+                RogerBeepDurationMs, RogerBeepFrequencyHz, micPeak, iqPeak,
+                transportDrained, RogerBeepTransportDrainTimeoutMs, RogerBeepTailGuardMs);
             return emitted;
         }
         catch (Exception ex)
@@ -626,6 +677,11 @@ public sealed class TxAudioIngest : IDisposable
         }
         finally
         {
+            if (bypassApplied)
+            {
+                try { engine.SetTxRogerBeepBypass(false); }
+                catch (Exception ex) { _log.LogWarning(ex, "tx.rogerBeep.bypass restore threw"); }
+            }
             lock (_sync)
             {
                 _ring.Clear();
@@ -634,6 +690,15 @@ public sealed class TxAudioIngest : IDisposable
             }
             Volatile.Write(ref _tailDraining, 0);
         }
+    }
+
+    private static bool SleepToBlockDeadline(long deadlineTicks, long stopwatchFrequency)
+    {
+        long remaining = deadlineTicks - System.Diagnostics.Stopwatch.GetTimestamp();
+        if (remaining <= 0) return false;
+        int ms = (int)Math.Ceiling(remaining * 1000.0 / stopwatchFrequency);
+        if (ms > 0) Thread.Sleep(ms);
+        return true;
     }
 
     /// <summary>
@@ -718,6 +783,8 @@ public sealed class TxAudioIngest : IDisposable
     // Null in unit tests.
     private readonly IAudioModemPort _audioModem;
     private readonly IProductTxAudioPort _productAudio;
+    private readonly ProductPluginAudioPort? _productPluginAudio;
+    private int _productPluginInjectionActive;
 
     private readonly Action<ReadOnlyMemory<float>>? _forwardP2;
     private readonly Func<TimeSpan, bool>? _drainTxTransport;
@@ -877,6 +944,43 @@ public sealed class TxAudioIngest : IDisposable
         // also observes this seam, so desktop native mic, browser mic, radio
         // jack, TCI, and playback all use the same pre-MOX metering path.
         MicPcmTapped?.Invoke(f32lePayload, source);
+        Span<float> samples = stackalloc float[MicBlockSamples];
+        var bytes = f32lePayload.Span;
+        for (var index = 0; index < samples.Length; index++)
+            samples[index] = BinaryPrimitives.ReadSingleLittleEndian(
+                bytes.Slice(index * sizeof(float), sizeof(float)));
+        _productPluginAudio?.PublishTxMic(TxRateHz, samples);
+        if (Volatile.Read(ref _productPluginInjectionActive) != 0)
+        {
+            lock (_sync) _droppedFrames++;
+            return;
+        }
+        ProcessMicPcm(samples, source);
+    }
+
+    private void OnProductPluginTxAudio(ReadOnlySpan<float> samples)
+    {
+        if (samples.Length != MicBlockSamples
+            || Volatile.Read(ref _productPluginInjectionActive) == 0)
+        {
+            lock (_sync) _droppedFrames++;
+            return;
+        }
+        ProcessMicPcm(samples, MicBlockSource.ProductPlugin);
+    }
+
+    private void SetProductPluginInjectionActive(bool active)
+    {
+        Volatile.Write(ref _productPluginInjectionActive, active ? 1 : 0);
+        lock (_sync)
+        {
+            _accumulatorFill = 0;
+            if (!active) _ring.Clear();
+        }
+    }
+
+    private void ProcessMicPcm(ReadOnlySpan<float> samples, MicBlockSource source)
+    {
 
         // Gate: process mic samples when MOX is on (normal TX) OR when the TX
         // monitor is on (preview without keying so the operator can hear
@@ -956,7 +1060,7 @@ public sealed class TxAudioIngest : IDisposable
         // TCI, and WAV playback bypass this gate entirely.
         if (monitorOn && !moxNow
             && source is MicBlockSource.Host or MicBlockSource.RadioMic
-            && ShouldSuppressIdleMonitorPreviewBlock(f32lePayload.Span))
+            && ShouldSuppressIdleMonitorPreviewBlock(samples))
         {
             lock (_sync) _accumulatorFill = 0;
             return;
@@ -1000,7 +1104,6 @@ public sealed class TxAudioIngest : IDisposable
 
             // Decode f32le into accumulator. WDSP wants -1..+1 range; browser
             // ships the same convention.
-            var src = f32lePayload.Span;
             int need = MicBlockSamples;
             if (_accumulatorFill + need > _accumulator.Length)
             {
@@ -1013,7 +1116,7 @@ public sealed class TxAudioIngest : IDisposable
             }
             for (int i = 0; i < MicBlockSamples; i++)
             {
-                float sample = BinaryPrimitives.ReadSingleLittleEndian(src.Slice(i * 4, 4));
+                float sample = samples[i];
                 _accumulator[_accumulatorFill + i] = DspPipelineService.SanitizeAudioSample(sample);
             }
             _accumulatorFill += MicBlockSamples;
@@ -1120,13 +1223,13 @@ public sealed class TxAudioIngest : IDisposable
         }
     }
 
-    private bool ShouldSuppressIdleMonitorPreviewBlock(ReadOnlySpan<byte> f32lePayload)
+    private bool ShouldSuppressIdleMonitorPreviewBlock(ReadOnlySpan<float> samples)
     {
         float peak = 0f;
         double sumSquares = 0.0;
         for (int i = 0; i < MicBlockSamples; i++)
         {
-            float sample = BinaryPrimitives.ReadSingleLittleEndian(f32lePayload.Slice(i * 4, 4));
+            float sample = samples[i];
             if (!float.IsFinite(sample)) sample = 0f;
             float abs = sample < 0f ? -sample : sample;
             if (abs > peak) peak = abs;

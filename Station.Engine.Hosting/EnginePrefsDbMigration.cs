@@ -26,6 +26,21 @@ internal static class EnginePrefsDbMigration
     internal const string StationControlMarkerId = "station-engine-v3-tci-cat";
     internal const int CurrentVersion = 3;
 
+    // Every collection the standalone engine owns in station-engine.db that a
+    // profile export may merge. This is the v1 engine families + v3 station
+    // control — deliberately NOT ps_settings (v2). PureSignal persistence is a
+    // full-stop zone: no export-path change that touches PS calibration data
+    // ships without explicit KB2UKA approval, so a merged export keeps whatever
+    // ps_settings copy the product file already holds (the stale pre-split
+    // one), exactly as the desktop export always did.
+    internal static IEnumerable<string> AllEngineOwnedCollectionNames()
+    {
+        foreach (var name in EngineCollectionNames)
+            yield return name;
+        foreach (var name in StationControlCollectionNames)
+            yield return name;
+    }
+
     internal static readonly IReadOnlyList<string> StationControlCollectionNames =
         Array.AsReadOnly(
         [

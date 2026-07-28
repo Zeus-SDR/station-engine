@@ -81,4 +81,10 @@ public enum MoxSource : byte
     /// press, releases only the MOX edge it claimed, and rides an already-keyed
     /// operator transmission without dropping it.</summary>
     QrmText = 9,
+    /// <summary>The out-of-process product-plugin audio/keying lease. Kept
+    /// distinct from <see cref="Plugin"/> so a desktop plugin can never
+    /// release a product lease (or vice versa). The lease owner is revoked
+    /// immediately on liveness loss and always yields to operator, hardware,
+    /// TUNE, CAT, and TCI requests.</summary>
+    ProductPlugin = 10,
 }

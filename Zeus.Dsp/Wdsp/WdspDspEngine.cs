@@ -361,6 +361,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // USB family positive) the same way RXA does through ApplyBandpassForMode.
     private RxaMode _txCurrentMode = RxaMode.USB;
     private bool _txDigitalBypass;
+    private bool _txRogerBeepBypass;
     // Operator configs last applied to TXA. Digital TX modes gate the effective
     // run bits only; these cached configs keep voice-mode restore exact.
     private TxPhaseRotatorConfig _txPhaseRotatorConfig = new();
@@ -2578,7 +2579,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // While keyed for TUN/two-tone the Leveler is forced off; don't let a
         // mid-key settings change re-enable it on the tune tone. Still record the
         // operator's intent below so the un-key restore lands correctly.
-        NativeMethods.SetTXALevelerSt(txa, (!_txLevelerForcedOff && cfg.LevelerEnabled) ? 1 : 0);
+        _txControlNative.SetTXALevelerSt(
+            txa,
+            (!_txLevelerForcedOff && !_txRogerBeepBypass && cfg.LevelerEnabled) ? 1 : 0);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
         NativeMethods.SetTXACompressorRun(txa, cfg.CompressorEnabled ? 1 : 0);
         NativeMethods.SetTXACompressorGain(txa, cfg.CompressorGainDb);
@@ -2650,7 +2653,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         mode is RxaMode.DIGU or RxaMode.DIGL;
 
     private int EffectiveTxRun(bool configuredEnabled) =>
-        configuredEnabled && !IsDigitalTxMode(_txCurrentMode) && !_txDigitalBypass ? 1 : 0;
+        configuredEnabled
+        && !IsDigitalTxMode(_txCurrentMode)
+        && !_txDigitalBypass
+        && !_txRogerBeepBypass
+            ? 1
+            : 0;
 
     // Caller holds _txaLock. Set shape before Run so enabling from OFF never
     // exposes a partial phase-rotator profile to a live TXA block.
@@ -2713,7 +2721,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // on tune). We restore Leveler on TUN-off so mic MOX keeps
                 // its current Thetis-matching behavior.
                 _txLevelerForcedOff = true;
-                NativeMethods.SetTXALevelerSt(txa, 0);
+                _txControlNative.SetTXALevelerSt(txa, 0);
                 _log.LogInformation("wdsp.setTxTune on=true mode=singletone freq={Freq:F0} mag={Mag:F5} leveler=off", toneFreq, toneMag);
             }
             else
@@ -2723,7 +2731,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // "on" — if the operator disabled the Leveler via SetTxLeveling,
                 // un-keying TUN must leave it disabled.
                 _txLevelerForcedOff = false;
-                NativeMethods.SetTXALevelerSt(txa, _txLevelerEnabled ? 1 : 0);
+                _txControlNative.SetTXALevelerSt(
+                    txa,
+                    (_txLevelerEnabled && !_txRogerBeepBypass) ? 1 : 0);
                 _log.LogInformation("wdsp.setTxTune on=false leveler={Leveler}",
                     _txLevelerEnabled ? "on" : "off");
             }
@@ -2790,6 +2800,25 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             }
         }
         _log.LogInformation("wdsp.setTxDigitalBypass bypass={Bypass}", bypass);
+    }
+
+    public void SetTxRogerBeepBypass(bool bypass)
+    {
+        if (_disposed != 0) return;
+        lock (_txaLock)
+        {
+            if (_txRogerBeepBypass == bypass) return;
+            _txRogerBeepBypass = bypass;
+            if (_txaChannelId is int txa)
+            {
+                ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
+                ApplyCfcMasterRunLocked(txa, _cfcConfig);
+                _txControlNative.SetTXALevelerSt(
+                    txa,
+                    (_txLevelerEnabled && !_txLevelerForcedOff && !bypass) ? 1 : 0);
+            }
+        }
+        _log.LogInformation("wdsp.setTxRogerBeepBypass bypass={Bypass}", bypass);
     }
 
     public void SetTxFilter(int lowHz, int highHz)
@@ -3073,7 +3102,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // doesn't need voice-energy AGC and Leveler can pump on the
                 // discrete tones.
                 _txLevelerForcedOff = true;
-                NativeMethods.SetTXALevelerSt(txa, 0);
+                _txControlNative.SetTXALevelerSt(txa, 0);
                 _log.LogInformation(
                     "wdsp.setTwoTone on=true f1={F1} f2={F2} signedF1={SF1} signedF2={SF2} mag={Mag:F3} mode={Mode}",
                     freq1, freq2, signedF1, signedF2, mag, _txCurrentMode);
@@ -3085,7 +3114,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // Restore the Leveler to the operator's setting (see SetTxTune)
                 // rather than hardcoding "on".
                 _txLevelerForcedOff = false;
-                NativeMethods.SetTXALevelerSt(txa, _txLevelerEnabled ? 1 : 0);
+                _txControlNative.SetTXALevelerSt(
+                    txa,
+                    (_txLevelerEnabled && !_txRogerBeepBypass) ? 1 : 0);
                 _log.LogInformation(
                     "wdsp.setTwoTone on=false f1={F1} f2={F2} mag={Mag:F3} leveler={Leveler}",
                     freq1, freq2, mag, _txLevelerEnabled ? "on" : "off");
@@ -3708,7 +3739,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         {
             if (_txaChannelId is not int id) return 0;
             txa = id;
-            skipTxAudioPlugins = _txDigitalBypass || IsDigitalTxMode(_txCurrentMode);
+            skipTxAudioPlugins =
+                _txDigitalBypass || _txRogerBeepBypass || IsDigitalTxMode(_txCurrentMode);
         }
 
         // fexchange2 wants mutable refs to the first float of each buffer.

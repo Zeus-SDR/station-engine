@@ -42,7 +42,9 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Zeus.Contracts;
@@ -64,6 +66,18 @@ public sealed class WdspWisdomInitializer
     /// </summary>
     internal const string SkipEnvironmentVariable = "ZEUS_WISDOM_SKIP";
 
+    // WDSP's wisdom file inside the wisdom directory, and its sidecar stamp.
+    // The historical ".version" name remains for an in-place migration from
+    // engine-version values to native-library content hashes.
+    internal const string WisdomFileName = "wdspWisdom01";
+    internal const string VersionStampFileName = WisdomFileName + ".version";
+    internal const string NativeStampPrefix = "native:";
+
+    // Operator-facing summary streamed as the WisdomStatus trailer on failure;
+    // the actionable detail stays in zeus-app.log.
+    internal const string FailureStatus =
+        "FFT setup failed — DSP will use the slow path. See zeus-app.log.";
+
     // 250 ms is fast enough that the splash text never feels stale, slow enough
     // that we're not P/Invoking 40×/s into wisdom_get_status() while FFTW is
     // doing real work on a background thread.
@@ -75,7 +89,10 @@ public sealed class WdspWisdomInitializer
     private readonly Action _ensureResolverRegistered;
     private readonly Func<string, int> _runWisdom;
     private readonly Func<string> _getWisdomStatus;
+    private readonly Func<string> _getWisdomDirectory;
+    private readonly Func<string> _getStamp;
     private readonly object _gate = new();
+    private readonly object _statusGate = new();
     private Task? _task;
     private int _phase = (int)WisdomPhase.Idle;
     private string _status = string.Empty;
@@ -93,12 +110,16 @@ public sealed class WdspWisdomInitializer
         ILogger<WdspWisdomInitializer>? logger,
         Action ensureResolverRegistered,
         Func<string, int> runWisdom,
-        Func<string> getWisdomStatus)
+        Func<string> getWisdomStatus,
+        Func<string>? getWisdomDirectory = null,
+        Func<string>? getStamp = null)
     {
         _log = logger ?? NullLogger<WdspWisdomInitializer>.Instance;
         _ensureResolverRegistered = ensureResolverRegistered ?? throw new ArgumentNullException(nameof(ensureResolverRegistered));
         _runWisdom = runWisdom ?? throw new ArgumentNullException(nameof(runWisdom));
         _getWisdomStatus = getWisdomStatus ?? throw new ArgumentNullException(nameof(getWisdomStatus));
+        _getWisdomDirectory = getWisdomDirectory ?? GetDefaultWisdomDirectory;
+        _getStamp = getStamp ?? ResolveCurrentStamp;
         RegisterAmbient(this);
     }
 
@@ -193,12 +214,37 @@ public sealed class WdspWisdomInitializer
 
     private void RunWisdom()
     {
+        bool success = false;
         try
         {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Zeus");
+            var dir = _getWisdomDirectory();
             Directory.CreateDirectory(dir);
+
+            // Rebake only when the native content that owns the FFTW plan
+            // shapes/flags changes. A missing, legacy, corrupt, or unreadable
+            // stamp counts as "differs". When the stamp matches we leave the
+            // file alone and the native import finishes instantly.
+            var stamp = _getStamp();
+            _log.LogDebug(
+                "wdsp.wisdom stamp mode={Mode}",
+                stamp.StartsWith(NativeStampPrefix, StringComparison.Ordinal)
+                    ? "native-content"
+                    : "version-fallback");
+            var stampPath = Path.Combine(dir, VersionStampFileName);
+            var wisdomPath = Path.Combine(dir, WisdomFileName);
+            if (!StampMatches(stampPath, stamp) && File.Exists(wisdomPath))
+            {
+                try
+                {
+                    File.Delete(wisdomPath);
+                    _log.LogInformation(
+                        "wdsp.wisdom native stamp changed; deleted stale cache for rebake");
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "wdsp.wisdom could not delete stale cache at {Path}", wisdomPath);
+                }
+            }
 
             // WDSP's wisdom.c does a plain strcat of "wdspWisdom01" onto the
             // directory without inserting a path separator (see native/wdsp/
@@ -214,6 +260,12 @@ public sealed class WdspWisdomInitializer
             _log.LogInformation(
                 "wdsp.wisdom ready result={Result} ({Source}) status={Status}",
                 result, result == 0 ? "loaded" : "built", status);
+
+            // Best-effort: failure to write the stamp must not fail the run,
+            // it just forces a rebake next launch. Never written on failure,
+            // so the next launch retries the bake.
+            TryWriteStamp(stampPath, stamp);
+            success = true;
         }
         catch (Exception ex)
         {
@@ -221,8 +273,172 @@ public sealed class WdspWisdomInitializer
         }
         finally
         {
-            SetPhase(WisdomPhase.Ready);
+            // Single serialized terminal transition: the phase flip stops the
+            // status poller, and publishing the failure summary inside the
+            // same gate guarantees the poller cannot clobber it with a stale
+            // planner string on its final in-flight iteration.
+            lock (_statusGate)
+            {
+                SetPhase(success ? WisdomPhase.Ready : WisdomPhase.Failed);
+                if (!success)
+                    SetStatus(FailureStatus);
+            }
         }
+    }
+
+    private static string GetDefaultWisdomDirectory() =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Zeus");
+
+    private string ResolveCurrentStamp()
+    {
+        try
+        {
+            if (WdspNativeLoader.TryGetResolvedNativeLibraryPath(out string? wdspPath)
+                && wdspPath is not null)
+            {
+                return ResolveStamp(
+                    wdspPath,
+                    WdspNativeLoader.FftwDependencyFilePaths(wdspPath),
+                    ResolveVersion,
+                    _log);
+            }
+
+            return ResolveStamp(null, Array.Empty<string>(), ResolveVersion, _log);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex,
+                "wdsp.wisdom native library resolution failed; using informational-version stamp");
+            return ResolveFallbackVersion(ResolveVersion, _log);
+        }
+    }
+
+    /// <summary>
+    /// Builds the stable native-content stamp. The path arguments form the
+    /// test seam, so regression tests use small fake files without loading or
+    /// invoking WDSP.
+    /// </summary>
+    internal static string ResolveStamp(
+        string? wdspPath,
+        IReadOnlyList<string> fftwDependencyPaths,
+        Func<string> getVersion,
+        ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(fftwDependencyPaths);
+        ArgumentNullException.ThrowIfNull(getVersion);
+        logger ??= NullLogger.Instance;
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(wdspPath) || !File.Exists(wdspPath))
+            {
+                logger.LogDebug(
+                    "wdsp.wisdom native library path unavailable; using informational-version stamp");
+                return ResolveFallbackVersion(getVersion, logger);
+            }
+
+            string wdspHash = HashFile(wdspPath);
+            var dependencies = new SortedDictionary<string, string>(StringComparer.Ordinal);
+
+            foreach (string dependencyPath in fftwDependencyPaths)
+            {
+                if (!File.Exists(dependencyPath))
+                    continue;
+
+                string fileName = Path.GetFileName(dependencyPath);
+                string component = fileName.Contains("fftw3f", StringComparison.OrdinalIgnoreCase)
+                    ? "fftw3f"
+                    : fileName.Contains("fftw3", StringComparison.OrdinalIgnoreCase)
+                        ? "fftw3"
+                        : throw new InvalidDataException(
+                            $"Unrecognized FFTW dependency file name: {fileName}");
+                dependencies[component] = HashFile(dependencyPath);
+            }
+
+            var components = new[] { $"wdsp={wdspHash}" }
+                .Concat(dependencies.Select(component => $"{component.Key}={component.Value}"));
+            return NativeStampPrefix + string.Join(';', components);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(
+                ex,
+                "wdsp.wisdom native library hashing failed; using informational-version stamp");
+            return ResolveFallbackVersion(getVersion, logger);
+        }
+    }
+
+    private static string HashFile(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream))[..16].ToLowerInvariant();
+    }
+
+    private static string ResolveFallbackVersion(Func<string> getVersion, ILogger logger)
+    {
+        try
+        {
+            string version = getVersion();
+            return string.IsNullOrWhiteSpace(version) ? "unknown" : version;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(
+                ex,
+                "wdsp.wisdom informational version unavailable; using unknown fallback stamp");
+            return "unknown";
+        }
+    }
+
+    // Informational version used only when the resolved native-library content
+    // cannot be hashed. Falling back to this assembly and then a constant keeps
+    // the pre-change invalidation semantics without risking startup failure.
+    internal static string ResolveVersion()
+    {
+        var entry = Assembly.GetEntryAssembly()
+            ?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(entry)) return entry;
+        var own = typeof(WdspWisdomInitializer).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion;
+        return string.IsNullOrWhiteSpace(own) ? "unknown" : own;
+    }
+
+    private bool StampMatches(string stampPath, string stamp)
+    {
+        try
+        {
+            return File.Exists(stampPath)
+                && string.Equals(File.ReadAllText(stampPath).Trim(), stamp, StringComparison.Ordinal);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "wdsp.wisdom stamp unreadable at {Path}; treating as changed", stampPath);
+            return false;
+        }
+    }
+
+    private void TryWriteStamp(string stampPath, string stamp)
+    {
+        try
+        {
+            File.WriteAllText(stampPath, stamp);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "wdsp.wisdom could not write stamp at {Path}; next launch will rebake", stampPath);
+        }
+    }
+
+    private void SetStatus(string s)
+    {
+        Volatile.Write(ref _status, s);
+        try { StatusChanged?.Invoke(s); }
+        catch (Exception ex) { _log.LogDebug(ex, "wdsp.wisdom StatusChanged subscriber threw"); }
     }
 
     // Polls the native status buffer on a separate thread. When WDSPwisdom
@@ -237,11 +453,19 @@ public sealed class WdspWisdomInitializer
             {
                 var s = _getWisdomStatus();
                 s = s.TrimEnd('\r', '\n', ' ', '\t');
-                if (!string.Equals(s, Volatile.Read(ref _status), StringComparison.Ordinal))
+                lock (_statusGate)
                 {
-                    Volatile.Write(ref _status, s);
-                    try { StatusChanged?.Invoke(s); }
-                    catch (Exception ex) { _log.LogDebug(ex, "wdsp.wisdom StatusChanged subscriber threw"); }
+                    // Re-check under the gate: RunWisdom's terminal
+                    // transition (phase flip + failure summary) holds the
+                    // same lock, so a poller iteration that started while
+                    // Building cannot overwrite the terminal status.
+                    if (Phase != WisdomPhase.Building) break;
+                    if (!string.Equals(s, Volatile.Read(ref _status), StringComparison.Ordinal))
+                    {
+                        Volatile.Write(ref _status, s);
+                        try { StatusChanged?.Invoke(s); }
+                        catch (Exception ex) { _log.LogDebug(ex, "wdsp.wisdom StatusChanged subscriber threw"); }
+                    }
                 }
                 Thread.Sleep(StatusPollInterval);
             }

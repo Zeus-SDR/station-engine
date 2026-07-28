@@ -27,6 +27,10 @@ public static class StationEngineHostingExtensions
         services.AddHttpClient();
 
         services.AddSingleton<StationEngineCapabilitiesService>();
+        // Windows Firewall status/apply for the Settings control — same
+        // service registration as the product host, so the engine's
+        // /api/system/windows-firewall routes behave identically.
+        services.AddSingleton<IWindowsFirewallService, WindowsFirewallService>();
         services.AddSingleton<IProductStreamSource>(_ => NullProductStreamSource.Instance);
         // Real (not null) sink: the SPA's clientErrorBeacon prefers the /ws
         // diagnostic frame, so a null sink would silently discard uncaught
@@ -35,9 +39,19 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<EngineClientDiagnosticSink>();
         services.AddSingleton<IClientDiagnosticSink>(sp =>
             sp.GetRequiredService<EngineClientDiagnosticSink>());
-        services.AddSingleton<IAudioModemPort, NullAudioModemPort>();
+        // Engine-owned mode-modem lease (standalone engine only; the desktop
+        // host keeps its in-process modem bridge). The TX-service lookup is
+        // lazy because TxService -> DspPipelineService -> IAudioModemPort
+        // would otherwise form a construction cycle; it is resolved only on
+        // the lease-teardown path when a modem-owned key must drop.
+        services.AddSingleton<ModeModemLeasePort>(sp =>
+            ActivatorUtilities.CreateInstance<ModeModemLeasePort>(
+                sp,
+                (Func<TxService?>)(() => sp.GetService<TxService>())));
+        services.AddSingleton<IAudioModemPort>(sp => sp.GetRequiredService<ModeModemLeasePort>());
         services.AddSingleton<ProductAudioRingPort>();
         services.AddSingleton<IProductTxAudioPort>(sp => sp.GetRequiredService<ProductAudioRingPort>());
+        services.AddSingleton<ProductPluginAudioPort>();
         services.AddSingleton<ITxAudioPreviewProcessor, NullTxAudioPreviewProcessor>();
         services.AddSingleton<IExternalReceiverSource, NullExternalReceiverSource>();
         services.AddSingleton<IExternalReceiverControlPort, NullExternalReceiverControlPort>();
@@ -91,6 +105,16 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<BottomPinStore>();
         services.AddSingleton<PanWfSplitStore>();
         services.AddSingleton<OperatorIdentityStore>();
+        // Zeus Link bundle settings mirror (feature toggles + amplifier
+        // configs as one opaque product JSON document). Product database, same
+        // reasoning as the operator UI families above: it must ride the
+        // exportable zeus-prefs.db so the splash Database row can back it up.
+        services.AddSingleton<ProductBundleSettingsStore>();
+        // Digital workspace prefs (per-mode FT8/FT4/WSPR settings + the Auto-CQ
+        // ack stamp). Same collections the desktop host uses, so the rows follow
+        // the operator between hosts on the same machine.
+        services.AddSingleton<Ft8SettingsStore>();
+        services.AddSingleton<OperatorAckStore>();
 
         services.AddSingleton<TxIqRing>();
         services.AddSingleton<ITxIqSource>(sp => sp.GetRequiredService<TxIqRing>());

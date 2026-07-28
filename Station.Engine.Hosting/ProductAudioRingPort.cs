@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA) and contributors.
 
+using System.Diagnostics;
 using Station.AudioRing;
 
 namespace Zeus.Server;
@@ -11,8 +12,33 @@ namespace Zeus.Server;
 /// </summary>
 public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 {
-    internal static readonly TimeSpan ResponseDeadline = TimeSpan.FromMilliseconds(4);
+    // Per-block reply window: three quarters of the block's own duration,
+    // clamped to [3 ms, 15 ms] (the ring itself rejects waits over one 20 ms
+    // block period). The product chain budgets itself at half the block, so a
+    // healthy product answers inside this window on EVERY block and the audio
+    // the operator hears stays 100% processed. A short hardcoded deadline
+    // splices processed and passthrough blocks every time the round trip
+    // straddles it — that splice is exactly the crackle an out-of-process
+    // plugin with real per-block latency (ML noise reduction) produced here.
+    internal static readonly TimeSpan MinResponseDeadline = TimeSpan.FromMilliseconds(3);
+    internal static readonly TimeSpan MaxResponseDeadline = TimeSpan.FromMilliseconds(15);
+    // Sustained full-window misses take the leg out of processing for a
+    // cooldown: pure passthrough with zero ring work (the audio pump never
+    // spins behind a dead or overloaded product, and no splice can reach the
+    // operator), then the first block past the cooldown probes again. Same
+    // fail-soft philosophy as the product-side auto-bypass, one level up.
+    internal const int LegOpenMissThreshold = 8;
+    internal static readonly TimeSpan LegOpenCooldown = TimeSpan.FromSeconds(1);
     internal static readonly TimeSpan PendingLeaseLifetime = TimeSpan.FromSeconds(5);
+
+    internal static TimeSpan ResponseDeadlineFor(int frames)
+    {
+        if (frames <= 0) return MinResponseDeadline;
+        var block = TimeSpan.FromSeconds(frames / (double)AudioRingProtocol.SampleRate);
+        var budget = TimeSpan.FromTicks(block.Ticks * 3 / 4);
+        if (budget < MinResponseDeadline) return MinResponseDeadline;
+        return budget > MaxResponseDeadline ? MaxResponseDeadline : budget;
+    }
 
     private readonly object _gate = new();
     private readonly ILogger<ProductAudioRingPort> _log;
@@ -27,6 +53,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     private long _rxAttemptedBlocks;
     private long _rxProcessedBlocks;
     private long _rxBypassedBlocks;
+    private long _txConsecutiveMisses;
+    private long _rxConsecutiveMisses;
+    private long _txOpenUntilTimestamp;
+    private long _rxOpenUntilTimestamp;
     private bool _disposed;
 
     public ProductAudioRingPort(ILogger<ProductAudioRingPort> log)
@@ -56,9 +86,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         if (string.IsNullOrWhiteSpace(request.Name)
             || request.Name.Length > 128
             || string.IsNullOrWhiteSpace(request.Version)
-            || request.Version.Length > 128)
+            || request.Version.Length > 128
+            || request.HttpPort is <= 0 or > 65_535)
         {
-            error = "name and version are required and limited to 128 characters";
+            error = "name and version are required and limited to 128 characters; httpPort must be 1..65535 when supplied";
             return false;
         }
 
@@ -86,8 +117,15 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                 Guid.NewGuid().ToString("N"),
                 request.Name,
                 request.Version,
+                request.HttpPort,
                 owner,
                 rxOwner);
+            // Leg-health state is session-scoped: a fresh product must never
+            // inherit miss counts or an open cooldown from a detached one.
+            Interlocked.Exchange(ref _txConsecutiveMisses, 0);
+            Interlocked.Exchange(ref _rxConsecutiveMisses, 0);
+            Interlocked.Exchange(ref _txOpenUntilTimestamp, 0);
+            Interlocked.Exchange(ref _rxOpenUntilTimestamp, 0);
             session.PendingTimer = new Timer(
                 static state =>
                 {
@@ -104,6 +142,20 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                 rxOwner.Endpoint);
             return true;
         }
+    }
+
+    public bool TryGetProductEndpoint(out int port)
+    {
+        lock (_gate)
+        {
+            if (_session?.HttpPort is int advertisedPort)
+            {
+                port = advertisedPort;
+                return true;
+            }
+        }
+        port = 0;
+        return false;
     }
 
     public async Task HoldLeaseAsync(string leaseId, HttpContext context)
@@ -167,7 +219,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             static session => session.Owner,
             ref _attemptedBlocks,
             ref _processedBlocks,
-            ref _bypassedBlocks);
+            ref _bypassedBlocks,
+            ref _txConsecutiveMisses,
+            ref _txOpenUntilTimestamp,
+            "tx");
 
     public void ProcessRx(Span<float> block48k)
         => ProcessBlock(
@@ -177,7 +232,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             static session => session.RxOwner,
             ref _rxAttemptedBlocks,
             ref _rxProcessedBlocks,
-            ref _rxBypassedBlocks);
+            ref _rxBypassedBlocks,
+            ref _rxConsecutiveMisses,
+            ref _rxOpenUntilTimestamp,
+            "rx");
 
     private void ProcessBlock(
         Span<float> block48k,
@@ -186,7 +244,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         Func<Session, AudioRingOwner> ownerFor,
         ref long attemptedBlocks,
         ref long processedBlocks,
-        ref long bypassedBlocks)
+        ref long bypassedBlocks,
+        ref long consecutiveMisses,
+        ref long openUntilTimestamp,
+        string leg)
     {
         var session = Volatile.Read(ref _session);
         if (session?.IsLeased != true
@@ -207,15 +268,52 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
         try
         {
+            // Leg open after sustained misses: pure passthrough with no ring
+            // work at all — the audio pump never spins behind a dead or
+            // overloaded product, and no processed/raw splice can reach the
+            // operator. The first block past the cooldown probes again below.
+            var openUntil = Interlocked.Read(ref openUntilTimestamp);
+            if (openUntil != 0 && Stopwatch.GetTimestamp() < openUntil)
+            {
+                Interlocked.Increment(ref bypassedBlocks);
+                return;
+            }
+
             if (ownerFor(session).TryRoundTrip(
                     block48k,
                     processed,
-                    ResponseDeadline,
+                    ResponseDeadlineFor(block48k.Length),
                     out _))
             {
                 processed.AsSpan(0, block48k.Length).CopyTo(block48k);
                 Interlocked.Increment(ref processedBlocks);
+                Interlocked.Exchange(ref consecutiveMisses, 0);
+                if (openUntil != 0
+                    && Interlocked.Exchange(ref openUntilTimestamp, 0) != 0)
+                {
+                    _log.LogInformation("product-audio {Leg} leg resumed after cooldown", leg);
+                }
                 return;
+            }
+
+            // Missed the reply window. A failed probe past cooldown silently
+            // extends the open state; otherwise count toward opening the leg.
+            var cooldownTicks = (long)(LegOpenCooldown.TotalSeconds * Stopwatch.Frequency);
+            if (openUntil != 0)
+            {
+                Interlocked.Exchange(
+                    ref openUntilTimestamp,
+                    Stopwatch.GetTimestamp() + cooldownTicks);
+            }
+            else if (Interlocked.Increment(ref consecutiveMisses) >= LegOpenMissThreshold
+                     && Interlocked.CompareExchange(
+                         ref openUntilTimestamp,
+                         Stopwatch.GetTimestamp() + cooldownTicks,
+                         0) == 0)
+            {
+                _log.LogWarning(
+                    "product-audio {Leg} leg paused after {Misses} consecutive missed deadlines; passing audio through unprocessed for {CooldownMs} ms",
+                    leg, LegOpenMissThreshold, (int)LegOpenCooldown.TotalMilliseconds);
             }
         }
         catch (Exception)
@@ -293,6 +391,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         string leaseId,
         string name,
         string version,
+        int? httpPort,
         AudioRingOwner owner,
         AudioRingOwner rxOwner)
     {
@@ -303,6 +402,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         public string LeaseId { get; } = leaseId;
         public string Name { get; } = name;
         public string Version { get; } = version;
+        public int? HttpPort { get; } = httpPort;
         public AudioRingOwner Owner { get; } = owner;
         public AudioRingOwner RxOwner { get; } = rxOwner;
         public Timer? PendingTimer { get; set; }

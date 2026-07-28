@@ -158,6 +158,13 @@ public sealed class TxService
     /// </summary>
     public event Action<bool>? TxActiveChanged;
 
+    /// <summary>
+    /// Raised before a source attempts a rising transmit edge. The leased
+    /// product-plugin port uses this pre-admission seam to relinquish its key
+    /// before an operator, hardware, TUNE, CAT, or TCI request is evaluated.
+    /// </summary>
+    internal event Action<MoxSource>? TransmitRequested;
+
     // Last TX-active value observed by the firing path. Read+written
     // under _sync inside the helpers below. The "fire off the lock"
     // contract above means we capture the new value under the lock,
@@ -535,6 +542,7 @@ public sealed class TxService
     /// </summary>
     public bool TrySetMox(bool on, MoxSource source, out string? error)
     {
+        if (on) TransmitRequested?.Invoke(source);
         lock (_transitionSync)
         {
             if (!on)
@@ -612,6 +620,44 @@ public sealed class TxService
     }
 
     /// <summary>
+    /// Dead-man release for the out-of-process product-plugin lease. Unlike a
+    /// normal operator release this deliberately skips voice/modem/roger-beep
+    /// tails: liveness loss must drop the wire before one 20 ms audio block.
+    /// Source ownership is still enforced, and an already-idle transmitter is
+    /// a successful no-op.
+    /// </summary>
+    internal bool TryReleaseMoxImmediately(MoxSource source, out string? error)
+    {
+        lock (_transitionSync)
+        {
+            TransmitIntent? active;
+            MoxSource? owner;
+            lock (_sync) { active = _activeIntent; owner = _moxOwner; }
+            if (active is null)
+            {
+                error = null;
+                return true;
+            }
+            if (active != TransmitIntent.Mox)
+            {
+                error = $"TX held by {active}; product lease cannot release it";
+                return false;
+            }
+            if (owner != source)
+            {
+                error = $"MOX held by {owner}; product lease cannot release it";
+                return false;
+            }
+
+            ConvergeToSafeIdle(faultLatched: false);
+            _log.LogInformation("tx.mox dead-man release source={Source}", source);
+            _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
+            error = null;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Arm or disarm the TwoTone test generator AND key MOX. Mirrors the Thetis
     /// chkTestIMD_CheckedChanged path (setup.cs:11162-11165, 11189-11216):
     /// TwoTone owns the MOX state while armed and unconditionally drops it on
@@ -627,6 +673,7 @@ public sealed class TxService
     public bool TrySetTwoTone(TwoToneSetRequest req, out string? error)
     {
         ArgumentNullException.ThrowIfNull(req);
+        if (req.Enabled) TransmitRequested?.Invoke(MoxSource.UI);
         lock (_transitionSync)
         {
             TransmitIntent? active;
@@ -705,6 +752,7 @@ public sealed class TxService
 
     public bool TrySetTun(bool on, MoxSource source, out string? error)
     {
+        if (on) TransmitRequested?.Invoke(source);
         lock (_transitionSync)
         {
             TransmitIntent? active;
@@ -749,6 +797,10 @@ public sealed class TxService
                 _pipeline.SetTxTune(true);
                 // Decision 11: apply generator and drive/PA/OC before DSP and
                 // the rising wire edge so no voice-IQ or normal-drive window exists.
+                // P2 SetTune itself emits a keyed high-priority packet, so align
+                // the NCO before publishing the TUN latch. RadioService.SetMox
+                // repeats this as an idempotent guard at the universal edge.
+                _radio.AlignLoForTx();
                 _radio.NotifyTunActive(true);
                 _pipeline.SetMox(true);
                 if (!EvaluateAdmission(TransmitIntent.Tun, source, out error))

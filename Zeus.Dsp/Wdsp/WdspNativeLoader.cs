@@ -42,6 +42,7 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -73,7 +74,7 @@ internal static class WdspNativeLoader
         lock (Gate)
         {
             if (_probedLoadable) return _loadable;
-            if (TryResolve(typeof(NativeMethods).Assembly, out var handle))
+            if (TryResolve(typeof(NativeMethods).Assembly, out var handle, out _))
             {
                 NativeLibrary.Free(handle);
                 _loadable = true;
@@ -97,7 +98,7 @@ internal static class WdspNativeLoader
             if (ExportCache.TryGetValue(symbolName, out bool available))
                 return available;
 
-            if (!TryResolve(typeof(NativeMethods).Assembly, out var handle))
+            if (!TryResolve(typeof(NativeMethods).Assembly, out var handle, out _))
             {
                 ExportCache[symbolName] = false;
                 return false;
@@ -119,17 +120,100 @@ internal static class WdspNativeLoader
     private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
         if (libraryName != NativeMethods.LibraryName) return IntPtr.Zero;
-        return TryResolve(assembly, out var handle) ? handle : IntPtr.Zero;
+        return TryResolve(assembly, out var handle, out _) ? handle : IntPtr.Zero;
     }
 
-    private static bool TryResolve(Assembly assembly, out IntPtr handle)
+    /// <summary>
+    /// Resolves the same loadable WDSP candidate used by the P/Invoke resolver
+    /// and returns its filesystem path. Bare-name system probing cannot reveal
+    /// a content path, so that case deliberately returns false.
+    /// </summary>
+    internal static bool TryGetResolvedNativeLibraryPath(out string? path)
+    {
+        lock (Gate)
+        {
+            bool loaded = TryResolve(typeof(NativeMethods).Assembly, out var handle, out path);
+            if (loaded)
+                NativeLibrary.Free(handle);
+            return loaded && path is not null;
+        }
+    }
+
+    private static bool TryResolve(Assembly assembly, out IntPtr handle, out string? resolvedPath)
     {
         foreach (var candidate in CandidatePaths(assembly))
         {
-            if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out handle))
+            if (!File.Exists(candidate)) continue;
+            PreloadFftwDependencies(Path.GetDirectoryName(candidate));
+            if (NativeLibrary.TryLoad(candidate, out handle))
+            {
+                resolvedPath = Path.GetFullPath(candidate);
                 return true;
+            }
         }
+        // Bare-name default probing (system paths / loader defaults): no
+        // preload, and the loaded image's content path is unknown here.
+        resolvedPath = null;
         return NativeLibrary.TryLoad(NativeMethods.LibraryName, assembly, null, out handle);
+    }
+
+    // FFTW runtime dependencies shipped beside libwdsp. On Linux the bundled
+    // libwdsp.so declares NEEDED libfftw3.so.3/libfftw3f.so.3 with no RPATH,
+    // and on macOS it references /opt/homebrew/opt/fftw/ absolute install
+    // names; on machines without a system FFTW the load fails and the DSP
+    // silently falls back to the synthetic engine. Loading the sibling FFTW
+    // libs by absolute path first registers their SONAME/install name
+    // process-wide, so the linker reuses them when libwdsp resolves.
+    // Deployment constraint: on macOS this only works while the bundled
+    // libfftw*.dylib keep their original LC_ID_DYLIB install names matching
+    // libwdsp's references; if a future build step rewrites install names
+    // (install_name_tool) it must keep libwdsp and the FFTW dylibs
+    // consistent, e.g. by repointing both to @loader_path.
+    internal static IReadOnlyList<string> FftwDependencyFileNames()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            return new[] { "libfftw3.3.dylib", "libfftw3f.3.dylib" };
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            return new[] { "libfftw3.so.3", "libfftw3f.so.3" };
+        // Windows links FFTW statically into wdsp.dll; unknown platforms get
+        // no preload either.
+        return Array.Empty<string>();
+    }
+
+    /// <summary>
+    /// Returns the bundled FFTW dependencies that exist beside the resolved
+    /// WDSP image, in stable double/float order. Windows links FFTW statically
+    /// into wdsp.dll, so there are no sibling paths there and hashing wdsp.dll
+    /// alone covers both WDSP and FFTW content.
+    /// </summary>
+    internal static IReadOnlyList<string> FftwDependencyFilePaths(string wdspPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(wdspPath);
+
+        string? directory = Path.GetDirectoryName(wdspPath);
+        if (string.IsNullOrEmpty(directory))
+            return Array.Empty<string>();
+
+        return FftwDependencyFileNames()
+            .Select(fileName => Path.Combine(directory, fileName))
+            .Where(File.Exists)
+            .ToArray();
+    }
+
+    private static void PreloadFftwDependencies(string? directory)
+    {
+        if (string.IsNullOrEmpty(directory)) return;
+        foreach (var fileName in FftwDependencyFileNames())
+        {
+            var fullPath = Path.Combine(directory, fileName);
+            if (!File.Exists(fullPath)) continue;
+            // Deliberately never freed: the pin keeps the SONAME/install name
+            // registered for the process lifetime so libwdsp's dependency
+            // resolution reuses this image. Missing files or load failures
+            // are ignored, falling back to today's system-libs behaviour.
+            if (NativeLibrary.TryLoad(fullPath, out _))
+                Debug.WriteLine($"wdsp.loader preloaded FFTW dependency {fullPath}");
+        }
     }
 
     private static IEnumerable<string> CandidatePaths(Assembly assembly)

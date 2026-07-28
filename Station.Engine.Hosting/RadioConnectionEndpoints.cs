@@ -13,6 +13,7 @@ using P2Radio = Zeus.Protocol2.Discovery.DiscoveredRadio;
 namespace Zeus.Server;
 
 internal sealed record ReclaimRadioRequest(string? Endpoint, string? Protocol);
+internal sealed record P1ConnectionIdentity(P1Radio? Probe, HpsdrBoardKind BoardKind);
 
 /// <summary>Maps engine-owned radio discovery and P1/P2 lifecycle routes.</summary>
 public static class RadioConnectionEndpoints
@@ -90,8 +91,10 @@ public static class RadioConnectionEndpoints
             // WDSPwisdom must finish before OpenChannel, otherwise FFTW runs its slow
             // per-size planner on the pipeline thread and RX packets pile up until
             // the radio drops. The UI keeps Connect disabled during build; this is
-            // the server-side guard for non-UI callers (curl, older clients).
-            if (wisdom.Phase != WisdomPhase.Ready)
+            // the server-side guard for non-UI callers (curl, older clients). A
+            // Failed bake must NOT block connect: the operator gets a working DSP
+            // on the slow path instead of a station they can never open.
+            if (wisdom.Phase is WisdomPhase.Idle or WisdomPhase.Building)
                 return Results.Json(
                     new { error = "DSP is preparing FFTW plans — try again in a moment." },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
@@ -104,51 +107,33 @@ public static class RadioConnectionEndpoints
             if (req.PreampOn is bool preamp) radio.SetPreamp(preamp);
             if (req.Atten is int atten) radio.SetAttenuator(new HpsdrAtten(atten));
 
-            // Plumb the discovered board byte through so RadioService can
-            // set the real board kind on the Protocol1Client rather than
-            // defaulting to HermesLite2 for every P1 connection — issue #294.
-            var boardKind = req.BoardId is byte bid
-                ? MapBoardByteP1(bid)
-                : HpsdrBoardKind.Unknown;
-
-            // Best-effort firmware capture for the "Report a problem" diagnostic
-            // snapshot. A short discovery broadcast (the radio isn't connected
-            // yet, so it answers) lets us match the code-version byte for this
-            // endpoint. Fail-open: any failure leaves firmware null and never
-            // blocks the connect — the diagnostic just shows "unknown".
-            string? firmware = null;
-            if (TryParseIpEndpoint(req.Endpoint, out var firmwareEndpoint))
+            // Best-effort identity and firmware capture. The radio is not yet
+            // connected, so it normally answers this short discovery probe.
+            // Fail-open: discovery failure must never prevent the connection.
+            var identity = await ResolveP1ConnectionIdentityAsync(
+                req.BoardId,
+                req.Endpoint,
+                p1Discovery,
+                log,
+                ctx.RequestAborted).ConfigureAwait(false);
+            var probe = identity.Probe;
+            var firmware = probe?.FirmwareString;
+            if (TryParseIpEndpoint(req.Endpoint, out var firmwareEndpoint)
+                && !req.Force
+                && probe?.Details.Busy == true)
             {
-                try
-                {
-                    var found = await p1Discovery.DiscoverAsync(
-                        TimeSpan.FromMilliseconds(400),
-                        ctx.RequestAborted).ConfigureAwait(false);
-                    var probe = found.FirstOrDefault(d => d.Ip.Equals(firmwareEndpoint.Address));
-                    firmware = probe?.FirmwareString;
-                    if (!req.Force && probe?.Details.Busy == true)
+                log.LogWarning(
+                    "api.connect REFUSED — P1 radio {Ip} reports BUSY (another controller owns it)",
+                    firmwareEndpoint.Address);
+                return Results.Json(
+                    new
                     {
-                        log.LogWarning(
-                            "api.connect REFUSED — P1 radio {Ip} reports BUSY (another controller owns it)",
-                            firmwareEndpoint.Address);
-                        return Results.Json(
-                            new
-                            {
-                                error =
-                                    "This radio is already in use by another controller. Use Reclaim to take exclusive control, then connect again.",
-                                busy = true,
-                                reclaimable = true,
-                            },
-                            statusCode: StatusCodes.Status409Conflict);
-                    }
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
-                {
-                    log.LogWarning(
-                        ex,
-                        "api.connect firmware probe failed — diagnostic firmware will be 'unknown'");
-                }
+                        error =
+                            "This radio is already in use by another controller. Use Reclaim to take exclusive control, then connect again.",
+                        busy = true,
+                        reclaimable = true,
+                    },
+                    statusCode: StatusCodes.Status409Conflict);
             }
 
             try
@@ -157,7 +142,7 @@ public static class RadioConnectionEndpoints
                     req.Endpoint,
                     req.SampleRate,
                     ctx.RequestAborted,
-                    boardKind,
+                    identity.BoardKind,
                     firmware).ConfigureAwait(false);
                 return Results.Ok(state);
             }
@@ -185,7 +170,9 @@ public static class RadioConnectionEndpoints
                 req.SampleRate,
                 req.Force);
 
-            if (wisdom.Phase != WisdomPhase.Ready)
+            // Same guard as /api/connect: block only while the bake is
+            // pending; a Failed bake must not lock the operator out.
+            if (wisdom.Phase is WisdomPhase.Idle or WisdomPhase.Building)
                 return Results.Json(
                     new { error = "DSP is preparing FFTW plans — try again in a moment." },
                     statusCode: StatusCodes.Status503ServiceUnavailable);
@@ -427,26 +414,95 @@ public static class RadioConnectionEndpoints
         return true;
     }
 
-    // Connect-time projection of the discovered board byte → kind. Protocol 1
-    // and Protocol 2 use DIFFERENT wire numbering for the dual-ADC family
-    // (Angelia/Orion/OrionMkII), so they MUST use separate maps that mirror
-    // Zeus.Protocol1/Protocol2 Discovery.ReplyParser respectively. Reusing one
-    // table for both was the connect-time half of issue #780 (a P2 ANAN-200D,
-    // byte 0x04, was projected through the P1 table as Angelia/100D).
-    // Do NOT merge these two.
-    private static HpsdrBoardKind MapBoardByteP1(byte raw) => raw switch
+    internal static async Task<P1ConnectionIdentity> ResolveP1ConnectionIdentityAsync(
+        byte? rawBoardId,
+        string endpoint,
+        IRadioDiscovery discovery,
+        ILogger logger,
+        CancellationToken cancellationToken)
     {
-        0x00 => HpsdrBoardKind.Metis,
-        0x01 => HpsdrBoardKind.Hermes,
-        0x02 => HpsdrBoardKind.HermesII,
-        0x04 => HpsdrBoardKind.Angelia,      // ANAN-100D (P1 wire)
-        0x05 => HpsdrBoardKind.Orion,        // ANAN-200D (P1 wire)
-        0x06 => HpsdrBoardKind.HermesLite2,
-        0x0A => HpsdrBoardKind.OrionMkII,
-        0x14 => HpsdrBoardKind.HermesC10,
-        _ => HpsdrBoardKind.Unknown,
-    };
+        P1Radio? probe = null;
+        if (TryParseIpEndpoint(endpoint, out var ipEndpoint))
+        {
+            probe = await TryProbeP1Async(
+                discovery,
+                ipEndpoint,
+                TimeSpan.FromMilliseconds(400),
+                logger,
+                cancellationToken).ConfigureAwait(false);
 
+            // Only shared wire byte 0x06 needs more evidence. Retry immediately
+            // with one longer receive window; all unambiguous boards retain the
+            // existing single-probe latency.
+            if (rawBoardId == 0x06 && probe is null)
+            {
+                probe = await TryProbeP1Async(
+                    discovery,
+                    ipEndpoint,
+                    TimeSpan.FromMilliseconds(1000),
+                    logger,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        var boardKind = ResolveP1BoardKind(rawBoardId, probe);
+        if (rawBoardId == 0x06 && probe is null)
+        {
+            logger.LogWarning(
+                "api.connect P1 identity could not be confirmed for ambiguous board byte 0x06 at {Endpoint}; falling back to HermesLite2",
+                endpoint);
+        }
+
+        return new P1ConnectionIdentity(probe, boardKind);
+    }
+
+    private static async Task<P1Radio?> TryProbeP1Async(
+        IRadioDiscovery discovery,
+        IPEndPoint endpoint,
+        TimeSpan timeout,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var found = await discovery.DiscoverAsync(timeout, cancellationToken)
+                .ConfigureAwait(false);
+            return found.FirstOrDefault(d => d.Ip.Equals(endpoint.Address));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "api.connect P1 identity probe failed for {Endpoint}; connection remains fail-open",
+                endpoint);
+            return null;
+        }
+    }
+
+    internal static HpsdrBoardKind ResolveP1BoardKind(byte? rawBoardId, P1Radio? probe)
+    {
+        if (probe is not null)
+            return probe.Board;
+
+        // A bare 0x06 cannot distinguish HL2 from a revised ANAN-10E. When
+        // probing succeeds both are classified correctly. When it fails, keep
+        // the pre-change HL2 behavior so a working HL2 never loses TX; guessing
+        // HermesII would send an incompatible 8-bit drive value to HL2 firmware.
+        if (rawBoardId == 0x06)
+            return HpsdrBoardKind.HermesLite2;
+
+        return rawBoardId is byte raw
+            ? ReplyParser.ClassifyBoard(raw, codeVersion: null)
+            : HpsdrBoardKind.Unknown;
+    }
+
+    // Protocol 2 uses different wire numbering for the dual-ADC family
+    // (Angelia/Orion/OrionMkII). This P2-only map mirrors its reply parser;
+    // reusing the P1 classifier here would recreate issue #780.
     private static HpsdrBoardKind MapBoardByteP2(byte raw) => raw switch
     {
         0x00 => HpsdrBoardKind.Metis,        // Atlas

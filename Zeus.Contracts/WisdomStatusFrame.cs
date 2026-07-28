@@ -52,14 +52,21 @@ public enum WisdomPhase : byte
     Idle = 0,
     Building = 1,
     Ready = 2,
+    // Additive on the wire: clients built before Failed existed map any
+    // phase other than 1 (Building) or 2 (Ready) to Idle, which is an
+    // acceptable degradation (no splash, connect allowed once the server
+    // guard also passes).
+    Failed = 3,
 }
 
 // [0x15][phase:u8][statusUtf8…]. Phase byte is mandatory; status string is
 // optional UTF-8 trailer carrying the live WDSP wisdom_get_status() string
 // (e.g. "Planning COMPLEX FORWARD FFT size 1024") so the splash can show
-// what's actually happening during the multi-minute first-run build. The
-// status buffer is sized to match the 128-byte fixed buffer in WDSP's
-// wisdom.c; longer strings are truncated to keep the frame bounded.
+// what's actually happening during the multi-minute first-run build. When
+// Phase is Failed the status trailer instead carries an operator-facing
+// failure summary (details stay in zeus-app.log). The status buffer is
+// sized to match the 128-byte fixed buffer in WDSP's wisdom.c; longer
+// strings are truncated to keep the frame bounded.
 public readonly record struct WisdomStatusFrame(WisdomPhase Phase, string Status = "")
 {
     public const int MinByteLength = 1 + 1;

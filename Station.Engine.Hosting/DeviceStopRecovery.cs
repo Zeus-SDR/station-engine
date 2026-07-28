@@ -30,13 +30,15 @@ internal static class DeviceStopRecovery
     internal static async Task<DeviceRecoveryResult> RunAsync(
         Func<TimeSpan, CancellationToken, Task> delay,
         Func<int, CancellationToken, Task<bool>> attempt,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan[]? backoff = null)
     {
+        var schedule = backoff ?? Backoff;
         try
         {
-            for (int index = 0; index < Backoff.Length; index++)
+            for (int index = 0; index < schedule.Length; index++)
             {
-                await delay(Backoff[index], cancellationToken).ConfigureAwait(false);
+                await delay(schedule[index], cancellationToken).ConfigureAwait(false);
                 if (await attempt(index + 1, cancellationToken).ConfigureAwait(false))
                     return DeviceRecoveryResult.Recovered;
             }

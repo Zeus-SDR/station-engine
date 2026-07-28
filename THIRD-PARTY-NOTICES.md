@@ -4,8 +4,14 @@
 
 This inventory covers every external package, native library, embedded native
 component, and model conveyed by the `station-engine` source export as audited
-on 2026-07-19. The corresponding upstream license and notice files are
+on 2026-07-27. The corresponding upstream license and notice files are
 preserved verbatim in [`THIRD-PARTY-LICENSES`](THIRD-PARTY-LICENSES/).
+
+## First-party components
+
+`Station.AudioRing` is first-party code additionally available under the MIT
+license. Its full license text is preserved in
+`Station.AudioRing/LICENSE.md`.
 
 ## Inventory
 
@@ -33,7 +39,7 @@ preserved verbatim in [`THIRD-PARTY-LICENSES`](THIRD-PARTY-LICENSES/).
   System.IO.Ports 10.0.0 and its platform runtime packages,
   Microsoft.Extensions.Logging.Abstractions 10.0.0, and
   Microsoft.Extensions.DependencyInjection.Abstractions 10.0.0, with no other
-  NuGet packages for the seven exported projects.
+  NuGet packages for the eight exported projects.
 - `Station.Engine.Hosting.csproj` explicitly copies the RNNoise model and WDSP
   `calculus` / `zetaHat.bin` data into build and publish output.
 - `Zeus.Dsp.csproj` explicitly includes every `*.dylib`, `*.so*`, and `*.dll`

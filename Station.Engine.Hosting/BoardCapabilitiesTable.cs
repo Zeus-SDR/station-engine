@@ -266,11 +266,12 @@ internal static class BoardCapabilitiesTable
         MaxPowerWatts = 250,
     };
 
-    // Red Pitaya (DH1KLM) — Saturn-class hardware but Thetis DISABLES the Orion
-    // mic-bias panel for it (DIY connector foot-gun) and it has no balanced XLR.
-    // Analog line-in only.
+    // Red Pitaya (DH1KLM) — Saturn-class hardware but Thetis disables the MkII
+    // BPF master select for OpenHPSDR-compatible DIY filter boards and disables
+    // the Orion mic-bias panel (DIY connector foot-gun). Analog line-in only.
     private static readonly BoardCapabilities SaturnRedPitaya = Saturn with
     {
+        MkiiBpf = false,
         HasMicBias = false,
     };
 

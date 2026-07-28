@@ -163,27 +163,55 @@ public static class TxControlEndpoints
         return endpoints;
     }
 
-    private static readonly HashSet<string> TxStationProfileIds = new(StringComparer.OrdinalIgnoreCase)
+    internal static bool TryValidateTxAudioProfileIdPointer(string? id, out string error)
     {
-        "studio-ssb",
-        "essb",
-        "dx",
-    };
-
-    private static bool TryValidateTxStationProfileId(string? id, out string error)
-    {
-        if (!string.IsNullOrWhiteSpace(id) && TxStationProfileIds.Contains(id))
+        // ProfileId now points at a unified TX audio profile. The fixed 3-up
+        // station-profile system is retired, and TxFidelityPolicyStore never
+        // enforced catalog membership, so validate only the slug shape emitted
+        // by TxAudioProfileService rather than restoring the retired whitelist.
+        if (string.IsNullOrWhiteSpace(id))
         {
-            error = "";
-            return true;
+            error = "profile id is required";
+            return false;
         }
-        error = "profile id must be one of studio-ssb, essb, dx";
-        return false;
+        if (id.Length > 256)
+        {
+            error = "profile id must be 256 characters or fewer";
+            return false;
+        }
+
+        // Uppercase input is accepted intentionally; the storage authority
+        // normalizes with ToLowerInvariant(), so input casing cannot collide.
+        var previousWasSeparator = true;
+        foreach (var ch in id)
+        {
+            if (char.IsLetterOrDigit(ch))
+            {
+                previousWasSeparator = false;
+                continue;
+            }
+            if (ch == '-' && !previousWasSeparator)
+            {
+                previousWasSeparator = true;
+                continue;
+            }
+
+            error = "profile id must be an alphanumeric slug with single '-' separators";
+            return false;
+        }
+        if (previousWasSeparator)
+        {
+            error = "profile id must be an alphanumeric slug with single '-' separators";
+            return false;
+        }
+
+        error = "";
+        return true;
     }
 
     private static bool TryValidateTxFidelityPolicy(TxFidelityPolicyDto policy, out string error)
     {
-        if (!TryValidateTxStationProfileId(policy.ProfileId, out error))
+        if (!TryValidateTxAudioProfileIdPointer(policy.ProfileId, out error))
             return false;
         if (policy.TargetSpectralDensity < 0 || policy.TargetSpectralDensity > 100)
         {

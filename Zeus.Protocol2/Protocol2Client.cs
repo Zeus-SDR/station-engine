@@ -165,6 +165,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
     private Socket? _sock;
+    private Action<byte[]>? _cmdHighPrioritySinkForTesting;
     private IPEndPoint? _radioEndpoint;
     private CancellationTokenSource? _rxCts;
     private Task? _rxTask;
@@ -513,6 +514,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqPacketsQueued;
     private long _txIqPacketsSent;
     private long _txIqQueuedPackets;
+    private long _txIqPacketsInFlight;
     private long _txIqQueueWriteFailures;
     private long _txIqSendFailures;
     private long _txIqResetDrainedPackets;
@@ -563,6 +565,14 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     {
         _log = log;
     }
+
+    // Socketless command-wire capture for service-level unit tests. When set,
+    // only high-priority packets are diverted; production never assigns it.
+    internal void SetCmdHighPrioritySinkForTesting(Action<byte[]>? sink) =>
+        _cmdHighPrioritySinkForTesting = sink;
+
+    private bool CanSendCmdHighPriority =>
+        _rxTask is not null || _cmdHighPrioritySinkForTesting is not null;
 
     public ChannelReader<IqFrame> IqFrames => _iqFrames.Reader;
     public long TotalFrames => Interlocked.Read(ref _totalFrames);
@@ -919,7 +929,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         var running = _rxTask is not null;
         _log.LogInformation("p2.tune hz={Hz} running={Running} hpSeq={Seq}",
             _rxFreqHz, running, _seqCmdHp);
-        if (running) SendCmdHighPriority(run: true);
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -948,7 +958,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             _txDucFreqHz = next;
             _txDucIndependent = true;
         }
-        if (_rxTask is not null) SendCmdHighPriority(run: true);
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -1502,7 +1512,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // next HP frame carries the operator's new antenna. Only flush when fully
         // unkeyed (a TUNE could still be active).
         if (!on && !_tuneActive) FlushPendingAntennas();
-        if (_rxTask is not null) PushTransmitEdge(on);
+        if (CanSendCmdHighPriority) PushTransmitEdge(on);
     }
 
     public void SetTune(bool on)
@@ -1510,7 +1520,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         _tuneActive = on;
         ResetTxIq();
         if (!on && !_moxOn) FlushPendingAntennas();
-        if (_rxTask is not null) PushTransmitEdge(on);
+        if (CanSendCmdHighPriority) PushTransmitEdge(on);
     }
 
     /// <summary>
@@ -1748,7 +1758,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         while (true)
         {
             var diag = TxIqDiagnosticsSnapshot();
-            if (diag.ScratchComplexSamples == 0 && diag.QueuedPackets == 0) return true;
+            if (diag.ScratchComplexSamples == 0
+                && diag.QueuedPackets == 0
+                && Volatile.Read(ref _txIqPacketsInFlight) == 0)
+                return true;
             if (timeoutTicks <= 0) return false;
             long elapsed = Stopwatch.GetTimestamp() - start;
             if (elapsed >= timeoutTicks) return false;
@@ -1808,14 +1821,19 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             // then starves the FIFO, showing up as a pulsed carrier.
             DropStaleTxIqPacketsIfBackedUpLocked();
             var queued = new RevisionedTxIqPacket(p, _txIqScratchRevision);
+            // Publish the count before the packet. The sender can dequeue as
+            // soon as TryWrite succeeds; incrementing afterward lets its
+            // decrement observe zero and leaves a phantom queued packet that
+            // makes WaitForTxIqQueueIdle time out forever.
+            Interlocked.Increment(ref _txIqQueuedPackets);
             if (_txIqQueue.Writer.TryWrite(queued))
             {
                 p = null!; // ownership transferred to the queue
                 Interlocked.Increment(ref _txIqPacketsQueued);
-                Interlocked.Increment(ref _txIqQueuedPackets);
             }
             else
             {
+                DecrementTxIqQueuedPacketsIfPositive();
                 Interlocked.Increment(ref _txIqQueueWriteFailures);
             }
         }
@@ -1885,85 +1903,96 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 catch (OperationCanceledException) { break; }
                 catch (ChannelClosedException) { break; }
                 if (!reader.TryRead(out var queued)) continue;
-                DecrementTxIqQueuedPacketsIfPositive();
-                var packet = queued.Buffer;
-                if (packet is null)
-                {
-                    Interlocked.Increment(ref _txIqSendFailures);
-                    _log.LogWarning("p2.txiq dropped null packet");
-                    continue;
-                }
-
+                // Transfer the packet from queued to in-flight without an
+                // observable idle gap. Tail drains must not return while the
+                // sender is still pacing or synchronously writing this packet.
+                Interlocked.Increment(ref _txIqPacketsInFlight);
                 try
                 {
-                    // Drain by wall-clock since the previous send.
-                    long now = Stopwatch.GetTimestamp();
-                    double elapsedSec = (now - lastTicks) / ticksPerSecond;
-                    fifoSamples -= elapsedSec * TxDacSampleRate;
-                    if (fifoSamples < 0.0) fifoSamples = 0.0;
-                    lastTicks = now;
-
-                    // If the radio's FIFO would overflow, wait a tick before the
-                    // next send. The 1 ms delay is coarse but well within the
-                    // FIFO's 6.5 ms target headroom, so no underrun risk.
-                    if (fifoSamples > TxFifoTargetSamples)
+                    DecrementTxIqQueuedPacketsIfPositive();
+                    var packet = queued.Buffer;
+                    if (packet is null)
                     {
-                        Thread.Sleep(1);
-                        if (ct.IsCancellationRequested) break;
-                        now = Stopwatch.GetTimestamp();
-                        elapsedSec = (now - lastTicks) / ticksPerSecond;
-                        fifoSamples -= elapsedSec * TxDacSampleRate;
-                        if (fifoSamples < 0.0) fifoSamples = 0.0;
-                        lastTicks = now;
+                        Interlocked.Increment(ref _txIqSendFailures);
+                        _log.LogWarning("p2.txiq dropped null packet");
+                        continue;
                     }
 
                     try
                     {
-                        // Decision 12: a packet dequeued before an unkey/trip
-                        // must not escape after pacing. Re-check its exact
-                        // transition revision immediately before the socket.
-                        if (!(_txIqSafetyGate?.Invoke(queued.SafetyRevision) ?? true))
-                        {
-                            Interlocked.Increment(ref _txIqSendFailures);
-                            continue;
-                        }
-                        fifoSamples += TxIqSamplesPerPacket;
-                        // ArrayPool may return a larger array; send exactly the
-                        // 1444-byte Protocol-2 payload, synchronously, before reuse.
-                        _sock!.SendTo(packet.AsSpan(0, BufLen), SocketFlags.None, ep);
-                        rateCount++;
-                        Interlocked.Increment(ref _txIqPacketsSent);
-                    }
-                    catch (ObjectDisposedException) { break; }
-                    catch (SocketException ex)
-                    {
-                        Interlocked.Increment(ref _txIqSendFailures);
-                        _log.LogWarning(ex, "p2.txiq send failed");
-                    }
+                        // Drain by wall-clock since the previous send.
+                        long now = Stopwatch.GetTimestamp();
+                        double elapsedSec = (now - lastTicks) / ticksPerSecond;
+                        fifoSamples -= elapsedSec * TxDacSampleRate;
+                        if (fifoSamples < 0.0) fifoSamples = 0.0;
+                        lastTicks = now;
 
-                    if (now - lastRateTicks >= ticksPerSecond)
-                    {
-                        // Diagnostics must NEVER take down the TX-IQ sender — the
-                        // outer catch exits the loop on any exception, so a bad log
-                        // call here silently stops all TX. (It did: ChannelReader.Count
-                        // throws NotSupportedException on an unbounded channel, which
-                        // killed the sender 24ms into key-down — no TX output at all.)
+                        // If the radio's FIFO would overflow, wait a tick before the
+                        // next send. The 1 ms delay is coarse but well within the
+                        // FIFO's 6.5 ms target headroom, so no underrun risk.
+                        if (fifoSamples > TxFifoTargetSamples)
+                        {
+                            Thread.Sleep(1);
+                            if (ct.IsCancellationRequested) break;
+                            now = Stopwatch.GetTimestamp();
+                            elapsedSec = (now - lastTicks) / ticksPerSecond;
+                            fifoSamples -= elapsedSec * TxDacSampleRate;
+                            if (fifoSamples < 0.0) fifoSamples = 0.0;
+                            lastTicks = now;
+                        }
+
                         try
                         {
-                            Volatile.Write(ref _txIqLastPacketsPerSecond, rateCount);
-                            Interlocked.Exchange(ref _txIqLastFifoModelSamples, (long)Math.Round(fifoSamples));
-                            Interlocked.Exchange(ref _txIqLastRateUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
-                            _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0}",
-                                rateCount, fifoSamples);
+                            // Decision 12: a packet dequeued before an unkey/trip
+                            // must not escape after pacing. Re-check its exact
+                            // transition revision immediately before the socket.
+                            if (!(_txIqSafetyGate?.Invoke(queued.SafetyRevision) ?? true))
+                            {
+                                Interlocked.Increment(ref _txIqSendFailures);
+                                continue;
+                            }
+                            fifoSamples += TxIqSamplesPerPacket;
+                            // ArrayPool may return a larger array; send exactly the
+                            // 1444-byte Protocol-2 payload, synchronously, before reuse.
+                            _sock!.SendTo(packet.AsSpan(0, BufLen), SocketFlags.None, ep);
+                            rateCount++;
+                            Interlocked.Increment(ref _txIqPacketsSent);
                         }
-                        catch { /* never let a diagnostic kill TX */ }
-                        rateCount = 0;
-                        lastRateTicks = now;
+                        catch (ObjectDisposedException) { break; }
+                        catch (SocketException ex)
+                        {
+                            Interlocked.Increment(ref _txIqSendFailures);
+                            _log.LogWarning(ex, "p2.txiq send failed");
+                        }
+
+                        if (now - lastRateTicks >= ticksPerSecond)
+                        {
+                            // Diagnostics must NEVER take down the TX-IQ sender — the
+                            // outer catch exits the loop on any exception, so a bad log
+                            // call here silently stops all TX. (It did: ChannelReader.Count
+                            // throws NotSupportedException on an unbounded channel, which
+                            // killed the sender 24ms into key-down — no TX output at all.)
+                            try
+                            {
+                                Volatile.Write(ref _txIqLastPacketsPerSecond, rateCount);
+                                Interlocked.Exchange(ref _txIqLastFifoModelSamples, (long)Math.Round(fifoSamples));
+                                Interlocked.Exchange(ref _txIqLastRateUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
+                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0}",
+                                    rateCount, fifoSamples);
+                            }
+                            catch { /* never let a diagnostic kill TX */ }
+                            rateCount = 0;
+                            lastRateTicks = now;
+                        }
+                    }
+                    finally
+                    {
+                        _txIqPacketPool.Return(packet);
                     }
                 }
                 finally
                 {
-                    _txIqPacketPool.Return(packet);
+                    Interlocked.Decrement(ref _txIqPacketsInFlight);
                 }
             }
         }
@@ -3222,7 +3251,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
         WriteBeU32(p, 1428, alex1);
         WriteBeU32(p, 1432, alex0);
-        _sock!.SendTo(p, new IPEndPoint(_radioEndpoint!.Address, 1027));
+        var testSink = _cmdHighPrioritySinkForTesting;
+        if (testSink is not null)
+            testSink(p);
+        else
+            _sock!.SendTo(p, new IPEndPoint(_radioEndpoint!.Address, 1027));
 
         if (_cmdHpTxLogGate.ShouldLog(_stopwatch.ElapsedMilliseconds, run, moxOn, tuneActive))
         {

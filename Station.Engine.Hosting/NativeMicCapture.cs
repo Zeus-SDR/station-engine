@@ -35,8 +35,9 @@ namespace Zeus.Server;
 /// to spin up the input device.</para>
 ///
 /// <para>Downmix: when the OS hands us a stereo / multichannel input
-/// (USB mics often default to stereo), we average across channels into a
-/// mono sample. Resample: miniaudio's internal resampler converts to 48 kHz
+/// (USB mics often default to stereo), the default remains averaging across
+/// channels into a mono sample. An operator may instead select one channel.
+/// Resample: miniaudio's internal resampler converts to 48 kHz
 /// if the device's native rate is something else (44.1 kHz common on Mac
 /// laptops). Both happen behind the data callback so this code only deals
 /// with 48 kHz mono frames.</para>
@@ -63,13 +64,20 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private volatile bool _intentionalStop;
     private int _deviceGeneration;
     private int _recoveryEpoch;
-    private int _recoveryScheduled;
+    private int _recoveryScheduled = -1;
     private readonly CancellationTokenSource _recoveryCancellation = new();
     private readonly CancellationToken _recoveryToken;
     private bool _disposed;
     private string? _activeInputDeviceId;
+    private int _sampleRate;
+    private int _channels;
+    // -1 means the compatibility default: mix every capture channel.
+    private int _inputChannel = -1;
     private readonly float[] _accum = new float[MicBlockSamples];
     private int _accumFill;
+    // Which capture channel the partially filled block was sourced from, so a
+    // selection change mid-block is discarded rather than spliced. -1 = mix all.
+    private int _accumChannel = -1;
     // Pre-allocated payload buffer reused for every flush; OnMicPcmBytes
     // takes ReadOnlyMemory<byte> but doesn't retain it, so reuse is safe.
     private readonly byte[] _payload = new byte[MicBlockBytes];
@@ -94,6 +102,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         _deviceSettings = deviceSettings;
         _inputFactory = new NativeMicInputFactory();
         _recoveryToken = _recoveryCancellation.Token;
+        _inputChannel = deviceSettings?.Get().InputChannel ?? -1;
     }
 
     internal NativeMicCapture(
@@ -109,6 +118,16 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
     public string? ConfiguredInputDeviceId => _deviceSettings?.Get().InputDeviceId;
     public string? ActiveInputDeviceId => _activeInputDeviceId;
+    public uint SampleRate => (uint)Math.Max(0, Volatile.Read(ref _sampleRate));
+    public uint Channels => (uint)Math.Max(0, Volatile.Read(ref _channels));
+    public int? InputChannel
+    {
+        get
+        {
+            int channel = Volatile.Read(ref _inputChannel);
+            return channel >= 0 ? channel : null;
+        }
+    }
 
     /// <summary>
     /// Capture-flow snapshot for remote diagnostics. Distinguishes "capture
@@ -152,6 +171,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _shutdown = true;
             _intentionalStop = true;
             Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Exchange(ref _recoveryScheduled, -1);
             Interlocked.Increment(ref _deviceGeneration);
             _recoveryCancellation.Cancel();
             try { _input?.Stop(); }
@@ -169,6 +189,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _shutdown = true;
             _intentionalStop = true;
             Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Exchange(ref _recoveryScheduled, -1);
             Interlocked.Increment(ref _deviceGeneration);
             _recoveryCancellation.Cancel();
             CloseInputLocked(dispose: true);
@@ -185,6 +206,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _intentionalStop = true;
             Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Exchange(ref _recoveryScheduled, -1);
             Interlocked.Increment(ref _deviceGeneration);
             try
             {
@@ -198,6 +220,18 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             }
         }
 
+        return Task.CompletedTask;
+    }
+
+    public Task SetInputChannelAsync(
+        int? inputChannel,
+        CancellationToken cancellationToken = default)
+    {
+        if (inputChannel is < 0)
+            throw new ArgumentOutOfRangeException(nameof(inputChannel));
+
+        _deviceSettings?.SetInputChannel(inputChannel);
+        Volatile.Write(ref _inputChannel, inputChannel ?? -1);
         return Task.CompletedTask;
     }
 
@@ -215,6 +249,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         if (!selected)
         {
             _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
+            ScheduleStartupOpenRecovery(null);
             return;
         }
 
@@ -227,6 +262,99 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
         LogOpenGaveUp("default fallback", fallbackFailure);
         _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
+        ScheduleStartupOpenRecovery(requestedDeviceId);
+    }
+
+    // Startup-open recovery: a failed FIRST open must not park the uplink
+    // until a relaunch. On macOS a fresh unsigned build re-prompts for the
+    // mic and the 5 s open timebox loses the race against the operator's
+    // answer — the 2026-07-23 field failure where a working mic died right
+    // after an upgrade with TCC already granted. Retry patiently on a
+    // background task with the same single-flight and abandon semantics as
+    // the device-stop recovery; a device change or shutdown abandons it.
+    private static readonly TimeSpan[] StartupOpenBackoff =
+    [
+        TimeSpan.FromSeconds(2),
+        TimeSpan.FromSeconds(5),
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(20),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(60),
+    ];
+
+    /// <summary>Test seam: the startup-open recovery pacing (instant in tests).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> StartupRecoveryDelay { get; set; } =
+        static (delay, ct) => Task.Delay(delay, ct);
+
+    private void ScheduleStartupOpenRecovery(string? configuredDeviceId)
+    {
+        if (_shutdown) return;
+        int recoveryEpoch = Volatile.Read(ref _recoveryEpoch);
+        if (Interlocked.CompareExchange(ref _recoveryScheduled, recoveryEpoch, -1) != -1) return;
+        var configuredDeviceLabel = configuredDeviceId ?? "default";
+        var delay = StartupRecoveryDelay;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var result = await DeviceStopRecovery.RunAsync(
+                    delay,
+                    (attempt, ct) =>
+                    {
+                        lock (_deviceSync)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            if (_shutdown
+                                || _intentionalStop
+                                || recoveryEpoch != Volatile.Read(ref _recoveryEpoch))
+                            {
+                                // Abandoned: stop retrying but report success so
+                                // the loop simply ends.
+                                return Task.FromResult(true);
+                            }
+                            _log.LogWarning(
+                                "audio.native.tx startup-open recovery attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
+                                attempt, configuredDeviceLabel);
+                            _intentionalStop = true;
+                            try
+                            {
+                                Interlocked.Increment(ref _deviceGeneration);
+                                CloseInputLocked(dispose: true);
+                                ResetAccumulation();
+                                OpenInputLocked(configuredDeviceId);
+                                bool recovered = _input is not null;
+                                if (recovered)
+                                    _log.LogInformation(
+                                        "audio.native.tx startup-open recovery succeeded attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
+                                        attempt, configuredDeviceLabel);
+                                return Task.FromResult(recovered);
+                            }
+                            finally
+                            {
+                                _intentionalStop = false;
+                            }
+                        }
+                    },
+                    _recoveryToken,
+                    StartupOpenBackoff).ConfigureAwait(false);
+
+                if (result == DeviceRecoveryResult.GaveUp)
+                    _log.LogError(
+                        "audio.native.tx startup-open recovery gave up configuredDeviceId={ConfiguredDeviceId}; change the input selection or relaunch to retry",
+                        configuredDeviceLabel);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(
+                    ex,
+                    "audio.native.tx startup-open recovery worker failed configuredDeviceId={ConfiguredDeviceId}",
+                    configuredDeviceLabel);
+            }
+            finally
+            {
+                Interlocked.CompareExchange(ref _recoveryScheduled, -1, recoveryEpoch);
+            }
+        });
     }
 
     private INativeMicInput? OpenInputTimeboxed(string? requestedDeviceId, out Exception? failure) =>
@@ -264,6 +392,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     {
         _input = input;
         _activeInputDeviceId = NormalizeDeviceId(requestedDeviceId) ?? ResolveDefaultInputDeviceId();
+        Volatile.Write(ref _sampleRate, checked((int)input.SampleRate));
+        Volatile.Write(ref _channels, checked((int)input.Channels));
         _log.LogInformation(
             "audio.native.tx CAPTURE DEVICE resolved={DeviceId} source={Source} rate={Rate}Hz channels={Channels}",
             _activeInputDeviceId ?? "system-default",
@@ -317,11 +447,14 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         }
         _input = null;
         _activeInputDeviceId = null;
+        Volatile.Write(ref _sampleRate, 0);
+        Volatile.Write(ref _channels, 0);
     }
 
     private void ResetAccumulation()
     {
         _accumFill = 0;
+        _accumChannel = Volatile.Read(ref _inputChannel);
     }
 
     // Internal for tests: lets the capture-diagnostics test drive the
@@ -337,6 +470,23 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         // the completed block at TxAudioIngest, after every capture transport
         // has converged on the same source-aware seam.
         int srcIdx = 0;
+        int selectedChannel = Volatile.Read(ref _inputChannel);
+
+        // Snapshotting once per callback is not enough on its own. _accumFill
+        // survives across callbacks, and most backends hand us less than one
+        // 960-sample block at a time — WASAPI shared mode is typically 480
+        // frames, ALSA/PulseAudio periods are often 256-512 — so a single
+        // on-air block is usually assembled from two or more callbacks. If the
+        // operator switched channel between them we would flush a block that
+        // splices two different mixer channels together, which radiates as a
+        // broadband click. Discard the partial block instead: the cost is under
+        // 20 ms of audio on a deliberate channel change, and never a click.
+        if (selectedChannel != _accumChannel)
+        {
+            _accumFill = 0;
+            _accumChannel = selectedChannel;
+        }
+
         while (srcIdx < frames)
         {
             int needBeforeFlush = MicBlockSamples - _accumFill;
@@ -347,6 +497,17 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 for (int i = 0; i < take; i++)
                 {
                     float sample = SanitizeCapturedSample(input[srcIdx + i]);
+                    _accum[_accumFill + i] = sample;
+                }
+            }
+            else if (selectedChannel >= 0 && selectedChannel < ch)
+            {
+                for (int i = 0; i < take; i++)
+                {
+                    // Capture channels are zero-based internally and on the
+                    // API wire; the SPA presents them as Channel 1, 2, ...
+                    float sample = SanitizeCapturedSample(
+                        input[((srcIdx + i) * ch) + selectedChannel]);
                     _accum[_accumFill + i] = sample;
                 }
             }
@@ -450,9 +611,10 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 _intentionalStop,
                 stoppedGeneration,
                 Volatile.Read(ref _deviceGeneration))) return;
-        if (Interlocked.CompareExchange(ref _recoveryScheduled, 1, 0) != 0) return;
 
         int recoveryEpoch = Volatile.Read(ref _recoveryEpoch);
+        if (Interlocked.CompareExchange(ref _recoveryScheduled, recoveryEpoch, -1) != -1) return;
+
         // Device selection can change between the first lock-free check and
         // winning the single-flight flag. Revalidate after capturing its
         // epoch so a stale callback can never reopen the newly selected route.
@@ -462,7 +624,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 stoppedGeneration,
                 Volatile.Read(ref _deviceGeneration)))
         {
-            Interlocked.Exchange(ref _recoveryScheduled, 0);
+            Interlocked.CompareExchange(ref _recoveryScheduled, -1, recoveryEpoch);
             return;
         }
         _ = Task.Run(async () =>
@@ -526,7 +688,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             }
             finally
             {
-                Interlocked.Exchange(ref _recoveryScheduled, 0);
+                Interlocked.CompareExchange(ref _recoveryScheduled, -1, recoveryEpoch);
             }
         });
     }

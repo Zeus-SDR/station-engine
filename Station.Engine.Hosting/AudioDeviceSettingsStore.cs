@@ -4,7 +4,10 @@ using LiteDB;
 
 namespace Zeus.Server;
 
-public sealed record AudioDeviceSettings(string? InputDeviceId, string? OutputDeviceId);
+public sealed record AudioDeviceSettings(
+    string? InputDeviceId,
+    string? OutputDeviceId,
+    int? InputChannel);
 
 public sealed class AudioDeviceSettingsStore : IDisposable
 {
@@ -39,10 +42,14 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         {
             var e = _docs.FindAll().FirstOrDefault();
             return e is null
-                ? new AudioDeviceSettings(InputDeviceId: null, OutputDeviceId: null)
+                ? new AudioDeviceSettings(
+                    InputDeviceId: null,
+                    OutputDeviceId: null,
+                    InputChannel: null)
                 : new AudioDeviceSettings(
                     InputDeviceId: Normalize(e.InputDeviceId),
-                    OutputDeviceId: Normalize(e.OutputDeviceId));
+                    OutputDeviceId: Normalize(e.OutputDeviceId),
+                    InputChannel: e.InputChannel is >= 0 ? e.InputChannel : null);
         }
     }
 
@@ -62,6 +69,19 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         {
             var e = GetOrCreateEntry();
             e.OutputDeviceId = Normalize(outputDeviceId);
+            SaveEntry(e);
+        }
+    }
+
+    public void SetInputChannel(int? inputChannel)
+    {
+        if (inputChannel is < 0)
+            throw new ArgumentOutOfRangeException(nameof(inputChannel));
+
+        lock (_sync)
+        {
+            var e = GetOrCreateEntry();
+            e.InputChannel = inputChannel;
             SaveEntry(e);
         }
     }
@@ -101,5 +121,6 @@ public sealed class AudioDeviceSettingsEntry
     public int Id { get; set; }
     public string? InputDeviceId { get; set; }
     public string? OutputDeviceId { get; set; }
+    public int? InputChannel { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

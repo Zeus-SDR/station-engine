@@ -284,6 +284,11 @@ public interface IDspEngine : IDisposable
     /// open.</summary>
     void SetTxDigitalBypass(bool bypass);
 
+    /// <summary>Temporarily bypass speech-only TX processing while a synthesized
+    /// roger beep is clocked through TXA. Implementations must preserve the
+    /// independent mode-owned digital bypass state when this window closes.</summary>
+    void SetTxRogerBeepBypass(bool bypass) { }
+
     /// <summary>Set TXA bandpass (SetTXABandpassFreqs). <paramref name="lowHz"/>
     /// / <paramref name="highHz"/> are signed Hz around baseband — LSB-style
     /// passbands are negative, DSB/AM/FM symmetric. No-op for Synthetic and

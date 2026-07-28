@@ -103,6 +103,7 @@ public sealed class PreferredRadioStore : IDisposable
                     {
                         Board = HpsdrBoardKind.Unknown,
                         OverrideDetection = false,
+                        OrionMkIIVariantChosen = false,
                         UpdatedUtc = DateTime.UtcNow,
                     });
                 }
@@ -130,6 +131,7 @@ public sealed class PreferredRadioStore : IDisposable
                     {
                         Board = board.Value,
                         OverrideDetection = overrideDetection ?? false,
+                        OrionMkIIVariantChosen = false,
                         UpdatedUtc = DateTime.UtcNow,
                     });
                 }
@@ -180,10 +182,29 @@ public sealed class PreferredRadioStore : IDisposable
     }
 
     /// <summary>
+    /// True when the operator has chosen a 0x0A variant. A row that predates
+    /// the marker hydrates it as null. A non-G2 legacy value proves an explicit
+    /// choice; legacy G2 remains ambiguous and requires one confirmation.
+    /// </summary>
+    public bool HasExplicitOrionMkIIVariant()
+    {
+        lock (_sync)
+        {
+            var e = _entries.FindAll().FirstOrDefault();
+            if (e is null || e.OrionMkIIVariantChosen is false)
+                return false;
+            return e.OrionMkIIVariantChosen is true
+                || e.OrionMkIIVariant != OrionMkIIVariant.G2;
+        }
+    }
+
+    public bool RequiresOrionMkIIVariantConfirmation(HpsdrBoardKind board) =>
+        board == HpsdrBoardKind.OrionMkII && !HasExplicitOrionMkIIVariant();
+
+    /// <summary>
     /// Persists the operator's chosen variant. Stored in the same single-row
-    /// preferences entry as the board / override-detection fields. Setting
-    /// to <see cref="OrionMkIIVariant.G2"/> is identical to "unset" (the
-    /// shipping default).
+    /// preferences entry as the board / override-detection fields. G2 remains
+    /// the shipping default, but saving it also records explicit confirmation.
     /// </summary>
     public void SetOrionMkIIVariant(OrionMkIIVariant variant)
     {
@@ -197,12 +218,14 @@ public sealed class PreferredRadioStore : IDisposable
                     Board = HpsdrBoardKind.Unknown,
                     OverrideDetection = false,
                     OrionMkIIVariant = variant,
+                    OrionMkIIVariantChosen = true,
                     UpdatedUtc = DateTime.UtcNow,
                 });
             }
             else
             {
                 existing.OrionMkIIVariant = variant;
+                existing.OrionMkIIVariantChosen = true;
                 existing.UpdatedUtc = DateTime.UtcNow;
                 _entries.Update(existing);
             }
@@ -242,6 +265,7 @@ public sealed class PreferredRadioStore : IDisposable
                 {
                     Board = HpsdrBoardKind.Unknown,
                     OverrideDetection = false,
+                    OrionMkIIVariantChosen = false,
                     EnableHl2BandVolts = enabled,
                     UpdatedUtc = DateTime.UtcNow,
                 });
@@ -335,6 +359,7 @@ public sealed class PreferredRadioStore : IDisposable
                 {
                     Board = HpsdrBoardKind.Unknown,
                     OverrideDetection = false,
+                    OrionMkIIVariantChosen = false,
                     // Store exactly what the operator set; leave unspecified
                     // options null so the resolver can apply the correct
                     // default for the active protocol (P2 on / P1 off). The
@@ -403,6 +428,7 @@ public sealed class PreferredRadioStore : IDisposable
                 {
                     Board = HpsdrBoardKind.Unknown,
                     OverrideDetection = false,
+                    OrionMkIIVariantChosen = false,
                     FrequencyCorrectionFactor = factor,
                     UpdatedUtc = DateTime.UtcNow,
                 });
@@ -431,6 +457,11 @@ public sealed class PreferredRadioEntry
     /// (the zero-default) for older rows that pre-date this field, which
     /// preserves Zeus' pre-#218 dispatch behaviour.</summary>
     public OrionMkIIVariant OrionMkIIVariant { get; set; }
+    /// <summary>Whether the operator explicitly confirmed the 0x0A variant.
+    /// Null means the row predates this marker; a legacy non-G2 value proves a
+    /// choice while legacy G2 remains ambiguous. False is reserved for rows
+    /// created after the confirmation gate was introduced.</summary>
+    public bool? OrionMkIIVariantChosen { get; set; }
     /// <summary>HL2 Band Volts PWM enable (issue #279). LiteDB hydrates as
     /// <c>false</c> for older rows that pre-date this field, which matches
     /// the shipping default.</summary>

@@ -18,7 +18,11 @@ public static class RadioHardwareEndpoints
         // variant once and the dispatch picks up the right bridge constants.
         endpoints.MapGet("/api/radio/variant", (PreferredRadioStore prefs) =>
         {
-            return Results.Ok(new { Variant = prefs.GetOrionMkIIVariant().ToString() });
+            return Results.Ok(new
+            {
+                Variant = prefs.GetOrionMkIIVariant().ToString(),
+                RequiresConfirmation = !prefs.HasExplicitOrionMkIIVariant(),
+            });
         });
 
         endpoints.MapPut("/api/radio/variant", (RadioVariantSetRequest req, PreferredRadioStore prefs) =>
@@ -30,7 +34,11 @@ public static class RadioHardwareEndpoints
                 return Results.BadRequest(new { error = $"unknown variant '{req.Variant}'" });
 
             prefs.SetOrionMkIIVariant(variant);
-            return Results.Ok(new { Variant = variant.ToString() });
+            return Results.Ok(new
+            {
+                Variant = variant.ToString(),
+                RequiresConfirmation = false,
+            });
         });
 
         // HL2-specific optional toggles (issue #279). Currently a single

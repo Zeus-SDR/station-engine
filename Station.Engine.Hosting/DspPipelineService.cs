@@ -1287,15 +1287,38 @@ public class DspPipelineService : BackgroundService,
     private readonly object _calPanLock = new();
 
     // Scratch buffer for the auto-AGC noise-floor estimate (issue #806). Filled
-    // and sorted in-place by TryComputeAutoAgcNoiseFloorDbm on the single meter
-    // thread; never read concurrently, so it needs no lock.
+    // and gated in-place by the floor tracker on the single meter thread;
+    // never read concurrently, so it needs no lock.
     private readonly float[] _autoAgcFloorBuf;
-    // Low percentile of the valid panadapter bins ⇒ the band noise floor. 0.20
-    // rejects up to ~80% spectrum occupancy (signals are the high bins).
-    private const double AutoAgcFloorPercentile = 0.20;
-    // Reject the estimate unless this many bins are real (not the -200 invalid
-    // sentinel); a near-dead span gives a meaningless floor.
-    private const int AutoAgcFloorMinValidBins = 64;
+    // Thetis-faithful band noise-floor tracker (display.cs processNoiseFloor
+    // port): gated quiet-bin mean + 2-tap power smoothing + 2 s attack lerp +
+    // fast-attack. Fed at the 5 Hz meter cadence; consumed by RadioService's
+    // auto-AGC-T servo. Replaces the old 20th-percentile estimator, which read
+    // ~2-5 dB low on dB-averaged pixels and is not what Thetis does.
+    private readonly AutoAgcNoiseFloorTracker _autoAgcTracker = new(feedFps: 5.0);
+    // Fast-attack trigger memory (Thetis sets FastAttackNoiseFloor on band
+    // change / >0.5 MHz VFO jump / preamp / attenuator step / auto re-engage).
+    // Detected here from the state snapshots the meter tick already reads. The
+    // MinValue sentinels suppress a false trigger on the first tick after
+    // construction or after auto is re-enabled.
+    private long _autoAgcLastVfoHz = long.MinValue;
+    private bool _autoAgcLastPreampOn;
+    private int _autoAgcLastAttenDb = int.MinValue;
+    private bool _autoAgcWasEnabled;
+    private long _autoAgcLastSpectrumFeedMs = long.MinValue;
+    private int _autoAgcFeedSource; // 0 none / 1 spectrum bins / 2 S-meter scalar
+    // Serializes tracker access between the P1/P2 meter tick and the P3
+    // sidecar meter publisher. The two are mutually exclusive on
+    // IsProtocol3Active in steady state, but a switchover tick can overlap by
+    // a frame, and the tracker is deliberately not thread-safe.
+    private readonly object _autoAgcTrackerLock = new();
+    // A VFO move this large means a band change (Thetis fast-attacks the noise
+    // floor on a > 0.5 MHz frequency delta, display.cs:911).
+    private const double AutoAgcFastAttackVfoDeltaHz = 500_000.0;
+    // Sustained spectrum outage before the tracker falls back to the S-meter:
+    // 1.5 s > normal frame gaps, short enough to keep tracking on engines that
+    // never produce a spectrum.
+    private const long AutoAgcSpectrumStaleMs = 1500;
     private readonly float[] _diagWfSnapshot;
     private long _diagWfSnapshotMs;
     private long _diagDisplayFrameMs;
@@ -1370,6 +1393,7 @@ public class DspPipelineService : BackgroundService,
     // the received modem audio with decoded speech.
     private readonly IAudioModemPort _audioModem;
     private readonly IProductTxAudioPort _productAudio;
+    private readonly ProductPluginAudioPort? _productPluginAudio;
 
     public DspPipelineService(
         RadioService radio,
@@ -1385,13 +1409,16 @@ public class DspPipelineService : BackgroundService,
         TxIqRing? txIqRing = null,
         IExternalRadioSidecar? externalRadioSidecar = null,
         IConfiguration? configuration = null,
-        IProductTxAudioPort? productAudio = null)
+        IProductTxAudioPort? productAudio = null,
+        ProductPluginAudioPort? productPluginAudio = null)
     {
         _radio = radio;
         _hub = hub;
         _txIqRing = txIqRing;
         _audioModem = audioModem ?? new NullAudioModemPort();
         _productAudio = productAudio ?? new NullProductTxAudioPort();
+        _productPluginAudio = productPluginAudio;
+        _productPluginAudio?.ConfigureLocalMonitorSink(EnqueueMonitorAudio);
         _externalRxAudioSource = externalRxAudioSource ?? new NullExternalRxAudioSource();
         _rxAudioMute = rxAudioMute;
         _hasExternalRadioSidecar = externalRadioSidecar is not null and not NullExternalRadioSidecar;
@@ -1407,6 +1434,11 @@ public class DspPipelineService : BackgroundService,
         _txTurnaround = new TxTurnaroundTelemetry(_log);
         var displayPerformance = DisplayPerformanceOptions.Resolve(configuration);
         _rxAnalyzerFftSize = displayPerformance.RxAnalyzerFftSize;
+        // WDSP's AGC threshold→max-gain conversion needs the FFT size of the
+        // analyzer the noise floor is measured from (wcpAGC.c:482) — give the
+        // auto-AGC servo the REAL analyzer size, not the WDSP channel block
+        // size (the old 1024 hardcode seated auto AGC-T ~12 dB too hot).
+        _radio.SetAutoAgcAnalyzerFftSize(_rxAnalyzerFftSize);
         _panadapterWidth = displayPerformance.PanadapterWidth;
         _panBuf = new float[_panadapterWidth];
         _wfBuf = new float[_panadapterWidth];
@@ -4429,7 +4461,7 @@ public class DspPipelineService : BackgroundService,
         // always agree.
         bool independentTxToSecondary = s.TxReceiverIndex >= 1 && s.Rx2Enabled;
         p2?.SetTxDucFrequency(
-            independentTxToSecondary ? CwOffset.EffectiveLoHz(s.Mode, RadioFrequencyResolver.TxFrequencyHz(s)) : 0);
+            independentTxToSecondary ? RadioService.TxEffectiveLoHz(s) : 0);
 
         // Issue #597 Phase 0: arm the RX display fast-attack when the LO
         // moves. First callback after construction only records the LO
@@ -6265,50 +6297,120 @@ public class DspPipelineService : BackgroundService,
     }
 
     /// <summary>
-    /// Estimates the band noise floor (raw display dB) for Auto-AGC from the
-    /// panadapter FFT — the same pre-AGC, per-bin spectrum Thetis tracks
-    /// (display.cs:5240-5264), not the post-AGC S-meter. Reads the cached
-    /// snapshot and delegates the percentile to <see cref="TryNoiseFloorFromDisplayBins"/>.
-    /// Returns false (caller passes NaN; the loop falls back to the S-meter) when
-    /// no fresh spectrum is available — a stale frame, a near-dead span, or any
-    /// engine/display state that did not produce a fresh analyzer frame within
-    /// the freshness window. The caller adds the board RX cal offset. Issue #806.
+    /// Drives the Thetis-faithful noise-floor tracker (AutoAgcNoiseFloorTracker,
+    /// a port of Thetis display.cs processNoiseFloor) once per meter tick and
+    /// returns the SETTLED band floor in raw display dB (caller adds the board
+    /// RX cal offset), or NaN when the tracker has not settled — during
+    /// fast-attack, before the first sample, or while keyed — so RadioService
+    /// holds its current offset exactly as Thetis's auto-AGC timer skips ticks
+    /// whose IsNoiseFloorGood is false (console.cs:46066).
+    ///
+    /// Feed arbitration (meter tick = 5 Hz): a fresh panadapter snapshot
+    /// (&le;300 ms) feeds the gated-bin estimator; a brief gap holds (no
+    /// sample); only a SUSTAINED outage (&gt; <see cref="AutoAgcSpectrumStaleMs"/>)
+    /// feeds the S-meter proxy via <paramref name="sMeterDbm"/> so engines
+    /// without a spectrum still track. Fast-attack triggers are detected from
+    /// the state snapshot the tick already reads: band-scale VFO jump, preamp
+    /// flip, attenuator step, and the auto-enabled rising edge (Thetis
+    /// display.cs:831-923). TX pauses the estimator (Thetis: no noise-floor
+    /// processing while MOX).
     /// </summary>
-    private bool TryComputeAutoAgcNoiseFloorDbm(out double floorDbm)
+    private double UpdateAutoAgcNoiseFloorDbm(StateDto state, double sMeterDbm, bool keyed, long nowMs, out bool spectrumSourced)
     {
-        floorDbm = double.NaN;
-        if (!TryCapturePanadapterSnapshot(_autoAgcFloorBuf, out _, out _, maxAgeMs: 300))
-            return false;
-        return TryNoiseFloorFromDisplayBins(
-            _autoAgcFloorBuf, AutoAgcFloorPercentile, AutoAgcFloorMinValidBins, out floorDbm);
+        lock (_autoAgcTrackerLock)
+        {
+            return UpdateAutoAgcNoiseFloorDbmLocked(state, sMeterDbm, keyed, nowMs, out spectrumSourced);
+        }
     }
 
-    /// <summary>
-    /// Pure noise-floor percentile over a panadapter display-dB buffer. Compacts
-    /// the valid bins to the front (SanitizeDisplayBuffer pins invalid bins to
-    /// DisplayInvalidBinDb = -200; excluding those and any absurdly low value
-    /// keeps the estimate on real noise, not dead band edges), then returns the
-    /// requested low percentile of the survivors. Returns false when fewer than
-    /// <paramref name="minValidBins"/> bins are real. NOTE: mutates
-    /// <paramref name="bins"/> in place (compacts + sorts); pass a scratch buffer.
-    /// </summary>
-    internal static bool TryNoiseFloorFromDisplayBins(
-        Span<float> bins, double percentile, int minValidBins, out double floorDbm)
+    private double UpdateAutoAgcNoiseFloorDbmLocked(StateDto state, double sMeterDbm, bool keyed, long nowMs, out bool spectrumSourced)
     {
-        floorDbm = double.NaN;
-        int n = 0;
-        for (int i = 0; i < bins.Length; i++)
+        spectrumSourced = false;
+        if (!state.AutoAgcEnabled)
         {
-            float v = bins[i];
-            if (float.IsFinite(v) && v > -190f)
-                bins[n++] = v;
+            if (_autoAgcWasEnabled)
+            {
+                _autoAgcTracker.Reset();
+                _autoAgcWasEnabled = false;
+                _autoAgcLastVfoHz = long.MinValue;
+                _autoAgcLastAttenDb = int.MinValue;
+                _autoAgcLastSpectrumFeedMs = long.MinValue;
+                _autoAgcFeedSource = 0;
+            }
+            return double.NaN;
         }
-        if (n < minValidBins) return false;
 
-        bins.Slice(0, n).Sort();
-        int idx = Math.Clamp((int)Math.Round((n - 1) * percentile), 0, n - 1);
-        floorDbm = bins[idx];
-        return true;
+        // No real radio engine (synthetic placeholder before first connect, or
+        // the offline-preview engine after a disconnect): there is no band to
+        // measure and the S-meter is a silence proxy, so engaging auto would
+        // crawl the gain to a rail off garbage. Hold instead. P3 is exempt —
+        // its meter rides the sidecar and its engine never has a spectrum by
+        // design, so the S-meter fallback below is its normal path.
+        if (!_radio.IsProtocol3Active && Volatile.Read(ref _engine) is not WdspDspEngine)
+            return double.NaN;
+
+        // Fast-attack triggers (Thetis FastAttackNoiseFloorRX1 setters).
+        if (!_autoAgcWasEnabled)
+        {
+            _autoAgcWasEnabled = true;
+            _autoAgcTracker.FastAttack(nowMs);
+        }
+        else
+        {
+            if (_autoAgcLastVfoHz != long.MinValue &&
+                Math.Abs(state.VfoHz - _autoAgcLastVfoHz) > AutoAgcFastAttackVfoDeltaHz)
+                _autoAgcTracker.FastAttack(nowMs);
+            if (state.PreampOn != _autoAgcLastPreampOn)
+                _autoAgcTracker.FastAttack(nowMs);
+            // Manual attenuator step only — EffectiveAttenDb would fast-attack
+            // on every auto-ATT ramp tick; the lerp follows that smoothly.
+            if (_autoAgcLastAttenDb != int.MinValue && state.AttenDb != _autoAgcLastAttenDb)
+                _autoAgcTracker.FastAttack(nowMs);
+        }
+        _autoAgcLastVfoHz = state.VfoHz;
+        _autoAgcLastPreampOn = state.PreampOn;
+        _autoAgcLastAttenDb = state.AttenDb;
+
+        // Thetis processes no noise floor while transmitting.
+        if (keyed) return double.NaN;
+
+        int feedSource;
+        if (TryCapturePanadapterSnapshot(_autoAgcFloorBuf, out _, out _, maxAgeMs: 300))
+        {
+            _autoAgcLastSpectrumFeedMs = nowMs;
+            _autoAgcTracker.AddBins(_autoAgcFloorBuf, nowMs);
+            feedSource = 1;
+        }
+        else if (_autoAgcLastSpectrumFeedMs != long.MinValue &&
+                 nowMs - _autoAgcLastSpectrumFeedMs <= AutoAgcSpectrumStaleMs)
+        {
+            // Brief gap (stale frame): hold — no sample this tick.
+            feedSource = 0;
+        }
+        else if (double.IsFinite(sMeterDbm) && sMeterDbm > -250.0)
+        {
+            // Sustained outage (engine genuinely produces no spectrum): S-meter
+            // fallback, smoothed by the tracker so it cannot step the gain.
+            _autoAgcTracker.AddScalar(sMeterDbm, nowMs);
+            feedSource = 2;
+        }
+        else
+        {
+            feedSource = 0;
+        }
+
+        // The two sources sit on different dBm frames (raw display bins vs
+        // calibrated S-meter): never blend them in one lerp — snap on switch
+        // (the old window code re-seeded on source change for the same reason).
+        if (feedSource != 0)
+        {
+            if (_autoAgcFeedSource != 0 && _autoAgcFeedSource != feedSource)
+                _autoAgcTracker.FastAttack(nowMs);
+            _autoAgcFeedSource = feedSource;
+        }
+
+        spectrumSourced = _autoAgcFeedSource == 1;
+        return _autoAgcTracker.IsGood ? _autoAgcTracker.FloorDbm : double.NaN;
     }
 
     internal static void FeedProtocol1Iq(
@@ -7428,6 +7530,9 @@ public class DspPipelineService : BackgroundService,
             // (audioSampleCount==0) read nothing this tick.
             int want = Math.Min(audioSampleCount, sec.AudioBuf.Length);
             int n = want > 0 ? engine.ReadAudio(secChan, sec.AudioBuf.AsSpan(0, want)) : 0;
+            if (n > 0)
+                _productPluginAudio?.PublishRxAudio(
+                    ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
             // count toward the MixRxAudioN divisor (which would attenuate the
@@ -7599,6 +7704,8 @@ public class DspPipelineService : BackgroundService,
                     Samples: new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
                 CaptureAudioDiagnostics("rx", in audioFrame, finalAudioRms, finalAudioPeak, txMonitorOn, squelch);
                 PublishAudio(in audioFrame);
+                _productPluginAudio?.PublishRxAudio(
+                    0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
                 RxAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
             }
             else if (!txMonitorOn && suppressRxAudioForTx)
@@ -7767,20 +7874,25 @@ public class DspPipelineService : BackgroundService,
             //
             var rx = engine.GetRxStageMeters(channel);
             var v2 = BuildRxMetersV2(rx, rxCalOffsetDb);
-            // Feed Auto-AGC a real spectrum-derived noise floor when one is
-            // available (#806); NaN falls the loop back to the S-meter `dbm`.
-            // Only pay for the snapshot copy + percentile sort when Auto-AGC is
-            // actually engaged — the loop early-returns otherwise anyway.
+            // Feed Auto-AGC the Thetis-faithful tracked noise floor (#806):
+            // a gated quiet-bin mean with 2 s attack + fast-attack, ported from
+            // Thetis display.cs processNoiseFloor. NaN = no settled floor this
+            // tick (fast-attack settling / TX / no spectrum) — the servo holds,
+            // exactly as Thetis's timer skips ticks whose IsNoiseFloorGood is
+            // false. Only pay for the snapshot copy + gated mean when Auto-AGC
+            // is actually engaged — the servo early-returns otherwise anyway.
             double spectrumFloorDbm = double.NaN;
-            if (state.AutoAgcEnabled &&
-                TryComputeAutoAgcNoiseFloorDbm(out double floorDbm))
+            if (state.AutoAgcEnabled)
             {
-                // Put the display-pixel floor on the same calibrated dBm scale as
-                // the S-meter path (RX pixels carry no cal offset of their own),
-                // so the loop's TargetAudioDb / [20,100] constants — tuned against
-                // S-meter dBm — apply. Any residual WDSP-display-vs-S-meter delta
-                // beyond this board offset is a bench-tune item (#806).
-                spectrumFloorDbm = floorDbm + rxCalOffsetDb;
+                double tracked = UpdateAutoAgcNoiseFloorDbm(
+                    state, dbm, _keyed, Environment.TickCount64, out bool fromSpectrum);
+                if (double.IsFinite(tracked))
+                {
+                    // Spectrum bins are raw (no cal of their own): put the floor
+                    // on the calibrated dBm scale. The S-meter fallback scalar is
+                    // already calibrated — adding the offset again would double it.
+                    spectrumFloorDbm = fromSpectrum ? tracked + rxCalOffsetDb : tracked;
+                }
             }
             _radio.HandleRxMetersForAutoAgc(dbm, spectrumFloorDbm, v2.AdcPk, v2.AgcGain, Environment.TickCount64);
             lock (_rxMeterDiagLock)
@@ -7848,7 +7960,21 @@ public class DspPipelineService : BackgroundService,
 
         _hub.Broadcast(new RxMeterFrame((float)dbm));
         RxMeterUpdated?.Invoke(channel, dbm);
-        _radio.HandleRxMetersForAutoAgc(dbm, double.NaN, v2.AdcPk, v2.AgcGain, Environment.TickCount64);
+        // P3 has no panadapter spectrum, so the tracker takes its S-meter
+        // fallback branch (gated + attack-smoothed) instead of the raw
+        // signalDbm the old loop consumed directly. dbm here is ALREADY
+        // cal-offset (ApplyRxMeterCalibration above), so no offset is added
+        // to the tracked value — unlike the raw-bin main path.
+        var p3State = _radio.Snapshot();
+        double p3Floor = double.NaN;
+        if (p3State.AutoAgcEnabled)
+        {
+            double tracked = UpdateAutoAgcNoiseFloorDbm(
+                p3State, dbm, _keyed, Environment.TickCount64, out _);
+            if (double.IsFinite(tracked))
+                p3Floor = tracked;
+        }
+        _radio.HandleRxMetersForAutoAgc(dbm, p3Floor, v2.AdcPk, v2.AgcGain, Environment.TickCount64);
         lock (_rxMeterDiagLock)
         {
             _diagRxMetersValid = true;

@@ -8,7 +8,8 @@ using System.Text;
 namespace Zeus.Server;
 
 /// <summary>
-/// Requires the launcher-provided station token on the product-audio API.
+/// Requires the launcher-provided station token on private station audio and
+/// product-plugin keying APIs.
 /// </summary>
 public static class StationAccessTokenAuthorization
 {
@@ -43,8 +44,20 @@ public static class StationAccessTokenAuthorization
     private static bool RequiresAuthorization(HttpRequest request)
     {
         return request.Path.StartsWithSegments(
-            "/api/station/product-audio",
-            StringComparison.OrdinalIgnoreCase);
+                   "/api/station/product-audio",
+                   StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
+                "/api/station/rx-audio",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
+                "/api/station/tx-audio",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
+                "/api/station/mode-modem",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
+                "/api/station/key",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool HasExpectedBearerToken(HttpRequest request, byte[] expectedHash)

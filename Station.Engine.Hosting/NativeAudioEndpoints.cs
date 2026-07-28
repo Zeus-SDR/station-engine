@@ -78,11 +78,14 @@ public static class NativeAudioEndpoints
         }
     }
 
-    private static async Task<IResult> SetNativeAudioDevices(
+    internal static async Task<IResult> SetNativeAudioDevices(
         NativeAudioDevicesSetRequest body,
         IServiceProvider sp,
         CancellationToken ct)
     {
+        if (body?.InputChannel is < -1)
+            return Results.BadRequest(new { error = "input channel must be -1 or greater" });
+
         var sink = sp.GetService<NativeAudioSink>();
         if (sink?.OutputEnabled != true) sink = null;
         var mic = sp.GetService<NativeMicCapture>();
@@ -127,6 +130,8 @@ public static class NativeAudioEndpoints
             await mic!.SetInputDeviceAsync(inputDeviceId, ct);
         if (plan.ApplyOutput)
             await sink!.SetOutputDeviceAsync(outputDeviceId, ct);
+        if (mic is not null)
+            await ApplyRequestedInputChannelAsync(mic, body?.InputChannel, ct);
 
         return Results.Ok(BuildNativeAudioDevicesResponse(
             sink,
@@ -152,7 +157,23 @@ public static class NativeAudioEndpoints
             Inputs: snapshot.Inputs.Select(ToNativeAudioDeviceDto).ToArray(),
             Outputs: snapshot.Outputs.Select(ToNativeAudioDeviceDto).ToArray(),
             Error: error,
-            InputDiagnostics: mic?.GetDiagnostics());
+            InputDiagnostics: mic?.GetDiagnostics(),
+            InputChannels: mic?.Channels is > 0 ? mic.Channels : null,
+            InputSampleRate: mic?.SampleRate is > 0 ? mic.SampleRate : null,
+            InputChannel: mic?.InputChannel);
+    }
+
+    internal static Task ApplyRequestedInputChannelAsync(
+        NativeMicCapture mic,
+        int? inputChannel,
+        CancellationToken ct)
+    {
+        // Request semantics deliberately differ from the response: omitted/null
+        // leaves the current selection unchanged, while -1 explicitly selects
+        // mix-all. Responses continue to use null to report mix-all.
+        return inputChannel is null
+            ? Task.CompletedTask
+            : mic.SetInputChannelAsync(inputChannel == -1 ? null : inputChannel, ct);
     }
 
     private static NativeAudioDeviceDto ToNativeAudioDeviceDto(MiniAudioDeviceInfo device) =>
@@ -166,7 +187,12 @@ public static class NativeAudioEndpoints
 }
 
 internal sealed record NativeMuteRequest(bool Muted);
-internal sealed record NativeAudioDevicesSetRequest(string? InputDeviceId, string? OutputDeviceId);
+internal sealed record NativeAudioDevicesSetRequest(
+    string? InputDeviceId,
+    string? OutputDeviceId,
+    // Request only: null/omitted preserves the selection; -1 selects mix-all;
+    // non-negative values select a zero-based capture channel.
+    int? InputChannel = null);
 internal sealed record NativeAudioDeviceDto(string Id, string Name, bool IsDefault);
 internal sealed record NativeAudioDevicesResponse(
     bool Supported,
@@ -180,4 +206,8 @@ internal sealed record NativeAudioDevicesResponse(
     // Optional capture-flow counters (additive; null when no mic capture is
     // registered). Lets a remote session tell "capture flowing but silent"
     // from "no capture callbacks" — both otherwise read as a floored meter.
-    NativeMicCaptureDiagnostics? InputDiagnostics = null);
+    NativeMicCaptureDiagnostics? InputDiagnostics = null,
+    uint? InputChannels = null,
+    uint? InputSampleRate = null,
+    // Response only: null reports mix-all; non-negative values are zero-based.
+    int? InputChannel = null);

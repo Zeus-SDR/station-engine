@@ -478,10 +478,11 @@ public static class PrefsDbPath
         return ProfilesDirName + "/" + safe + ".db";
     }
 
-    // Read a profile's raw bytes for export/download. Opens with
-    // FileShare.ReadWrite so the active (currently open) database can still be
-    // exported. Throws if the path escapes the data dir or the file is missing.
-    public static byte[] ReadProfileBytes(string relativePath, out string fileName)
+    // Resolve a profile relative path to its validated full path under
+    // DataDir. Throws when the path escapes the data dir or the file is
+    // missing. Used by the merged profile export, which also needs the
+    // profile's engine-side companion path (EnginePathForProductPath).
+    internal static string ResolveProfileFullPath(string relativePath)
     {
         if (string.IsNullOrWhiteSpace(relativePath))
             throw new ArgumentException("Relative path is required.", nameof(relativePath));
@@ -490,12 +491,7 @@ public static class PrefsDbPath
             ?? throw new ArgumentException("Path is outside the Zeus data directory.", nameof(relativePath));
         if (!File.Exists(full))
             throw new FileNotFoundException("Database does not exist.", full);
-
-        fileName = Path.GetFileName(full);
-        using var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var ms = new MemoryStream();
-        fs.CopyTo(ms);
-        return ms.ToArray();
+        return full;
     }
 
     private static PrefsDatabaseInfo DescribeDefault(string active)

@@ -167,6 +167,34 @@ public sealed class AudioRingOwner : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Publishes one capture block without waiting for the bundle. A full ring
+    /// drops the new block and returns <c>false</c>; the engine audio producer
+    /// is never backpressured by a slow or dead consumer.
+    /// </summary>
+    public bool TryPublish(ReadOnlySpan<float> input)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateSamples(input);
+        DrainUnmatchedOutput();
+        var sequence = Interlocked.Increment(ref _sequence);
+        return _input.TryWrite(sequence, input) && _inputSignal.TrySet();
+    }
+
+    /// <summary>
+    /// Reads one bundle-produced injection block without waiting. The caller
+    /// owns pacing and malformed/sequence policy.
+    /// </summary>
+    public bool TryReadOutput(Span<float> output, out long sequence, out int sampleCount)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (output.IsEmpty || output.Length > AudioRingProtocol.MaxSamplesPerBlock)
+            throw new ArgumentException("An audio-ring output buffer must hold 1 through 1024 samples.");
+        var read = _output.TryRead(out sequence, out sampleCount, output);
+        if (read) _outputSignal.Drain();
+        return read;
+    }
+
     private bool DrainResponses(long wanted, int wantedSamples, Span<float> output, out bool found)
     {
         found = false;
@@ -180,6 +208,14 @@ public sealed class AudioRingOwner : IDisposable
         }
 
         return false;
+    }
+
+    private void DrainUnmatchedOutput()
+    {
+        while (_output.TryRead(out _, out _, _discard))
+        {
+        }
+        _outputSignal.Drain();
     }
 
     public void Dispose()
@@ -203,9 +239,17 @@ public sealed class AudioRingOwner : IDisposable
 
     private static void ValidateBlock(ReadOnlySpan<float> input, Span<float> output)
     {
-        if (input.IsEmpty
-            || input.Length > AudioRingProtocol.MaxSamplesPerBlock
-            || output.Length < input.Length)
+        ValidateSamples(input);
+        if (output.Length < input.Length)
+        {
+            throw new ArgumentException(
+                $"Audio-ring blocks must contain 1 through {AudioRingProtocol.MaxSamplesPerBlock} samples.");
+        }
+    }
+
+    private static void ValidateSamples(ReadOnlySpan<float> input)
+    {
+        if (input.IsEmpty || input.Length > AudioRingProtocol.MaxSamplesPerBlock)
         {
             throw new ArgumentException(
                 $"Audio-ring blocks must contain 1 through {AudioRingProtocol.MaxSamplesPerBlock} samples.");
@@ -420,6 +464,7 @@ public sealed class AudioRingConsumer : IDisposable
     private readonly AudioRingOwner.MappedRing _input;
     private readonly AudioRingOwner.MappedRing _output;
     private readonly float[] _block = new float[AudioRingProtocol.MaxSamplesPerBlock];
+    private long _injectSequence;
     private bool _disposed;
 
     public AudioRingConsumer(AudioRingEndpoint endpoint)
@@ -447,6 +492,64 @@ public sealed class AudioRingConsumer : IDisposable
                     _outputSignal.TrySet();
             }
         }
+    }
+
+    /// <summary>
+    /// Read-only capture pump: delivers each inbound engine block to
+    /// <paramref name="processor"/> without echoing to the output ring. Used by
+    /// leased RX-audio / TX-mic taps, which observe engine audio and never
+    /// produce a response frame.
+    /// </summary>
+    public void RunCapture(AudioBlockProcessor processor, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(processor);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!_inputSignal.Wait(TimeSpan.FromMilliseconds(50)))
+                continue;
+            while (_input.TryRead(out _, out var sampleCount, _block))
+                processor(_block.AsSpan(0, sampleCount));
+        }
+    }
+
+    /// <summary>
+    /// Producer primitive for a leased TX-audio injection ring: offers one block
+    /// to the engine without waiting. Returns false when the ring is momentarily
+    /// full (the caller drops the block — bounded, no queue growth, matching the
+    /// contract's overflow policy). Blocks longer than
+    /// <see cref="AudioRingProtocol.MaxSamplesPerBlock"/> are rejected.
+    /// </summary>
+    public bool TryInject(ReadOnlySpan<float> block)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (block.IsEmpty || block.Length > AudioRingProtocol.MaxSamplesPerBlock)
+            return false;
+        var sequence = Interlocked.Increment(ref _injectSequence);
+        if (!_output.TryWrite(sequence, block))
+            return false;
+        _outputSignal.TrySet();
+        return true;
+    }
+
+    /// <summary>Reads one engine capture block without writing an echo.</summary>
+    public bool TryReadInput(Span<float> output, TimeSpan timeout, out int sampleCount)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (output.IsEmpty || output.Length > AudioRingProtocol.MaxSamplesPerBlock)
+            throw new ArgumentException("An audio-ring input buffer must hold 1 through 1024 samples.");
+        if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(5))
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        if (_input.TryRead(out _, out sampleCount, output))
+        {
+            _inputSignal.Drain();
+            return true;
+        }
+        if (!_inputSignal.Wait(timeout))
+        {
+            sampleCount = 0;
+            return false;
+        }
+        return _input.TryRead(out _, out sampleCount, output);
     }
 
     public void Dispose()

@@ -15,6 +15,7 @@ internal interface IWdspTxControlNative
     void SetTXAPHROTNstages(int channel, int nstages);
     void SetTXAPHROTAutoMode(int channel, int autoMode);
     void SetTXAPHROTReverse(int channel, int reverse);
+    void SetTXALevelerSt(int channel, int state);
 }
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
@@ -58,4 +59,7 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXAPHROTReverse(int channel, int reverse) =>
         NativeMethods.SetTXAPHROTReverse(channel, reverse);
+
+    public void SetTXALevelerSt(int channel, int state) =>
+        NativeMethods.SetTXALevelerSt(channel, state);
 }

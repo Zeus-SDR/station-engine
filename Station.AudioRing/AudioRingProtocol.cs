@@ -46,7 +46,10 @@ public sealed record AudioRingEndpoint(
     int SampleRate,
     int MaxSamplesPerBlock);
 
-public sealed record ProductAudioAttachRequest(string Name, string Version);
+public sealed record ProductAudioAttachRequest(
+    string Name,
+    string Version,
+    int? HttpPort = null);
 
 public sealed record ProductAudioAttachResponse(
     string LeaseId,

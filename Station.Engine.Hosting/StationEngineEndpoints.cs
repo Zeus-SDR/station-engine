@@ -4,6 +4,7 @@
 using System.Globalization;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Zeus.Contracts;
+using Zeus.Server.Diagnostics;
 
 namespace Zeus.Server;
 
@@ -67,6 +68,10 @@ public static class StationEngineEndpoints
         // the route used to be mapped only by the product host, so the IMD
         // tool 404'd against a standalone engine (attach mode).
         endpoints.MapImdMeasure();
+        // Same field gap as ImdMeasure: the SPA's Windows Firewall control
+        // (/api/system/windows-firewall[+ /allow]) was product-host-only, so
+        // it 404'd against a standalone engine in attach mode.
+        endpoints.MapWindowsFirewallEndpoints();
         endpoints.MapStationEngineCapabilitiesEndpoint();
         endpoints.MapNativeAudioEndpoints();
         endpoints.MapRadioStateEndpoint();
@@ -92,6 +97,10 @@ public static class StationEngineEndpoints
         endpoints.MapSpectralZoomEndpoint();
         endpoints.MapWorkspaceZoomEndpoint();
         endpoints.MapOperatorUiSettingsEndpoints();
+        // Same field gap as the operator UI prefs: the SPA's Zeus Digital
+        // settings tab reads/writes /api/ft8/settings (+ autocq-ack) against
+        // the engine in attach mode, and the standalone host mapped neither.
+        endpoints.MapDigitalSettingsEndpoints();
         endpoints.MapWorkspaceLayoutEndpoints();
         endpoints.MapBandPlanEndpoints();
         endpoints.MapPaSettingsEndpoints();
@@ -109,6 +118,26 @@ public static class StationEngineEndpoints
         // preferred); without this route uncaught SPA errors vanish in local
         // attach whenever the websocket is closed or reconnecting.
         endpoints.MapClientDiagnosticLogEndpoint();
+        // Field gap: the prefs-database (profile) routes were product-host-only,
+        // so the connect splash's Database row 404'd and hid itself in attach
+        // mode — Zeus Link operators could not import, export, create, or switch
+        // settings databases. Mapped from the same shared mapper the product
+        // host uses so both surfaces behave identically.
+        endpoints.MapPrefsDatabaseEndpoints();
+        // Same field gap: /api/app/restart was product-host-only, and switching
+        // the active database only applies on relaunch. The engine variant
+        // exits gracefully and lets the Zeus Link launcher supervisor respawn
+        // it — it must NOT self-relaunch like the desktop AppRestartService.
+        endpoints.MapEngineAppControlEndpoints();
+        // Zeus Link bundle settings mirror: the product reads its feature
+        // toggles and amplifier configs back from the engine (the exportable
+        // zeus-prefs.db) so they survive updates and ride splash-row exports.
+        endpoints.MapProductBundleSettingsEndpoints();
+        // Support lifeline for "the engine wrote no zeus-app.log" field
+        // reports: which build actually runs, where its log should live,
+        // whether the on-disk sink is healthy (and why not), and the in-memory
+        // ring tail when the file itself cannot be written.
+        endpoints.MapEngineLogDiagnosticsEndpoint();
 
         endpoints.Map("/ws", AttachWebSocketAsync);
         return endpoints;

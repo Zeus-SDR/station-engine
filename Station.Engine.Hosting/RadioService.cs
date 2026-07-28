@@ -60,14 +60,17 @@ public sealed class RadioService : IDisposable
     internal const int MaxDisplayZoomLevel = WidebandSpectrumAnalyzer.MaxZoomLevel;
     internal const double DefaultAgcTopDb = 90.0;   // Thetis radio.cs:1021 rx_agc_max_gain default
     // Operator AGC-T baseline range. Below ~30 dB the RX audio is effectively
-    // muted and 90 dB is the Thetis default / loudest the AGC will drive; the
-    // old -20..120 span (mirroring the raw Thetis slider) exposed a large dead
-    // region the operator never used. The slider is linear across this window.
+    // muted; the top is Thetis's +120 slider rail. The 30..90 window used
+    // before was proved too narrow on the bench: auto AGC-T legitimately
+    // seats above 90 on quiet bands (the floor-derived top is ~96-110 on
+    // 40m-class floors), and an operator mirroring Thetis's "crank it up,
+    // let auto seat it" workflow needs the lever to reach those values.
     // NOTE: this bounds only the manual baseline (AgcTopDb). Auto-AGC's offset
     // (AgcOffsetDb) and the effective value it pushes to WDSP are NOT bounded
-    // by this — see AgcMinEffectiveAgcT / AgcMaxEffectiveAgcT.
+    // by this — auto roams the full Thetis AGC-top clamp of [-20, +120] dB
+    // (AgcTopMinDb / AgcTopMaxDb below, console.cs:45997).
     internal const double MinAgcTopDb = 30.0;
-    internal const double MaxAgcTopDb = 90.0;
+    internal const double MaxAgcTopDb = 120.0;
 
     // Floor (Hz) for the signed RX/TX bandpass width pushed through SetFilter.
     // A zero-width bandpass means WDSP's RXASetPassband passes nothing through
@@ -302,22 +305,14 @@ public sealed class RadioService : IDisposable
     private long _lastOverloadMs = long.MinValue;   // wall-clock of the last overload window (release hold-off)
     private int _lastAppliedEffectiveDb = -1;   // so the first send always fires
 
-    // Auto-AGC control-loop state. Tracks the band noise floor and places the
-    // effective AGC-T so the floor lands near a fixed reference (Thetis-style
-    // noise-floor calibration). The follower JUMPS to the target each tick
-    // rather than slewing — Thetis does the same, and the smoothing lives in the
-    // floor estimate (the percentile window), not the follower. The old slewed
-    // version (0.5 dB/tick into a 1.5 dB deadband after a full 6 s window) took
-    // ~30 s to settle a band change; jumping to a fast, short-window floor (with
-    // a fast-attack re-seed on a band-scale tune) settles in ~1-2 s like Thetis.
-    private const int AgcNoiseFloorWindowSamples = 6;  // 6 × 500 ms = 3 s window (was 12 / 6 s)
-    private const int AgcNoiseFloorMinSamples = 3;     // act after ~1.5 s; don't wait for a full window
-    private const double AgcNoiseFloorPercentile = 0.20;
-    private const double AgcDeadbandDb = 0.5;          // narrow no-move zone (was 1.5) — closes the last bit of error
-    // A VFO move this large means a band change: drop the floor window so it
-    // re-seeds to the new band's noise within ~1.5 s instead of averaging the
-    // old band in (Thetis fast-attack on band/freq delta > 0.5 MHz).
-    private const double AgcFastAttackVfoDeltaHz = 500_000.0;
+    // Auto-AGC control-loop state. The band noise floor itself is estimated in
+    // DspPipelineService by AutoAgcNoiseFloorTracker (a faithful port of
+    // Thetis's display.cs processNoiseFloor: gated quiet-bin mean, 2-tap power
+    // smoothing, 2 s attack lerp, fast-attack). This loop consumes the settled
+    // floor and JUMPS the effective AGC-T to the servo target each tick —
+    // Thetis does the same; the smoothing lives in the floor estimate, not the
+    // follower.
+    private const double AgcDeadbandDb = 0.5;          // narrow no-move zone — closes the last bit of error
 
     // ── Auto-AGC-T threshold servo (Thetis parity) ──────────────────────────
     // Auto-AGC-T sets the AGC *threshold* (knee) to the noise floor, exactly as
@@ -330,15 +325,26 @@ public sealed class RadioService : IDisposable
     //
     // Thetis user offset on the floor (udRX1AutoAGCOffset), default 0 dB.
     private const double AutoAgcOffsetDb = 0.0;
-    // Calibration that aligns our panadapter noise-floor dBm with the WDSP AGC
-    // threshold reference (Thetis agcCalOffset, console.cs:33287 — ~2 dB + display
-    // cal). Our spectrumFloorDbm already carries the panadapter calibration, so
-    // the residual is small; this is the one bench-tunable knob. 0 = identity.
-    private const double AgcThreshCalOffsetDb = 0.0;
-    // FFT size WDSP uses in the threshold→max-gain conversion. MUST equal
-    // WdspDspEngine.RxaInSize (the size passed to SetRXAAGCThresh) so the
-    // in-process form matches the engine exactly.
-    private const double AgcThreshFftSize = 1024.0;
+    // Thetis seats the knee 2 dB BELOW the displayed noise floor: its
+    // agcCalOffset (console.cs:33282) is `2.0f + displayCal + preampDelta −
+    // fftSizeFudge`, and every term except the constant 2 cancels against the
+    // calibration the displayed bins already carry — drawing Thetis's own AGC-T
+    // knee line lands it exactly at NF − 2 dB (the fftSizeFudge term only
+    // compensates Thetis's display convention at non-default FFT sizes and
+    // cancels identically). Our spectrumFloorDbm is on the same calibrated
+    // display-dBm scale, so the full residual is this 2 dB.
+    private const double AgcThreshCalOffsetDb = 2.0;
+    // FFT size used in WDSP's threshold→max-gain conversion (wcpAGC.c:482:
+    // noise_offset = 10·log10(bandwidth·size/rate)). Thetis passes the DISPLAY
+    // ANALYZER FFT size here (console.cs:45987 — specRX FFTSize, 4096 by
+    // default) because the floor was measured from that analyzer's bins: the
+    // term converts per-bin noise to in-passband noise, so it MUST match the
+    // FFT the floor came from. Zeus's RX analyzer runs 16384 (8192 on the
+    // low-power profile) — plumbed in from DisplayPerformanceOptions by
+    // DspPipelineService at construction. (The old hardcoded 1024 — the WDSP
+    // channel block size, not any FFT — under-corrected by 12 dB and seated
+    // auto AGC-T ~12 dB too hot.)
+    private double _autoAgcAnalyzerFftSize = 16_384.0;
     // 20·log10(out_target), out_target = (1−e^−n_tau)·0.9999 with n_tau=4
     // (wcpAGC.c:122, create_wcpagc RXA.c:340/345). Constant across all modes.
     private const double AgcOutTargetDb = -0.1615;
@@ -350,20 +356,6 @@ public sealed class RadioService : IDisposable
     private const double AgcTopMaxDb = 120.0;
     private double _agcOffsetDb;
     private long _lastAgcTickMs = long.MinValue;
-    private long _lastAutoAgcVfoHz = long.MinValue;
-    private readonly double[] _noiseFloorWindow = new double[AgcNoiseFloorWindowSamples];
-    private int _noiseFloorWindowIdx;
-    private int _noiseFloorWindowFill;
-    // Which source is currently filling the floor window (0 none / 1 spectrum /
-    // 2 S-meter fallback) and the last time a real spectrum floor arrived
-    // (Environment.TickCount64 ms). Together these (a) keep the two differently-
-    // calibrated sources from being mixed in one percentile window, and (b) make
-    // the loop fall back to the S-meter ONLY after the spectrum has been absent
-    // long enough to be a true outage, not a single dropped frame — without this,
-    // a sustained stale-spectrum period under steady RX would freeze tracking.
-    private int _autoAgcWindowSource;
-    private long _lastSpectrumFloorMs = long.MinValue;
-    private const long AgcSpectrumStaleMs = 1500;  // 3 ticks; > normal frame gaps
 
     // 100 ms between 1-dB steps. Events arrive at ~1.2 kHz (192 kSps), so
     // without throttling the offset would saturate at 31 dB in ~30 ms. At 10 Hz
@@ -2044,61 +2036,61 @@ public sealed class RadioService : IDisposable
     /// Returns true when the LO was actually moved (caller may want to
     /// log it for diagnostics), false on no-op.
     /// </summary>
-    // Remembered RX centre while keyed under CTUN, so RestoreLoAfterTx() can
-    // put the frozen NCO back on un-key. long.MinValue == "not in a TX cycle"
-    // (or CTUN off — only CTUN records). Guarded by _sync.
+    // Remembered RX centre while keyed with the LO parked off the dial, so
+    // RestoreLoAfterTx() can put the frozen NCO back on un-key.
+    // long.MinValue == "not in a TX cycle". Guarded by _sync.
     private long _ctunPreTxLoHz = long.MinValue;
 
-    // Capture the receive centre exactly once per key-down when TX must move
-    // the shared radio LO away from the current RX view. That is CTUN and TX B.
-    // Caller must hold _sync.
+    // Capture the receive centre exactly once per key-down, before TX moves
+    // the shared radio LO away from the current RX view (CTUN freeze, TX B,
+    // XIT, or an autopan/pure-pan offset). Caller must hold _sync. Call only
+    // when a snap is about to move the LO — an unconditional record would
+    // make RestoreLoAfterTx write the LO back on every un-key even when TX
+    // never moved it.
     private void RememberFrozenLoUnderLock()
     {
-        // XIT (CTUN off, VFO A) also drags the shared LO to dial+XIT for TX, so
-        // the pre-TX RX centre must be remembered for RestoreLoAfterTx to put
-        // back on un-key — otherwise RX would stay off by the XIT offset.
-        if ((_state.CtunEnabled || _state.TxReceiverIndex >= 1 || _state.XitEnabled)
-            && _ctunPreTxLoHz == long.MinValue)
+        if (_ctunPreTxLoHz == long.MinValue)
             _ctunPreTxLoHz = _state.RadioLoHz;
     }
 
     public bool AlignLoForCwTx()
     {
-        long vfo;
-        RxMode mode;
-        long currentLo;
+        long targetLo;
         lock (_sync)
         {
-            vfo = TxCarrierHz(_state);
-            mode = _state.Mode;
-            currentLo = _state.RadioLoHz;
+            // Read state, compute the target, decide, and record the frozen
+            // centre in ONE critical section: a concurrent state change
+            // between read and record would otherwise snap to a stale target
+            // or park the restore centre on the wrong frequency.
+            if (_state.Mode != RxMode.CWU && _state.Mode != RxMode.CWL) return false;
+            targetLo = CwOffset.EffectiveLoHz(_state.Mode, TxCarrierHz(_state));
+            if (targetLo == _state.RadioLoHz) return false;
             RememberFrozenLoUnderLock();
         }
-        if (mode != RxMode.CWU && mode != RxMode.CWL) return false;
-        long targetLo = CwOffset.EffectiveLoHz(mode, vfo);
-        if (targetLo == currentLo) return false;
         SetRadioLoUnchecked(targetLo);
         return true;
     }
 
     /// <summary>
-    /// CTUN TX alignment for all modes (the phone/digi analogue of
-    /// <see cref="AlignLoForCwTx"/>). When CTUN froze the hardware NCO off the
-    /// dial for RX, the shared P1/P2 VFO register would otherwise transmit on
-    /// the frozen centre — the #470 bug. Called from <see cref="SetMox"/> on
-    /// the key-down edge: snap the hardware LO to the dial's effective LO so
-    /// the carrier lands on frequency, remembering the frozen centre for
-    /// <see cref="RestoreLoAfterTx"/> to put back on un-key. No-op when CTUN is
-    /// off (classic tuning already keeps LO == dial). Mirrors Thetis, which
-    /// writes VFOAFreq to the NCO on MOX and restores CentreFrequency on RX
+    /// TX LO alignment for all modes (the phone/digi analogue of
+    /// <see cref="AlignLoForCwTx"/>). When the hardware NCO sits off the dial
+    /// for RX, the shared P1/P2 VFO register would otherwise transmit on that
+    /// centre — the #470 bug (CTUN freeze) and its CTUN-off twin: XIT, and
+    /// pure-pan / keep-in-view autopan (/api/radio/lo) deliberately parks the
+    /// LO off the dial while VfoHz stays put, and the P2 TX DUC follows RX0,
+    /// so keying in that window radiates on the parked centre, not the dial.
+    /// Called from <see cref="SetMox"/> on the key-down edge: snap the
+    /// hardware LO to the dial's effective LO so the carrier lands on
+    /// frequency, remembering the parked centre for
+    /// <see cref="RestoreLoAfterTx"/> to put back on un-key. No-op only when
+    /// the LO already sits on the target. Mirrors Thetis, which writes
+    /// VFOAFreq to the NCO on MOX and restores CentreFrequency on RX
     /// (console.cs UpdateTXDDSFreq / HdwMOXChanged). Returns true if the LO
     /// moved.
     /// </summary>
     public bool AlignLoForTx()
     {
-        long vfo;
-        RxMode mode;
-        long currentLo;
+        long targetLo;
         lock (_sync)
         {
             // Dual-RX split TX on Protocol 2: the TX carrier is placed by the
@@ -2111,16 +2103,12 @@ public sealed class RadioService : IDisposable
             if (_state.TxReceiverIndex >= 1 && _state.Rx2Enabled
                 && ConnectedBoardKind == HpsdrBoardKind.OrionMkII)
                 return false;
-            // XIT moves the carrier even with CTUN off on VFO A, so align then
-            // too (RememberFrozenLoUnderLock captured the RX centre to restore).
-            if (!_state.CtunEnabled && _state.TxReceiverIndex < 1 && !_state.XitEnabled) return false;
-            vfo = TxCarrierHz(_state);
-            mode = _state.Mode;
-            currentLo = _state.RadioLoHz;
+            // Read state, compute the target, decide, and record the frozen
+            // centre in ONE critical section (see AlignLoForCwTx).
+            targetLo = CwOffset.EffectiveLoHz(_state.Mode, TxCarrierHz(_state));
+            if (targetLo == _state.RadioLoHz) return false;
             RememberFrozenLoUnderLock();
         }
-        long targetLo = CwOffset.EffectiveLoHz(mode, vfo);
-        if (targetLo == currentLo) return false;
         SetRadioLoUnchecked(targetLo);
         return true;
     }
@@ -2856,10 +2844,9 @@ public sealed class RadioService : IDisposable
         Mutate(s =>
         {
             _preampOn = on;
-            // Fast-attack (#806): a preamp/LNA change steps the noise floor, so
-            // drop the auto-AGC floor window to re-seed on the new level (Thetis
-            // display.cs:893-906). No-op when Auto-AGC is off. Mutate holds _sync.
-            ResetAutoAgcNoiseFloorWindow();
+            // Fast-attack (#806): a preamp/LNA change steps the noise floor.
+            // The pipeline's floor tracker observes the PreampOn edge in the
+            // state snapshot and fast-attacks itself (Thetis display.cs:893-906).
             return s with { PreampOn = on };
         });
         // P1 path: Protocol1Client owns the bit; SetPreamp pushes the
@@ -2885,11 +2872,11 @@ public sealed class RadioService : IDisposable
             effective = Math.Clamp(_atten.ClampedDb + _attOffsetDb, HpsdrAtten.MinDb, HpsdrAtten.MaxDb);
             _lastAppliedEffectiveDb = effective;
             // Fast-attack (#806): an operator attenuator step shifts the noise
-            // floor by that many dB, so re-seed the auto-AGC floor window. (The
+            // floor by that many dB; the pipeline's floor tracker observes the
+            // AttenDb change in the state snapshot and fast-attacks itself. (The
             // gradual auto-ATT ramp pushes effective attenuation through
-            // ActiveClient directly, NOT this setter, so it does not re-seed and
-            // the floor follows it smoothly.)
-            ResetAutoAgcNoiseFloorWindow();
+            // ActiveClient directly, NOT this setter, so it does not trigger a
+            // fast-attack and the floor follows it smoothly.)
         }
         ActiveClient?.SetAttenuator(new HpsdrAtten(effective));
         return Snapshot();
@@ -3061,14 +3048,15 @@ public sealed class RadioService : IDisposable
                 // to the user's baseline immediately.
                 _agcOffsetDb = 0.0;
                 _lastAgcTickMs = long.MinValue;
-                ResetAutoAgcNoiseFloorWindow();
                 _state = _state with { AgcOffsetDb = 0.0 };
             }
             else
             {
-                // Turning auto on: reset timer + window so we recalibrate.
+                // Turning auto on: reset the tick timer so we recalibrate. The
+                // pipeline's floor tracker fast-attacks on the enabled edge it
+                // observes in the state snapshot, so the loop re-seeds from the
+                // current band (Thetis fast-attack semantics).
                 _lastAgcTickMs = long.MinValue;
-                ResetAutoAgcNoiseFloorWindow();
             }
         }
         var snap = Snapshot();
@@ -3081,18 +3069,16 @@ public sealed class RadioService : IDisposable
         return snap;
     }
 
-    // Drops the auto-AGC noise-floor window so the next samples re-seed the floor
-    // estimate from scratch. This is Thetis's "fast-attack": a band change,
-    // attenuator step, preamp/LNA toggle, power-on, or a TX pause all invalidate
-    // the old floor (Thetis display.cs:893-919). Also clears the window-source tag
-    // so the next seed re-establishes which source is live. (_lastSpectrumFloorMs
-    // is intentionally NOT cleared — it is a rolling availability timestamp.)
-    // Caller MUST hold _sync.
-    private void ResetAutoAgcNoiseFloorWindow()
+    /// <summary>
+    /// Set by DspPipelineService at construction: the RX display-analyzer FFT
+    /// size (DisplayPerformanceOptions.RxAnalyzerFftSize, 16384 stock / 8192
+    /// low-power) that produced the panadapter bins the floor is measured from.
+    /// WDSP's threshold→max-gain conversion is only self-consistent when this
+    /// matches that FFT (wcpAGC.c:482).
+    /// </summary>
+    internal void SetAutoAgcAnalyzerFftSize(double fftSize)
     {
-        _noiseFloorWindowFill = 0;
-        _noiseFloorWindowIdx = 0;
-        _autoAgcWindowSource = 0;
+        if (fftSize > 0) _autoAgcAnalyzerFftSize = fftSize;
     }
 
     /// <summary>
@@ -3115,7 +3101,7 @@ public sealed class RadioService : IDisposable
         //    fhigh−flow is the RX passband width WDSP runs (our _state filter edges).
         double bwHz = Math.Max(1.0, Math.Abs(_state.FilterHighHz - _state.FilterLowHz));
         double rate = Math.Max(1.0, _state.SampleRate);
-        double noiseOffset = 10.0 * Math.Log10(bwHz * AgcThreshFftSize / rate);
+        double noiseOffset = 10.0 * Math.Log10(bwHz * _autoAgcAnalyzerFftSize / rate);
         // 3) top = 20·log10(max_gain) = 20·log10(out_target) − 20·log10(var_gain)
         //    − (thresh + noiseOffset). Canned modes run slope 0 ⇒ var_gain 1 ⇒ its
         //    term is 0 (Thetis auto-AGC-T is used with canned modes).
@@ -3125,150 +3111,76 @@ public sealed class RadioService : IDisposable
     }
 
     /// <summary>
-    /// Auto-AGC-T control loop. Estimates the band noise floor from a sliding
-    /// window of panadapter-FFT floor samples (low percentile = robust to
-    /// signals) and, via <see cref="AutoAgcTopFromNoiseFloor"/>, seats the AGC
-    /// knee at that floor exactly as Thetis does — carrying the result as
+    /// Auto-AGC-T control loop. Consumes the settled band noise floor estimated
+    /// upstream by DspPipelineService's AutoAgcNoiseFloorTracker (the Thetis
+    /// display.cs processNoiseFloor port) and, via
+    /// <see cref="AutoAgcTopFromNoiseFloor"/>, seats the AGC knee at that floor
+    /// exactly as Thetis's 500 ms tmrAutoAGC_Tick does — carrying the result as
     /// AgcOffsetDb on top of the operator baseline. A deadband suppresses
-    /// sub-dB dither; band/VFO jumps re-seed the window (fast-attack).
+    /// sub-dB dither. When no settled floor is available (tracker fast-
+    /// attacking after a band change, or no spectrum at all) the loop HOLDS
+    /// the current offset, exactly as Thetis's timer skips a tick whose
+    /// IsNoiseFloorGood is false.
     /// </summary>
     internal void HandleRxMeterForAutoAgc(double signalDbm, long nowMs) =>
         HandleRxMetersForAutoAgc(signalDbm, double.NaN, double.NaN, double.NaN, nowMs);
 
     // Back-compat overload (no spectrum floor): callers/tests that only have the
-    // S-meter delegate here. spectrumFloorDbm = NaN makes the loop fall back to
-    // signalDbm exactly as before.
+    // S-meter delegate here. spectrumFloorDbm = NaN means "no settled floor",
+    // so the loop holds — the S-meter fallback lives in the pipeline's tracker.
     internal void HandleRxMetersForAutoAgc(double signalDbm, double adcPkDbfs, double agcGainDb, long nowMs) =>
         HandleRxMetersForAutoAgc(signalDbm, double.NaN, adcPkDbfs, agcGainDb, nowMs);
 
-    // Primary overload (issue #806). spectrumFloorDbm is a real per-band noise
-    // floor measured from the panadapter FFT — the same physical quantity Thetis
-    // tracks. When finite it REPLACES signalDbm as the floor source. signalDbm,
-    // which in this integration is the post-AGC audio-RMS fallback (it moves with
-    // the signal, not the floor), is kept only as the degraded fallback for when
-    // no fresh spectrum is available (stale analyzer frame / near-dead span).
-    //
-    // adcPkDbfs and agcGainDb are retained for call-site/back-compat and
-    // diagnostics only — they NO LONGER drive the loop. They previously fed a
-    // Zeus-only ADC-overload cut that pumped strong signals; Thetis's servo
-    // tracks the noise floor and nothing else (see the windowReady block below).
+    // Primary overload (issue #806). spectrumFloorDbm is the tracker's SETTLED
+    // per-band noise floor — the same physical quantity Thetis tracks
+    // (displayed-dBm scale, RX cal offset already applied by the pipeline).
+    // signalDbm (post-AGC audio-RMS S-meter) is unused here — it moves with
+    // the signal, not the floor; the pipeline's tracker owns the only
+    // S-meter fallback path (sustained spectrum outage), gated and smoothed so
+    // it cannot pump. adcPkDbfs and agcGainDb are retained for call-site
+    // back-compat and diagnostics only.
     internal void HandleRxMetersForAutoAgc(double signalDbm, double spectrumFloorDbm, double adcPkDbfs, double agcGainDb, long nowMs)
     {
         bool changedOffset = false;
         double newOffset = 0.0;
-        double noiseFloor = double.NaN;
 
         lock (_sync)
         {
             if (!_state.AutoAgcEnabled) return;
-            if (_mox) return;   // Pause during TX
-            bool hasSpectrumFloor = double.IsFinite(spectrumFloorDbm) && spectrumFloorDbm > -250.0;
-            bool hasSignalMeter = double.IsFinite(signalDbm) && signalDbm > -250.0;
-            if (!hasSpectrumFloor && !hasSignalMeter) return;
+            if (_mox) return;   // Pause during TX (Thetis: tmrAutoAGC_Tick skips on _mox)
+            // No settled floor this tick → hold (Thetis: timer skips when
+            // IsNoiseFloorGood is false, e.g. during fast-attack settle).
+            if (!double.IsFinite(spectrumFloorDbm) || spectrumFloorDbm <= -250.0) return;
 
-            // If we paused for longer than the analysis window (TX,
-            // just-toggled-on, RX dropout) the
-            // window may hold stale samples — clear before re-accumulating.
-            if (_lastAgcTickMs != long.MinValue && nowMs - _lastAgcTickMs > AgcNoiseFloorWindowSamples * 500)
-            {
-                ResetAutoAgcNoiseFloorWindow();
-            }
-
-            // Fast-attack: a band-scale VFO move makes the old band's samples
-            // meaningless, so drop the window and re-seed to the new band's floor
-            // (Thetis re-seeds in ~1 s on a > 0.5 MHz change). A small in-band
-            // tune does NOT reset — only a band-change-scale jump.
-            if (_lastAutoAgcVfoHz != long.MinValue &&
-                Math.Abs(_state.VfoHz - _lastAutoAgcVfoHz) > AgcFastAttackVfoDeltaHz)
-            {
-                ResetAutoAgcNoiseFloorWindow();
-            }
-            _lastAutoAgcVfoHz = _state.VfoHz;
-
+            // Thetis's auto-AGC timer runs at 500 ms.
             if (_lastAgcTickMs != long.MinValue && nowMs - _lastAgcTickMs < 500)
                 return;
             _lastAgcTickMs = nowMs;
 
-            // Choose the floor source for this tick. A real spectrum floor (#806)
-            // always wins. A BRIEF spectrum dropout (< AgcSpectrumStaleMs) is
-            // treated as transient — hold the window rather than inject the
-            // S-meter proxy, which sits on a different scale and moves with the
-            // signal. Only a SUSTAINED outage (stale frame / <64 valid bins for
-            // longer than that, e.g. an engine that genuinely never produces a
-            // spectrum) falls back to signalDbm, so the loop keeps tracking
-            // instead of freezing. The two sources are never mixed in one
-            // percentile window: switching source re-seeds the window.
-            if (hasSpectrumFloor) _lastSpectrumFloorMs = nowMs;
-            bool spectrumRecent = _lastSpectrumFloorMs != long.MinValue &&
-                                  nowMs - _lastSpectrumFloorMs < AgcSpectrumStaleMs;
-            int floorSource;        // 0 hold, 1 spectrum, 2 S-meter fallback
-            double floorSample;
-            if (hasSpectrumFloor) { floorSource = 1; floorSample = spectrumFloorDbm; }
-            else if (spectrumRecent) { floorSource = 0; floorSample = 0.0; }   // transient: hold
-            else if (hasSignalMeter) { floorSource = 2; floorSample = signalDbm; }
-            else { floorSource = 0; floorSample = 0.0; }
-            if (floorSource != 0)
-            {
-                if (_autoAgcWindowSource != 0 && _autoAgcWindowSource != floorSource)
-                    ResetAutoAgcNoiseFloorWindow();
-                _autoAgcWindowSource = floorSource;
-                _noiseFloorWindow[_noiseFloorWindowIdx] = floorSample;
-                _noiseFloorWindowIdx = (_noiseFloorWindowIdx + 1) % _noiseFloorWindow.Length;
-                if (_noiseFloorWindowFill < _noiseFloorWindow.Length) _noiseFloorWindowFill++;
-            }
+            // Thetis auto-AGC-T: drive the AGC *threshold* (knee) to the noise
+            // floor and let WDSP derive the max-gain ("AGC-T top"). That top
+            // becomes the effective AGC-T; AgcOffsetDb carries it relative to
+            // the operator baseline so state/slider reflect it and the existing
+            // SetAgcTop(AgcTopDb+AgcOffsetDb) apply path pushes the same
+            // max_gain SetRXAAGCThresh would have. Manual AGC-T is untouched:
+            // SetAgcTop zeroes the offset and disables auto, so this never runs
+            // in manual mode.
+            double noiseFloor = spectrumFloorDbm;
+            double autoTop = AutoAgcTopFromNoiseFloor(noiseFloor);
+            double desiredOffset = autoTop - _state.AgcTopDb;
 
-            // Act as soon as we have a few samples (~1.5 s) — don't wait to fill
-            // the whole window. The percentile is computed over however many
-            // samples we have, which is enough to place the floor and start
-            // converging fast.
-            bool windowReady = _noiseFloorWindowFill >= AgcNoiseFloorMinSamples;
-            double desiredOffset = _agcOffsetDb;
-            if (windowReady)
-            {
-                // Robust floor estimate: a low percentile of the window rejects
-                // transient signal energy so we track the true noise, not peaks.
-                // stackalloc (≤ AgcNoiseFloorWindowSamples doubles) keeps the
-                // 500 ms loop allocation-free — no per-tick GC pressure.
-                Span<double> sorted = stackalloc double[_noiseFloorWindowFill];
-                for (int i = 0; i < _noiseFloorWindowFill; i++)
-                    sorted[i] = _noiseFloorWindow[i];
-                sorted.Sort();
-                int floorIndex = Math.Clamp(
-                    (int)Math.Round((sorted.Length - 1) * AgcNoiseFloorPercentile),
-                    0,
-                    sorted.Length - 1);
-                noiseFloor = sorted[floorIndex];
-
-                // Thetis auto-AGC-T: drive the AGC *threshold* (knee) to the noise
-                // floor and let WDSP derive the max-gain ("AGC-T top"). That top
-                // becomes the effective AGC-T; AgcOffsetDb carries it relative to
-                // the operator baseline so state/slider reflect it and the existing
-                // SetAgcTop(AgcTopDb+AgcOffsetDb) apply path pushes the same
-                // max_gain SetRXAAGCThresh would have. Manual AGC-T is untouched:
-                // SetAgcTop zeroes the offset and disables auto, so this never runs
-                // in manual mode.
-                double autoTop = AutoAgcTopFromNoiseFloor(noiseFloor);
-                desiredOffset = autoTop - _state.AgcTopDb;
-            }
             // Thetis's auto-AGC-T tick (console.cs tmrAutoAGC_Tick:46066) does ONE
             // thing: seat the AGC threshold at the SETTLED noise floor. It never
-            // reacts to instantaneous signal level or ADC peak. An earlier Zeus-only
-            // "ADC overload protection" used to cut the effective AGC-T whenever WDSP
-            // was cutting hard AND the ADC ran hot — which, on a steady strong
-            // signal, pulled the gain down and then released it as the signal paused.
-            // That MANUFACTURED the loudness pumping operators reported ("a strong
-            // signal goes low then high"). Removed: the noise-floor servo alone is
-            // the Thetis-faithful, non-pumping behaviour. Recovering from a genuine
-            // ADC overload is the operator's RF-gain / attenuation call (auto-ATT
-            // owns that path) — it is not the audio AGC loop's job, and post-ADC AGC
-            // cannot un-clip an already-overdriven sample anyway. When the floor
-            // window isn't ready yet, desiredOffset simply holds the current offset.
-
+            // reacts to instantaneous signal level or ADC peak. Recovering from
+            // a genuine ADC overload is the operator's RF-gain / attenuation
+            // call (auto-ATT owns that path) — it is not the audio AGC loop's
+            // job, and post-ADC AGC cannot un-clip an already-overdriven sample
+            // anyway.
             double delta = desiredOffset - _agcOffsetDb;
             // Deadband: ignore sub-0.5 dB wobble so a jumpy floor estimate can't
             // dither the gain every tick. Above it, JUMP straight to the target
-            // (no slew) — the floor window is the smoother, so the target moves
-            // gently in steady state and snaps only on a real band change.
+            // (no slew) — the tracker upstream is the smoother, so the target
+            // moves gently in steady state and snaps only on a real band change.
             if (Math.Abs(delta) < AgcDeadbandDb) return;
 
             _agcOffsetDb = desiredOffset;
@@ -3281,7 +3193,7 @@ public sealed class RadioService : IDisposable
         if (changedOffset)
         {
             StateChanged?.Invoke(Snapshot());
-            _log.LogDebug("auto-agc offset={Offset}dB noisefloor={Floor}dBm", newOffset, noiseFloor);
+            _log.LogDebug("auto-agc offset={Offset}dB noisefloor={Floor}dBm", newOffset, spectrumFloorDbm);
         }
     }
 
@@ -3292,14 +3204,16 @@ public sealed class RadioService : IDisposable
     // console.cs:22188 — TX uses its own TxAttenData path, not the RX ramp).
     internal void SetMox(bool on)
     {
-        // CTUN: the hardware NCO is frozen off the dial for RX. Snap it to the
-        // dial before the wire MOX bit flips so TX lands on frequency, and
-        // restore the frozen centre after un-key so the RX view returns. This
-        // is the universal keying chokepoint — MOX, TUN, CW, and two-tone all
-        // route through here — so every TX path is covered. Both helpers are
-        // no-ops when CTUN is off. (CW pre-aligns in CwEngine for its baseband
-        // calc; AlignLoForTx then finds the LO already on the dial and is a
-        // no-op, but the frozen centre it recorded is still restored below.)
+        // The hardware NCO can sit off the dial for RX (CTUN freeze, or an
+        // autopan/pure-pan offset). Snap it to the dial before the wire MOX
+        // bit flips so TX lands on frequency, and restore the parked centre
+        // after un-key so the RX view returns. This is the universal keying
+        // chokepoint — MOX, TUN, CW, and two-tone all route through here — so
+        // every TX path is covered. Both helpers are no-ops when the LO
+        // already sits on the dial. (CW pre-aligns in CwEngine for its
+        // baseband calc; AlignLoForTx then finds the LO already on the dial
+        // and is a no-op, but the frozen centre it recorded is still restored
+        // below.)
         // Latch _mox before AlignLoForTx so a concurrent guarded SetRadioLo
         // (the frontend LO heartbeat) cannot slip between the snap and guard.
         lock (_sync) _mox = on;
@@ -4246,7 +4160,6 @@ public sealed class RadioService : IDisposable
         {
             _agcOffsetDb = 0.0;
             _lastAgcTickMs = long.MinValue;
-            ResetAutoAgcNoiseFloorWindow();
             return s with { AgcTopDb = clamped, AgcOffsetDb = 0.0, AutoAgcEnabled = false };
         });
         // Persist only the user-baseline (AgcTopDb); the offset is live-recomputed.
