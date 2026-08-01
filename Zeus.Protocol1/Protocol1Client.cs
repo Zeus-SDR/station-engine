@@ -2244,7 +2244,7 @@ public sealed class Protocol1Client : IProtocol1Client
                             "inbound UDP. This is common when Tailscale or another VPN is " +
                             "installed (it reclassifies the LAN adapter as Public network). " +
                             "Temporarily disable Windows Firewall to confirm, then add a " +
-                            "permanent inbound rule for OpenhpsdrZeus.exe.",
+                            "permanent inbound rule for Zeus.exe.",
                             failurePolicy.ConsecutiveTransientFailures);
                     else
                         _log.LogWarning(

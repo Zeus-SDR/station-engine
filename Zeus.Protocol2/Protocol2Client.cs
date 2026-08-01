@@ -2287,7 +2287,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// Burn-zone interlock (PureSignal hard rule, issue #960). The G2E
     /// single-ADC time-multiplexed PS feedback path (compose + de-interleave,
     /// below) is fully wired but held DARK in production until BOTH coupled
-    /// pre-conditions land with KB2UKA sign-off:
+    /// pre-conditions land with maintainer sign-off:
     ///   (A) the byte-59 (Angelia_atten_Tx0) protective seed is pushed to the
     ///       wire on connect/arm in
     ///       <c>RadioService.ApplyPsHwPeakForConnection</c>. The single shared
@@ -2352,7 +2352,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     ///
     /// Flipping this true autonomously is forbidden — see CLAUDE.md
     /// "Hard Rules — PureSignal". The production flag flip and the final byte-59
-    /// seed value (<see cref="PsTxAdcProtectFloorDb"/>) require KB2UKA sign-off
+    /// seed value (<see cref="PsTxAdcProtectFloorDb"/>) require maintainer sign-off
     /// plus 10E bench verification of first-key-down ADC overload.
     /// </summary>
     /// <remarks>
@@ -2374,7 +2374,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// on <c>FPGA_PTT</c> — <c>Hermes.v:1483</c>, <c>Tx_specific_C&amp;C.v:182-183</c>).
     /// 31 dB = the maximum (safest) attenuation, seeded so a fresh first key-down
     /// with PS armed cannot slam the coupler into the ADC at 0 dB. The final
-    /// production value is bench-cal pending and KB2UKA-gated.
+    /// production value is bench-cal pending and maintainer-gated.
     /// </summary>
     internal const byte PsTxAdcProtectFloorDb = 31;
 

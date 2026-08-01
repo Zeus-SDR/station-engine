@@ -69,6 +69,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly CancellationToken _recoveryToken;
     private bool _disposed;
     private string? _activeInputDeviceId;
+    private string? _inputError;
     private int _sampleRate;
     private int _channels;
     // -1 means the compatibility default: mix every capture channel.
@@ -118,6 +119,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
     public string? ConfiguredInputDeviceId => _deviceSettings?.Get().InputDeviceId;
     public string? ActiveInputDeviceId => _activeInputDeviceId;
+    public string? InputError => Volatile.Read(ref _inputError);
     public uint SampleRate => (uint)Math.Max(0, Volatile.Read(ref _sampleRate));
     public uint Channels => (uint)Math.Max(0, Volatile.Read(ref _channels));
     public int? InputChannel
@@ -248,6 +250,9 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         LogOpenGaveUp(selected ? "selected" : "default", failure);
         if (!selected)
         {
+            Volatile.Write(
+                ref _inputError,
+                "No usable microphone input is available. Select an input device or retry.");
             _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
             ScheduleStartupOpenRecovery(null);
             return;
@@ -261,6 +266,9 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         }
 
         LogOpenGaveUp("default fallback", fallbackFailure);
+        Volatile.Write(
+            ref _inputError,
+            "Neither the selected microphone nor the system default input could be opened. TX microphone audio is unavailable.");
         _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
         ScheduleStartupOpenRecovery(requestedDeviceId);
     }
@@ -391,6 +399,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private void AdoptInputLocked(INativeMicInput input, string? requestedDeviceId)
     {
         _input = input;
+        Volatile.Write(ref _inputError, null);
         _activeInputDeviceId = NormalizeDeviceId(requestedDeviceId) ?? ResolveDefaultInputDeviceId();
         Volatile.Write(ref _sampleRate, checked((int)input.SampleRate));
         Volatile.Write(ref _channels, checked((int)input.Channels));

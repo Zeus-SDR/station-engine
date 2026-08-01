@@ -154,9 +154,17 @@ public sealed class BandPlanStore : IDisposable
         {
             try
             {
-                var doc = JsonDocument.Parse(File.ReadAllText(file));
-                var regionId = doc.RootElement.GetProperty("regionId").GetString() ?? "";
-                var segsElem = doc.RootElement.GetProperty("segments");
+                using var doc = JsonDocument.Parse(File.ReadAllText(file));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object
+                    || !doc.RootElement.TryGetProperty("regionId", out var regionIdElement)
+                    || regionIdElement.ValueKind != JsonValueKind.String
+                    || !doc.RootElement.TryGetProperty("segments", out var segsElem)
+                    || segsElem.ValueKind != JsonValueKind.Array)
+                {
+                    _log.LogError("band.segments.load.failed file={File} reason=invalid shape", file);
+                    continue;
+                }
+                var regionId = regionIdElement.GetString() ?? "";
                 var segs = JsonSerializer.Deserialize<List<SegmentJson>>(segsElem.GetRawText(), _jsonOpts) ?? [];
 
                 _shipped[regionId] = segs.Select(s => new BandSegment(

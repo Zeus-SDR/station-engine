@@ -65,7 +65,7 @@ public static class NativeAudioEndpoints
                 mic,
                 snapshot,
                 supported: true,
-                error: null));
+                error: mic?.InputError));
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
         {

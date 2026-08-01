@@ -30,7 +30,7 @@ internal static class EnginePrefsDbMigration
     // profile export may merge. This is the v1 engine families + v3 station
     // control — deliberately NOT ps_settings (v2). PureSignal persistence is a
     // full-stop zone: no export-path change that touches PS calibration data
-    // ships without explicit KB2UKA approval, so a merged export keeps whatever
+    // ships without explicit maintainer approval, so a merged export keeps whatever
     // ps_settings copy the product file already holds (the stale pre-split
     // one), exactly as the desktop export always did.
     internal static IEnumerable<string> AllEngineOwnedCollectionNames()
