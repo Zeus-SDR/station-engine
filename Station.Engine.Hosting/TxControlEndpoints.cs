@@ -149,6 +149,38 @@ public static class TxControlEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
+        static IResult GetAudioSuitePreview(RadioService radio)
+        {
+            return Results.Ok(new { supported = true, enabled = radio.Snapshot().TxMonitorEnabled });
+        }
+
+        static IResult SetAudioSuitePreview(
+            PreviewSetRequest body,
+            RadioService radio,
+            DspPipelineService pipe)
+        {
+            // Meter-only is requested by Auto Tune so it can run the chain for
+            // metering without the operator hearing the demodulated monitor.
+            // Apply it before flipping the monitor on so the first monitor tick
+            // already honours suppression; clearing on disable is handled by the
+            // monitor latch in DspPipelineService.
+            bool meterOnly = body.Enabled && (body.MeterOnly ?? false);
+            pipe.SetTxMonitorMeterOnly(meterOnly);
+            var state = radio.SetTxMonitor(new TxMonitorSetRequest(body.Enabled));
+            return Results.Ok(new { supported = true, enabled = state.TxMonitorEnabled, meterOnly });
+        }
+
+        // Audio Suite Preview toggle — operator-facing alias for TX Monitor.
+        // It drives the WDSP TX-monitor path, which demodulates post-TXA IQ
+        // back to mono audio after the full transmit chain (Audio Suite/VST
+        // route, leveler, compressor, CFC, ALC, bandpass, CFIR). This keeps
+        // Audio Suite "Preview ON" a 1:1 off-air comparison with what would
+        // reach the radio, rather than the older plugin-chain-only preview.
+        endpoints.MapGet("/api/audio-suite/preview", GetAudioSuitePreview);
+        endpoints.MapPut("/api/audio-suite/preview", SetAudioSuitePreview);
+        endpoints.MapGet("/api/tx-audio-suite/preview", GetAudioSuitePreview);
+        endpoints.MapPut("/api/tx-audio-suite/preview", SetAudioSuitePreview);
+
         // Preview-path toggle. The engine call lives in
         // DspPipelineService.UpdateState so it lands beside the rest of the
         // TX-side seam plumbing on the next tick.
@@ -223,3 +255,5 @@ public static class TxControlEndpoints
     }
 
 }
+
+internal sealed record PreviewSetRequest(bool Enabled, bool? MeterOnly = null);

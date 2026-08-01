@@ -63,6 +63,14 @@ public sealed class CatOptions
     public bool AutoReport { get; set; } = false;
 
     /// <summary>
+    /// Promote rate-bounded CAT wire records from Debug to Information so they
+    /// are included in the product diagnostic ring and support log attachment.
+    /// Defaults to false; enable through Cat:WireLogAtInformation (or the
+    /// equivalent environment setting) for a focused CAT capture.
+    /// </summary>
+    public bool WireLogAtInformation { get; set; } = false;
+
+    /// <summary>
     /// Limit TX drive (PC command) to a safe level for unattended automated
     /// operation. When true, drive is clamped to 50%. Defaults to false.
     /// Mirrors <see cref="Tci.TciOptions.LimitPowerLevels"/>.

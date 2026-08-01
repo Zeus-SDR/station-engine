@@ -36,6 +36,7 @@ public sealed class CatSession : IDisposable
     private readonly TciRateLimiter _rateLimiter;
     private readonly CatCommandHandler _handler;
     private readonly Action<string>? _directSend;
+    private readonly CatWireLogger _wireLog;
 
     private readonly ConcurrentQueue<string> _outbound = new();
     private readonly SemaphoreSlim _outboundSignal = new(0);
@@ -54,6 +55,7 @@ public sealed class CatSession : IDisposable
         _client = client;
         _stream = client.GetStream();
         _log = log;
+        _wireLog = new CatWireLogger(log, id.ToString("N"), options.WireLogAtInformation);
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
         _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
     }
@@ -70,6 +72,7 @@ public sealed class CatSession : IDisposable
         _id = id;
         _log = log;
         _directSend = sendForTest;
+        _wireLog = new CatWireLogger(log, id.ToString("N"), options.WireLogAtInformation);
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
         _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
     }
@@ -109,6 +112,7 @@ public sealed class CatSession : IDisposable
         if (_directSend is { } direct)
         {
             direct(line);
+            _wireLog.Tx(line);
             return;
         }
         _outbound.Enqueue(line);
@@ -132,6 +136,7 @@ public sealed class CatSession : IDisposable
                     var bytes = Encoding.ASCII.GetBytes(line);
                     await stream.WriteAsync(bytes, ct);
                     await stream.FlushAsync(ct);
+                    _wireLog.Tx(line);
                 }
             }
         }
@@ -162,7 +167,8 @@ public sealed class CatSession : IDisposable
 
                 foreach (var token in commands)
                 {
-                    try { _handler.Dispatch(token); }
+                    try { await DispatchAsync(token, ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
                     catch (Exception ex) { _log.LogDebug(ex, "cat dispatch error id={Id} token={Token}", _id, token); }
                 }
             }
@@ -173,11 +179,25 @@ public sealed class CatSession : IDisposable
         catch (Exception ex) { _log.LogDebug(ex, "cat recv loop failed id={Id}", _id); }
     }
 
-    internal void DispatchForTest(string token) => _handler.Dispatch(token);
+    private async ValueTask DispatchAsync(string token, CancellationToken cancellationToken)
+    {
+        _wireLog.Rx(token + ";");
+        await _handler.DispatchAsync(token, cancellationToken);
+    }
+
+    internal void DispatchForTest(string token)
+    {
+        _wireLog.Rx(token + ";");
+        _handler.Dispatch(token);
+    }
+
+    internal ValueTask DispatchForTestAsync(string token, CancellationToken cancellationToken = default) =>
+        DispatchAsync(token, cancellationToken);
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        try { _wireLog.FlushSuppressed(); } catch { }
         try { _rateLimiter.Dispose(); } catch { }
         try { _outboundSignal.Release(); } catch { }
         try { _stream?.Dispose(); } catch { }

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA) and contributors.
 
 using System.Globalization;
+using System.Net;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Zeus.Contracts;
 using Zeus.Server.Diagnostics;
@@ -23,41 +24,56 @@ public static class StationEngineEndpoints
         "http://127.0.0.1:5173",
     };
 
-    public static void ConfigureCors(CorsPolicyBuilder policy)
+    public static void ConfigureCors(
+        CorsPolicyBuilder policy,
+        bool allowLanSameHost = false,
+        Func<string?>? requestHost = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
         policy
-            .SetIsOriginAllowed(IsBrowserOriginAllowed)
+            .SetIsOriginAllowed(origin => IsBrowserOriginAllowed(
+                origin,
+                allowLanSameHost,
+                requestHost?.Invoke()))
             .AllowAnyHeader()
             .AllowAnyMethod()
             // navigator.sendBeacon (workspace-layout unload flush) always sends
             // a credentialed request, and its application/json Blob forces a
             // CORS preflight. Without Access-Control-Allow-Credentials the
             // browser rejects that preflight and the beacon never reaches the
-            // engine. Safe here: the origin check is the loopback-only
-            // predicate plus the pinned origins above — never a wildcard (and
-            // ASP.NET would throw on AllowAnyOrigin + AllowCredentials).
+            // engine. Safe here: the origin check is the pinned/loopback
+            // predicate plus, only in LAN mode, a local/private form of the
+            // request's own host — never a wildcard (and ASP.NET would throw
+            // on AllowAnyOrigin + AllowCredentials).
             .AllowCredentials();
     }
 
     /// <summary>
     /// Allows the pinned remote origins plus any plain-HTTP loopback origin.
-    /// In the Zeus Link topology the proprietary bundle serves the web app
-    /// from 127.0.0.1 on a dynamic port (WebKit refuses https-page-to-
-    /// http-loopback mixed content, so the app cannot be remote-hosted). The
-    /// engine itself binds loopback only, so a loopback browser origin has
-    /// the same trust as any local process.
+    /// Loopback mode retains the Zeus Link desktop-webview rule: the bundle
+    /// serves the app from 127.0.0.1 on a dynamic port. LAN mode additionally
+    /// accepts a plain-HTTP local/private origin whose host equals the engine
+    /// request's Host header, allowing a product-served SPA on another port of
+    /// the same appliance without trusting public DNS names that can be
+    /// rebound to the appliance.
     /// </summary>
-    internal static bool IsBrowserOriginAllowed(string origin)
+    internal static bool IsBrowserOriginAllowed(
+        string origin,
+        bool allowLanSameHost = false,
+        string? requestHost = null)
     {
         if (AllowedBrowserOrigins.Contains(origin)) return true;
         if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
         if (uri.Scheme != Uri.UriSchemeHttp) return false;
-        return uri.Host is "127.0.0.1" or "localhost" or "[::1]" or "::1";
+        if (IsLoopbackHost(uri.Host)) return true;
+        return allowLanSameHost
+            && HostsEqual(uri.Host, requestHost)
+            && IsLanApplianceHost(uri.Host);
     }
 
     public static IEndpointRouteBuilder MapStationEngineEndpoints(
-        this IEndpointRouteBuilder endpoints)
+        this IEndpointRouteBuilder endpoints,
+        bool allowLanSameHost = false)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
@@ -138,12 +154,17 @@ public static class StationEngineEndpoints
         // whether the on-disk sink is healthy (and why not), and the in-memory
         // ring tail when the file itself cannot be written.
         endpoints.MapEngineLogDiagnosticsEndpoint();
+        endpoints.MapEngineRadioDiagnosticsEndpoint();
 
-        endpoints.Map("/ws", AttachWebSocketAsync);
+        endpoints.Map(
+            "/ws",
+            context => AttachWebSocketAsync(context, allowLanSameHost));
         return endpoints;
     }
 
-    private static async Task AttachWebSocketAsync(HttpContext context)
+    private static async Task AttachWebSocketAsync(
+        HttpContext context,
+        bool allowLanSameHost)
     {
         if (!context.WebSockets.IsWebSocketRequest)
         {
@@ -155,13 +176,14 @@ public static class StationEngineEndpoints
         if (origins.Count > 1
             || (origins.Count == 1
                 && (origins[0] is not { } origin
-                    // Must match the CORS policy exactly: pinned remote origins
-                    // plus any plain-http loopback origin (the bundle serves
-                    // the app from a dynamic loopback port). Field defect:
-                    // this check still used the raw list after #501 moved the
-                    // policy to the predicate, so the panadapter WebSocket got
-                    // a 403 from the bundle-served app.
-                    || !IsBrowserOriginAllowed(origin))))
+                    // Must match the CORS policy exactly, including the
+                    // bind-lan same-host allowance, or the product-served
+                    // panadapter WebSocket is rejected after HTTP requests
+                    // have already succeeded.
+                    || !IsBrowserOriginAllowed(
+                        origin,
+                        allowLanSameHost,
+                        context.Request.Host.Host))))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;
@@ -187,6 +209,44 @@ public static class StationEngineEndpoints
             displayRxId: displayRxId,
             suppressAudio: suppressAudio).ConfigureAwait(false);
     }
+
+    private static bool IsLoopbackHost(string host) =>
+        NormalizeHost(host) is "127.0.0.1" or "localhost" or "::1";
+
+    private static bool HostsEqual(string originHost, string? requestHost) =>
+        !string.IsNullOrWhiteSpace(requestHost)
+        && string.Equals(
+            NormalizeHost(originHost),
+            NormalizeHost(requestHost),
+            StringComparison.OrdinalIgnoreCase);
+
+    internal static bool IsLanApplianceHost(string host)
+    {
+        var normalized = NormalizeHost(host);
+        if (IPAddress.TryParse(normalized, out var address))
+        {
+            if (IPAddress.IsLoopback(address)) return true;
+            if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                var bytes = address.GetAddressBytes();
+                return bytes[0] == 10
+                    || (bytes[0] == 172 && bytes[1] is >= 16 and <= 31)
+                    || (bytes[0] == 192 && bytes[1] == 168)
+                    || (bytes[0] == 169 && bytes[1] == 254);
+            }
+
+            return address.IsIPv6LinkLocal;
+        }
+
+        return (!normalized.Contains('.') && !normalized.Contains(':'))
+            || (normalized.Length > ".local".Length
+                && normalized.EndsWith(
+                    ".local",
+                    StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string NormalizeHost(string host) =>
+        host.Trim().TrimStart('[').TrimEnd(']');
 
     private static bool TryParseSessionOptions(
         IQueryCollection query,

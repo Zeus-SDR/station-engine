@@ -59,7 +59,10 @@ internal sealed class CatCommandHandler
     /// first push naturally.</summary>
     public void EnableAutoInfo() => Volatile.Write(ref _autoInfo, 1);
 
-    public void Dispatch(string token)
+    public void Dispatch(string token) =>
+        DispatchAsync(token, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+    public async ValueTask DispatchAsync(string token, CancellationToken cancellationToken)
     {
         string cmd = CatProtocol.CommandId(token);
         string args = CatProtocol.Args(token);
@@ -72,8 +75,12 @@ internal sealed class CatCommandHandler
             case "FB": HandleFreq(args, vfoB: true); break;
             case "MD": HandleMode(args); break;
             case "IF": HandleIf(); break;
-            case "TX": _tx.TrySetMox(true, MoxSource.Cat, out _); break;   // explicit key only
-            case "RX": _tx.TrySetMox(false, MoxSource.Cat, out _); break;
+            case "TX":
+                await _tx.TrySetMoxFromCatAsync(true, cancellationToken);
+                break;                                                    // explicit key only
+            case "RX":
+                await _tx.TrySetMoxFromCatAsync(false, cancellationToken);
+                break;
             case "FR": HandleFrFt(args, "FR"); break;                     // RX VFO / split (report-only Tier-1)
             case "FT": HandleFrFt(args, "FT"); break;
             case "SM": HandleSmeter(); break;

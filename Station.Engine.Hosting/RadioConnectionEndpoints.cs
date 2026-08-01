@@ -158,10 +158,9 @@ public static class RadioConnectionEndpoints
 
         endpoints.MapPost("/api/connect/p2", async (
             ConnectRequest req,
-            DspPipelineService dsp,
             RadioService radio,
             WdspWisdomInitializer wisdom,
-            P2Discovery p2Discovery,
+            IProtocol2ConnectionConnector p2Connection,
             HttpContext ctx) =>
         {
             log.LogInformation(
@@ -217,14 +216,13 @@ public static class RadioConnectionEndpoints
             // Probe result is reused after the busy-gate to capture the
             // firmware version for the diagnostics snapshot — null on a forced
             // connect, which deliberately skips the probe.
-            P2Radio? probe = null;
+            Protocol2ConnectionProbe? probe = null;
             if (!req.Force)
             {
                 try
                 {
-                    probe = await p2Discovery.ProbeAsync(
-                        ipEndpoint.Address,
-                        TimeSpan.FromMilliseconds(700),
+                    probe = await p2Connection.ProbeAsync(
+                        ipEndpoint,
                         ctx.RequestAborted).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { throw; }
@@ -233,7 +231,7 @@ public static class RadioConnectionEndpoints
                     log.LogWarning(ex, "api.connect.p2 busy-probe failed — allowing connect");
                 }
 
-                if (probe?.Details.Busy == true)
+                if (probe?.Busy == true)
                 {
                     log.LogWarning(
                         "api.connect.p2 REFUSED — radio {Ip} reports BUSY (another controller owns it); refusing second-master connect",
@@ -274,13 +272,13 @@ public static class RadioConnectionEndpoints
             try
             {
                 // Firmware version for the "Report a problem" diagnostic snapshot.
-                rateKhz = await dsp.ConnectP2Async(
+                rateKhz = await p2Connection.ConnectAsync(
                     ipEndpoint,
                     rateKhz,
-                    numAdc: 2,
-                    ctx.RequestAborted,
                     boardKind,
-                    probe?.FirmwareString).ConfigureAwait(false);
+                    probe?.Firmware,
+                    sampleRateExplicit: true,
+                    ctx.RequestAborted).ConfigureAwait(false);
                 return Results.Ok(new
                 {
                     protocol = "P2",
@@ -301,9 +299,11 @@ public static class RadioConnectionEndpoints
 
         endpoints.MapPost("/api/disconnect/p2", async (
             DspPipelineService dsp,
+            IP2AutoConnectControl p2AutoConnect,
             HttpContext ctx) =>
         {
             log.LogInformation("api.disconnect.p2");
+            p2AutoConnect.DisableForManualDisconnect();
             await dsp.DisconnectP2Async(ctx.RequestAborted).ConfigureAwait(false);
             return Results.Ok(new { status = "disconnected" });
         });
@@ -312,9 +312,11 @@ public static class RadioConnectionEndpoints
             RadioService radio,
             IExternalRadioSidecar sidecar,
             DspPipelineService dsp,
+            IP2AutoConnectControl p2AutoConnect,
             HttpContext ctx) =>
         {
             log.LogInformation("api.disconnect");
+            p2AutoConnect.DisableForManualDisconnect();
             if (radio.IsProtocol3Active)
             {
                 await sidecar.DisconnectAsync(ctx.RequestAborted).ConfigureAwait(false);
@@ -401,18 +403,8 @@ public static class RadioConnectionEndpoints
         return details;
     }
 
-    private static bool TryParseIpEndpoint(string raw, out IPEndPoint endpoint)
-    {
-        endpoint = null!;
-        var separator = raw.LastIndexOf(':');
-        var host = separator > 0 ? raw[..separator] : raw;
-        var port = 1024;
-        if (separator > 0 && int.TryParse(raw[(separator + 1)..], out var parsedPort))
-            port = parsedPort;
-        if (!IPAddress.TryParse(host, out var ip)) return false;
-        endpoint = new IPEndPoint(ip, port);
-        return true;
-    }
+    internal static bool TryParseIpEndpoint(string raw, out IPEndPoint endpoint) =>
+        Protocol2ConnectionEndpoint.TryParse(raw, out endpoint);
 
     internal static async Task<P1ConnectionIdentity> ResolveP1ConnectionIdentityAsync(
         byte? rawBoardId,

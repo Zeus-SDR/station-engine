@@ -18,14 +18,32 @@ public static class EngineLogDiagnosticsEndpoints
         this IEndpointRouteBuilder endpoints)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
-        endpoints.MapGet("/api/diagnostics/engine-log", (IServiceProvider services) =>
+        endpoints.MapGet(
+            "/api/diagnostics/engine-log",
+            (RequestDelegate)(context =>
         {
-            var buffer = services.GetService<DiagnosticLogBuffer>();
-            var sink = services.GetService<IDiagnosticLogFileSink>();
-            return Results.Ok(EngineLogDiagnosticsSnapshot.Capture(buffer, sink));
-        });
+            var buffer = context.RequestServices.GetService<DiagnosticLogBuffer>();
+            var sink = context.RequestServices.GetService<IDiagnosticLogFileSink>();
+            var maxLines = ResolveMaxLines(
+                context.Request.Query["lines"].ToString());
+            return context.Response.WriteAsJsonAsync(
+                EngineLogDiagnosticsSnapshot.Capture(
+                    buffer,
+                    sink,
+                    maxLines));
+        }));
         return endpoints;
     }
+
+    internal static int ResolveMaxLines(string? value) =>
+        int.TryParse(
+            value,
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var requested)
+        && requested > 0
+            ? Math.Min(requested, DiagnosticLogBuffer.Capacity)
+            : DiagnosticLogBuffer.ReportTailLines;
 }
 
 internal sealed record EngineLogDiagnosticsSnapshot(
@@ -41,7 +59,8 @@ internal sealed record EngineLogDiagnosticsSnapshot(
 {
     public static EngineLogDiagnosticsSnapshot Capture(
         DiagnosticLogBuffer? buffer,
-        IDiagnosticLogFileSink? sink)
+        IDiagnosticLogFileSink? sink,
+        int maxLines = DiagnosticLogBuffer.ReportTailLines)
     {
         var logPath = PrefsDbPath.AppLogPath();
         var exists = false;
@@ -67,6 +86,6 @@ internal sealed record EngineLogDiagnosticsSnapshot(
             LogBytes: bytes,
             SinkDegraded: status?.Degraded,
             SinkLastError: status?.LastError,
-            RecentLines: buffer?.Snapshot() ?? []);
+            RecentLines: buffer?.Snapshot(maxLines) ?? []);
     }
 }

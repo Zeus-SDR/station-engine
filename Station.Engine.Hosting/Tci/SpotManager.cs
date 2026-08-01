@@ -42,7 +42,11 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+#if ZEUS_PRODUCT_HOST
+namespace Zeus.Product.Hosting.Tci;
+#else
 namespace Zeus.Server.Tci;
+#endif
 
 public enum SpotSource
 {

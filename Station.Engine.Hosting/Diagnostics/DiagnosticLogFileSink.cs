@@ -4,14 +4,14 @@ using System.Text;
 namespace Zeus.Server.Diagnostics;
 
 /// <summary>
-/// Rolling on-disk log file. Writes the same formatted+redacted lines the
-/// in-memory <see cref="DiagnosticLogBuffer"/> holds, so the recent log persists
-/// across a backend crash for the support sidecar to tail.
+/// Rolling on-disk log file. Writes every formatted and redacted line supplied
+/// by the logger provider, including framework Information lines intentionally
+/// excluded from the in-memory report ring.
 ///
 /// Design notes:
 /// <list type="bullet">
 /// <item>Auto-flush on every write — crash freshness beats throughput here; the
-/// ring is Information+ only, so volume is modest and we want the last lines on
+/// provider is Information+ only, so volume is bounded and we want the last lines on
 /// disk <i>before</i> the process dies.</item>
 /// <item>Best-effort: any I/O failure is swallowed (the sink stays "down" until a
 /// later write succeeds). A diagnostic sink must never crash the app or throw

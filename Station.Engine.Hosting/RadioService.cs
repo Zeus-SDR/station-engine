@@ -1022,6 +1022,14 @@ public sealed class RadioService : IDisposable
         get { lock (_sync) return _mox; }
     }
 
+    /// <summary>Atomic CAT IF projection. Frequency, mode, and the transient
+    /// wire MOX latch must come from the same radio-state acquisition so an
+    /// unsolicited status frame cannot mix opposite sides of a MOX edge.</summary>
+    internal (long VfoHz, RxMode Mode, bool Mox) SnapshotCatIfState()
+    {
+        lock (_sync) return (_state.VfoHz, _state.Mode, _mox);
+    }
+
     public StateDto Snapshot()
     {
         lock (_sync)

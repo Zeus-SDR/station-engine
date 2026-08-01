@@ -13,6 +13,12 @@ using Zeus.Server.Tci;
 
 namespace Zeus.StationEngine;
 
+internal enum StationEngineBindMode
+{
+    Loopback,
+    Lan,
+}
+
 public partial class Program
 {
     private const string CorsPolicyName = "ZeusLinkLocalAttach";
@@ -43,7 +49,8 @@ public partial class Program
         {
             Console.Error.WriteLine($"StationEngine: {ex.Message}");
             Console.Error.WriteLine(
-                "usage: StationEngine --port <1..65535> [--native-audio-output <true|false>]");
+                "usage: StationEngine --port <1..65535> [--bind <loopback|lan>] " +
+                "[--native-audio-output <true|false>]");
             diagnosticLogFileSink.Dispose();
             return 2;
         }
@@ -117,7 +124,7 @@ public partial class Program
         });
 
         // Self-diagnostic log capture, mirroring the product host (ZeusHost): a
-        // singleton ring buffer retains the last ~1000 formatted log lines and a
+        // singleton ring buffer retains the last ~4000 formatted log lines and a
         // rolling on-disk sink mirrors the same redacted lines to
         // DataDir/logs/zeus-app.log so the recent log SURVIVES an engine crash —
         // a Zeus Link tester whose engine dies before the panadapter paints
@@ -157,10 +164,13 @@ public partial class Program
         });
         builder.Services.Configure<Microsoft.Extensions.Hosting.HostOptions>(options =>
             options.ShutdownTimeout = TimeSpan.FromSeconds(3));
-        builder.WebHost.ConfigureKestrel(options =>
+        builder.WebHost.ConfigureKestrel(server =>
         {
-            options.Listen(IPAddress.Loopback, port);
-            options.ConfigureTciListener(tciEnabled, tciBindAddress, tciPort);
+            if (ListenOnAllInterfaces(options.BindMode))
+                server.ListenAnyIP(port);
+            else
+                server.Listen(IPAddress.Loopback, port);
+            server.ConfigureTciListener(tciEnabled, tciBindAddress, tciPort);
         });
 
         builder.Services.Configure<JsonOptions>(options =>
@@ -188,13 +198,30 @@ public partial class Program
                 options.AutoReport = pendingCat.AutoReport;
             });
         }
-        builder.Services.AddCors(options => options.AddPolicy(
+        var httpContextAccessor = new HttpContextAccessor();
+        builder.Services.AddSingleton<IHttpContextAccessor>(httpContextAccessor);
+        builder.Services.AddCors(cors => cors.AddPolicy(
             CorsPolicyName,
-            StationEngineEndpoints.ConfigureCors));
+            policy => StationEngineEndpoints.ConfigureCors(
+                policy,
+                allowLanSameHost: options.BindMode == StationEngineBindMode.Lan,
+                requestHost: () => httpContextAccessor.HttpContext?.Request.Host.Host)));
+        var p2AutoConnectEndpoint = Environment.GetEnvironmentVariable(
+            P2AutoConnectService.EndpointEnvironmentVariable);
         builder.Services.AddStationEngine(new StationEngineHostingOptions(
-            NativeAudioOutputEnabled: options.NativeAudioOutputEnabled));
+            NativeAudioOutputEnabled: options.NativeAudioOutputEnabled,
+            P2AutoConnectEndpoint: string.IsNullOrWhiteSpace(p2AutoConnectEndpoint)
+                ? null
+                : p2AutoConnectEndpoint));
 
         var app = builder.Build();
+        if (options.BindMode == StationEngineBindMode.Lan)
+        {
+            app.Logger.LogInformation(
+                "station-engine --bind lan opens only the HTTP engine listener; " +
+                "TCI and CAT retain their separately configured bind addresses " +
+                "(default loopback)");
+        }
         app.UseCors(CorsPolicyName);
         app.UseStationAccessTokenAuthorization(
             Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable));
@@ -206,15 +233,16 @@ public partial class Program
 
         AnchorWdspDataFiles(app);
         WireEngineBroadcasts(app);
-        app.MapStationEngineEndpoints();
+        app.MapStationEngineEndpoints(options.BindMode == StationEngineBindMode.Lan);
         return app;
     }
 
     internal static int ParsePort(IReadOnlyList<string> args) => ParseOptions(args).Port;
 
-    private static StationEngineCommandLineOptions ParseOptions(IReadOnlyList<string> args)
+    internal static StationEngineCommandLineOptions ParseOptions(IReadOnlyList<string> args)
     {
         int? port = null;
+        StationEngineBindMode? bindMode = null;
         bool? nativeAudioOutputEnabled = null;
         for (var index = 0; index < args.Count; index++)
         {
@@ -229,6 +257,18 @@ public partial class Program
                         throw new ArgumentException(
                             "--port requires an integer from 1 through 65535");
                     port = parsed;
+                    break;
+                case "--bind":
+                    if (bindMode is not null)
+                        throw new ArgumentException("--bind may be specified only once");
+                    if (++index >= args.Count)
+                        throw new ArgumentException("--bind requires loopback or lan");
+                    bindMode = args[index] switch
+                    {
+                        "loopback" => StationEngineBindMode.Loopback,
+                        "lan" => StationEngineBindMode.Lan,
+                        _ => throw new ArgumentException("--bind requires loopback or lan"),
+                    };
                     break;
                 case "--native-audio-output":
                     if (nativeAudioOutputEnabled is not null)
@@ -246,11 +286,16 @@ public partial class Program
 
         return new StationEngineCommandLineOptions(
             Port: port ?? throw new ArgumentException("--port is required"),
+            BindMode: bindMode ?? StationEngineBindMode.Loopback,
             NativeAudioOutputEnabled: nativeAudioOutputEnabled ?? false);
     }
 
-    private sealed record StationEngineCommandLineOptions(
+    internal static bool ListenOnAllInterfaces(StationEngineBindMode options) =>
+        options == StationEngineBindMode.Lan;
+
+    internal sealed record StationEngineCommandLineOptions(
         int Port,
+        StationEngineBindMode BindMode,
         bool NativeAudioOutputEnabled);
 
     private static void PrepareEnginePreferences()

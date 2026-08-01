@@ -52,7 +52,10 @@ namespace Zeus.Server;
 
 public sealed class StreamingHub
 {
-    private const int MaxBacklogPerClient = 4;
+    // Attach primes wisdom, spots, diagnostics, and five chat snapshots before
+    // the send loop starts. Keep enough bounded room for that control-plane
+    // burst plus live edges that can race it.
+    private const int MaxBacklogPerClient = 16;
 
     // Matches MsgType.MicPcm; the client→server uplink type-byte.
     private const byte MsgTypeMicPcm = 0x20;
@@ -100,11 +103,12 @@ public sealed class StreamingHub
     private readonly IClientDiagnosticSink _clientDiagnosticSink;
 
     // ---- Step 1 drop-counter probe for issue #299 -----------------------
-    // Each per-client send queue is bounded to MaxBacklogPerClient=4. When
+    // Each per-client send queue is bounded to MaxBacklogPerClient. When
     // the producer outruns SendLoopAsync — e.g. under a TCP/WebView stall —
-    // non-display writes discard the oldest frame. Display snapshots for the
-    // same RX stream coalesce in place. These counters distinguish actual
-    // evictions from display coalescing while retaining the #299 log names.
+    // high-rate telemetry is discarded before control-plane frames. Display
+    // snapshots for the same RX stream coalesce in place. These counters
+    // distinguish actual evictions from display coalescing while retaining
+    // the #299 log names.
     //
     // Buckets:
     //   audio   — RX audio frames (the user-audible path)
@@ -277,7 +281,7 @@ public sealed class StreamingHub
     {
         if (result.Change == SendQueueChange.Coalesced)
             Interlocked.Increment(ref _displayCoalesced);
-        else if (result.Change == SendQueueChange.DroppedOldest)
+        else if (result.Change is SendQueueChange.DroppedOldest or SendQueueChange.DroppedIncoming)
             RecordDroppedFrame(result.DroppedType);
     }
 

@@ -8,14 +8,14 @@ namespace Zeus.Server.Diagnostics;
 /// you cannot collect logs retroactively, so the button just snapshots whatever
 /// is already here.
 ///
-/// Capacity is generous (<see cref="Capacity"/>) so a report can always include
-/// the most recent <see cref="ReportTailLines"/> (100) lines the operator asked
-/// for, plus headroom for recipe-specific filtering.
+/// Capacity is generous (<see cref="Capacity"/>) so a report can retain a useful
+/// history window and reserve older warnings and errors while still including
+/// the newest Information lines.
 /// </summary>
 public sealed class DiagnosticLogBuffer
 {
     /// <summary>How many lines the ring retains.</summary>
-    public const int Capacity = 1000;
+    public const int Capacity = 4000;
 
     /// <summary>How many trailing lines the report ships (operator requirement).</summary>
     public const int ReportTailLines = 100;

@@ -7,7 +7,8 @@ using Zeus.Protocol1;
 namespace Zeus.Server;
 
 public sealed record StationEngineHostingOptions(
-    bool NativeAudioOutputEnabled = false);
+    bool NativeAudioOutputEnabled = false,
+    string? P2AutoConnectEndpoint = null);
 
 /// <summary>Registers the complete standalone station-engine runtime.</summary>
 public static class StationEngineHostingExtensions
@@ -155,6 +156,7 @@ public static class StationEngineHostingExtensions
             Func<TxAudioIngest?> txIngestFactory = () => sp.GetService<TxAudioIngest>();
             return ActivatorUtilities.CreateInstance<DspPipelineService>(sp, txIngestFactory);
         });
+        services.AddProtocol2ConnectionServices();
         services.AddSingleton<FrequencyCalibrationService>();
         services.AddSingleton<ImdMeasureService>();
         services.AddSingleton<TxService>();
@@ -190,6 +192,13 @@ public static class StationEngineHostingExtensions
         // boot instead of silently running at defaults until the first edit.
         services.AddHostedService<DisplaySettingsApplyService>();
         services.AddHostedService(sp => sp.GetRequiredService<DspPipelineService>());
+        if (!string.IsNullOrWhiteSpace(options.P2AutoConnectEndpoint))
+        {
+            services.AddSingleton(new P2AutoConnectOptions(options.P2AutoConnectEndpoint));
+            services.AddSingleton<P2AutoConnectService>();
+            services.AddHostedService(sp =>
+                sp.GetRequiredService<P2AutoConnectService>());
+        }
         services.AddHostedService(sp => sp.GetRequiredService<TxAudioIngestStartup>());
         services.AddHostedService(sp => sp.GetRequiredService<TxMicMeterService>());
         services.AddHostedService(sp => sp.GetRequiredService<SignalJammerTxSource>());

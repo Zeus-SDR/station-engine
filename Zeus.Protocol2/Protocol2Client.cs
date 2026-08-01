@@ -3566,6 +3566,39 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             (ushort)(alex1 >> 16));
     }
 
+    /// <summary>
+    /// True when <paramref name="board"/> carries the classic Alex filter board
+    /// (RX high-pass filters) rather than the ANAN-7000 / Saturn band-pass board.
+    ///
+    /// The two generations reuse the same low Alex0 bits with different per-band
+    /// meanings, so selecting the wrong table can reject the tuned band. Thetis
+    /// <c>console.cs:setAlex1HPF</c> sends only OrionMkII, Saturn, and HermesC10
+    /// through its BPF path; pihpsdr <c>new_protocol.c</c> likewise reserves that
+    /// path for NEW_DEVICE_ORION2, NEW_DEVICE_SATURN, and NEW_DEVICE_G1, with its
+    /// default using the old ANAN-100/200 HPFs. The bit maps are documented
+    /// separately in pihpsdr <c>alex.h</c>.
+    ///
+    /// This is deliberately a POSITIVE allow-list, not the references' inverted
+    /// default — do NOT "simplify" it to
+    /// <c>board is not (OrionMkII or HermesC10)</c>. Two boards are intentionally
+    /// left on the ANAN-7000 branch so their wire bytes stay identical to the
+    /// pre-#714 behaviour:
+    /// <list type="bullet">
+    /// <item><see cref="HpsdrBoardKind.Unknown"/> (0xFF) is the disconnected /
+    /// unrecognised sentinel. A future unrecognised Apache board is far likelier
+    /// to be Saturn-family, and pinning the sentinel keeps the wire unchanged if
+    /// discovery ever degrades on a board that is otherwise known-good.</item>
+    /// <item><see cref="HpsdrBoardKind.HermesLite2"/> (0x06) has no Alex filter
+    /// board at all, so these bits are inert; it is pinned rather than moved.</item>
+    /// </list>
+    /// </summary>
+    internal static bool IsClassicAlexBoard(HpsdrBoardKind board) => board is
+        HpsdrBoardKind.Metis        // 0x00 Mercury+Penelope+Metis / Atlas
+        or HpsdrBoardKind.Hermes    // 0x01 Hermes / ANAN-10 / ANAN-100
+        or HpsdrBoardKind.HermesII  // 0x02 ANAN-10E / ANAN-100B
+        or HpsdrBoardKind.Angelia   // 0x04 ANAN-100D (issue #714)
+        or HpsdrBoardKind.Orion;    // 0x05 ANAN-200D (issue #714)
+
     internal static uint ComputeAlexWord(
         uint rxFreqHz,
         uint txFreqHz,
@@ -3576,13 +3609,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         bool psEnabled = false)
     {
         uint word = 0;
-        bool classicAlex = board is HpsdrBoardKind.Hermes or HpsdrBoardKind.HermesII;
         bool forceRxBypass = rfFilters is not null
             && (rfFilters.RxBypassAll
                 || (xmit && rfFilters.RxBypassOnTx)
                 || (xmit && psEnabled && rfFilters.RxBypassOnPureSignal));
 
-        word |= classicAlex
+        word |= IsClassicAlexBoard(board)
             ? BpfBitsClassicAlex(rxFreqHz, rfFilters, forceRxBypass)
             : BpfBitsAnan7000(rxFreqHz, rfFilters, forceRxBypass);
         // LPF bit positions and band thresholds are identical across both

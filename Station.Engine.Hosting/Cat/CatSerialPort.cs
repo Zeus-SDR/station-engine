@@ -48,6 +48,7 @@ internal sealed class CatSerialPort : IDisposable
 
     private readonly TciRateLimiter _rateLimiter;
     private readonly CatCommandHandler _handler;
+    private readonly CatWireLogger _wireLog;
     private readonly object _writeLock = new();
 
     private SerialPort? _port;
@@ -65,6 +66,7 @@ internal sealed class CatSerialPort : IDisposable
         _dataBits = dataBits;
         _stopBits = stopBits;
         _log = log;
+        _wireLog = new CatWireLogger(log, $"serial:{path}", options.WireLogAtInformation);
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
         _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
     }
@@ -150,7 +152,12 @@ internal sealed class CatSerialPort : IDisposable
             foreach (var token in commands)
             {
                 Interlocked.Increment(ref _activity);
-                try { _handler.Dispatch(token); }
+                try
+                {
+                    _wireLog.Rx(token + ";");
+                    await _handler.DispatchAsync(token, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
                 catch (Exception ex) { _log.LogDebug(ex, "cat.serial dispatch error port={Port} token={Token}", _path, token); }
             }
         }
@@ -168,7 +175,11 @@ internal sealed class CatSerialPort : IDisposable
         {
             lock (_writeLock)
             {
-                if (port.IsOpen) port.Write(line);
+                if (port.IsOpen)
+                {
+                    port.Write(line);
+                    _wireLog.Tx(line);
+                }
             }
         }
         catch (Exception ex)
@@ -184,6 +195,7 @@ internal sealed class CatSerialPort : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        try { _wireLog.FlushSuppressed(); } catch { }
         _rateLimiter.Dispose();
         var port = _port;
         _port = null;

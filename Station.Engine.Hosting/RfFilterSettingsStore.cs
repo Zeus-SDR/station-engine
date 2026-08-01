@@ -9,6 +9,7 @@
 
 using LiteDB;
 using Zeus.Contracts;
+using Zeus.Protocol2;
 
 namespace Zeus.Server;
 
@@ -233,7 +234,7 @@ public sealed class RfFilterSettingsStore : IDisposable
         board is not HpsdrBoardKind.HermesLite2 and not HpsdrBoardKind.Unknown;
 
     private static string ProfileKeyFor(HpsdrBoardKind board) =>
-        board is HpsdrBoardKind.Hermes or HpsdrBoardKind.HermesII
+        Protocol2Client.IsClassicAlexBoard(board)
             ? ClassicProfileKey
             : AnanProfileKey;
 

@@ -2657,7 +2657,10 @@ public sealed record TxAudioProfileDto(
     Dictionary<string, Dictionary<string, string>> NativePluginStates, // zeusId -> {settingKey -> jsonValue}
     // ---- fidelity policy ----
     int TargetSpectralDensity,       // [0,100]
-    DateTime CreatedUtc, DateTime UpdatedUtc);
+    DateTime CreatedUtc, DateTime UpdatedUtc,
+    // Product TX Suite uses this marker to distinguish real captured DSP
+    // values from the placeholder fields found in legacy product profiles.
+    int SchemaVersion = 2);
 
 public sealed record TxAudioProfilesResponse(IReadOnlyList<TxAudioProfileDto> Profiles);
 

@@ -107,23 +107,18 @@ public sealed class TciRateLimiter : IDisposable
     {
         if (_pending.IsEmpty) return;
 
-        // Snapshot and clear atomically
-        var toSend = _pending.ToArray();
-        foreach (var kvp in toSend)
+        foreach (string key in _pending.Keys)
         {
-            _pending.TryRemove(kvp.Key, out _);
-        }
-
-        // Send outside the lock
-        foreach (var kvp in toSend)
-        {
-            try
+            if (_pending.TryRemove(key, out string? line))
             {
-                _send(kvp.Value);
-            }
-            catch
-            {
-                // Don't let a send failure stop other events from flushing
+                try
+                {
+                    _send(line);
+                }
+                catch
+                {
+                    // Don't let a send failure stop other events from flushing
+                }
             }
         }
     }

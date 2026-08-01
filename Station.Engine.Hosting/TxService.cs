@@ -326,6 +326,16 @@ public sealed class TxService
         if (current.Status == ConnectionStatus.Connected
             && proposed.Status != ConnectionStatus.Connected)
             return;
+        // CAT may restore the receive dial after the radio wire has dropped
+        // while post-wire DSP teardown is still serialized by _transitionSync.
+        // Once host intent is clear there is no active transmission to
+        // revalidate, so that safe RX-only tune must not be rejected merely
+        // because teardown still owns the transition lock.
+        TransmitIntent? activeIntent;
+        // This callback may already hold RadioService._sync. Keep the TxService
+        // lock field-only, release it, then make the reentrant radio read.
+        lock (_sync) activeIntent = _activeIntent;
+        if (activeIntent is null && !_radio.IsMox) return;
         if (!Monitor.TryEnter(_transitionSync))
             throw new TransmitSafetyRejectedException("TX state change blocked while a transmit transition is in progress");
         try
@@ -480,10 +490,12 @@ public sealed class TxService
         }
     }
 
-    private void ConvergeToSafeIdle(bool faultLatched)
+    private void ConvergeToSafeIdle(bool faultLatched, Action? onPostWireIdle = null)
     {
         long revision = NextTransitionRevision();
         bool failed = false;
+        bool wireDropped = false;
+        bool hostClearedEarly = false;
         void Safe(string step, Action action)
         {
             try { action(); }
@@ -500,16 +512,37 @@ public sealed class TxService
         // attempted; stale host booleans never suppress convergence.
         Safe("egress.revoke", _pipeline.RevokeTxEgress);
         Safe("hardwareCw.disarm", () => _radio.SetHardwareCwSafetyBlocked(true));
-        Safe("wire.mox.off", () => _radio.SetMox(false));
+        Safe("wire.mox.off", () =>
+        {
+            _radio.SetMox(false);
+            wireDropped = true;
+        });
         var wireDroppedTs = _stopwatchTicks();
         Safe("authority.revoke", () => _radio.SetTxSafetyAuthority(false));
         Safe("generator.tune.off", () => _pipeline.SetTxTune(false));
         Safe("generator.twoTone.off", () => _radio.SetTwoToneRuntimeEnabled(false));
         Safe("tune.latch.off", _radio.ClearTunActiveForSafety);
         Safe("drive.inhibit", _radio.ApplyTxSafetyInhibit);
+
+        // A CAT release can unblock its ordered command stream once the wire is
+        // down and host state reports RX. The potentially-blocking DSP teardown
+        // remains behind _transitionSync, so a new TX transition cannot race it;
+        // only RX-safe state changes such as the Fake It FA restore may proceed.
+        if (onPostWireIdle is not null && wireDropped)
+        {
+            ClearHostIntent(revision);
+            _safety.ObserveConfirmedIdle();
+            onPostWireIdle();
+            hostClearedEarly = true;
+        }
+
         Safe("dsp.mox.off", () => _pipeline.SetMox(false));
-        ClearHostIntent(revision);
-        _safety.ObserveConfirmedIdle();
+        if (!hostClearedEarly)
+        {
+            ClearHostIntent(revision);
+            _safety.ObserveConfirmedIdle();
+            onPostWireIdle?.Invoke();
+        }
 
         if (failed)
         {
@@ -546,32 +579,7 @@ public sealed class TxService
         lock (_transitionSync)
         {
             if (!on)
-            {
-                TransmitIntent? active;
-                MoxSource? owner;
-                lock (_sync) { active = _activeIntent; owner = _moxOwner; }
-                if (active == TransmitIntent.Mox
-                    && source != MoxSource.UI
-                    && owner is not null
-                    && owner != source)
-                {
-                    error = $"MOX held by {owner}; only UI can override";
-                    return false;
-                }
-                if (active is not null && active != TransmitIntent.Mox && source != MoxSource.UI)
-                {
-                    error = $"TX held by {active}; only UI can force the master unkey";
-                    return false;
-                }
-
-                if (active == TransmitIntent.Mox)
-                    DrainMoxTailBestEffort();
-                ConvergeToSafeIdle(faultLatched: false);
-                _log.LogInformation("tx.mox on=false");
-                _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
-                error = null;
-                return true;
-            }
+                return TrySetMoxOffUnderTransitionLock(source, onPostWireIdle: null, out error);
 
             if (!EvaluateAdmission(TransmitIntent.Mox, source, out error)) return false;
             lock (_sync)
@@ -617,6 +625,92 @@ public sealed class TxService
                 return false;
             }
         }
+    }
+
+    /// <summary>
+    /// CAT transition path. Release preserves the configured pre-wire TX tail,
+    /// then unblocks the session as soon as hardware wire and host MOX truth are
+    /// RX. Post-wire DSP teardown continues on the thread pool while holding
+    /// the normal transition lock. Key-up deliberately remains synchronous and
+    /// waits for that lock: CAT responsiveness never takes priority over
+    /// completing teardown before a new transmission.
+    /// </summary>
+    internal async ValueTask<(bool Success, string? Error)> TrySetMoxFromCatAsync(
+        bool on,
+        CancellationToken cancellationToken)
+    {
+        if (on)
+        {
+            bool success = TrySetMox(true, MoxSource.Cat, out string? keyError);
+            return (success, keyError);
+        }
+
+        var ready = new TaskCompletionSource<(bool Success, string? Error)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        bool queued = ThreadPool.QueueUserWorkItem(_ =>
+        {
+            bool success = false;
+            string? releaseError = null;
+            try
+            {
+                lock (_transitionSync)
+                {
+                    success = TrySetMoxOffUnderTransitionLock(
+                        MoxSource.Cat,
+                        () => ready.TrySetResult((true, null)),
+                        out releaseError);
+                }
+            }
+            catch (Exception ex)
+            {
+                releaseError = ex.Message;
+                _log.LogWarning(ex, "tx.mox.cat.release.failed");
+            }
+            finally
+            {
+                ready.TrySetResult((success, releaseError));
+            }
+        });
+
+        if (!queued)
+        {
+            bool success = TrySetMox(false, MoxSource.Cat, out string? releaseError);
+            return (success, releaseError);
+        }
+
+        return await ready.Task.WaitAsync(cancellationToken);
+    }
+
+    private bool TrySetMoxOffUnderTransitionLock(
+        MoxSource source,
+        Action? onPostWireIdle,
+        out string? error)
+    {
+        TransmitIntent? active;
+        MoxSource? owner;
+        lock (_sync) { active = _activeIntent; owner = _moxOwner; }
+        if (active == TransmitIntent.Mox
+            && source != MoxSource.UI
+            && owner is not null
+            && owner != source)
+        {
+            error = $"MOX held by {owner}; only UI can override";
+            return false;
+        }
+        if (active is not null && active != TransmitIntent.Mox && source != MoxSource.UI)
+        {
+            error = $"TX held by {active}; only UI can force the master unkey";
+            return false;
+        }
+
+        if (active == TransmitIntent.Mox)
+            DrainMoxTailBestEffort();
+        ConvergeToSafeIdle(faultLatched: false, onPostWireIdle);
+        _log.LogInformation("tx.mox on=false");
+        _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
+        error = null;
+        return true;
     }
 
     /// <summary>
