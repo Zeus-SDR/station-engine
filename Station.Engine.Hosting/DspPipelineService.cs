@@ -743,11 +743,43 @@ public class DspPipelineService : BackgroundService,
         public long IqRmsLogMs; // 1 Hz IQ RMS/peak probe gate
         public long RoutedFrames; // diag: IQ frames routed to this receiver index
         public long FedFrames;    // diag: IQ frames actually FeedIq'd (channel open)
+        // Last values applied to this WDSP channel. Radio state notifications are
+        // whole-state snapshots, so a VFO-B drag otherwise re-sends mode, filter,
+        // AGC, NR, and squelch on every mouse move. In particular, SetMode clears
+        // WDSP's queued demodulated audio. RX1 already change-latches these values;
+        // keep the same behavior for every secondary receiver.
+        public RxMode? AppliedMode;
+        public int AppliedFilterLowHz = int.MinValue;
+        public int AppliedFilterHighHz = int.MinValue;
+        public long AppliedVfoHz = long.MinValue;
+        public int AppliedCtunShiftHz = int.MinValue;
+        public double AppliedAgcTopDb = double.NaN;
+        public NrConfig? AppliedNr;
+        public AgcConfig? AppliedAgc;
+        public SquelchConfig? AppliedSquelch;
+        public BandpassWindow? AppliedBandpassWindow;
+        public int AppliedZoom = int.MinValue;
         // Slewed AF-gain dB last pushed to this secondary's WDSP channel.
         // NaN sentinel = "no value applied yet" — used at channel-open so
         // the freshly-opened channel snaps to the operator's target instead
         // of dragging from a stale 0 dB. See AfGainSlewMaxDbPerTick.
         public double AppliedAfGainDb = double.NaN;
+
+        public void ResetAppliedState()
+        {
+            AppliedMode = null;
+            AppliedFilterLowHz = int.MinValue;
+            AppliedFilterHighHz = int.MinValue;
+            AppliedVfoHz = long.MinValue;
+            AppliedCtunShiftHz = int.MinValue;
+            AppliedAgcTopDb = double.NaN;
+            AppliedAfGainDb = double.NaN;
+            AppliedNr = null;
+            AppliedAgc = null;
+            AppliedSquelch = null;
+            AppliedBandpassWindow = null;
+            AppliedZoom = int.MinValue;
+        }
     }
     private readonly SecondaryRx[] _secondaryRx;
     private int _sampleRateHz;
@@ -4609,11 +4641,19 @@ public class DspPipelineService : BackgroundService,
             _appliedAgcCeilingDb = StepTowardCappedDb(
                 _appliedAgcCeilingDb, effectiveAgcTarget, AgcTopSlewMaxDbPerTick);
             engine.SetAgcTop(channel, _appliedAgcCeilingDb);
-            if (rx2Channel >= 0) engine.SetAgcTop(rx2Channel, _appliedAgcCeilingDb);
+            if (rx2Channel >= 0)
+            {
+                engine.SetAgcTop(rx2Channel, _appliedAgcCeilingDb);
+                _secondaryRx[1].AppliedAgcTopDb = _appliedAgcCeilingDb;
+            }
             for (int ri = 2; ri < MaxReceivers; ri++)
             {
                 int sec = Volatile.Read(ref _secondaryRx[ri].ChannelId);
-                if (sec >= 0) engine.SetAgcTop(sec, _appliedAgcCeilingDb);
+                if (sec >= 0)
+                {
+                    engine.SetAgcTop(sec, _appliedAgcCeilingDb);
+                    _secondaryRx[ri].AppliedAgcTopDb = _appliedAgcCeilingDb;
+                }
             }
         }
         // (Removed: the manual AGC "knee" push. WDSP's threshold and AGC-T are
@@ -5216,6 +5256,11 @@ public class DspPipelineService : BackgroundService,
         }
         catch
         {
+            // ApplyState advances per-control latches only after each successful
+            // setter. If a later setter fails, the native channel is discarded;
+            // none of those remembered values describe the next fresh channel.
+            // Reset all of them so a retry performs the complete initialization.
+            rx.ResetAppliedState();
             try { engine.CloseChannel(opened); } catch { /* best-effort */ }
             throw;
         }
@@ -5227,7 +5272,7 @@ public class DspPipelineService : BackgroundService,
         Volatile.Write(ref _secondaryRx[rxIndex].ChannelId, -1);
         // NaN = "no value applied yet" — a future reopen snaps to the
         // operator's target instead of slewing from this stale value.
-        _secondaryRx[rxIndex].AppliedAfGainDb = double.NaN;
+        _secondaryRx[rxIndex].ResetAppliedState();
         try { engine.CloseChannel(chan); }
         catch (Exception ex)
         {
@@ -5246,7 +5291,7 @@ public class DspPipelineService : BackgroundService,
             Volatile.Write(ref _secondaryRx[i].ChannelId, -1);
             // See SecondaryRx.AppliedAfGainDb — engine swap discards any
             // prior slewed state, so the new channel snaps to its target.
-            _secondaryRx[i].AppliedAfGainDb = double.NaN;
+            _secondaryRx[i].ResetAppliedState();
         }
     }
 
@@ -5351,9 +5396,23 @@ public class DspPipelineService : BackgroundService,
         // symmetric DIGU/DIGL state before it reaches the secondary engine.
         var (secEngineMode, signedFilterLow, signedFilterHigh) = SecondaryEngineFilterFor(
             mode, vfoHz, filterLow, filterHigh);
-        engine.SetMode(channelId, secEngineMode);
-        engine.SetFilter(channelId, signedFilterLow, signedFilterHigh);
-        engine.SetVfoHz(channelId, vfoHz);
+        if (rx.AppliedMode != secEngineMode)
+        {
+            engine.SetMode(channelId, secEngineMode);
+            rx.AppliedMode = secEngineMode;
+        }
+        if (rx.AppliedFilterLowHz != signedFilterLow ||
+            rx.AppliedFilterHighHz != signedFilterHigh)
+        {
+            engine.SetFilter(channelId, signedFilterLow, signedFilterHigh);
+            rx.AppliedFilterLowHz = signedFilterLow;
+            rx.AppliedFilterHighHz = signedFilterHigh;
+        }
+        if (rx.AppliedVfoHz != vfoHz)
+        {
+            engine.SetVfoHz(channelId, vfoHz);
+            rx.AppliedVfoHz = vfoHz;
+        }
         UpdateRxLo(rxIndex, s);
         // P2 true-DDC: the secondary's hardware DDC sits at rx.LoHz, so the WDSP
         // shift roams the dial within that window — EffectiveLoHz(vfo) − rx.LoHz.
@@ -5366,13 +5425,21 @@ public class DspPipelineService : BackgroundService,
             vfoHz,
             rx.LoHz,
             protocol2: _p2Client is not null);
-        engine.SetCtunShift(channelId, shiftHz);
+        if (rx.AppliedCtunShiftHz != shiftHz)
+        {
+            engine.SetCtunShift(channelId, shiftHz);
+            rx.AppliedCtunShiftHz = shiftHz;
+        }
         // AGC-T fanout uses the per-tick slewed ceiling computed in the
         // main OnRadioStateChanged block, not the raw target — so RX2..N
         // see the same rate-capped dB as RX1 (no extra fan-out wiring
-        // needed at the slew-advance site). Pushing every tick re-applies
-        // the value on a freshly-opened channel for free.
-        engine.SetAgcTop(channelId, _appliedAgcCeilingDb);
+        // needed at the slew-advance site). The applied-value latch still
+        // guarantees a freshly-opened channel receives the current value.
+        if (rx.AppliedAgcTopDb != _appliedAgcCeilingDb)
+        {
+            engine.SetAgcTop(channelId, _appliedAgcCeilingDb);
+            rx.AppliedAgcTopDb = _appliedAgcCeilingDb;
+        }
         // Per-secondary AF-gain slew: each receiver has its own slider
         // (Receivers[i].AfGainDb) so the rate-cap state is per-SecondaryRx.
         // NaN sentinel = "no value applied yet" — snaps on the first push
@@ -5380,13 +5447,37 @@ public class DspPipelineService : BackgroundService,
         double afNext = double.IsNaN(rx.AppliedAfGainDb)
             ? afGainDb
             : StepTowardCappedDb(rx.AppliedAfGainDb, afGainDb, AfGainSlewMaxDbPerTick);
-        engine.SetRxAfGainDb(channelId, afNext);
-        rx.AppliedAfGainDb = afNext;
-        engine.SetNoiseReduction(channelId, nr);
-        engine.SetAgc(channelId, agc);
-        engine.SetSquelch(channelId, squelch);
-        engine.SetRxBandpassWindow(channelId, s.RxFilterWindow);
-        engine.SetZoom(channelId, DdcZoomLevel(s.ZoomLevel));
+        if (rx.AppliedAfGainDb != afNext)
+        {
+            engine.SetRxAfGainDb(channelId, afNext);
+            rx.AppliedAfGainDb = afNext;
+        }
+        if (rx.AppliedNr != nr)
+        {
+            engine.SetNoiseReduction(channelId, nr);
+            rx.AppliedNr = nr;
+        }
+        if (rx.AppliedAgc != agc)
+        {
+            engine.SetAgc(channelId, agc);
+            rx.AppliedAgc = agc;
+        }
+        if (rx.AppliedSquelch != squelch)
+        {
+            engine.SetSquelch(channelId, squelch);
+            rx.AppliedSquelch = squelch;
+        }
+        if (rx.AppliedBandpassWindow != s.RxFilterWindow)
+        {
+            engine.SetRxBandpassWindow(channelId, s.RxFilterWindow);
+            rx.AppliedBandpassWindow = s.RxFilterWindow;
+        }
+        int zoom = DdcZoomLevel(s.ZoomLevel);
+        if (rx.AppliedZoom != zoom)
+        {
+            engine.SetZoom(channelId, zoom);
+            rx.AppliedZoom = zoom;
+        }
     }
 
     // iter5 (task #4): the four channel pumps that used to live here

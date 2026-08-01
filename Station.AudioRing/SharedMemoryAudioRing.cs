@@ -8,6 +8,8 @@ namespace Station.AudioRing;
 /// <summary>Engine-owned side of a private bidirectional audio-ring session.</summary>
 public sealed class AudioRingOwner : IDisposable
 {
+    private static readonly long SignalWaitSliceTicks =
+        Math.Max(1, System.Diagnostics.Stopwatch.Frequency / 1_000);
     private const int SlotCount = 8;
     private const int RingHeaderBytes = 64;
     private const int SlotHeaderBytes = 32;
@@ -142,7 +144,7 @@ public sealed class AudioRingOwner : IDisposable
 
         var started = AudioRingProtocol.Timestamp();
         var sequence = Interlocked.Increment(ref _sequence);
-        DrainResponses(sequence, input.Length, output, out _);
+        DrainResponses(sequence, input.Length, out _);
         if (!_input.TryWrite(sequence, input) || !_inputSignal.TrySet())
         {
             roundTripTicks = AudioRingProtocol.ElapsedTicks(started);
@@ -150,16 +152,44 @@ public sealed class AudioRingOwner : IDisposable
         }
 
         var timeoutTicks = timeout.TotalSeconds * System.Diagnostics.Stopwatch.Frequency;
-        while (AudioRingProtocol.ElapsedTicks(started) < timeoutTicks)
+        var spinner = new SpinWait();
+        while (true)
         {
-            if (DrainResponses(sequence, input.Length, output, out var found) && found)
+            var remainingTicks = timeoutTicks - AudioRingProtocol.ElapsedTicks(started);
+            if (remainingTicks <= 0)
+                break;
+
+            if (DrainResponses(sequence, input.Length, out var found) && found)
             {
-                _outputSignal.Drain();
                 roundTripTicks = AudioRingProtocol.ElapsedTicks(started);
+                if (roundTripTicks > timeoutTicks)
+                    break;
+                _discard.AsSpan(0, input.Length).CopyTo(output);
+                _outputSignal.Drain();
                 return true;
             }
 
-            Thread.SpinWait(32);
+            remainingTicks = timeoutTicks - AudioRingProtocol.ElapsedTicks(started);
+            if (remainingTicks <= 0)
+                break;
+
+            // A short spin catches responses that are already being committed.
+            // After that, block on the existing cross-process edge instead of
+            // consuming the CPU needed by Product and nested plug-in workers.
+            // Always re-check the ring after Wait: an edge may be stale or a
+            // response may commit exactly as the deadline expires.
+            if (spinner.Count < 8)
+            {
+                spinner.SpinOnce();
+                continue;
+            }
+
+            // Keep waits short. Besides limiting scheduler wake-up jitter, this
+            // makes the ring itself authoritative if a platform signal edge is
+            // coalesced or consumed just before the response is committed.
+            var waitTicks = Math.Min(remainingTicks, SignalWaitSliceTicks);
+            _outputSignal.Wait(TimeSpan.FromSeconds(
+                waitTicks / System.Diagnostics.Stopwatch.Frequency));
         }
 
         _outputSignal.Drain();
@@ -195,14 +225,13 @@ public sealed class AudioRingOwner : IDisposable
         return read;
     }
 
-    private bool DrainResponses(long wanted, int wantedSamples, Span<float> output, out bool found)
+    private bool DrainResponses(long wanted, int wantedSamples, out bool found)
     {
         found = false;
         while (_output.TryRead(out var sequence, out var sampleCount, _discard))
         {
             if (sequence != wanted || sampleCount != wantedSamples)
                 continue;
-            _discard.AsSpan(0, sampleCount).CopyTo(output);
             found = true;
             return true;
         }

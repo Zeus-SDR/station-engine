@@ -125,6 +125,29 @@ source file, any such dual-licensing notice from that file is to be
 preserved in the corresponding Zeus per-file header — not stripped to
 GPL alone.
 
+## SPE Expert 1.5K Taurus amplifier support
+
+The amplifier backend under
+[`Station.Engine.Hosting/SpeTaurus/`](Station.Engine.Hosting/SpeTaurus/) is
+distributed under **GNU General Public License, version 3 or (at your option)
+any later version** (GPL-3.0-or-later). Its detailed source and licensing record
+is preserved in
+[`Station.Engine.Hosting/SpeTaurus/SOURCE.md`](Station.Engine.Hosting/SpeTaurus/SOURCE.md).
+
+Review found substantial source overlap with the GPL-3.0-or-later Taurus
+desktop implementation, which was itself informed by
+[`netjordan/spe-expert-remote`](https://github.com/netjordan/spe-expert-remote).
+The earlier independent/clean-room claim was withdrawn. Relocation into the
+public GPL station engine provides the approved distribution path for that
+provenance. The implementation was also developed with the public
+[SPE Application Programmer's Guide, revision 1.1](https://www.spetlc.com/images/download/SPE_Application_Programmers_Guide.pdf)
+and the [FTDI D2XX Programmer's Guide](https://ftdichip.com/wp-content/uploads/2025/06/D2XX_Programmers_Guide.pdf),
+plus FTDI's public D2XX driver documentation.
+
+The rest of the engine is GPL-2.0-or-later, whose "or later" option permits
+combination with this GPL-3.0-or-later work. The resulting station-engine
+binary is therefore distributed as **GPL-3.0-or-later**.
+
 ## WDSP
 
 Zeus loads **WDSP** (Warren Pratt, NR0V) via P/Invoke for all on-air DSP.

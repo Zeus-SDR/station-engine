@@ -12,21 +12,29 @@ The source is maintained by Douglas J. Cerrato (KB2UKA) and Christian Suarez
 
 ## License
 
-The Zeus Station Engine is licensed under the **GNU General Public License,
-version 2 or (at your option) any later version**. The full text is in
-[`LICENSE`](LICENSE); provenance and per-component attribution are in
-[`ATTRIBUTIONS.md`](ATTRIBUTIONS.md); third-party components and their
-preserved license texts are inventoried in
+The station engine binary is conveyed under the **GNU General Public License,
+version 3 or (at your option) any later version**. The full text is in
+[`LICENSE`](LICENSE), which also states the scope summarised here; provenance
+and per-component attribution are in [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md);
+third-party components and their preserved license texts are inventoried in
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+Most first-party engine code is licensed **GPL-2.0-or-later**, and those files
+individually remain available under that license; the version 2 text is in
+[`LICENSE.GPL-2.0`](LICENSE.GPL-2.0). The SPE Expert 1.5K Taurus amplifier
+support under `Station.Engine.Hosting/SpeTaurus/` is **GPL-3.0-or-later** (its
+provenance is recorded in
+[`Station.Engine.Hosting/SpeTaurus/SOURCE.md`](Station.Engine.Hosting/SpeTaurus/SOURCE.md)).
+Because the engine combines both, the distributed binary is GPL-3.0-or-later —
+permitted by the "or later" option on the GPL-2.0-or-later portions.
 
 This repository is the **complete corresponding source** for the station engine
 binary distributed with Zeus SDR. Each release tag here matches the engine
 shipped in the corresponding Zeus release.
 
 `Station.AudioRing` is first-party code additionally published under the MIT
-license so it can be reused outside Zeus; all other first-party code here is
-GPL-2.0-or-later. Third-party components carry their own licences — see
-[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+license so it can be reused outside Zeus. Third-party components carry their own
+licences — see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 The Zeus SDR client that drives this engine is a separate, proprietary program
 communicating over the loopback station protocol documented below. It is not

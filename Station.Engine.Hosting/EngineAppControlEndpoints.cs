@@ -10,18 +10,17 @@
 namespace Zeus.Server;
 
 /// <summary>
-/// App-lifecycle routes for the standalone station engine. Only restart is
-/// mapped: the Zeus Link launcher supervises the engine process and respawns
-/// it after ANY exit (see the launcher engine supervisor), so an engine
-/// "restart" is a graceful shutdown — the launcher brings the replacement up
-/// with the same arguments on the same port. This deliberately does NOT reuse
-/// the desktop host's AppRestartService, which self-relaunches a detached
-/// replacement process; under the launcher that would race the supervisor's
-/// own respawn and put two engines on one port.
+/// App-lifecycle routes for the standalone station engine. The Zeus Link
+/// launcher supervises the engine process and respawns it after any exit, so
+/// while the supervisor is live an engine restart or shutdown produces the
+/// same supervised replacement. This deliberately does not reuse the desktop
+/// host's AppRestartService, which would race that supervisor.
 ///
-/// Quit is NOT mapped on the engine: exiting the engine alone is meaningless
-/// under a supervisor that immediately respawns it. Closing the Zeus Link
-/// window is the launcher's concern.
+/// <c>POST /shutdown</c> is the launcher's graceful engine-stop contract, not
+/// an operator quit command. During launcher teardown it lets the engine finish
+/// its three-second host shutdown budget instead of being force-killed after
+/// the launcher's five-second wait. Keep this contract aligned with
+/// <c>zeus-link-launcher/src/engine/process.rs</c>.
 /// </summary>
 public static class EngineAppControlEndpoints
 {
@@ -34,51 +33,89 @@ public static class EngineAppControlEndpoints
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
-        endpoints.MapPost("/api/app/restart", (HttpContext ctx, IHostApplicationLifetime lifetime) =>
-        {
-            // Guard: loopback requests only, and when an Origin header is
-            // present it must be an allowed browser origin (pinned app origins
-            // or plain-http loopback). The desktop host's same-origin guard
-            // (LocalRequestGuard.RejectIfNotLocalSameOrigin) would reject the
-            // legitimate Zeus Link flow, where the product bundle serves the
-            // SPA from a DIFFERENT loopback port than the engine — so the
-            // engine uses the same origin allowlist as its /ws WebSocket.
-            if (!LocalRequestGuard.IsLocalRequest(ctx))
+        endpoints.MapPost(
+            "/api/app/restart",
+            (HttpContext ctx, IHostApplicationLifetime lifetime, ILoggerFactory loggerFactory) =>
             {
-                return Results.Json(
-                    new { error = "Open Zeus on the machine running the engine to restart Zeus." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
+                var rejection = RejectDisallowedRequest(ctx, "restart");
+                if (rejection is not null)
+                    return rejection;
 
-            var origins = ctx.Request.Headers.Origin;
-            if (origins.Count > 1
-                || (origins.Count == 1
-                    && (origins[0] is not { } origin
-                        || !StationEngineEndpoints.IsBrowserOriginAllowed(origin))))
-            {
-                return Results.Json(
-                    new { error = "Zeus can only restart from an allowed local app origin." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(RestartFlushDelayMs).ConfigureAwait(false);
-                try
-                {
-                    lifetime.StopApplication();
-                }
-                catch
-                {
-                    // The host may already be stopping (test hosts, shutdown
-                    // race) — the launcher respawn decision does not depend on
-                    // this call landing.
-                }
+                StopAfterResponseFlush(lifetime, Log(loggerFactory));
+                return Results.Ok(new { restarting = true });
             });
 
-            return Results.Ok(new { restarting = true });
-        });
+        endpoints.MapPost(
+            "/shutdown",
+            (HttpContext ctx, IHostApplicationLifetime lifetime, ILoggerFactory loggerFactory) =>
+            {
+                var rejection = RejectDisallowedRequest(ctx, "shut down");
+                if (rejection is not null)
+                    return rejection;
+
+                var log = Log(loggerFactory);
+                // The operator report behind issue #716 contained no
+                // shutdown-time evidence at all — the engine had no way to say
+                // it had been asked to stop. Stamp that into zeus-app.log so
+                // the next "Zeus will not close" report is diagnosable.
+                log.LogInformation("engine.shutdown accepted");
+                StopAfterResponseFlush(lifetime, log);
+                return Results.Ok(new { shuttingDown = true });
+            });
 
         return endpoints;
+    }
+
+    private static IResult? RejectDisallowedRequest(HttpContext ctx, string action)
+    {
+        // Guard: loopback requests only, and when an Origin header is present
+        // it must be an allowed browser origin. This admits the launcher
+        // request (loopback, no Origin) and the product SPA on another loopback
+        // port while rejecting tunneled or foreign-browser requests.
+        if (!LocalRequestGuard.IsLocalRequest(ctx))
+        {
+            return Results.Json(
+                new { error = $"Open Zeus on the machine running the engine to {action} Zeus." },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        var origins = ctx.Request.Headers.Origin;
+        if (origins.Count > 1
+            || (origins.Count == 1
+                && (origins[0] is not { } origin
+                    || !StationEngineEndpoints.IsBrowserOriginAllowed(origin))))
+        {
+            return Results.Json(
+                new { error = $"Zeus can only {action} from an allowed local app origin." },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        return null;
+    }
+
+    private static ILogger Log(ILoggerFactory loggerFactory) =>
+        loggerFactory.CreateLogger(nameof(EngineAppControlEndpoints));
+
+    private static void StopAfterResponseFlush(IHostApplicationLifetime lifetime, ILogger log)
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(RestartFlushDelayMs).ConfigureAwait(false);
+            try
+            {
+                lifetime.StopApplication();
+            }
+            catch (Exception ex)
+            {
+                // Keep swallowing: the host may already be stopping (test
+                // hosts, shutdown race), and the launcher's force-kill bounds
+                // the worst case either way. But do NOT swallow it SILENTLY —
+                // if StopApplication ever fails for a real reason, this line is
+                // the only evidence that the engine was told to stop and did
+                // not, which is exactly the gap that made issue #716 hard to
+                // diagnose.
+                log.LogWarning(ex, "engine.stop request did not reach the host");
+            }
+        });
     }
 }

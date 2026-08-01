@@ -167,6 +167,14 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private long _c10LastFeedbackBlocks;
     private bool _c10DeadPathWarned;
 
+    // Inspired by Thetis PSForm.cs:688-699's bounded single-cal retries, but
+    // deliberately narrower: this caps only DOWNWARD recovery steps per keyed
+    // HermesII single-cal session. Protective upward attenuation for hot
+    // feedback is never capped. HermesC10 remains two-tone-only.
+    private const int HermesIISingleCalMaxRecoverySteps = 5;
+    private int _hermesIISingleCalRecoverySteps;
+    private bool _hermesIISingleCalRetriesWarned;
+
     // Stall detection for "calcc is alive but never produces a fit". Operator
     // signature: PS armed + keyed for >StallThreshold seconds with
     // CalibrationAttempts pinned at 0 → almost certainly hw_peak set higher
@@ -175,6 +183,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
     // _stallStartTickMs is the first keyed tick where info5==0; _stallWarned
     // suppresses repeat log lines once we've already warned for this stall.
     private long _stallStartTickMs;
+    private long _stallStartFeedbackBlocks;
     private bool _stallWarned;
     private static readonly TimeSpan StallThreshold = TimeSpan.FromSeconds(5);
 
@@ -308,6 +317,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private void ClearStallFlag()
     {
         _stallStartTickMs = 0;
+        _stallStartFeedbackBlocks = 0;
         // Clear wedge-watchdog tracking on every idle/disarm/unkey exit so the
         // freeze clock starts fresh on the next key-up — a frozen info5 from a
         // prior over must not count toward a wedge against the new transmission.
@@ -317,6 +327,47 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _stallWarned = false;
             _radio.SetPsCalibrationStalled(false);
         }
+    }
+
+    private void LogCalibrationStallWarning(PsStageMeters psm, long elapsedMs)
+    {
+        var board = _radio.ConnectedBoardKind;
+        if (!UsesHardenedSingleAdcPsPolicy(board))
+        {
+            _log.LogWarning(
+                "psAutoAttn.stall info5=0 for {ElapsedMs}ms — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
+                elapsedMs);
+            return;
+        }
+
+        var p1 = _radio.ActiveClient;
+        long blocksNow = p1?.PsFeedbackBlocksDelivered ?? 0;
+        long blocksDelta = Math.Max(0, blocksNow - _stallStartFeedbackBlocks);
+        var lastFeedback = p1?.LastPsFeedbackObservation;
+        long? lastFeedbackAgeMs = lastFeedback is { } observation
+            ? Math.Max(0, (long)(DateTimeOffset.UtcNow - observation.ObservedAt).TotalMilliseconds)
+            : null;
+        float? lastRxPeak = lastFeedback?.RxPeak;
+        float? lastTxPeak = lastFeedback?.TxPeak;
+        long? lastBlocksDelivered = lastFeedback?.BlocksDelivered;
+        int feedback = (int)Math.Round(psm.FeedbackLevel);
+        int attenuationDb = ReadRadioTxAttnDb();
+
+        if (board == HpsdrBoardKind.HermesII && feedback <= 0)
+        {
+            _log.LogWarning(
+                "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — if blocks are flowing with near-zero peaks, run two-tone or single-cal with AutoAttenuate ON to recover the attenuation rail; if blocksDelta=0, check the DDC0/DDC1 wire/routing path.",
+                feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                blocksNow, blocksDelta, lastRxPeak, lastTxPeak,
+                lastBlocksDelivered, lastFeedbackAgeMs);
+            return;
+        }
+
+        _log.LogWarning(
+            "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
+            feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+            blocksNow, blocksDelta, lastRxPeak, lastTxPeak,
+            lastBlocksDelivered, lastFeedbackAgeMs);
     }
 
     // Diagnostic — emits one line whenever the gate outcome CHANGES. Without
@@ -372,7 +423,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
             ResetC10CollectStall();
+            ResetHermesIISingleCalRecovery();
             _stallStartTickMs = 0;
+            _stallStartFeedbackBlocks = 0;
             _stallWarned = false;
             _lastAutoCalTickMs = 0;
             // Fresh arm → re-converge then lock. SetPsEnabled(true) set runcal=1.
@@ -392,6 +445,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
             ResetC10CollectStall();
+            ResetHermesIISingleCalRecovery();
             ClearStallFlag();
             LogGate("skip=PsEnabled-off");
             return;
@@ -434,6 +488,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
             ResetC10CollectStall();
+            ResetHermesIISingleCalRecovery();
             ClearStallFlag();
             LogGate("skip=not-keyed");
             return;
@@ -460,19 +515,22 @@ public sealed class PsAutoAttenuateService : BackgroundService
         if (stallPsm.CalibrationAttempts == 0)
         {
             long now = Environment.TickCount64;
-            if (_stallStartTickMs == 0) _stallStartTickMs = now;
+            if (_stallStartTickMs == 0)
+            {
+                _stallStartTickMs = now;
+                _stallStartFeedbackBlocks = _radio.ActiveClient?.PsFeedbackBlocksDelivered ?? 0;
+            }
             else if (!_stallWarned && now - _stallStartTickMs >= (long)StallThreshold.TotalMilliseconds)
             {
                 _stallWarned = true;
                 _radio.SetPsCalibrationStalled(true);
-                _log.LogWarning(
-                    "psAutoAttn.stall info5=0 for {ElapsedMs}ms — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
-                    now - _stallStartTickMs);
+                LogCalibrationStallWarning(stallPsm, now - _stallStartTickMs);
             }
         }
         else if (_stallStartTickMs != 0)
         {
             _stallStartTickMs = 0;
+            _stallStartFeedbackBlocks = 0;
             if (_stallWarned)
             {
                 _stallWarned = false;
@@ -1032,15 +1090,18 @@ public sealed class PsAutoAttenuateService : BackgroundService
                     return;
                 }
 
-                // Same G2E policy as the P2 branch: the attenuation servo
-                // runs ONLY during the deliberate two-tone calibration, never
-                // mid-QSO voice TX (piHPSDR parity, ps_menu.c:169-177).
-                // Correction itself still runs on voice with the calibrated
-                // value; only attenuator WRITES are two-tone-scoped.
-                if (!_tx.IsTwoToneOn)
+                // HermesC10 keeps the field-proven G2E two-tone-only policy.
+                // HermesII also admits an explicitly keyed single-cal session,
+                // matching Thetis PSForm.cs:688-699 bounded retry behaviour.
+                // Voice automode remains excluded so attenuation never moves
+                // during an ordinary QSO.
+                bool hermesIISingleCal = _radio.ConnectedBoardKind == HpsdrBoardKind.HermesII
+                    && s.PsSingle
+                    && _tx.IsMoxOn;
+                if (!_tx.IsTwoToneOn && !hermesIISingleCal)
                 {
                     ResetC10CollectStall();
-                    LogGate("c10.skip=not-twotone (G2E servo is two-tone-only)");
+                    LogGate("c10.skip=outside-calibration-window");
                     return;
                 }
 
@@ -1064,6 +1125,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                         _c10CollectStallTicks = 0;
                         if (_currentAttnDb > TxAttnMinDb)
                         {
+                            if (!HermesIISingleCalDownwardRecoveryAvailable(s, feedback)) return;
                             // The escape only fires at fb=0, where the Thetis formula rail is -10 dB.
                             _c10DeltaDb = -10;
                             _c10SavedAuto = s.PsAuto;
@@ -1112,6 +1174,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 {
                     if (psm.CalibrationAttempts > 0 && _currentAttnDb > TxAttnMinDb)
                     {
+                        if (!HermesIISingleCalDownwardRecoveryAvailable(s, feedback)) return;
                         _c10DeltaDb = -10;
                         _c10SavedAuto = s.PsAuto;
                         _c10SavedSingle = s.PsSingle;
@@ -1132,6 +1195,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 bool tooQuiet = feedback < FeedbackLowThreshold && _currentAttnDb > TxAttnMinDb;
                 if (!tooHot && !tooQuiet)
                 {
+                    if (feedback >= FeedbackLowThreshold)
+                        ResetHermesIISingleCalRecovery();
+
                     // G2E post-calibration persist — same policy as the P2
                     // branch: only a value that has PRODUCED an in-window fit
                     // is worth restoring on the next connect; mid-walk values
@@ -1153,6 +1219,11 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 // so a single dance pulls a hot envelope back into window
                 // in one cycle. NaN guard + ±100 dB rails per mi0bot.
                 _c10DeltaDb = ComputeAttnStepDb(feedback);
+                if (_c10DeltaDb < 0
+                    && !HermesIISingleCalDownwardRecoveryAvailable(s, feedback))
+                {
+                    return;
+                }
 
                 // Save the operator's current cal-mode so RestoreOperation
                 // brings it back exactly. mi0bot uses _save_singlecalON /
@@ -1188,6 +1259,12 @@ public sealed class PsAutoAttenuateService : BackgroundService
                         _currentAttnDb, newAttn);
                     _currentAttnDb = newAttn;
                     p1.SetPsTxAttenOnTxDb(newAttn);
+                    if (_radio.ConnectedBoardKind == HpsdrBoardKind.HermesII
+                        && _c10SavedSingle
+                        && _c10DeltaDb < 0)
+                    {
+                        _hermesIISingleCalRecoverySteps++;
+                    }
                     // Mid-walk values surface to the UI but are NOT persisted
                     // — same G2E policy as the P2 branch: only a value that
                     // produced an in-window fit lands in the per-board store
@@ -1223,5 +1300,28 @@ public sealed class PsAutoAttenuateService : BackgroundService
         _c10CollectStallTicks = 0;
         _c10LastFeedbackBlocks = 0;
         _c10DeadPathWarned = false;
+    }
+
+    private bool HermesIISingleCalDownwardRecoveryAvailable(StateDto s, int feedback)
+    {
+        if (_radio.ConnectedBoardKind != HpsdrBoardKind.HermesII || !s.PsSingle)
+            return true;
+        if (_hermesIISingleCalRecoverySteps < HermesIISingleCalMaxRecoverySteps)
+            return true;
+
+        if (!_hermesIISingleCalRetriesWarned)
+        {
+            _hermesIISingleCalRetriesWarned = true;
+            _log.LogWarning(
+                "psAutoAttn.hermesii.singlecal retries exhausted fb={Fb} attn={Db} — check tap padding / hwPeak / feedback path",
+                feedback, _currentAttnDb);
+        }
+        return false;
+    }
+
+    private void ResetHermesIISingleCalRecovery()
+    {
+        _hermesIISingleCalRecoverySteps = 0;
+        _hermesIISingleCalRetriesWarned = false;
     }
 }

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA) and contributors.
 
 using Zeus.Server.Cat;
+using Zeus.Server.SpeTaurus;
 using Zeus.Server.Tci;
 
 namespace Zeus.Server;
@@ -32,6 +33,17 @@ public static class StationControlHostingExtensions
         services.AddSingleton<CatSerialConfigStore>();
         services.AddSingleton<CatSerialService>();
         services.AddHostedService(sp => sp.GetRequiredService<CatSerialService>());
+        return services;
+    }
+
+    public static IServiceCollection AddSpeTaurusServices(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.AddSingleton(sp => new SpeTaurusService(
+            sp.GetRequiredService<ILogger<SpeTaurusService>>()));
+        services.AddHostedService(sp => new SpeTaurusWorker(
+            sp.GetRequiredService<SpeTaurusService>()));
         return services;
     }
 }

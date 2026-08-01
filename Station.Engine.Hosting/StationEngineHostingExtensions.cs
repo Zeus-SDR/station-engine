@@ -177,12 +177,14 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<CwEngine>();
         services.AddSingleton<ExternalPttService>();
         services.AddSingleton<NativeMicCapture>();
+        services.AddSingleton<EngineCacheJanitor>();
 
         // Each hosted registration aliases the singleton used by endpoints
         // and other engine services, so there is exactly one instance of each.
         // Native sources start after the core pipeline and therefore stop
         // before it. This prevents an asynchronous device-open callback from
         // creating a preview DSP engine after shutdown has already begun.
+        services.AddHostedService<EngineCacheJanitorStartup>();
         services.AddHostedService(sp => sp.GetRequiredService<SaturnSpeakerAudioSink>());
         services.AddHostedService(sp => sp.GetRequiredService<WisdomBootstrapService>());
         // Push persisted display settings into the DSP before DspPipelineService
@@ -212,6 +214,7 @@ public static class StationEngineHostingExtensions
 
         services.AddTciServices();
         services.AddCatServices();
+        services.AddSpeTaurusServices();
 
         return services;
     }

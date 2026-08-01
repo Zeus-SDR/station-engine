@@ -69,10 +69,10 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // jitter.
     private const int RingCapacity = 65_536;
 
-    // Floor for the prebuffer cushion: hold ~120 ms before starting/resuming
+    // Floor for the prebuffer cushion: hold ~90 ms before starting/resuming
     // playback, and refill to this depth after every (re)buffer.
     //
-    // Why 120 ms and why adaptive (#742): the producer is the DSP RX tick, which
+    // Why 90 ms and why adaptive (#742): the producer is the DSP RX tick, which
     // publishes audio in BURSTS gated to ~33 ms (MaybeTickInline) on the RX
     // packet thread — the same thread that also runs the squelch/leveler/plugin
     // chain and the panadapter/waterfall work. The consumer is the miniaudio
@@ -84,14 +84,15 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // tail (heard as crackle): a G2 report showed ~4.6% of callbacks short-read
     // (222k silence samples) while the DSP side was provably healthy.
     //
-    // 120 ms ≈ 3.6 tick intervals — absorbs a stalled tick with headroom. The
+    // 90 ms ≈ 2.7 tick intervals — absorbs a stalled tick with headroom while
+    // avoiding a permanent 120 ms latency floor. The
     // EFFECTIVE target is also made adaptive at runtime to the negotiated device
     // period (see OnPlaybackData): miniaudio may ignore our 480-frame request and
     // hand us a larger callback, in which case the cushion grows to ≥ 4 callbacks
     // so a big-period default device can't outrun a thin fixed cushion. Pure
     // latency-vs-robustness trade — managed only, identical on every platform.
     // (History: 20 ms underran badly, 60 ms underran under load — both #733/#742.)
-    private const int PlaybackPrebufferSamples = 5760;
+    private const int PlaybackPrebufferSamples = 4320;
 
     // Keep selected/default playback opens bounded for the same reason as native
     // mic capture: stale OS audio endpoints must not block desktop startup.
@@ -624,7 +625,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     }
 
     // Effective prebuffer/refill cushion for a device callback of
-    // <paramref name="totalFrames"/> frames: the larger of the 120 ms floor and
+    // <paramref name="totalFrames"/> frames: the larger of the 90 ms floor and
     // four callbacks deep, capped to leave one callback of ring headroom (a
     // target ≥ capacity would wedge rebuffering forever). #742.
     internal static int ComputePrebufferTarget(int totalFrames)
@@ -652,7 +653,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
             ? stackalloc float[totalFrames]
             : new float[totalFrames];
 
-        // Size the cushion to the LARGER of the 120 ms floor and 4× this device's
+        // Size the cushion to the LARGER of the 90 ms floor and 4× this device's
         // actual callback (the negotiated period may exceed our 480-frame
         // request). #742.
         int prebufferTarget = ComputePrebufferTarget(totalFrames);

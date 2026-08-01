@@ -366,6 +366,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // run bits only; these cached configs keep voice-mode restore exact.
     private TxPhaseRotatorConfig _txPhaseRotatorConfig = new();
     private CfcConfig _cfcConfig = CfcConfig.Default;
+    // Operator's Compressor on/off, last applied via SetTxLeveling. Digital TX
+    // and roger-beep bypasses force only the effective run bit off; this cache
+    // preserves the operator's intent for exact voice-mode restore while the
+    // configured compressor gain remains untouched. Seeded false to match the
+    // TXA-open TxLevelingConfig default. Written/read under _txaLock.
+    private bool _txCompressorEnabled;
     // Operator's Leveler on/off, last applied via SetTxLeveling. The TUN and
     // two-tone paths force the Leveler St=0 while keyed and restore it on
     // un-key; they read this so the restore lands on the operator's setting
@@ -596,13 +602,17 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // first-open behaviour.
     }
 
-    internal void OpenTxChannelForTests(int txaChannelId, RxMode mode = RxMode.USB)
+    internal void OpenTxChannelForTests(
+        int txaChannelId,
+        RxMode mode = RxMode.USB,
+        bool compressorEnabled = false)
     {
         lock (_txaLock)
         {
             _txaChannelId = txaChannelId;
             _txaNativeOwned = false;
             _txCurrentMode = MapMode(mode);
+            _txCompressorEnabled = compressorEnabled;
         }
     }
 
@@ -1038,6 +1048,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         if (!_channels.TryGetValue(channelId, out var state)) return;
         var mapped = MapMode(mode);
+        // Whole-radio state notifications can repeat the current mode while an
+        // unrelated control (notably a secondary VFO) is moving. Reapplying the
+        // same mode is unnecessary and would discard queued demodulated audio
+        // below, producing a short interruption on every tuning event.
+        if (state.CurrentMode == mapped) return;
         NativeMethods.SetRXAMode(channelId, (int)mapped);
         state.CurrentMode = mapped;
         _log.LogInformation("wdsp.setMode channel={Id} mode={Mode}", channelId, mapped);
@@ -2583,7 +2598,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             txa,
             (!_txLevelerForcedOff && !_txRogerBeepBypass && cfg.LevelerEnabled) ? 1 : 0);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
-        NativeMethods.SetTXACompressorRun(txa, cfg.CompressorEnabled ? 1 : 0);
+        _txCompressorEnabled = cfg.CompressorEnabled;
+        _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(cfg.CompressorEnabled));
         NativeMethods.SetTXACompressorGain(txa, cfg.CompressorGainDb);
         _txLevelerEnabled = cfg.LevelerEnabled;
     }
@@ -2685,6 +2701,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private void ApplyCfcMasterRunLocked(int txa, CfcConfig cfg) =>
         _txControlNative.SetTXACFCOMPRun(txa, EffectiveTxRun(cfg.Enabled));
 
+    // Caller holds _txaLock. Digital-mode bypass gates only the compressor run;
+    // the operator's compressor gain stays exactly as configured.
+    private void ApplyTxCompressorRunLocked(int txa) =>
+        _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(_txCompressorEnabled));
+
     public void SetTxTune(bool on)
     {
         if (_disposed != 0) return;
@@ -2751,6 +2772,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             _txCurrentMode = mapped;
             ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
             ApplyCfcMasterRunLocked(txa, _cfcConfig);
+            ApplyTxCompressorRunLocked(txa);
             // TXA bandpass is now operator-controlled — DspPipelineService
             // asserts SetTxFilter after SetTxMode using the per-mode-family
             // memory in RadioService. No auto-apply here.
@@ -2797,6 +2819,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
+                ApplyTxCompressorRunLocked(txa);
             }
         }
         _log.LogInformation("wdsp.setTxDigitalBypass bypass={Bypass}", bypass);
@@ -2813,6 +2836,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
+                ApplyTxCompressorRunLocked(txa);
                 _txControlNative.SetTXALevelerSt(
                     txa,
                     (_txLevelerEnabled && !_txLevelerForcedOff && !bypass) ? 1 : 0);

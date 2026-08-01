@@ -6,6 +6,7 @@ using System.Net;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Zeus.Contracts;
 using Zeus.Server.Diagnostics;
+using Zeus.Server.SpeTaurus;
 
 namespace Zeus.Server;
 
@@ -130,6 +131,7 @@ public static class StationEngineEndpoints
         endpoints.MapRadioCalibrationEndpoints();
         endpoints.MapTciEndpoints();
         endpoints.MapCatEndpoints();
+        endpoints.MapSpeTaurusEndpoints();
         // Client-error beacon fallback transport (the /ws diagnostic frame is
         // preferred); without this route uncaught SPA errors vanish in local
         // attach whenever the websocket is closed or reconnecting.
