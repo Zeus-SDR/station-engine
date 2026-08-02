@@ -112,7 +112,21 @@ public static class TxControlEndpoints
             if (req.Percent < 0 || req.Percent > 100)
                 return Results.BadRequest(new { error = "percent must be 0..100" });
             r.SetDrive(req.Percent);
-            return Results.Ok(new { drivePercent = req.Percent });
+            return Results.Ok(new { drivePercent = r.Snapshot().DrivePct });
+        });
+
+        endpoints.MapPost("/api/tx/drive-max", (DriveMaxSetRequest req, RadioService r) =>
+        {
+            log.LogInformation("api.tx.drive-max percent={Pct}", req.Percent);
+            if (req.Percent < 1 || req.Percent > 100)
+                return Results.BadRequest(new { error = "percent must be 1..100" });
+            var state = r.SetDriveMaximum(req.Percent);
+            return Results.Ok(new
+            {
+                driveMaxPercent = state.DriveMaxPct,
+                drivePercent = state.DrivePct,
+                tunePercent = state.TunePct,
+            });
         });
 
         return endpoints;

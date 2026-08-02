@@ -91,6 +91,7 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _rate = (int)HpsdrSampleRate.Rate48k;
     private int _preamp;       // 0 / 1
     private int _attenDb;      // 0..31 dB (HpsdrAtten value)
+    private int _attenAdc1Db;  // ADC1: C1[4:0] in the shared 0x16 frame
     private int _antenna = (int)HpsdrAntenna.Ant1;
     // RX-antenna relay change deferred while keyed (external-ports plan —
     // antenna slice, #804). SAFETY: the Alex relay matrix must never be
@@ -960,6 +961,7 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _rate, (int)config.Rate);
         Interlocked.Exchange(ref _preamp, config.PreampOn ? 1 : 0);
         Interlocked.Exchange(ref _attenDb, config.Atten.ClampedDb);
+        Interlocked.Exchange(ref _attenAdc1Db, 0);
         Interlocked.Exchange(ref _droppedFrames, 0);
         Interlocked.Exchange(ref _totalFrames, 0);
         ResetRxParserState();
@@ -1139,6 +1141,13 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _adcRandom, randomEnabled ? 1 : 0);
     }
     public void SetAttenuator(HpsdrAtten atten) => Interlocked.Exchange(ref _attenDb, atten.ClampedDb);
+    public void SetAdcAttenuator(byte adc, HpsdrAtten atten)
+    {
+        if (adc == 0)
+            Interlocked.Exchange(ref _attenDb, atten.ClampedDb);
+        else if (adc == 1)
+            Interlocked.Exchange(ref _attenAdc1Db, atten.ClampedDb);
+    }
     /// <summary>
     /// Select the RX antenna relay (ANT1/2/3). SAFETY (external-ports plan —
     /// antenna slice, #804): while keyed, the Alex/relay matrix must not be
@@ -1840,7 +1849,8 @@ public sealed class Protocol1Client : IProtocol1Client
             LineInGain: (byte)Volatile.Read(ref _lineInGain),
             AtuTune: Volatile.Read(ref _atuTuneUntilTicks) > Environment.TickCount64,
             TxAntenna: (HpsdrAntenna)Volatile.Read(ref _txAntenna),
-            UserDigOut: (byte)Volatile.Read(ref _userDigOut));
+            UserDigOut: (byte)Volatile.Read(ref _userDigOut),
+            Adc1Atten: new HpsdrAtten(Volatile.Read(ref _attenAdc1Db)));
     }
 
     private void RxLoop()
@@ -2447,7 +2457,10 @@ public sealed class Protocol1Client : IProtocol1Client
                 4  => (ControlFrame.CcRegister.RxFreq,     ControlFrame.CcRegister.RxFreq3),
                 5  => (ControlFrame.CcRegister.RxFreq,     ControlFrame.CcRegister.RxFreq4),
                 6  => (ControlFrame.CcRegister.LnaTxGainStable, ControlFrame.CcRegister.RxFreq),
-                7  => (ControlFrame.CcRegister.Attenuator, ControlFrame.CcRegister.RxFreq),
+                // ADC1 Step-ATT shares C&C 0x0B with the CW keyer. Emit it
+                // only while receiving: Auto-ATT pauses under MOX, and the
+                // PS transmit/calibration rotation remains byte-identical.
+                7  => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.RxFreq),
                 8  => (ControlFrame.CcRegister.RxFreq,     ControlFrame.CcRegister.TxFreq),
                 9  => (ControlFrame.CcRegister.RxFreq,     ControlFrame.CcRegister.DriveFilter),
                 10 => (ControlFrame.CcRegister.RxFreq3,    ControlFrame.CcRegister.RxFreq4),

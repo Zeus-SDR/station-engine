@@ -1025,14 +1025,14 @@ public sealed record StateDto(
     // operator's choice follows any client connecting to this radio. Defaulted
     // so legacy state frames (no field) deserialize unchanged.
     int WorkspaceZoomPct = 100,
-    // Auto-attenuator control loop. When on (default), the server raises
-    // AttOffsetDb by 1 per ~100 ms window in which any ADC-overload bit was
-    // seen, and decays it by 1 per clean window. Ported from Thetis
-    // console.cs:22167 (handleOverload).
+    // Auto-attenuator control loop. When on (default), the server qualifies
+    // clipped-bit reports with Thetis's leaky counter, applies a bounded rescue
+    // step, and releases only after the configured clean hold. A configured P2
+    // magnitude limit can act before the clipped-bit report arrives.
     bool AutoAttEnabled = true,
     int AttOffsetDb = 0,
     // Red-lamp flag derived from Thetis' overload-level counter
-    // (+2 per overload cycle, -1 per clean, clamped 0..5, warn when >3).
+    // (+1 per overload cycle, -1 per clean, clamped 0..5, warn when >3).
     bool AdcOverloadWarning = false,
     // Currently active filter preset slot name (e.g. "F6", "VAR1"). Null when
     // the filter was set by a drag edit without a named slot context.
@@ -1183,6 +1183,10 @@ public sealed record StateDto(
     // instead of pushing its own localStorage default back over the wire.
     // Default 0 mirrors RadioService._drivePct seed.
     int DrivePct = 0,
+    // Station-wide ceiling for normal DRV and TUN. Persisted with radio state;
+    // carried here so every frontend sees the authoritative rail.
+    // Default 100 preserves legacy state frames.
+    int DriveMaxPct = 100,
     // Independent TUN drive slider 0..100. Same persistence pattern as
     // DrivePct. Default 10 mirrors RadioService._tunePct seed — a 0 default
     // would make pressing TUN appear to do nothing on first key.
@@ -1579,7 +1583,9 @@ public sealed record SpotsSettings(
     bool HideWorked = false,
     bool EnrichQrz = false,
     // --- scan mode: seconds the VFO dwells on each spot before stepping ---
-    int ScanDwellSeconds = 8)
+    int ScanDwellSeconds = 8,
+    // --- activation labels in the shared panadapter spot overlay ---
+    bool ShowOnPanadapter = false)
 {
     public const int MinPollSeconds = 30;
     public const int MaxPollSeconds = 600;
@@ -1729,6 +1735,8 @@ public sealed record TxReceiverSetRequest(int Index);
 
 public sealed record DriveSetRequest(int Percent);
 
+public sealed record DriveMaxSetRequest(int Percent);
+
 /// <summary>TX pre-key (MOX) delay in milliseconds, 0..500. See
 /// <see cref="StateDto.TxMoxPreKeyDelayMs"/>.</summary>
 public sealed record TxPreKeyDelaySetRequest(int DelayMs);
@@ -1852,11 +1860,10 @@ public sealed record AutoAttSetRequest(bool Enabled);
 // legacy Auto-ATT toggle: existing /api/auto-att still maps to Enabled, while
 // /api/rx/adc-protection exposes the ramp timing, step size, maximum automatic
 // offset, warning threshold, release hold-off, and optional Protocol-2
-// max-magnitude soft limit. Defaults mirror Thetis' handleOverload loop:
-// 100 ms windows, 1 dB attack/release steps, 31 dB maximum offset, attenuation
-// and the warning lamp both gated on a sustained overload (level > 3), a 2 s
-// hold before the offset unwinds (Thetis' nudAutoAttHold), and no
-// magnitude-only attack unless the operator explicitly sets a limit.
+// max-magnitude soft limit. The 100 ms leaky overload qualification mirrors
+// Thetis' handleOverload loop. Zeus improves the recovery with a bounded 4 dB
+// first rescue, operator-configurable attack/release steps and ceiling, a 2 s
+// clean hold, and an optional predictive Protocol-2 magnitude threshold.
 public sealed record AdcProtectionConfig(
     bool Enabled = true,
     int AttackMs = 100,

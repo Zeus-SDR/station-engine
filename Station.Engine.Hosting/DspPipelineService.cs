@@ -1116,6 +1116,7 @@ public class DspPipelineService : BackgroundService,
     // offset), so the existing overload control loop continues to drive the
     // radio on P2. Sentinel -1 forces the first push regardless of value.
     private int _appliedEffectiveAttDb = -1;
+    private int _appliedAttenuatorAdc = -1;
     private bool _appliedPreampOn;
 
     private int _seq;
@@ -4049,6 +4050,30 @@ public class DspPipelineService : BackgroundService,
     internal static bool IsSupportedNrMode(NrMode mode) =>
         mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Rnnr or NrMode.Sbnr;
 
+    internal static double EffectiveAgcGainDb(StateDto state) => Math.Clamp(
+        RadioService.AgcBaseline(state) + state.AgcOffsetDb,
+        RadioService.MinAgcFixedGainDb,
+        RadioService.MaxAgcTopDb);
+
+    internal static AgcConfig EffectiveAgcConfig(AgcConfig configured, double effectiveGainDb) =>
+        configured.Mode == AgcMode.Fixed
+            ? configured with
+            {
+                FixedGainDb = Math.Clamp(
+                    effectiveGainDb,
+                    RadioService.MinAgcFixedGainDb,
+                    RadioService.MaxAgcTopDb),
+            }
+            : configured;
+
+    private static void SetP2Attenuator(Zeus.Protocol2.Protocol2Client client, int adc, int db)
+    {
+        if (adc == 1)
+            client.SetRx1Attenuator(db);
+        else
+            client.SetAttenuator(db);
+    }
+
     internal static DspRxChainDiagnosticsDto BuildRxDspChainDiagnostics(
         StateDto state,
         IReadOnlyList<NotchDto>? notches,
@@ -4058,7 +4083,9 @@ public class DspPipelineService : BackgroundService,
         SquelchConfig? appliedSquelch = null)
     {
         var nr = NormalizeNrConfig(state.Nr ?? new NrConfig());
-        var agc = state.Agc ?? new AgcConfig(AgcMode.Med);
+        var agc = EffectiveAgcConfig(
+            state.Agc ?? new AgcConfig(AgcMode.Med),
+            EffectiveAgcGainDb(state));
         var squelch = state.Squelch ?? new SquelchConfig();
         int notchCount = notches?.Count ?? 0;
         int activeNotchCount = notches?.Count(static n => n.Active) ?? 0;
@@ -4072,7 +4099,7 @@ public class DspPipelineService : BackgroundService,
         bool appliedNrMatches = appliedNr is null || nr.Equals(appliedNr);
         bool appliedAgcMatches = appliedAgc is null || agc.Equals(appliedAgc);
         bool appliedSquelchMatches = appliedSquelch is null || squelch.Equals(appliedSquelch);
-        double effectiveAgcTopDb = Math.Round(state.AgcTopDb + state.AgcOffsetDb, 1);
+        double effectiveAgcTopDb = Math.Round(EffectiveAgcGainDb(state), 1);
 
         var activeFeatures = new List<string>();
         if (effectiveNr) activeFeatures.Add($"nr-{nrRuntime.EffectiveNrMode.ToLowerInvariant()}");
@@ -4635,7 +4662,7 @@ public class DspPipelineService : BackgroundService,
         // a smooth ceiling; the secondary RX block fans the same slewed dB
         // to every active secondary so RX2..N see one consistent ceiling
         // this tick (and don't double-step against the main-block push).
-        double effectiveAgcTarget = s.AgcTopDb + s.AgcOffsetDb;
+        double effectiveAgcTarget = EffectiveAgcGainDb(s);
         if (effectiveAgcTarget != _appliedAgcCeilingDb)
         {
             _appliedAgcCeilingDb = StepTowardCappedDb(
@@ -4715,8 +4742,10 @@ public class DspPipelineService : BackgroundService,
             _appliedDiversity = diversity;
         }
         var agc = freeDvMode
-            ? new AgcConfig(AgcMode.Fixed, FixedGainDb: s.AgcTopDb)
-            : (s.Agc ?? new AgcConfig(AgcMode.Med));
+            ? new AgcConfig(AgcMode.Fixed, FixedGainDb: RadioService.AgcBaseline(s))
+            : EffectiveAgcConfig(
+                s.Agc ?? new AgcConfig(AgcMode.Med),
+                _appliedAgcCeilingDb);
         if (!agc.Equals(_appliedAgc))
         {
             engine.SetAgc(channel, agc);
@@ -4908,12 +4937,28 @@ public class DspPipelineService : BackgroundService,
         // without this forward the S-ATT slider and the auto-ATT overload
         // ramp both fail silently on Angelia / ANAN-100D. RadioService
         // raises StateChanged whenever AttOffsetDb moves, so the auto-ATT
-        // control loop reaches the wire through this block too.
+        // control loop reaches the wire through this block too. Route the
+        // single primary-RX control to the ADC selected by that receiver;
+        // ADC1 uses the independent byte-1442 attenuator.
         int effectiveAttDb = Math.Clamp(s.AttenDb + s.AttOffsetDb, 0, 31);
-        if (resync || effectiveAttDb != _appliedEffectiveAttDb)
+        int attenuatorAdc = RadioService.ReceiverAdcSource(s, 0) == 1 ? 1 : 0;
+        if (resync
+            || effectiveAttDb != _appliedEffectiveAttDb
+            || attenuatorAdc != _appliedAttenuatorAdc)
         {
-            _p2Client?.SetAttenuator(effectiveAttDb);
+            if (_p2Client is { } attenuatorClient)
+            {
+                if (_appliedAttenuatorAdc != attenuatorAdc)
+                {
+                    if (_appliedAttenuatorAdc == 0)
+                        attenuatorClient.SetAttenuator(0);
+                    else if (_appliedAttenuatorAdc == 1)
+                        _radio.ApplyG2AdcOptionsToP2Client(attenuatorClient, _radio.ConnectedBoardKind);
+                }
+                SetP2Attenuator(attenuatorClient, attenuatorAdc, effectiveAttDb);
+            }
             _appliedEffectiveAttDb = effectiveAttDb;
+            _appliedAttenuatorAdc = attenuatorAdc;
         }
 
         // PS-Monitor (issue #121) — pure UI source routing. No engine call,
@@ -5084,7 +5129,10 @@ public class DspPipelineService : BackgroundService,
         _adaptiveSquelch = new AdaptiveSquelchState();
         var s = _radio.Snapshot();
         var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
-        var agc = s.Agc ?? new AgcConfig(AgcMode.Med);
+        double effectiveAgc = EffectiveAgcGainDb(s);
+        var agc = EffectiveAgcConfig(
+            s.Agc ?? new AgcConfig(AgcMode.Med),
+            effectiveAgc);
         var squelch = s.Squelch ?? new SquelchConfig();
         var txLeveling = s.TxLeveling ?? new TxLevelingConfig();
         var txPhaseRotator = s.TxPhaseRotator ?? new TxPhaseRotatorConfig();
@@ -5117,7 +5165,6 @@ public class DspPipelineService : BackgroundService,
         int ritHz = s.RitEnabled ? (int)s.RitHz : 0;
         int ctunShiftHz = (int)(CwOffset.EffectiveLoHz(s.Mode, s.VfoHz) - s.RadioLoHz) + ritHz;
         engine.SetCtunShift(channelId, ctunShiftHz);
-        double effectiveAgc = s.AgcTopDb + s.AgcOffsetDb;
         engine.SetAgcTop(channelId, effectiveAgc);
         engine.SetRxAfGainDb(channelId, s.RxAfGainDb);
         // Re-push TX mic gain + Leveler on every fresh engine so the channel
@@ -5166,7 +5213,7 @@ public class DspPipelineService : BackgroundService,
         _appliedCtunOffsetHz = ctunShiftHz;
         _appliedTxLowHz = txOpenLow;
         _appliedTxHighHz = txOpenHigh;
-        _appliedAgcCeilingDb = s.AgcTopDb + s.AgcOffsetDb;
+        _appliedAgcCeilingDb = effectiveAgc;
         _appliedRxAfGainDb = s.RxAfGainDb;
         // Reset every secondary's per-RX AF-gain slew state — the engine has
         // just opened a fresh RX1 channel (full engine swap or reconnect), so
@@ -5388,7 +5435,9 @@ public class DspPipelineService : BackgroundService,
     {
         var rx = _secondaryRx[rxIndex];
         var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
-        var agc = s.Agc ?? new AgcConfig(AgcMode.Med);
+        var agc = EffectiveAgcConfig(
+            s.Agc ?? new AgcConfig(AgcMode.Med),
+            _appliedAgcCeilingDb);
         var squelch = s.Squelch ?? new SquelchConfig();
         var (mode, vfoHz, filterLow, filterHigh, afGainDb) = SecondaryRxParams(s, rxIndex);
         // FreeDV on a secondary RX follows the same band-convention sideband as the
@@ -5607,7 +5656,7 @@ public class DspPipelineService : BackgroundService,
         await client.ConnectAsync(radioEndpoint, ct).ConfigureAwait(false);
         // Seed the operator's RX front-end (preamp + step attenuator) BEFORE
         // StartAsync so the very first CmdHighPriority emitted inside the
-        // start sequence carries the correct values. SetPreamp/SetAttenuator
+        // start sequence carries the correct values. The setters below
         // pre-StartAsync only stash into private fields (the early-return on
         // _rxTask==null path), so no wire packets fly here — they ride the
         // CmdHighPriority(run=1) inside StartAsync below. Without this seed
@@ -5615,8 +5664,10 @@ public class DspPipelineService : BackgroundService,
         // until the operator nudged either control. Issue #126.
         bool initialPreamp = _radio.PreampOn;
         int initialAttDb = _radio.EffectiveAttenDb;
+        int initialAttenuatorAdc = RadioService.ReceiverAdcSource(
+            _radio.Snapshot(),
+            0) == 1 ? 1 : 0;
         client.SetPreamp(initialPreamp);
-        client.SetAttenuator(initialAttDb);
         // Frequency-correction factor (issue #325) — rehydrate before the
         // first CmdHighPriority(run=1) so the operator's calibration applies
         // to the very first NCO phase-word. 1.0 = factory default, no-op.
@@ -5626,6 +5677,7 @@ public class DspPipelineService : BackgroundService,
         // matches the persisted setting; RadioService also replays after
         // MarkProtocol2Connected and on live setting changes.
         _radio.ApplyG2AdcOptionsToP2Client(client, boardKind);
+        SetP2Attenuator(client, initialAttenuatorAdc, initialAttDb);
         client.AttachWidebandFrameHandler(OnP2WidebandFrame);
         bool initialWidebandTransport =
             Volatile.Read(ref _widebandDisplayEnabled) != 0 && _hub.DisplayStreamRequested;
@@ -5708,17 +5760,29 @@ public class DspPipelineService : BackgroundService,
         // settles.
         _appliedPreampOn = initialPreamp;
         _appliedEffectiveAttDb = initialAttDb;
+        _appliedAttenuatorAdc = initialAttenuatorAdc;
         bool nowPreamp = _radio.PreampOn;
         int nowAttDb = _radio.EffectiveAttenDb;
+        int nowAttenuatorAdc = RadioService.ReceiverAdcSource(
+            _radio.Snapshot(),
+            0) == 1 ? 1 : 0;
         if (nowPreamp != initialPreamp)
         {
             client.SetPreamp(nowPreamp);
             _appliedPreampOn = nowPreamp;
         }
-        if (nowAttDb != initialAttDb)
+        if (nowAttDb != initialAttDb || nowAttenuatorAdc != initialAttenuatorAdc)
         {
-            client.SetAttenuator(nowAttDb);
+            if (nowAttenuatorAdc != initialAttenuatorAdc)
+            {
+                if (initialAttenuatorAdc == 0)
+                    client.SetAttenuator(0);
+                else
+                    _radio.ApplyG2AdcOptionsToP2Client(client, boardKind);
+            }
+            SetP2Attenuator(client, nowAttenuatorAdc, nowAttDb);
             _appliedEffectiveAttDb = nowAttDb;
+            _appliedAttenuatorAdc = nowAttenuatorAdc;
         }
         // iter5: attach as the synchronous RX sink. See AttachRxSinkP1 in
         // OnRadioConnected for full rationale — same lock-free hot path.

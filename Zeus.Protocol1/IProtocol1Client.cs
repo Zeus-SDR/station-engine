@@ -87,6 +87,12 @@ public interface IProtocol1Client : IDisposable
     /// </summary>
     void SetAdcDitherRandom(bool ditherEnabled, bool randomEnabled);
     void SetAttenuator(HpsdrAtten atten);
+    /// <summary>Route receive attenuation to a physical ADC. Implementations
+    /// that only support ADC0 retain their existing behavior.</summary>
+    void SetAdcAttenuator(byte adc, HpsdrAtten atten)
+    {
+        if (adc == 0) SetAttenuator(atten);
+    }
     void SetAntennaRx(HpsdrAntenna ant);
     /// <summary>
     /// Select the TX antenna relay (ANT1/2/3) — Config-frame C4[1:0], external-

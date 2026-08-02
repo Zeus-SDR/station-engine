@@ -71,6 +71,7 @@ public sealed class RadioService : IDisposable
     // (AgcTopMinDb / AgcTopMaxDb below, console.cs:45997).
     internal const double MinAgcTopDb = 30.0;
     internal const double MaxAgcTopDb = 120.0;
+    internal const double MinAgcFixedGainDb = -20.0;
 
     // Floor (Hz) for the signed RX/TX bandpass width pushed through SetFilter.
     // A zero-width bandpass means WDSP's RXASetPassband passes nothing through
@@ -294,6 +295,9 @@ public sealed class RadioService : IDisposable
     private int _attOffsetDb;
     private int _adcOverloadLevel;          // 0..5, Thetis-style "red lamp" counter
     private bool _overloadSeenInWindow;     // any overload since last tick
+    private bool _hardOverloadSeenInWindow;
+    private bool _softMagnitudeSeenInWindow;
+    private ushort _maxMagnitudeSeenInWindow;
     private byte _lastAdcOverloadBits;
     private ushort? _lastAdc0MaxMagnitude;
     private ushort? _lastAdc1MaxMagnitude;
@@ -323,16 +327,15 @@ public sealed class RadioService : IDisposable
     // identical max_gain, so the in-process form is bit-faithful to Thetis while
     // avoiding a second engine round-trip on the hot meter path.
     //
-    // Thetis user offset on the floor (udRX1AutoAGCOffset), default 0 dB.
-    private const double AutoAgcOffsetDb = 0.0;
-    // Thetis seats the knee 2 dB BELOW the displayed noise floor: its
-    // agcCalOffset (console.cs:33282) is `2.0f + displayCal + preampDelta −
-    // fftSizeFudge`, and every term except the constant 2 cancels against the
-    // calibration the displayed bins already carry — drawing Thetis's own AGC-T
-    // knee line lands it exactly at NF − 2 dB (the fftSizeFudge term only
-    // compensates Thetis's display convention at non-default FFT sizes and
-    // cancels identically). Our spectrumFloorDbm is on the same calibrated
-    // display-dBm scale, so the full residual is this 2 dB.
+    // Thetis user offset on the floor (udRX1AutoAGCOffset). The shipped setup
+    // control starts at +20 dB and its startup handler copies that value into
+    // AutoAGCOffsetRX1. Zeus has no separate offset knob yet, so use the actual
+    // reference default rather than the old 0 dB assumption, which seated the
+    // automatic threshold roughly 20 dB too hot.
+    private const double AutoAgcOffsetDb = 20.0;
+    // In non-Fixed modes Thetis subtracts a 2 dB calibration residual after
+    // applying the configured floor shift. Fixed is the sole 0 dB exception
+    // (console.cs agcCalOffset), because the result drives RXFixedAGC directly.
     private const double AgcThreshCalOffsetDb = 2.0;
     // FFT size used in WDSP's threshold→max-gain conversion (wcpAGC.c:482:
     // noise_offset = 10·log10(bandwidth·size/rate)). Thetis passes the DISPLAY
@@ -506,7 +509,8 @@ public sealed class RadioService : IDisposable
         var persistedCfc = _dspSettingsStore.GetCfc() ?? CfcConfig.Default;
         // AGC mode + custom params. Null on a fresh install / legacy DB row
         // falls back to the Med default so first-connect behaviour is unchanged.
-        var persistedAgc = _dspSettingsStore.GetAgc() ?? new AgcConfig(AgcMode.Med);
+        var persistedAgc = NormalizeAgcConfig(
+            _dspSettingsStore.GetAgc() ?? new AgcConfig(AgcMode.Med));
         // RX squelch. Null on a fresh install / legacy DB row falls back to the
         // off default so first-connect behaviour is unchanged (Thetis §5).
         var persistedSquelch = _dspSettingsStore.GetSquelch() ?? new SquelchConfig();
@@ -589,6 +593,10 @@ public sealed class RadioService : IDisposable
         // about; existing domain stores (DspSettings, PsSettings, etc.) still
         // hydrate the wider config they own.
         var rsSnap = _radioStateStore?.Get();
+        // Keep the private hardware baseline and the public snapshot in lockstep.
+        // Previously StateDto.AttenDb was hydrated while every wire/startup and
+        // auto-ATT calculation still read this field's 0 dB initializer.
+        _atten = new HpsdrAtten(rsSnap?.AttenDb ?? 0);
         _adcProtection = NormalizeAdcProtection(new AdcProtectionConfig(
             Enabled: rsSnap?.AutoAttEnabled ?? true,
             AttackMs: rsSnap?.AdcProtectionAttackMs ?? 100,
@@ -640,6 +648,13 @@ public sealed class RadioService : IDisposable
             _txTimeoutSec = ClampTxTimeoutSec(rsSnap.TxTimeoutSec);
         }
 
+        // Missing on legacy RadioState rows -> 100, preserving the historical
+        // unrestricted slider. Clamp restored DRV/TUN before StateDto exists so
+        // startup cannot briefly exceed the saved amplifier-safe maximum.
+        int startupDriveMaxPct = Math.Clamp(rsSnap?.DriveMaxPct ?? 100, 1, 100);
+        _drivePct = Math.Min(_drivePct, startupDriveMaxPct);
+        _tunePct = Math.Min(_tunePct, startupDriveMaxPct);
+
         // RX2 (VFO-B) tuning is hydrated into the canonical Receivers[1] entry —
         // the flat VFO-B StateDto fields were retired in the A/B wire collapse.
         // Legacy rows that never stored RX2 fall back to the RX1 values, exactly
@@ -670,7 +685,7 @@ public sealed class RadioService : IDisposable
             Agc: persistedAgc,
             Squelch: persistedSquelch,
             TxLeveling: persistedTxLeveling,
-            AttenDb: rsSnap?.AttenDb ?? 0,
+            AttenDb: _atten.ClampedDb,
             Nr: persistedNr,
             // NR3 (RNNoise): native availability is a static probe of the loaded
             // libwdsp's RNNR exports; the installed-model name comes from the
@@ -724,6 +739,7 @@ public sealed class RadioService : IDisposable
             // rsSnap block; mirror them into the StateDto so SetDrive doesn't
             // become the only path that puts these into the broadcast.
             DrivePct: Volatile.Read(ref _drivePct),
+            DriveMaxPct: startupDriveMaxPct,
             TunePct: Volatile.Read(ref _tunePct),
             TxMoxPreKeyDelayMs: Volatile.Read(ref _txMoxPreKeyDelayMs),
             TxMoxTailDelayMs: Volatile.Read(ref _txMoxTailDelayMs),
@@ -1254,7 +1270,7 @@ public sealed class RadioService : IDisposable
             // offset from a previous session doesn't leak onto new hardware.
             _attOffsetDb = 0;
             _adcOverloadLevel = 0;
-            _overloadSeenInWindow = false;
+            ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
@@ -1290,6 +1306,10 @@ public sealed class RadioService : IDisposable
                     _state = _state with { SampleRate = hpsdrRate.SampleRateHz() };
             }
             await client.StartAsync(new StreamConfig(hpsdrRate, _preampOn, _atten), ct).ConfigureAwait(false);
+            // StreamConfig carries the legacy ADC0 attenuator value. Re-apply
+            // the primary receiver route now that the client is running so a
+            // receiver assigned to ADC1 gets C&C 0x0B instead of ADC0's 0x0A.
+            ApplyPrimaryAttenuatorToActiveClient(EffectiveAttenDb);
             // Retune the radio to the persisted hardware NCO (RadioLoHz). The
             // dial (VfoHz) may sit elsewhere; WDSP's shift stage covers the
             // gap. Hydration above already guarantees RadioLoHz != 0 by
@@ -1536,7 +1556,10 @@ public sealed class RadioService : IDisposable
                 else SetRxAfGain(af);
             }
             if (adcSource is byte a)
+            {
                 Mutate(s => WithReceiverAdcSource(s, index, a));
+                if (index == 0) ApplyPrimaryAttenuatorToActiveClient(EffectiveAttenDb);
+            }
             return Snapshot();
         }
         if (index < 2 || index >= _extraReceivers.Length)
@@ -2869,8 +2892,17 @@ public sealed class RadioService : IDisposable
 
     public StateDto SetAttenuator(HpsdrAtten atten)
     {
-        _atten = atten;
-        Mutate(s => s with { AttenDb = atten.ClampedDb });
+        Mutate(s =>
+        {
+            _atten = atten;
+            // An automatic offset cannot exceed the remaining 31 dB hardware
+            // headroom. Trimming it here prevents a high manual baseline from
+            // leaving a long tail of invisible release steps above saturation.
+            _attOffsetDb = Math.Min(
+                _attOffsetDb,
+                Math.Min(_adcProtection.MaxOffsetDb, HpsdrAtten.MaxDb - _atten.ClampedDb));
+            return s with { AttenDb = atten.ClampedDb, AttOffsetDb = _attOffsetDb };
+        });
         // Honour any active auto-ATT offset when the user adjusts the baseline.
         // _lastAppliedEffectiveDb is invalidated so the new sum reaches the radio
         // even if it happens to equal the previous effective value.
@@ -2886,8 +2918,23 @@ public sealed class RadioService : IDisposable
             // ActiveClient directly, NOT this setter, so it does not trigger a
             // fast-attack and the floor follows it smoothly.)
         }
-        ActiveClient?.SetAttenuator(new HpsdrAtten(effective));
+        ApplyPrimaryAttenuatorToActiveClient(effective);
         return Snapshot();
+    }
+
+    private void ApplyPrimaryAttenuatorToActiveClient(int effectiveDb)
+    {
+        var client = ActiveClient;
+        if (client is null) return;
+
+        byte adc;
+        lock (_sync) adc = ReceiverAdcSource(_state, 0) == 1 ? (byte)1 : (byte)0;
+        var effective = new HpsdrAtten(effectiveDb);
+        // Clear the formerly selected physical ADC as part of every route push;
+        // this makes a live ADC-source change atomic from the control layer's
+        // perspective and prevents stale attenuation on the old antenna input.
+        client.SetAdcAttenuator(0, adc == 0 ? effective : HpsdrAtten.Zero);
+        client.SetAdcAttenuator(1, adc == 1 ? effective : HpsdrAtten.Zero);
     }
 
     public StateDto SetAutoAtt(bool enabled)
@@ -2906,14 +2953,14 @@ public sealed class RadioService : IDisposable
                 // the hardware comes back to the user's baseline immediately.
                 _attOffsetDb = 0;
                 _adcOverloadLevel = 0;
-                _overloadSeenInWindow = false;
+                ResetAdcProtectionWindowNoLock();
                 _lastOverloadMs = long.MinValue;
                 _state = _state with { AttOffsetDb = 0, AdcOverloadWarning = false };
                 int baseline = _atten.ClampedDb;
                 if (_lastAppliedEffectiveDb != baseline)
                 {
                     _lastAppliedEffectiveDb = baseline;
-                    ActiveClient?.SetAttenuator(_atten);
+                    ApplyPrimaryAttenuatorToActiveClient(baseline);
                 }
             }
             else
@@ -2973,7 +3020,7 @@ public sealed class RadioService : IDisposable
             {
                 _attOffsetDb = 0;
                 _adcOverloadLevel = 0;
-                _overloadSeenInWindow = false;
+                ResetAdcProtectionWindowNoLock();
                 _lastOverloadMs = long.MinValue;
                 if (_state.AttOffsetDb != 0 || _state.AdcOverloadWarning)
                 {
@@ -2982,12 +3029,18 @@ public sealed class RadioService : IDisposable
                     _stateDirty = true;
                 }
             }
-            else if (_attOffsetDb > next.MaxOffsetDb)
+            else
             {
-                _attOffsetDb = next.MaxOffsetDb;
-                _state = _state with { AttOffsetDb = _attOffsetDb };
-                stateBroadcastNeeded = true;
-                _stateDirty = true;
+                int maxDynamicOffset = Math.Min(
+                    next.MaxOffsetDb,
+                    HpsdrAtten.MaxDb - _atten.ClampedDb);
+                if (_attOffsetDb > maxDynamicOffset)
+                {
+                    _attOffsetDb = maxDynamicOffset;
+                    _state = _state with { AttOffsetDb = _attOffsetDb };
+                    stateBroadcastNeeded = true;
+                    _stateDirty = true;
+                }
             }
 
             int effective = Math.Clamp(_atten.ClampedDb + _attOffsetDb, HpsdrAtten.MinDb, HpsdrAtten.MaxDb);
@@ -3002,7 +3055,7 @@ public sealed class RadioService : IDisposable
 
         if (effectiveToApply is int eff)
         {
-            ActiveClient?.SetAttenuator(new HpsdrAtten(eff));
+            ApplyPrimaryAttenuatorToActiveClient(eff);
         }
 
         if (_stateDirty) FlushState();
@@ -3041,6 +3094,22 @@ public sealed class RadioService : IDisposable
         MagnitudeSoftLimit = Math.Clamp(config.MagnitudeSoftLimit, 0, ushort.MaxValue),
         ReleaseHoldMs = Math.Clamp(config.ReleaseHoldMs, 0, 10_000),
     };
+
+    private void ResetAdcProtectionWindowNoLock()
+    {
+        _overloadSeenInWindow = false;
+        _hardOverloadSeenInWindow = false;
+        _softMagnitudeSeenInWindow = false;
+        _maxMagnitudeSeenInWindow = 0;
+    }
+
+    internal static int MagnitudeAttackStepDb(ushort maxMagnitude, int softLimit, int minimumStepDb)
+    {
+        int floor = Math.Clamp(minimumStepDb, 1, 6);
+        if (softLimit <= 0 || maxMagnitude <= softLimit) return floor;
+        double excessDb = 20.0 * Math.Log10(maxMagnitude / (double)softLimit);
+        return Math.Clamp(Math.Max(floor, (int)Math.Ceiling(excessDb)), 1, 6);
+    }
 
     public StateDto SetAutoAgc(bool enabled)
     {
@@ -3101,9 +3170,11 @@ public sealed class RadioService : IDisposable
     /// </summary>
     internal double AutoAgcTopFromNoiseFloor(double noiseFloorDbm)
     {
+        var agc = _state.Agc ?? new AgcConfig(AgcMode.Med);
+        double calOffsetDb = agc.Mode == AgcMode.Fixed ? 0.0 : AgcThreshCalOffsetDb;
         // 1) Desired AGC threshold (Thetis: floor + userOffset − cal), clamped.
         double thresh = Math.Clamp(
-            noiseFloorDbm + AutoAgcOffsetDb - AgcThreshCalOffsetDb,
+            noiseFloorDbm + AutoAgcOffsetDb - calOffsetDb,
             AgcThreshMinDbm, AgcThreshMaxDbm);
         // 2) WDSP bandwidth/FFT term: 10·log10((fhigh−flow)·size/rate) (wcpAGC.c:482).
         //    fhigh−flow is the RX passband width WDSP runs (our _state filter edges).
@@ -3111,9 +3182,13 @@ public sealed class RadioService : IDisposable
         double rate = Math.Max(1.0, _state.SampleRate);
         double noiseOffset = 10.0 * Math.Log10(bwHz * _autoAgcAnalyzerFftSize / rate);
         // 3) top = 20·log10(max_gain) = 20·log10(out_target) − 20·log10(var_gain)
-        //    − (thresh + noiseOffset). Canned modes run slope 0 ⇒ var_gain 1 ⇒ its
-        //    term is 0 (Thetis auto-AGC-T is used with canned modes).
-        double top = AgcOutTargetDb - (thresh + noiseOffset);
+        //    − (thresh + noiseOffset). WDSP sets var_gain=10^(slope/200),
+        //    while Zeus/Thetis send Custom's UI slope multiplied by 10. Its dB
+        //    contribution is therefore exactly the UI slope. Canned modes use 0.
+        double slopeDb = agc.Mode == AgcMode.Custom
+            ? Math.Clamp(agc.Slope ?? 0, 0, 20)
+            : 0.0;
+        double top = AgcOutTargetDb - slopeDb - (thresh + noiseOffset);
         // 4) Thetis rounds and clamps the resulting top (console.cs:45996-45998).
         return Math.Clamp(Math.Round(top), AgcTopMinDb, AgcTopMaxDb);
     }
@@ -3122,8 +3197,8 @@ public sealed class RadioService : IDisposable
     /// Auto-AGC-T control loop. Consumes the settled band noise floor estimated
     /// upstream by DspPipelineService's AutoAgcNoiseFloorTracker (the Thetis
     /// display.cs processNoiseFloor port) and, via
-    /// <see cref="AutoAgcTopFromNoiseFloor"/>, seats the AGC knee at that floor
-    /// exactly as Thetis's 500 ms tmrAutoAGC_Tick does — carrying the result as
+    /// <see cref="AutoAgcTopFromNoiseFloor"/>, seats the AGC knee at Thetis's
+    /// configured floor shift exactly as its 500 ms tmrAutoAGC_Tick does — carrying the result as
     /// AgcOffsetDb on top of the operator baseline. A deadband suppresses
     /// sub-dB dither. When no settled floor is available (tracker fast-
     /// attacking after a band change, or no spectrum at all) the loop HOLDS
@@ -3175,7 +3250,7 @@ public sealed class RadioService : IDisposable
             // in manual mode.
             double noiseFloor = spectrumFloorDbm;
             double autoTop = AutoAgcTopFromNoiseFloor(noiseFloor);
-            double desiredOffset = autoTop - _state.AgcTopDb;
+            double desiredOffset = autoTop - AgcBaseline(_state);
 
             // Thetis's auto-AGC-T tick (console.cs tmrAutoAGC_Tick:46066) does ONE
             // thing: seat the AGC threshold at the SETTLED noise floor. It never
@@ -3247,7 +3322,8 @@ public sealed class RadioService : IDisposable
         int? onlyIfDrivePctIs = null,
         bool abortIfTxActive = false)
     {
-        int clamped = Math.Clamp(percent, 0, 100);
+        int requested = Math.Clamp(percent, 0, 100);
+        int clamped = 0;
         // Mutate() broadcasts the new StateDto to subscribed clients and
         // flips _stateDirty so the debounce flush persists to LiteDB. Without
         // the broadcast a fresh client connect would not see the hydrated
@@ -3259,6 +3335,7 @@ public sealed class RadioService : IDisposable
                 (abortIfTxActive && (_mox || _tunActive)))
                 return null;
 
+            clamped = Math.Min(requested, Math.Clamp(s.DriveMaxPct, 1, 100));
             Interlocked.Exchange(ref _drivePct, clamped);
             return s with { DrivePct = clamped };
         }, out bool applied);
@@ -3569,7 +3646,8 @@ public sealed class RadioService : IDisposable
         int? onlyIfTunePctIs = null,
         bool abortIfTxActive = false)
     {
-        int clamped = Math.Clamp(percent, 0, 100);
+        int requested = Math.Clamp(percent, 0, 100);
+        int clamped = 0;
         Mutate(s =>
         {
             // Close recall's value and key-up TOCTOU windows atomically.
@@ -3577,6 +3655,7 @@ public sealed class RadioService : IDisposable
                 (abortIfTxActive && (_mox || _tunActive)))
                 return null;
 
+            clamped = Math.Min(requested, Math.Clamp(s.DriveMaxPct, 1, 100));
             Interlocked.Exchange(ref _tunePct, clamped);
             return s with { TunePct = clamped };
         }, out bool applied);
@@ -3930,7 +4009,18 @@ public sealed class RadioService : IDisposable
         if (client is null) return;
         var options = ResolveG2AdcOptionsForWire(connectedBoard);
         client.SetAdcDitherRandom(options.DitherEnabled, options.RandomEnabled);
-        client.SetRx1Attenuator(options.Rx1AttenuatorSupported ? options.Rx1AttenuatorDb : 0);
+        int adc1Attenuation;
+        lock (_sync)
+        {
+            // ADC1's standalone G2 preference owns byte 1442 unless the
+            // primary receiver is explicitly sourced from ADC1. In that case
+            // the front-panel S-ATT baseline/Auto offset owns the same hardware
+            // attenuator and must remain authoritative across option replays.
+            adc1Attenuation = ReceiverAdcSource(_state, 0) == 1
+                ? Math.Clamp(_atten.ClampedDb + _attOffsetDb, 0, 31)
+                : options.Rx1AttenuatorSupported ? options.Rx1AttenuatorDb : 0;
+        }
+        client.SetRx1Attenuator(adc1Attenuation);
     }
 
     /// <summary>
@@ -4025,6 +4115,25 @@ public sealed class RadioService : IDisposable
     //   - Connected (push current snapshot to fresh client)
     private void RecomputePaAndPush() => RecomputePaAndPushCore(safetyInhibit: false);
 
+    public StateDto SetDriveMaximum(int percent)
+    {
+        int maximum = Math.Clamp(percent, 1, 100);
+        Mutate(s =>
+        {
+            int drive = Math.Min(s.DrivePct, maximum);
+            int tune = Math.Min(s.TunePct, maximum);
+            Interlocked.Exchange(ref _drivePct, drive);
+            Interlocked.Exchange(ref _tunePct, tune);
+            return s with { DrivePct = drive, DriveMaxPct = maximum, TunePct = tune };
+        });
+        // Reduce live RF before touching storage, then persist this infrequent
+        // hardware-protection setting before acknowledging the change so an
+        // abrupt exit cannot restore an older, higher ceiling on next launch.
+        RecomputePaAndPush();
+        FlushState();
+        return Snapshot();
+    }
+
     private void RecomputePaAndPushCore(bool safetyInhibit)
     {
         var stateSnap = Snapshot();
@@ -4040,9 +4149,14 @@ public sealed class RadioService : IDisposable
 
         bool tunActive;
         lock (_sync) tunActive = _tunActive;
-        int activePct = tunActive
+        int requestedPct = tunActive
             ? Volatile.Read(ref _tunePct)
             : Volatile.Read(ref _drivePct);
+        // Belt-and-suspenders enforcement at the final TX-chain seam. Normal
+        // setters and the PA-change callback already clamp state, but this
+        // prevents any racing legacy/internal source from producing a drive
+        // byte above the persisted amplifier ceiling.
+        int activePct = Math.Min(requestedPct, Math.Clamp(stateSnap.DriveMaxPct, 1, 100));
         // Route through the per-board drive-profile so HL2's 4-bit drive
         // register is respected (bottom nibble ignored by gateware). See
         // Zeus.Server.RadioDriveProfile + docs/lessons/hl2-drive-byte-
@@ -4066,8 +4180,8 @@ public sealed class RadioService : IDisposable
             && cfg.Global.PaEnabled && !bandCfg.DisablePa;
 
         _log.LogInformation(
-            "pa.recompute tunActive={Tun} pct={Pct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, activePct, stateSnap.TxVfo, txHz, bandName ?? "?", bandCfg.PaGainDb, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
+            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
+            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, bandName ?? "?", bandCfg.PaGainDb, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
         ActiveClient?.SetDriveByte(driveByte);
@@ -4144,16 +4258,18 @@ public sealed class RadioService : IDisposable
     internal static byte ComputeDriveByte(int drivePct, double paGainDb, int maxWatts)
         => DriveByteMath.ComputeFullByte(drivePct, paGainDb, maxWatts);
 
-    // "AGC Top" slider — max post-AGC gain in dB. Clamped to the operator
-    // baseline range (MinAgcTopDb..MaxAgcTopDb = 30..90); below 30 the audio
-    // is effectively muted and 90 is the Thetis default / loudest the AGC
-    // drives, so the wider raw-Thetis span was dead travel. This clamp is authoritative for
-    // BOTH the REST /api/agcGain endpoint and the TCI agc_gain command.
-    // DspPipelineService picks this up through the StateChanged event and
-    // forwards it to the active engine.
+    // "AGC Top" slider — max post-AGC gain in dB. In Fixed mode Thetis routes
+    // this same front-panel RF control to RXFixedAGC (-20..120) while retaining
+    // the normal max-gain baseline for the next non-Fixed mode. Keep those two
+    // baselines separate by storing Fixed in AgcConfig.FixedGainDb.
     public StateDto SetAgcTop(double topDb)
     {
-        double clamped = Math.Clamp(topDb, MinAgcTopDb, MaxAgcTopDb);
+        bool fixedMode;
+        lock (_sync) fixedMode = (_state.Agc?.Mode ?? AgcMode.Med) == AgcMode.Fixed;
+        double clamped = Math.Clamp(
+            topDb,
+            fixedMode ? MinAgcFixedGainDb : MinAgcTopDb,
+            MaxAgcTopDb);
         // Grabbing the AGC-T slider takes MANUAL control. The value pushed to
         // WDSP is the EFFECTIVE AGC-T = AgcTopDb + AgcOffsetDb, where the offset
         // is the Auto-AGC control-loop accumulator. If Auto-AGC kept running,
@@ -4164,14 +4280,34 @@ public sealed class RadioService : IDisposable
         // under _sync (Mutate invokes fn exactly once inside the lock). Net
         // effect: the effective AGC-T equals the slider EXACTLY. Auto-AGC is a
         // deliberate mode the operator re-enables from its own toggle.
+        AgcConfig? fixedConfigToPersist = null;
         Mutate(s =>
         {
             _agcOffsetDb = 0.0;
             _lastAgcTickMs = long.MinValue;
-            return s with { AgcTopDb = clamped, AgcOffsetDb = 0.0, AutoAgcEnabled = false };
+            if ((s.Agc?.Mode ?? AgcMode.Med) == AgcMode.Fixed)
+            {
+                fixedConfigToPersist = NormalizeAgcConfig(
+                    (s.Agc ?? new AgcConfig(AgcMode.Fixed)) with { FixedGainDb = clamped });
+                return s with
+                {
+                    Agc = fixedConfigToPersist,
+                    AgcOffsetDb = 0.0,
+                    AutoAgcEnabled = false,
+                };
+            }
+            return s with
+            {
+                AgcTopDb = clamped,
+                AgcOffsetDb = 0.0,
+                AutoAgcEnabled = false,
+            };
         });
-        // Persist only the user-baseline (AgcTopDb); the offset is live-recomputed.
-        _dspSettingsStore.SetAgcTopDb(clamped);
+        // Persist only the active user baseline; the offset is live-recomputed.
+        if (fixedConfigToPersist is not null)
+            _dspSettingsStore.SetAgc(fixedConfigToPersist);
+        else
+            _dspSettingsStore.SetAgcTopDb(clamped);
         return Snapshot();
     }
 
@@ -4289,10 +4425,29 @@ public sealed class RadioService : IDisposable
     public StateDto SetAgc(AgcConfig cfg)
     {
         ArgumentNullException.ThrowIfNull(cfg);
-        Mutate(s => s with { Agc = cfg });
-        _dspSettingsStore.SetAgc(cfg);
+        var normalized = NormalizeAgcConfig(cfg);
+        Mutate(s => s with { Agc = normalized });
+        _dspSettingsStore.SetAgc(normalized);
         return Snapshot();
     }
+
+    internal static AgcConfig NormalizeAgcConfig(AgcConfig cfg) => cfg with
+    {
+        Slope = cfg.Slope is int slope ? Math.Clamp(slope, 0, 20) : null,
+        DecayMs = cfg.DecayMs is int decay ? Math.Clamp(decay, 1, 5_000) : null,
+        HangMs = cfg.HangMs is int hang ? Math.Clamp(hang, 1, 5_000) : null,
+        HangThreshold = cfg.HangThreshold is int threshold
+            ? Math.Clamp(threshold, 0, 100)
+            : null,
+        FixedGainDb = cfg.FixedGainDb is double fixedGain
+            ? Math.Clamp(fixedGain, MinAgcFixedGainDb, MaxAgcTopDb)
+            : null,
+    };
+
+    internal static double AgcBaseline(StateDto state) =>
+        state.Agc?.Mode == AgcMode.Fixed
+            ? Math.Clamp(state.Agc.FixedGainDb ?? 20.0, MinAgcFixedGainDb, MaxAgcTopDb)
+            : Math.Clamp(state.AgcTopDb, MinAgcTopDb, MaxAgcTopDb);
 
     // RX squelch (mode-aware single control). Replace-style like SetAgc; the
     // engine apply happens in DspPipelineService via the _appliedSquelch latch.
@@ -4928,7 +5083,7 @@ public sealed class RadioService : IDisposable
         return s with { Receivers = list };
     }
 
-    private static byte ReceiverAdcSource(StateDto s, int index)
+    internal static byte ReceiverAdcSource(StateDto s, int index)
     {
         if (s.Receivers is { } receivers)
         {
@@ -5060,6 +5215,7 @@ public sealed class RadioService : IDisposable
                 FmTxFilterLoAbs = fmTx.LoAbs,   FmTxFilterHiAbs = fmTx.HiAbs,
                 CwTxFilterLoAbs = cwTx.LoAbs,   CwTxFilterHiAbs = cwTx.HiAbs,
                 DrivePct = snap.DrivePct,
+                DriveMaxPct = snap.DriveMaxPct,
                 TunePct = snap.TunePct,
                 TxMoxPreKeyDelayMs = snap.TxMoxPreKeyDelayMs,
                 TxMoxTailDelayMs = snap.TxMoxTailDelayMs,
@@ -5126,7 +5282,7 @@ public sealed class RadioService : IDisposable
             _connectedFirmware = firmware;
             _attOffsetDb = 0;
             _adcOverloadLevel = 0;
-            _overloadSeenInWindow = false;
+            ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
@@ -5195,7 +5351,7 @@ public sealed class RadioService : IDisposable
             _connectedFirmware = null;
             _attOffsetDb = 0;
             _adcOverloadLevel = 0;
-            _overloadSeenInWindow = false;
+            ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
@@ -5234,7 +5390,7 @@ public sealed class RadioService : IDisposable
             _connectedFirmware = firmware;
             _attOffsetDb = 0;
             _adcOverloadLevel = 0;
-            _overloadSeenInWindow = false;
+            ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
@@ -5266,7 +5422,7 @@ public sealed class RadioService : IDisposable
             _connectedFirmware = null;
             _attOffsetDb = 0;
             _adcOverloadLevel = 0;
-            _overloadSeenInWindow = false;
+            ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
@@ -5423,13 +5579,13 @@ public sealed class RadioService : IDisposable
 
     /// <summary>
     /// Protocol-1 compatibility entrypoint for tests and the P1 overload
-    /// event. Uses the same configurable protection core as Protocol 2; the
-    /// default config preserves the old Thetis-style 100 ms / 1 dB loop.
+    /// event. Uses the same configurable primary-RX protection core as
+    /// Protocol 2.
     /// </summary>
     internal void HandleAdcOverload(AdcOverloadStatus status, long nowMs)
     {
         byte bits = (byte)((status.Adc0 ? 0x01 : 0) | (status.Adc1 ? 0x02 : 0));
-        HandleAdcProtection(status.AnyOverload, bits, null, null, nowMs);
+        HandleAdcProtection(bits, null, null, nowMs);
     }
 
     /// <summary>
@@ -5439,9 +5595,7 @@ public sealed class RadioService : IDisposable
     /// </summary>
     internal void HandleP2AdcTelemetry(P2TelemetryReading reading, long nowMs)
     {
-        bool anyOverload = reading.AdcOverloadBits != 0;
         HandleAdcProtection(
-            anyOverload,
             reading.AdcOverloadBits,
             reading.Adc0MaxMagnitude,
             reading.Adc1MaxMagnitude,
@@ -5455,7 +5609,6 @@ public sealed class RadioService : IDisposable
     /// most one policy step per attack/release window so the ramp is bounded.
     /// </summary>
     private void HandleAdcProtection(
-        bool hardOverload,
         byte overloadBits,
         ushort? adc0MaxMagnitude,
         ushort? adc1MaxMagnitude,
@@ -5481,11 +5634,30 @@ public sealed class RadioService : IDisposable
             if (_mox) return;   // TX-side ATT is owned by a different code path
 
             var cfg = _adcProtection;
+            // The single front-panel S-ATT control belongs to the primary RX.
+            // Route protection telemetry through that receiver's physical ADC
+            // instead of OR-ing unrelated ADCs and attenuating the wrong input.
+            byte protectedAdc = ReceiverAdcSource(_state, 0) == 1 ? (byte)1 : (byte)0;
+            bool protectedHardOverload = (overloadBits & (1 << protectedAdc)) != 0;
+            ushort? protectedMagnitude = protectedAdc == 1
+                ? adc1MaxMagnitude
+                : adc0MaxMagnitude;
             bool magnitudeSoftHit = cfg.MagnitudeSoftLimit > 0
-                && ((adc0MaxMagnitude ?? 0) >= cfg.MagnitudeSoftLimit
-                    || (adc1MaxMagnitude ?? 0) >= cfg.MagnitudeSoftLimit);
+                && (protectedMagnitude ?? 0) >= cfg.MagnitudeSoftLimit;
 
-            if (hardOverload || magnitudeSoftHit) _overloadSeenInWindow = true;
+            if (protectedHardOverload)
+            {
+                _overloadSeenInWindow = true;
+                _hardOverloadSeenInWindow = true;
+            }
+            if (magnitudeSoftHit)
+            {
+                _overloadSeenInWindow = true;
+                _softMagnitudeSeenInWindow = true;
+            }
+            _maxMagnitudeSeenInWindow = Math.Max(
+                _maxMagnitudeSeenInWindow,
+                protectedMagnitude ?? 0);
 
             if (_lastTickMs == long.MinValue)
             {
@@ -5498,7 +5670,10 @@ public sealed class RadioService : IDisposable
             _lastTickMs = nowMs;
 
             bool seen = _overloadSeenInWindow;
-            _overloadSeenInWindow = false;
+            bool hardSeen = _hardOverloadSeenInWindow;
+            bool softSeen = _softMagnitudeSeenInWindow;
+            ushort maxMagnitudeSeen = _maxMagnitudeSeenInWindow;
+            ResetAdcProtectionWindowNoLock();
 
             if (seen)
             {
@@ -5508,12 +5683,34 @@ public sealed class RadioService : IDisposable
                 // that counter exactly so the gate below matches its >3 timing.
                 _adcOverloadLevel = Math.Min(5, _adcOverloadLevel + 1);
 
-                // Gate the ramp on a *sustained* overload — Thetis only touches
-                // the attenuator once _adc_overload_level[i] > 3 (console.cs:
-                // 21518), the same threshold that turns the lamp red. A single
-                // transient spike no longer pulls in attenuation.
-                if (_adcOverloadLevel > cfg.WarningThreshold && _attOffsetDb < cfg.MaxOffsetDb)
-                    _attOffsetDb = Math.Min(cfg.MaxOffsetDb, _attOffsetDb + cfg.AttackStepDb);
+                // Hard-overload qualification is Thetis-faithful: wait until
+                // the leaky counter crosses the warning threshold. Its separate
+                // step-shift counter is normally 4 at that first action, so use
+                // the same 4 dB rescue instead of leaving the ADC clipped while
+                // a 1 dB/s-style ramp catches up. Subsequent windows stay at the
+                // configured bounded step, avoiding Thetis's increasingly large
+                // 5/6/7... dB overshoot.
+                bool qualifiedHard = hardSeen && _adcOverloadLevel > cfg.WarningThreshold;
+                // A configured P2 magnitude limit is predictive headroom data,
+                // not a clipped-bit transient. It may act immediately and picks
+                // the smallest whole-dB step that brings the observed peak back
+                // under the requested limit.
+                bool qualifiedSoft = softSeen;
+                int maxDynamicOffset = Math.Min(
+                    cfg.MaxOffsetDb,
+                    HpsdrAtten.MaxDb - _atten.ClampedDb);
+                if ((qualifiedHard || qualifiedSoft) && _attOffsetDb < maxDynamicOffset)
+                {
+                    int attackDb = cfg.AttackStepDb;
+                    if (qualifiedHard && _attOffsetDb == 0)
+                        attackDb = Math.Max(attackDb, Math.Min(4, _adcOverloadLevel));
+                    if (qualifiedSoft)
+                        attackDb = MagnitudeAttackStepDb(
+                            maxMagnitudeSeen,
+                            cfg.MagnitudeSoftLimit,
+                            attackDb);
+                    _attOffsetDb = Math.Min(maxDynamicOffset, _attOffsetDb + attackDb);
+                }
             }
             else
             {
@@ -5549,7 +5746,7 @@ public sealed class RadioService : IDisposable
 
         if (effectiveToApply is int eff)
         {
-            ActiveClient?.SetAttenuator(new HpsdrAtten(eff));
+            ApplyPrimaryAttenuatorToActiveClient(eff);
         }
         if (changedWarning)
         {

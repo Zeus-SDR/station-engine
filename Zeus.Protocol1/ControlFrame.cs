@@ -327,7 +327,10 @@ internal static class ControlFrame
         // off for HL2. Both default false → matches Thetis' netInterface.c init
         // (`adc[i].dither = adc[i].random = 0`) and is byte-identical to today.
         bool AdcDitherEnabled = false,
-        bool AdcRandomEnabled = false);
+        bool AdcRandomEnabled = false,
+        // Physical ADC1 step attenuator. Thetis shares C0=0x16 with the keyer:
+        // ADC1 occupies C1[4:0] plus enable C1[5], while keyer fields use C2..C4.
+        HpsdrAtten Adc1Atten = default);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -631,6 +634,7 @@ internal static class ControlFrame
     {
         // C&C 0x0B layout (gateware rtl/cw_openhpsdr.sv:29-34, where
         // cmd_data[31:24]=C1, [23:16]=C2, [15:8]=C3, [7:0]=C4):
+        //   ADC1 step ATT = cmd_data[28:24] → C1[4:0], enable C1[5]
         //   keyer_reverse = cmd_data[22]    → C2[6]
         //   keyer_mode    = cmd_data[15:14] → C3[7:6]
         //   keyer_speed   = cmd_data[13:8]  → C3[5:0]
@@ -639,7 +643,8 @@ internal static class ControlFrame
         int speed = Math.Clamp(s.CwKeyerSpeedWpm, 0, CwKeyerMaxWpm);
         byte mode = (byte)((byte)s.CwKeyerMode & 0x03);
 
-        c14[0] = 0;                                              // C1 — unused
+        int adc1Db = s.Adc1Atten.ClampedDb;
+        c14[0] = adc1Db == 0 ? (byte)0 : (byte)(0x20 | adc1Db);  // C1 ADC1 ATT
         c14[1] = (byte)(CwKeyerDefaultReverse ? 1 << 6 : 0);     // C2[6] reverse
         c14[2] = (byte)((mode << 6) | (speed & 0x3F));           // C3[7:6] mode | [5:0] speed
         c14[3] = (byte)((CwKeyerDefaultSpacing ? 1 << 7 : 0)

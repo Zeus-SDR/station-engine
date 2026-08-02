@@ -19,6 +19,7 @@ namespace Zeus.Contracts;
 /// {"kind":"message","message":{...ChatMessage...}}
 /// {"kind":"history","room":"lobby","messages":[{...ChatMessage...}, ...]}
 /// {"kind":"friends","friends":{...ChatFriendsDto...}}
+/// {"kind":"ptt","ptt":{...ChatPttSignal...}}
 /// {"kind":"rooms","rooms":[{...ChatRoomDto...}, ...]}
 /// {"kind":"banned","message":"..."}
 /// {"kind":"cleared","room":"lobby"}
@@ -58,6 +59,10 @@ public static class ChatEventFrame
     /// <summary>Encodes a friend-graph envelope into a 0x35 frame.</summary>
     public static byte[] Friends(ChatFriendsDto friends) =>
         Encode(new FriendsEnvelope(friends));
+
+    /// <summary>Encodes an ephemeral PTT signalling envelope into a 0x35 frame.</summary>
+    public static byte[] Ptt(ChatPttSignal ptt) =>
+        Encode(new PttEnvelope(ptt));
 
     /// <summary>Encodes the operator's visible-rooms list into a 0x35 frame.</summary>
     public static byte[] Rooms(IReadOnlyList<ChatRoomDto> rooms) =>
@@ -128,6 +133,11 @@ public static class ChatEventFrame
     public sealed record FriendsEnvelope(ChatFriendsDto Friends)
     {
         public string Kind => "friends";
+    }
+
+    public sealed record PttEnvelope(ChatPttSignal Ptt)
+    {
+        public string Kind => "ptt";
     }
 
     public sealed record RoomsEnvelope(IReadOnlyList<ChatRoomDto> Rooms)

@@ -124,7 +124,7 @@ public static class TxTimingAndTestEndpoints
             if (req.Percent < 0 || req.Percent > 100)
                 return Results.BadRequest(new { error = "percent must be 0..100" });
             r.SetTuneDrive(req.Percent);
-            return Results.Ok(new { tunePercent = req.Percent });
+            return Results.Ok(new { tunePercent = r.Snapshot().TunePct });
         });
 
         // Two-tone test generator (TXA PostGen mode=1). Protocol-agnostic — works

@@ -180,6 +180,8 @@ public sealed class RadioStateEntry
     public int WorkspaceZoomPct { get; set; } = 100;
     // Drive slider % (0..100). Default 0 mirrors RadioService._drivePct seed.
     public int DrivePct { get; set; }
+    // Station-wide DRV/TUN ceiling. Missing on legacy rows -> unrestricted 100.
+    public int DriveMaxPct { get; set; } = 100;
     // TUN drive slider % (0..100). Default 10 mirrors RadioService._tunePct seed —
     // a 0 default would make pressing TUN appear to do nothing.
     public int TunePct { get; set; } = 10;
