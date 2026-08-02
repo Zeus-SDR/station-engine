@@ -4,6 +4,7 @@
 using Zeus.Server.Cat;
 using Zeus.Server.SpeTaurus;
 using Zeus.Server.Tci;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Zeus.Server;
 
@@ -36,12 +37,28 @@ public static class StationControlHostingExtensions
         return services;
     }
 
-    public static IServiceCollection AddSpeTaurusServices(this IServiceCollection services)
+    public static IServiceCollection AddSpeTaurusServices(
+        this IServiceCollection services,
+        string? configDbPathOverride = null)
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        services.AddSingleton(sp => new SpeTaurusService(
-            sp.GetRequiredService<ILogger<SpeTaurusService>>()));
+        services.TryAddSingleton<IInstalledFeatureState, NoInstalledFeatureState>();
+        services.AddSingleton(_ => new SpeTaurusConfigStore(configDbPathOverride));
+        services.AddSingleton(sp =>
+        {
+            var store = sp.GetRequiredService<SpeTaurusConfigStore>();
+            return new SpeTaurusService(
+                sp.GetRequiredService<ILogger<SpeTaurusService>>(),
+                initialConfig: store.Get(),
+                persistConfig: store.Set,
+                features: sp.GetRequiredService<IInstalledFeatureState>());
+        });
+        services.AddSingleton<ExpertAmpServerControl>();
+        services.AddSingleton<SpeTaurusAutomaticTuneCoordinator>();
+        services.TryAddSingleton<TuneCarrierCommandCoordinator>();
+        services.AddSingleton<IAmplifierTunePreflight, ExpertAmpServerTunePreflight>();
+        services.AddSingleton<ExpertAmpServerDiscovery>();
         services.AddHostedService(sp => new SpeTaurusWorker(
             sp.GetRequiredService<SpeTaurusService>()));
         return services;

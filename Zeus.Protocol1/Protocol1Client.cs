@@ -209,6 +209,7 @@ public sealed class Protocol1Client : IProtocol1Client
     // _startHandshakeActive under a newer one (last-writer-wins hazard).
     private CancellationTokenSource? _handshakeCts;
     private int _handshakeGeneration;
+    private int _startHandshakeFailed;
     private long _ep2SendSeq;           // shared EP2 sequence: TxLoop + pre-announce frames
     // Start-handshake (F3): after start, if no VALID parsed EP6 packet within
     // the timeout, re-send start, up to Attempts total. Internal knobs so
@@ -301,6 +302,13 @@ public sealed class Protocol1Client : IProtocol1Client
     public ChannelReader<IqFrame> IqFrames => _channel.Reader;
     public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
     public long TotalFrames => Interlocked.Read(ref _totalFrames);
+    internal bool StartHandshakeFailed => Volatile.Read(ref _startHandshakeFailed) != 0;
+
+    internal void RecordInitialStartHandshakeFailed() =>
+        Volatile.Write(ref _startHandshakeFailed, 1);
+
+    internal void RecordInitialStartHandshakeSucceeded() =>
+        Volatile.Write(ref _startHandshakeFailed, 0);
 
     public event Action? Disconnected;
     /// <summary>Fires (at most once per stall, from the RX thread) when PS is
@@ -964,6 +972,7 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _attenAdc1Db, 0);
         Interlocked.Exchange(ref _droppedFrames, 0);
         Interlocked.Exchange(ref _totalFrames, 0);
+        RecordInitialStartHandshakeSucceeded();
         ResetRxParserState();
 
         // The HTTP request token gates setup only. Linking the live radio
@@ -1027,7 +1036,10 @@ public sealed class Protocol1Client : IProtocol1Client
         // up to 3 attempts — piHPSDR retries the whole start sequence 10×
         // (old_protocol.c:2894-2918). After the final failed attempt the
         // existing consecutive-timeout teardown takes over unchanged.
-        BeginStartHandshakeWatchdog(_loopCts.Token, StartWatchdogMode.InitialStart);
+        BeginStartHandshakeWatchdog(
+            _loopCts.Token,
+            StartWatchdogMode.InitialStart,
+            attributeFailureToConnectionStart: true);
         }
         finally
         {
@@ -1486,7 +1498,10 @@ public sealed class Protocol1Client : IProtocol1Client
     /// chance; after the final failure the existing timeout-to-Disconnected
     /// teardown fires unchanged.
     /// </summary>
-    private void BeginStartHandshakeWatchdog(CancellationToken ct, StartWatchdogMode mode)
+    private void BeginStartHandshakeWatchdog(
+        CancellationToken ct,
+        StartWatchdogMode mode,
+        bool attributeFailureToConnectionStart = false)
     {
         // Supersede any prior watchdog (see the _handshakeCts field comment):
         // exactly one watchdog may own start re-sends at a time. Capture the
@@ -1533,6 +1548,8 @@ public sealed class Protocol1Client : IProtocol1Client
                         if (token.IsCancellationRequested) return;
                         if (Interlocked.Read(ref _totalFrames) > baseline)
                         {
+                            if (attributeFailureToConnectionStart)
+                                RecordInitialStartHandshakeSucceeded();
                             if (mode == StartWatchdogMode.RxRecovery)
                             {
                                 _log.LogInformation("p1.rx.recover ok attempt={Attempt}", attempt);
@@ -1567,6 +1584,8 @@ public sealed class Protocol1Client : IProtocol1Client
                 }
                 else
                 {
+                    if (attributeFailureToConnectionStart)
+                        RecordInitialStartHandshakeFailed();
                     _log.LogWarning(
                         "p1.start.handshake no valid EP6 after {Max} attempts — RX-timeout teardown takes over",
                         maxAttempts);

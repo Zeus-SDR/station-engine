@@ -99,11 +99,22 @@ public static class TxControlEndpoints
         // TUN: internal-tune carrier. Flips SetTXAPostGenRun on WDSP; server-side is
         // where the PRD's drive clamp to min(drive, 25) lives, and where we gate
         // mutual exclusion with MOX so the HL2 sees exactly one of them active.
-        endpoints.MapPost("/api/tx/tun", (TunSetRequest req, TxService tx) =>
+        endpoints.MapPost("/api/tx/tun", async Task<IResult> (
+            TunSetRequest req,
+            TxService tx,
+            [Microsoft.AspNetCore.Mvc.FromServices] TuneCarrierCommandCoordinator coordinator,
+            CancellationToken cancellationToken) =>
         {
-            if (!tx.TrySetTun(req.On, out var err))
-                return Results.Conflict(new { error = err });
-            return Results.Ok(new { tunOn = tx.IsTunOn });
+            var result = await coordinator.SetAsync(req.On, tx, cancellationToken)
+                .ConfigureAwait(false);
+            if (!result.Success)
+            {
+                var body = new { error = result.Error };
+                return result.ExternalFailure
+                    ? Results.Json(body, statusCode: StatusCodes.Status503ServiceUnavailable)
+                    : Results.Conflict(body);
+            }
+            return Results.Ok(new { tunOn = result.TunOn });
         });
 
         endpoints.MapPost("/api/tx/drive", (DriveSetRequest req, RadioService r) =>

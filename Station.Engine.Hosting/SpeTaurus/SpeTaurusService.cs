@@ -28,11 +28,14 @@ public sealed record SpeTaurusConfig(
     int IdlePollingMs = 1000,
     int ResponseTimeoutMs = 1200,
     int ConnectTimeoutMs = 3000,
-    string D2xxSerial = "");
+    string D2xxSerial = "",
+    string ExpertServerUrl = "",
+    int TuneArmTimeoutMs = 2000);
 
 internal sealed record SpeTaurusStatus(
     bool Enabled,
     bool Connected,
+    bool ControlReady,
     string ConnectionState,
     string Transport,
     string Endpoint,
@@ -54,9 +57,16 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     private readonly ILogger _log;
     private readonly Func<string, ISpeTransport> _transportFactory;
     private readonly Func<SpeD2xxScan> _d2xxScan;
+    private readonly Action<SpeTaurusConfig>? _persistConfig;
+    private readonly IInstalledFeatureState? _features;
+    private readonly IInstalledFeatureChangeSource? _featureChanges;
     private readonly SemaphoreSlim _io = new(1, 1);
     private readonly SpeChangePulse _changed = new();
     private readonly object _stateGate = new();
+    private readonly object _featureIoGate = new();
+    private readonly object _configIoGate = new();
+    private CancellationTokenSource _featureIoCancellation = new();
+    private CancellationTokenSource _configIoCancellation = new();
 
     private volatile SpeTaurusConfig _config;
     private ISpeTransport? _transport;
@@ -74,7 +84,9 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         ILogger<SpeTaurusService> log,
         Func<string, ISpeTransport>? transportFactory = null,
         SpeTaurusConfig? initialConfig = null,
-        Func<SpeD2xxScan>? d2xxScan = null)
+        Func<SpeD2xxScan>? d2xxScan = null,
+        Action<SpeTaurusConfig>? persistConfig = null,
+        IInstalledFeatureState? features = null)
     {
         _log = log;
         var startupConfig = (initialConfig ?? new SpeTaurusConfig()) with
@@ -97,6 +109,11 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             _ => new SpeSerialTransport(),
         });
         _d2xxScan = d2xxScan ?? (() => SpeD2xxDiscovery.Scan());
+        _persistConfig = persistConfig;
+        _features = features;
+        _featureChanges = features as IInstalledFeatureChangeSource;
+        if (_featureChanges is not null)
+            _featureChanges.Changed += OnFeatureStateChanged;
     }
 
     internal SpeTaurusConfig Config => _config;
@@ -107,8 +124,9 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         lock (_stateGate)
         {
             return new(
-                config.Enabled,
+                config.Enabled && FeatureActive,
                 _transport?.IsOpen == true,
+                _transport?.IsOpen == true && _amplifier is not null,
                 _connectionState,
                 config.Transport,
                 Endpoint(config),
@@ -132,15 +150,7 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         await _io.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var changedTransport = !SameEndpoint(_config, next);
-            _config = next;
-            if (changedTransport || !next.Enabled)
-                await CloseLockedAsync(next.Enabled ? "configuration-changed" : "disabled", null)
-                    .ConfigureAwait(false);
-            lock (_stateGate)
-            {
-                if (next.Enabled && _connectionState == "disabled") _connectionState = "idle";
-            }
+            await ApplyConfigLockedAsync(next).ConfigureAwait(false);
         }
         finally
         {
@@ -148,6 +158,56 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             _changed.Pulse();
         }
         return _config;
+    }
+
+    internal async Task<SpeTaurusConfig?> TrySetConfigAsync(
+        SpeTaurusConfig expected,
+        SpeTaurusConfig requested,
+        CancellationToken cancellationToken)
+    {
+        var next = Sanitize(requested);
+        await _io.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!ReferenceEquals(expected, _config)) return null;
+            await ApplyConfigLockedAsync(next).ConfigureAwait(false);
+            return _config;
+        }
+        finally
+        {
+            _io.Release();
+            _changed.Pulse();
+        }
+    }
+
+    internal async Task<IDisposable?> TryAcquireConfigLeaseAsync(
+        SpeTaurusConfig expected,
+        CancellationToken cancellationToken)
+    {
+        await _io.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (ReferenceEquals(expected, _config))
+            return new SemaphoreLease(_io);
+        _io.Release();
+        return null;
+    }
+
+    private async Task ApplyConfigLockedAsync(SpeTaurusConfig next)
+    {
+        var changedTransport = !SameEndpoint(_config, next);
+        AdvanceConfigEpoch(next);
+        if (changedTransport || !next.Enabled)
+            await CloseLockedAsync(next.Enabled ? "configuration-changed" : "disabled", null)
+                .ConfigureAwait(false);
+        lock (_stateGate)
+        {
+            if (next.Enabled && _connectionState == "disabled") _connectionState = "idle";
+        }
+        try { _persistConfig?.Invoke(next); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "spe-taurus.config persistence failed");
+            lock (_stateGate) _error = "Taurus settings could not be persisted: " + ex.Message;
+        }
     }
 
     internal SpeTaurusStatus RefreshDevices()
@@ -166,7 +226,7 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         ExecuteCommandAsync(
             SpeCommand.Operate,
             allowAlarmedStandby: !operate,
-            requireOperate: false,
+            requireStandby: false,
             before => before.Operate == operate,
             after => after.Operate == operate,
             cancellationToken);
@@ -180,7 +240,7 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         return ExecuteCommandAsync(
             command,
             allowAlarmedStandby: false,
-            requireOperate: false,
+            requireStandby: false,
             _ => false,
             command switch
             {
@@ -195,9 +255,9 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         ExecuteCommandAsync(
             SpeCommand.Tune,
             allowAlarmedStandby: false,
-            requireOperate: true,
+            requireStandby: true,
             _ => false,
-            after => !HasAlarm(after),
+            after => !HasAlarm(after) && !after.Operate && !after.Transmitting,
             cancellationToken);
 
     // Accessed only while _io is held; used by cycle validators so they
@@ -212,6 +272,13 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             {
                 var signal = _changed.Capture();
                 var config = _config;
+                if (!FeatureActive)
+                {
+                    await CloseForGateAsync("feature-inactive", stoppingToken).ConfigureAwait(false);
+                    await _changed.WaitOrDelayAsync(signal, ReconnectBackoff, stoppingToken)
+                        .ConfigureAwait(false);
+                    continue;
+                }
                 if (!config.Enabled)
                 {
                     await CloseForGateAsync("disabled", stoppingToken).ConfigureAwait(false);
@@ -258,6 +325,10 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        if (_featureChanges is not null)
+            _featureChanges.Changed -= OnFeatureStateChanged;
+        CancelFeatureIo();
+        CancelConfigIo();
         _changed.Pulse();
         await _io.WaitAsync().ConfigureAwait(false);
         try { await CloseLockedAsync("disposed", null).ConfigureAwait(false); }
@@ -271,6 +342,7 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     private async Task<bool> PollCycleAsync(SpeTaurusConfig config, CancellationToken cancellationToken)
     {
         await _io.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var featureIo = LinkFeatureIo(cancellationToken);
         try
         {
             if (!CanUse(config))
@@ -278,14 +350,19 @@ internal sealed class SpeTaurusService : IAsyncDisposable
                 await CloseLockedAsync("disabled", null).ConfigureAwait(false);
                 return false;
             }
-            if (!await EnsureOpenLockedAsync(config, cancellationToken).ConfigureAwait(false)) return false;
-            var sample = await RequestStatusLockedAsync(config, cancellationToken).ConfigureAwait(false);
+            if (!await EnsureOpenLockedAsync(config, featureIo.Token).ConfigureAwait(false)) return false;
+            var sample = await RequestStatusLockedAsync(config, featureIo.Token).ConfigureAwait(false);
             ApplySample(sample);
             return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException) when (featureIo.IsCancellationRequested)
+        {
+            await CloseLockedAsync("feature-inactive", "feature-inactive").ConfigureAwait(false);
+            return false;
         }
         catch (Exception ex)
         {
@@ -299,29 +376,30 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     private async Task<SpeTaurusStatus> ExecuteCommandAsync(
         SpeCommand command,
         bool allowAlarmedStandby,
-        bool requireOperate,
+        bool requireStandby,
         Func<SpeAmplifierStatus, bool> alreadySatisfied,
         Func<SpeAmplifierStatus, bool> confirmed,
         CancellationToken cancellationToken)
     {
         await _io.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var featureIo = LinkFeatureIo(cancellationToken);
         var writeAttempted = false;
         try
         {
             var config = _config;
             if (!CanUse(config))
                 return Reject("amplifier-disabled");
-            if (!await EnsureOpenLockedAsync(config, cancellationToken).ConfigureAwait(false))
+            if (!await EnsureOpenLockedAsync(config, featureIo.Token).ConfigureAwait(false))
                 return Status();
 
-            var before = await RequestStatusLockedAsync(config, cancellationToken).ConfigureAwait(false);
+            var before = await RequestStatusLockedAsync(config, featureIo.Token).ConfigureAwait(false);
             ApplySample(before);
             _commandBefore = before;
             if (before.Transmitting) return Reject("Control is blocked while the amplifier reports TX.");
             if (HasAlarm(before) && !allowAlarmedStandby)
                 return Reject($"Control is blocked by amplifier alarm {before.AlarmCode}: {before.Alarm}");
-            if (requireOperate && !before.Operate)
-                return Reject("ATU tune is blocked until the amplifier is in OPERATE.");
+            if (requireStandby && before.Operate)
+                return Reject("ATU tune is blocked while the amplifier is in OP/OPERATE. Put it in STANDBY first.");
             if (alreadySatisfied(before)) return Status();
 
             // Recheck the active configuration immediately before the one
@@ -331,12 +409,12 @@ internal sealed class SpeTaurusService : IAsyncDisposable
 
             var transport = _transport ?? throw new IOException("Transport is not connected.");
             writeAttempted = true;
-            await transport.WriteAsync(SpeProtocol.EncodeCommand(command), cancellationToken)
+            await transport.WriteAsync(SpeProtocol.EncodeCommand(command), featureIo.Token)
                 .ConfigureAwait(false);
-            var responseStatus = await WaitForCommandResponseLockedAsync(command, config, cancellationToken)
+            var responseStatus = await WaitForCommandResponseLockedAsync(command, config, featureIo.Token)
                 .ConfigureAwait(false);
             var after = responseStatus
-                ?? await RequestStatusLockedAsync(config, cancellationToken).ConfigureAwait(false);
+                ?? await RequestStatusLockedAsync(config, featureIo.Token).ConfigureAwait(false);
             ApplySample(after);
             if (!confirmed(after))
                 throw new IOException("The command response was valid, but its effect was not confirmed.");
@@ -348,6 +426,14 @@ internal sealed class SpeTaurusService : IAsyncDisposable
                 await CloseLockedAsync("ambiguous-command", "Command cancellation left its outcome unknown; the transport was closed.")
                     .ConfigureAwait(false);
             throw;
+        }
+        catch (OperationCanceledException) when (featureIo.IsCancellationRequested)
+        {
+            var message = writeAttempted
+                ? "Feature deactivation left the command outcome unknown; the transport was closed."
+                : "amplifier-disabled";
+            await CloseLockedAsync(writeAttempted ? "ambiguous-command" : "feature-inactive", message)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -523,8 +609,78 @@ internal sealed class SpeTaurusService : IAsyncDisposable
         }
     }
 
+    private bool FeatureActive =>
+        _features?.IsActive(ExpertAmpServerTunePreflight.PluginId) ?? true;
+
+    private void OnFeatureStateChanged()
+    {
+        lock (_featureIoGate)
+        {
+            if (FeatureActive)
+            {
+                if (_featureIoCancellation.IsCancellationRequested)
+                {
+                    _featureIoCancellation.Dispose();
+                    _featureIoCancellation = new();
+                }
+            }
+            else
+            {
+                _featureIoCancellation.Cancel();
+            }
+        }
+        _changed.Pulse();
+    }
+
+    internal CancellationTokenSource LinkFeatureIo(CancellationToken cancellationToken)
+    {
+        lock (_featureIoGate)
+            return CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _featureIoCancellation.Token);
+    }
+
+    internal CancellationTokenSource LinkConfigIo(
+        SpeTaurusConfig expectedConfig,
+        CancellationToken cancellationToken)
+    {
+        lock (_configIoGate)
+        {
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _configIoCancellation.Token);
+            if (!ReferenceEquals(expectedConfig, _config)) linked.Cancel();
+            return linked;
+        }
+    }
+
+    private void AdvanceConfigEpoch(SpeTaurusConfig next)
+    {
+        CancellationTokenSource previous;
+        lock (_configIoGate)
+        {
+            previous = _configIoCancellation;
+            _configIoCancellation = new();
+            _config = next;
+        }
+        previous.Cancel();
+        previous.Dispose();
+    }
+
+    private void CancelConfigIo()
+    {
+        lock (_configIoGate)
+            _configIoCancellation.Cancel();
+    }
+
+    private void CancelFeatureIo()
+    {
+        lock (_featureIoGate)
+            _featureIoCancellation.Cancel();
+    }
+
     private bool CanUse(SpeTaurusConfig config) =>
-        !_disposed && config.Enabled && ReferenceEquals(config, _config);
+        !_disposed && FeatureActive && config.Enabled && ReferenceEquals(config, _config);
 
     private static bool HasAlarm(SpeAmplifierStatus status) =>
         !string.Equals(status.AlarmCode, "N", StringComparison.OrdinalIgnoreCase);
@@ -582,11 +738,15 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     {
         var transport = (config.Transport ?? "local").Trim().ToLowerInvariant();
         if (transport is not ("local" or "d2xx" or "tcp")) transport = "local";
+        var expertServerUrl = SanitizeExpertServerUrl(config.ExpertServerUrl);
         var baud = config.BaudRate is 9600 or 14400 or 19200 or 28800 or 38400 or 57600 or 115200
             ? config.BaudRate
             : 115200;
         return config with
         {
+            // Expert Amp Server owns the G2-side /dev device. Never also try
+            // to open that Linux path through the PC's local SerialPort API.
+            Enabled = config.Enabled && expertServerUrl.Length == 0,
             Transport = transport,
             PortName = (config.PortName ?? "").Trim()[..Math.Min((config.PortName ?? "").Trim().Length, 256)],
             BaudRate = baud,
@@ -597,9 +757,35 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             ResponseTimeoutMs = Math.Clamp(config.ResponseTimeoutMs, 200, 5000),
             ConnectTimeoutMs = Math.Clamp(config.ConnectTimeoutMs, 250, 30000),
             D2xxSerial = SanitizeD2xxSerial(config.D2xxSerial),
+            ExpertServerUrl = expertServerUrl,
+            TuneArmTimeoutMs = Math.Clamp(config.TuneArmTimeoutMs, 500, 5000),
         };
     }
 
+    internal static string SanitizeExpertServerUrl(string? value)
+    {
+        var candidate = (value ?? "").Trim();
+        if (candidate.Length == 0) return "";
+        if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri)
+            || uri.Scheme is not ("http" or "https")
+            || string.IsNullOrWhiteSpace(uri.Host)
+            || uri.UserInfo.Length != 0
+            || uri.Query.Length != 0
+            || uri.Fragment.Length != 0
+            || uri.AbsolutePath is not ("" or "/"))
+            throw new ArgumentException(
+                "Expert Amp Server URL must be an HTTP(S) origin such as http://g2-radio.local:8088 with no credentials, path, query, or fragment.",
+                nameof(value));
+        return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+    }
+
+}
+
+internal sealed class SemaphoreLease(SemaphoreSlim semaphore) : IDisposable
+{
+    private SemaphoreSlim? _semaphore = semaphore;
+
+    public void Dispose() => Interlocked.Exchange(ref _semaphore, null)?.Release();
 }
 
 internal sealed class SpeChangePulse

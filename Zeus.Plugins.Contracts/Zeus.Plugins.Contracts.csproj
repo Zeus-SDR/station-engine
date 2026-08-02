@@ -1,0 +1,25 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Openhpsdr.Zeus.Plugins.Contracts</PackageId>
+    <Description>Public surface for ZeusSDR plugins. Reference from plugin projects.</Description>
+    <Authors>Douglas J. Cerrato (KB2UKA), Christian Suarez (N9WAR), and contributors</Authors>
+    <PackageLicenseExpression>GPL-2.0-or-later</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Zeus-SDR/zeussdr</RepositoryUrl>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <!-- ABI 1 plugins must remain loadable by the 1.0.5 stable host even when
+         they are built from a newer Zeus source tree. File and package versions
+         still follow Directory.Build.props; only the CLR binding identity is
+         pinned for the lifetime of this ABI. -->
+    <AssemblyVersion>1.0.5.0</AssemblyVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+</Project>

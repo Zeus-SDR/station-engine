@@ -1,0 +1,33 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Minimal no-op managed entrypoint for host-scanned VST3 plugins.
+
+    A scanned .vst3 has no managed code of its own, but the Zeus plugin
+    loader requires every package to ship an assembly implementing
+    IZeusPlugin. This project is that assembly: the VstDirectoryScanService
+    drops this DLL into each generated plugin directory alongside a
+    synthesized plugin.json. The actual audio comes from the manifest's
+    audio.vst3Path, which AudioPluginBridge wraps in a VstHostAudioPlugin.
+
+    It is embedded as a resource into Zeus.Plugins.Host and written out at
+    scan time, so it must stay tiny and free of extra dependencies — only
+    Zeus.Plugins.Contracts (which the host supplies from its own load
+    context at runtime, hence Private=false here).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Zeus.Plugins.Contracts\Zeus.Plugins.Contracts.csproj">
+      <Private>false</Private>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

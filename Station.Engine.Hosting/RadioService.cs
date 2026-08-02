@@ -43,6 +43,7 @@
 // License for details.
 
 using System.Net;
+using System.Net.NetworkInformation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Zeus.Contracts;
@@ -251,7 +252,11 @@ public sealed class RadioService : IDisposable
     private Func<int, TransmitSafetyDecision>? _txDriveSafetyEvaluator;
 
     private Protocol1Client? _activeClient;
+    private P1ConnectionAttempt? _activeP1ConnectionAttempt;
     private Action? _activeClientDisconnectedHandler;
+    private readonly P1StartFailureRecovery? _p1StartFailureRecovery;
+    private CancellationTokenSource _operatorConnectionActionCts = new();
+    private long _operatorConnectionGeneration;
     // One ownership gate for all in-process radio transports. P1 and P2 must
     // never race into two UDP masters driving the same relay-bearing hardware.
     internal SemaphoreSlim RadioLifecycleGate { get; } = new(1, 1);
@@ -443,7 +448,7 @@ public sealed class RadioService : IDisposable
     private readonly IExternalReceiverSource _externalReceiverSource;
     private readonly int? _defaultConnectSampleRateHz;
 
-    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null)
+    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null)
     {
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<RadioService>();
@@ -458,6 +463,12 @@ public sealed class RadioService : IDisposable
         _radioStateStore = radioStateStore;
         _bandMemoryStore = bandMemoryStore;
         _audioStore = audioStore;
+        if (p1Discovery is not null)
+        {
+            _p1StartFailureRecovery = new P1StartFailureRecovery(
+                p1Discovery,
+                loggerFactory.CreateLogger<P1StartFailureRecovery>());
+        }
         _defaultConnectSampleRateHz = DisplayPerformanceOptions.Resolve(configuration).DefaultConnectSampleRateHz;
         _paStore.Changed += RecomputePaAndPush;
         // An antenna edit re-pushes the active band's selection server-
@@ -1200,12 +1211,24 @@ public sealed class RadioService : IDisposable
     }
 
     public async Task<StateDto> ConnectAsync(string endpoint, int sampleRate, CancellationToken ct = default,
-        HpsdrBoardKind discoveredKind = HpsdrBoardKind.Unknown, string? firmware = null)
+        HpsdrBoardKind discoveredKind = HpsdrBoardKind.Unknown, string? firmware = null,
+        PhysicalAddress? mac = null)
     {
+        var (generation, operatorActionToken) = BeginOperatorConnectionAction();
+        var attempt = new P1ConnectionAttempt(
+            endpoint,
+            sampleRate,
+            discoveredKind,
+            firmware,
+            mac,
+            generation,
+            operatorActionToken,
+            IsAutomaticRetry: false);
         await RadioLifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await ConnectCoreAsync(endpoint, sampleRate, ct, discoveredKind, firmware)
+            await DisconnectSupersededP1AutomaticRetryAsync().ConfigureAwait(false);
+            return await ConnectCoreAsync(attempt, ct)
                 .ConfigureAwait(false);
         }
         finally
@@ -1215,12 +1238,13 @@ public sealed class RadioService : IDisposable
     }
 
     private async Task<StateDto> ConnectCoreAsync(
-        string endpoint,
-        int sampleRate,
-        CancellationToken ct,
-        HpsdrBoardKind discoveredKind,
-        string? firmware)
+        P1ConnectionAttempt attempt,
+        CancellationToken ct)
     {
+        string endpoint = attempt.Endpoint;
+        int sampleRate = attempt.SampleRate;
+        var discoveredKind = attempt.DiscoveredKind;
+        string? firmware = attempt.Firmware;
         if (!TryParseEndpoint(endpoint, out var ipEndpoint))
             throw new ArgumentException($"Invalid endpoint '{endpoint}'.", nameof(endpoint));
 
@@ -1237,6 +1261,9 @@ public sealed class RadioService : IDisposable
         Action? clientDisconnectedHandler = null;
         lock (_sync)
         {
+            if (_operatorConnectionGeneration != attempt.Generation
+                || attempt.OperatorActionToken.IsCancellationRequested)
+                throw new OperationCanceledException(attempt.OperatorActionToken);
             if (_activeClient is not null || _p2Active || _p3Active)
                 throw new InvalidOperationException("Already connected. Disconnect first.");
 
@@ -1248,7 +1275,7 @@ public sealed class RadioService : IDisposable
                 _txIqSource,
                 _rxAudioSource);
             client.AdcOverloadObserved += OnAdcOverload;
-            clientDisconnectedHandler = () => OnClientDisconnected(client);
+            clientDisconnectedHandler = () => OnClientDisconnected(client, attempt);
             client.Disconnected += clientDisconnectedHandler;
             _activeClientDisconnectedHandler = clientDisconnectedHandler;
             // #1302 F4: PS feedback watchdog — fires when an armed HermesC10
@@ -1258,6 +1285,7 @@ public sealed class RadioService : IDisposable
             // restarts the radio out of the misframed state.
             client.PsFeedbackStalled += OnPsFeedbackStalled;
             _activeClient = client;
+            _activeP1ConnectionAttempt = attempt;
             // Record the discovered firmware for the diagnostics snapshot.
             _connectedFirmware = firmware;
             _state = _state with
@@ -1306,6 +1334,7 @@ public sealed class RadioService : IDisposable
                     _state = _state with { SampleRate = hpsdrRate.SampleRateHz() };
             }
             await client.StartAsync(new StreamConfig(hpsdrRate, _preampOn, _atten), ct).ConfigureAwait(false);
+            ThrowIfSuperseded(attempt);
             // StreamConfig carries the legacy ADC0 attenuator value. Re-apply
             // the primary receiver route now that the client is running so a
             // receiver assigned to ADC1 gets C&C 0x0B instead of ADC0's 0x0A.
@@ -1357,6 +1386,7 @@ public sealed class RadioService : IDisposable
                 client.SetFrequencyCorrectionFactor(_preferredRadioStore.GetFrequencyCorrectionFactor());
             }
 
+            ThrowIfSuperseded(attempt);
             Mutate(s => s with { Status = ConnectionStatus.Connected });
             _log.LogInformation("radio.connected endpoint={Ep} rate={Rate}", ipEndpoint, hpsdrRate);
             Connected?.Invoke(client);
@@ -1397,6 +1427,7 @@ public sealed class RadioService : IDisposable
                 if (ReferenceEquals(_activeClient, client))
                 {
                     _activeClient = null;
+                    _activeP1ConnectionAttempt = null;
                     if (ReferenceEquals(_activeClientDisconnectedHandler, clientDisconnectedHandler))
                         _activeClientDisconnectedHandler = null;
                 }
@@ -1407,8 +1438,11 @@ public sealed class RadioService : IDisposable
         }
     }
 
-    public Task<StateDto> DisconnectAsync(CancellationToken ct = default) =>
-        DisconnectClientAsync(expectedClient: null, ct);
+    public Task<StateDto> DisconnectAsync(CancellationToken ct = default)
+    {
+        BeginOperatorConnectionAction();
+        return DisconnectClientAsync(expectedClient: null, ct);
+    }
 
     private async Task<StateDto> DisconnectClientAsync(
         Protocol1Client? expectedClient,
@@ -1442,6 +1476,7 @@ public sealed class RadioService : IDisposable
                 return _state;
             client = _activeClient;
             _activeClient = null;
+            _activeP1ConnectionAttempt = null;
             disconnectedHandler = _activeClientDisconnectedHandler;
             _activeClientDisconnectedHandler = null;
             _connectedFirmware = null;
@@ -4973,6 +5008,9 @@ public sealed class RadioService : IDisposable
             _hl2GpioStore.Changed -= PushHl2Gpio;
         try { DisconnectAsync(CancellationToken.None).GetAwaiter().GetResult(); }
         catch { /* best-effort */ }
+        try { _operatorConnectionActionCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+        _operatorConnectionActionCts.Dispose();
         if (_stateFlushTimer is not null)
         {
             // Parameterless Dispose does not wait for in-flight callbacks; that
@@ -5269,6 +5307,9 @@ public sealed class RadioService : IDisposable
         HpsdrBoardKind boardKind = HpsdrBoardKind.Unknown,
         string? firmware = null)
     {
+        // Claiming the hardware for P2 supersedes any pending P1 start-failure
+        // auto-retry, whichever path marked the connection.
+        NotifyOperatorConnectionAction();
         Protocol2Client? previous;
         lock (_sync)
         {
@@ -5378,6 +5419,9 @@ public sealed class RadioService : IDisposable
         int maxReceivers,
         string? firmware = null)
     {
+        // Claiming the hardware for P3 supersedes any pending P1 start-failure
+        // auto-retry, whichever path marked the connection.
+        NotifyOperatorConnectionAction();
         Protocol2Client? previous;
         lock (_sync)
         {
@@ -5545,10 +5589,115 @@ public sealed class RadioService : IDisposable
         _preferredRadioStore?.GetOrionMkIIVariant() ?? OrionMkIIVariant.G2;
 
     // Fires from the Protocol1 RX thread when consecutive receive timeouts exhaust
-    // the threshold — the radio stopped sending. Runs DisconnectAsync on the thread
-    // pool so StopAsync's _rxThread.Join() doesn't deadlock the calling thread.
-    private void OnClientDisconnected(Protocol1Client disconnectedClient) =>
-        _ = Task.Run(() => DisconnectClientAsync(disconnectedClient, CancellationToken.None));
+    // the threshold — the radio stopped sending. Runs teardown and any initial-start
+    // post-mortem on the thread pool so StopAsync's _rxThread.Join() cannot deadlock.
+    private void OnClientDisconnected(
+        Protocol1Client disconnectedClient,
+        P1ConnectionAttempt attempt) =>
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await HandleClientDisconnectedAsync(disconnectedClient, attempt).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "p1.disconnect handling failed");
+            }
+        });
+
+    private async Task HandleClientDisconnectedAsync(
+        Protocol1Client disconnectedClient,
+        P1ConnectionAttempt attempt)
+    {
+        await RadioLifecycleGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                if (!ReferenceEquals(_activeClient, disconnectedClient))
+                    return;
+            }
+
+            bool startHandshakeFailed = disconnectedClient.StartHandshakeFailed;
+            long framesDelivered = disconnectedClient.TotalFrames;
+            await DisconnectClientCoreAsync(disconnectedClient, CancellationToken.None).ConfigureAwait(false);
+
+            if (_p1StartFailureRecovery is null)
+                return;
+
+            await _p1StartFailureRecovery.HandleAsync(
+                startHandshakeFailed,
+                framesDelivered,
+                attempt,
+                async (retryAttempt, retryCt) =>
+                {
+                    await ConnectCoreAsync(retryAttempt, retryCt).ConfigureAwait(false);
+                },
+                () => IsCurrentOperatorConnectionAction(attempt),
+                attempt.OperatorActionToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            RadioLifecycleGate.Release();
+        }
+    }
+
+    private (long Generation, CancellationToken Token) BeginOperatorConnectionAction()
+    {
+        var next = new CancellationTokenSource();
+        CancellationTokenSource previous;
+        long generation;
+        lock (_sync)
+        {
+            previous = _operatorConnectionActionCts;
+            _operatorConnectionActionCts = next;
+            generation = ++_operatorConnectionGeneration;
+        }
+
+        try { previous.Cancel(); }
+        catch (ObjectDisposedException) { }
+        previous.Dispose();
+        return (generation, next.Token);
+    }
+
+    internal void NotifyOperatorConnectionAction() => BeginOperatorConnectionAction();
+
+    internal async Task DisconnectSupersededP1AutomaticRetryAsync()
+    {
+        Protocol1Client? supersededRetry;
+        lock (_sync)
+        {
+            supersededRetry = _activeP1ConnectionAttempt is
+                {
+                    IsAutomaticRetry: true,
+                } activeAttempt
+                && activeAttempt.Generation != _operatorConnectionGeneration
+                    ? _activeClient
+                    : null;
+        }
+
+        if (supersededRetry is not null)
+        {
+            await DisconnectClientCoreAsync(supersededRetry, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private bool IsCurrentOperatorConnectionAction(P1ConnectionAttempt attempt)
+    {
+        lock (_sync)
+        {
+            return _operatorConnectionGeneration == attempt.Generation
+                   && !attempt.OperatorActionToken.IsCancellationRequested;
+        }
+    }
+
+    private void ThrowIfSuperseded(P1ConnectionAttempt attempt)
+    {
+        if (!IsCurrentOperatorConnectionAction(attempt))
+            throw new OperationCanceledException(attempt.OperatorActionToken);
+    }
 
     // #1302 F4: PS feedback watchdog fired — an armed HermesC10 stream went
     // 2 s with zero parseable 4-DDC packets while datagrams kept arriving

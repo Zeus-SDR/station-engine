@@ -160,6 +160,8 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<FrequencyCalibrationService>();
         services.AddSingleton<ImdMeasureService>();
         services.AddSingleton<TxService>();
+        services.AddSingleton<IInstalledFeatureState, NoInstalledFeatureState>();
+        services.AddSingleton<TuneCarrierCommandCoordinator>();
         services.AddSingleton<TxAudioIngest>();
         services.AddSingleton<TxAudioIngestStartup>();
         services.AddSingleton<TxMicMeterService>();

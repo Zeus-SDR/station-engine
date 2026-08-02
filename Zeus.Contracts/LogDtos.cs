@@ -93,6 +93,14 @@ public sealed record CreateLogEntryRequest(
     string? Comment = null,
     DateTime? QsoDateTimeUtc = null);
 
+public sealed record QrzSyncResponse(
+    int FetchedCount,
+    int InsertedCount,
+    int DuplicateCount,
+    int PageCount,
+    bool FullSync,
+    string? Error = null);
+
 /// <summary>
 /// Partial QSO update. Null leaves a field unchanged; empty strings and empty
 /// lists explicitly clear text/list fields. Nullable value fields use explicit

@@ -5584,9 +5584,11 @@ public class DspPipelineService : BackgroundService,
         string? firmware = null,
         bool sampleRateExplicit = true)
     {
+        _radio.NotifyOperatorConnectionAction();
         await _radio.RadioLifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            await _radio.DisconnectSupersededP1AutomaticRetryAsync().ConfigureAwait(false);
             return await ConnectP2CoreAsync(
                 radioEndpoint,
                 sampleRateKhz,
@@ -6251,6 +6253,7 @@ public class DspPipelineService : BackgroundService,
 
     public async Task DisconnectP2Async(CancellationToken ct)
     {
+        _radio.NotifyOperatorConnectionAction();
         await _radio.RadioLifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {

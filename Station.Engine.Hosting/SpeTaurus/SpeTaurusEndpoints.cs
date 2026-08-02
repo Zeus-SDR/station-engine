@@ -30,7 +30,10 @@ public static class SpeTaurusEndpoints
         ArgumentNullException.ThrowIfNull(endpoints);
 
         var group = endpoints.MapGroup("/api/amp/spe-taurus");
-        group.MapGet("/status", (SpeTaurusService service) => Results.Ok(service.Status()));
+        group.MapGet("/status", async (
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control,
+            CancellationToken ct) => Results.Ok(
+                await control.StatusAsync(ct).ConfigureAwait(false)));
         group.MapGet("/config", (SpeTaurusService service) => Results.Ok(service.Config));
         group.MapPost("/config", async Task<IResult> (
             SpeTaurusConfig? config,
@@ -51,19 +54,54 @@ public static class SpeTaurusEndpoints
             Results.Ok(service.RefreshDevices()));
         group.MapPost("/devices/refresh", (SpeTaurusService service) =>
             Results.Ok(service.RefreshDevices()));
+        group.MapPost("/discover", async (
+            [Microsoft.AspNetCore.Mvc.FromServices] SpeTaurusService service,
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerDiscovery discovery,
+            [Microsoft.AspNetCore.Mvc.FromServices] RadioService radio,
+            CancellationToken ct) =>
+        {
+            var expectedConfig = service.Config;
+            var result = await discovery.DiscoverAsync(
+                expectedConfig,
+                radio.Snapshot().Endpoint,
+                ct).ConfigureAwait(false);
+            if (!result.Found || result.Url is null)
+                return Results.Ok(new { result.Found, result.Probed });
+
+            var config = await service.TrySetConfigAsync(
+                expectedConfig,
+                expectedConfig with { ExpertServerUrl = result.Url },
+                ct).ConfigureAwait(false);
+            if (config is null)
+                return Results.Conflict(new
+                {
+                    error = "Taurus configuration changed while discovery was running; the newer settings were kept."
+                });
+            return Results.Ok(new
+            {
+                result.Found,
+                result.Url,
+                result.ModelName,
+                result.Source,
+                result.Probed,
+                Config = config,
+            });
+        });
         group.MapPost("/operate", async (
             SpeOperateRequest request,
-            SpeTaurusService service,
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control,
             CancellationToken ct) => Results.Ok(
-                await service.SetOperateAsync(request.Operate, ct).ConfigureAwait(false)));
-        group.MapPost("/power-level", async (SpeTaurusService service, CancellationToken ct) =>
-            Results.Ok(await service.CycleAsync(SpeCommand.PowerLevel, ct).ConfigureAwait(false)));
-        group.MapPost("/antenna", async (SpeTaurusService service, CancellationToken ct) =>
-            Results.Ok(await service.CycleAsync(SpeCommand.Antenna, ct).ConfigureAwait(false)));
-        group.MapPost("/input", async (SpeTaurusService service, CancellationToken ct) =>
-            Results.Ok(await service.CycleAsync(SpeCommand.Input, ct).ConfigureAwait(false)));
-        group.MapPost("/atu/tune", async (SpeTaurusService service, CancellationToken ct) =>
-            Results.Ok(await service.TuneAsync(ct).ConfigureAwait(false)));
+                await control.SetOperateAsync(request.Operate, ct).ConfigureAwait(false)));
+        group.MapPost("/power-level", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.CycleAsync(SpeCommand.PowerLevel, ct).ConfigureAwait(false)));
+        group.MapPost("/antenna", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.CycleAsync(SpeCommand.Antenna, ct).ConfigureAwait(false)));
+        group.MapPost("/input", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.CycleAsync(SpeCommand.Input, ct).ConfigureAwait(false)));
+        group.MapPost("/atu/tune", async (
+            [Microsoft.AspNetCore.Mvc.FromServices] SpeTaurusAutomaticTuneCoordinator coordinator,
+            CancellationToken ct) => Results.Ok(
+                await coordinator.TuneAsync(ct).ConfigureAwait(false)));
         return endpoints;
     }
 }

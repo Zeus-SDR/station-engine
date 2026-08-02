@@ -10,6 +10,7 @@ using Zeus.Server;
 using Zeus.Server.Cat;
 using Zeus.Server.Diagnostics;
 using Zeus.Server.Tci;
+using Zeus.Plugins.Host;
 
 namespace Zeus.StationEngine;
 
@@ -213,6 +214,17 @@ public partial class Program
             P2AutoConnectEndpoint: string.IsNullOrWhiteSpace(p2AutoConnectEndpoint)
                 ? null
                 : p2AutoConnectEndpoint));
+        builder.Services.AddZeusPlugins(
+            prefsDbPathProvider: PrefsDbPath.EngineGet,
+            options: new PluginManagerOptions
+            {
+                HostDataDirectory = Path.GetDirectoryName(PrefsDbPath.LogbookPath()),
+                PluginRoot = StationFeaturePluginRoot(),
+            });
+        // The later registration intentionally replaces the engine's inert
+        // fallback so optional hardware behavior follows the live plugin
+        // activation state, including uninstall/deactivation without restart.
+        builder.Services.AddSingleton<IInstalledFeatureState, PluginFeatureState>();
 
         var app = builder.Build();
         if (options.BindMode == StationEngineBindMode.Lan)
@@ -225,6 +237,7 @@ public partial class Program
         app.UseCors(CorsPolicyName);
         app.UseStationAccessTokenAuthorization(
             Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable));
+        app.Use(RejectRemotePluginMutations);
         app.UseWebSockets(new WebSocketOptions
         {
             KeepAliveInterval = TimeSpan.FromSeconds(20),
@@ -234,7 +247,36 @@ public partial class Program
         AnchorWdspDataFiles(app);
         WireEngineBroadcasts(app);
         app.MapStationEngineEndpoints(options.BindMode == StationEngineBindMode.Lan);
+        var pluginManager = app.Services.GetRequiredService<PluginManager>();
+        pluginManager.StartAsync(default).GetAwaiter().GetResult();
+        PluginEndpoints.MapAll(app, pluginManager);
         return app;
+    }
+
+    internal static async Task RejectRemotePluginMutations(
+        HttpContext context,
+        RequestDelegate next)
+    {
+        var path = context.Request.Path;
+        var pathText = path.Value ?? string.Empty;
+        var mutatesPluginState = path.StartsWithSegments("/api/plugins/install")
+            || string.Equals(pathText, "/api/plugins/checkout", StringComparison.OrdinalIgnoreCase)
+            || (HttpMethods.IsDelete(context.Request.Method)
+                && pathText.StartsWith("/api/plugins/", StringComparison.OrdinalIgnoreCase)
+                && pathText.Count(character => character == '/') == 3);
+        var remoteAddress = context.Connection.RemoteIpAddress;
+        if (mutatesPluginState
+            && (remoteAddress is null || !IPAddress.IsLoopback(remoteAddress)))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                error = "Plugin installation and removal are available only from this station computer.",
+            }).ConfigureAwait(false);
+            return;
+        }
+
+        await next(context).ConfigureAwait(false);
     }
 
     internal static int ParsePort(IReadOnlyList<string> args) => ParseOptions(args).Port;
@@ -307,6 +349,18 @@ public partial class Program
         var productPath = PrefsDbPath.Get();
         EnginePrefsDbMigration.RunIfNeeded(productPath, enginePath);
         AudioDevicePrefsMigration.RunIfNeeded(productPath, enginePath);
+    }
+
+    private static string StationFeaturePluginRoot()
+    {
+        var configured = Environment.GetEnvironmentVariable(PluginRoot.EnvVar);
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured;
+
+        var desktopPluginRoot = PluginRoot.DefaultPath();
+        var zeusDataDirectory = Path.GetDirectoryName(desktopPluginRoot)
+            ?? throw new InvalidOperationException("Could not resolve the Zeus data directory.");
+        return Path.Combine(zeusDataDirectory, "features");
     }
 
     private static TciRuntimeConfig? LoadPersistedTci()

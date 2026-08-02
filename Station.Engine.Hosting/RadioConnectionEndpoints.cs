@@ -143,7 +143,8 @@ public static class RadioConnectionEndpoints
                     req.SampleRate,
                     ctx.RequestAborted,
                     identity.BoardKind,
-                    firmware).ConfigureAwait(false);
+                    firmware,
+                    probe?.Mac).ConfigureAwait(false);
                 return Results.Ok(state);
             }
             catch (ArgumentException ex)
