@@ -73,6 +73,8 @@ public sealed class TciServer : IHostedService, IDisposable
     private readonly TxAudioIngest _txAudioIngest;
     private readonly CwEngine _cwEngine;
     private readonly CwSettingsStore _cwSettings;
+    private readonly TransverterSettingsStore _transverterSettings;
+    private readonly LayoutStore _layouts;
     private readonly ILoggerFactory _loggerFactory;
     // Tracks the previous CW engine state so we only emit cw_macros_empty
     // on the Sending → Idle transition (i.e. when the queue actually
@@ -129,6 +131,8 @@ public sealed class TciServer : IHostedService, IDisposable
         TxAudioIngest txAudioIngest,
         CwEngine cwEngine,
         CwSettingsStore cwSettings,
+        TransverterSettingsStore transverterSettings,
+        LayoutStore layouts,
         ILoggerFactory loggerFactory)
     {
         _log = loggerFactory.CreateLogger<TciServer>();
@@ -141,6 +145,8 @@ public sealed class TciServer : IHostedService, IDisposable
         _txAudioIngest = txAudioIngest;
         _cwEngine = cwEngine;
         _cwSettings = cwSettings;
+        _transverterSettings = transverterSettings;
+        _layouts = layouts;
         _loggerFactory = loggerFactory;
     }
 
@@ -164,6 +170,8 @@ public sealed class TciServer : IHostedService, IDisposable
         _pipeline.RxAudioAvailable += OnRxAudioAvailable;
         _txMeters.TxMetersUpdated += OnTxMetersUpdated;
         _cwEngine.Status += OnCwEngineStatus;
+        _transverterSettings.Changed += OnTransverterSettingsChanged;
+        _layouts.ActiveTransverterEnabledChanged += OnActiveTransverterEnabledChanged;
         _subscribed = true;
 
         _log.LogInformation("tci.listening bind={Bind} port={Port}", _options.BindAddress, _options.Port);
@@ -184,6 +192,8 @@ public sealed class TciServer : IHostedService, IDisposable
             _pipeline.RxAudioAvailable -= OnRxAudioAvailable;
             _txMeters.TxMetersUpdated -= OnTxMetersUpdated;
             _cwEngine.Status -= OnCwEngineStatus;
+            _transverterSettings.Changed -= OnTransverterSettingsChanged;
+            _layouts.ActiveTransverterEnabledChanged -= OnActiveTransverterEnabledChanged;
             _subscribed = false;
         }
 
@@ -227,7 +237,21 @@ public sealed class TciServer : IHostedService, IDisposable
 
         var id = Guid.NewGuid();
         var sessionLog = _loggerFactory.CreateLogger<TciSession>();
-        var session = new TciSession(id, ws, sessionLog, _radio, _tx, _pipeline, _spots, _options, _cwEngine, _cwSettings, _txAudioIngest, this);
+        var session = new TciSession(
+            id,
+            ws,
+            sessionLog,
+            _radio,
+            _tx,
+            _pipeline,
+            _spots,
+            _options,
+            _cwEngine,
+            _cwSettings,
+            _txAudioIngest,
+            this,
+            _transverterSettings,
+            _layouts);
 
         _clients[id] = session;
         _log.LogInformation("tci.client.connected id={Id} total={Count}", id, _clients.Count);
@@ -270,19 +294,12 @@ public sealed class TciServer : IHostedService, IDisposable
             _lastBroadcastState = state;
         }
 
-        // Broadcast VFO, mode, filter changes to all clients
-        // Use rate limiting for VFO (can fire rapidly during tuning)
-        BroadcastRateLimited("vfo:0,0", TciProtocol.Command("vfo", 0, 0, state.VfoHz));
-        BroadcastRateLimited("vfo:0,1", TciProtocol.Command("vfo", 0, 1, state.VfoHz));
-        BroadcastRateLimited("dds:0", TciProtocol.Command("dds", 0, CwOffset.EffectiveLoHz(state)));
+        BroadcastFrequencyState(state, includeVfoLimits: false);
 
         // Mode and filter are less frequent — send immediately
         string tciMode = TciProtocol.ModeToTci(state.Mode);
         Broadcast(TciProtocol.Command("modulation", 0, tciMode));
         Broadcast(TciProtocol.Command("rx_filter_band", 0, state.FilterLowHz, state.FilterHighHz));
-
-        // TX frequency event (derived from VFO)
-        Broadcast(TciProtocol.Command("tx_frequency", state.VfoHz));
 
         // IF limits on sample rate change
         int halfRate = state.SampleRate / 2;
@@ -293,6 +310,62 @@ public sealed class TciServer : IHostedService, IDisposable
         {
             _lastBroadcastAttenDb = state.AttenDb;
             Broadcast(TciProtocol.Command("rx_step_att_ex", 0, state.AttenDb));
+        }
+    }
+
+    private void OnTransverterSettingsChanged() =>
+        BroadcastFrequencyState(_radio.Snapshot(), includeVfoLimits: true);
+
+    private void OnActiveTransverterEnabledChanged(string radioKey, bool enabled)
+    {
+        if (string.Equals(
+                radioKey,
+                _radio.ConnectedBoardKind.ToString(),
+                StringComparison.Ordinal))
+            BroadcastFrequencyState(_radio.Snapshot(), includeVfoLimits: true);
+    }
+
+    private void BroadcastFrequencyState(StateDto state, bool includeVfoLimits)
+    {
+        var transverter = _transverterSettings.GetForConnectedRadio(_layouts, _radio);
+
+        // VFO/DDS events can fire rapidly during tuning, so retain the existing
+        // per-session coalescing while translating only at the TCI boundary.
+        BroadcastRateLimited(
+            "vfo:0,0",
+            TciProtocol.Command(
+                "vfo", 0, 0, TransverterFrequencyConverter.ToRfHz(state.VfoHz, transverter)));
+        BroadcastRateLimited(
+            "vfo:0,1",
+            TciProtocol.Command(
+                "vfo",
+                0,
+                1,
+                TransverterFrequencyConverter.ToRfHz(
+                    RadioFrequencyResolver.TxDialFrequencyHz(state), transverter)));
+        BroadcastRateLimited(
+            "dds:0",
+            TciProtocol.Command(
+                "dds",
+                0,
+                TransverterFrequencyConverter.ToRfHz(
+                    CwOffset.EffectiveLoHz(state), transverter)));
+        var txFrequencyHz = TransverterFrequencyConverter.ToRfHz(
+            RadioFrequencyResolver.TxFrequencyHz(state), transverter);
+        Broadcast(TciProtocol.Command("tx_frequency", txFrequencyHz));
+        Broadcast(TciExtendedFrequency.Command(
+            txFrequencyHz,
+            state.Rx2Enabled,
+            TciExtendedFrequency.TxUsesVfoB(state)));
+
+        if (includeVfoLimits)
+        {
+            Broadcast(TciProtocol.Command(
+                "vfo_limits",
+                TransverterFrequencyConverter.ToRfHz(
+                    TransverterFrequencyConverter.MinimumRadioFrequencyHz, transverter),
+                TransverterFrequencyConverter.ToRfHz(
+                    TransverterFrequencyConverter.MaximumRadioFrequencyHz, transverter)));
         }
     }
 

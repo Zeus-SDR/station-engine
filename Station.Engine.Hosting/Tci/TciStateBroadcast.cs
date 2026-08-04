@@ -67,6 +67,9 @@ public static class TciStateBroadcast
             cmds.Add(TciProtocol.Command("xit_enable", 0, next.XitEnabled));
         if (Changed(prev, next, static s => (int)s.XitHz))
             cmds.Add(TciProtocol.Command("xit_offset", 0, (int)next.XitHz));
+        if (Changed(prev, next, RadioFrequencyResolver.IsSplitEnabledForTx))
+            cmds.Add(TciProtocol.Command("split_enable", 0,
+                RadioFrequencyResolver.IsSplitEnabledForTx(next)));
 
         if (Changed(prev, next, static s => s.Agc?.Mode ?? AgcMode.Med))
             cmds.Add(TciProtocol.Command("agc_mode", 0, TciProtocol.AgcModeToTci(next.Agc?.Mode ?? AgcMode.Med)));

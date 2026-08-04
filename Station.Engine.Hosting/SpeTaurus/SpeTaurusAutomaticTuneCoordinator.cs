@@ -28,6 +28,7 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
 {
     private static readonly TimeSpan CompletionTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan OperateRestoreSettle = TimeSpan.FromSeconds(1);
     private readonly SemaphoreSlim _operation = new(1, 1);
 
     internal async Task<SpeTaurusStatus> TuneAsync(CancellationToken cancellationToken)
@@ -38,10 +39,15 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
                 cancellationToken).ConfigureAwait(false);
 
         var carrierStarted = false;
+        var tuneCompleted = false;
+        var restoreOperate = false;
+        var restoreCommitted = false;
+        SpeTaurusStatus? committedStatus = null;
+        SpeTaurusConfig? expectedConfig = null;
         string? failure = null;
         try
         {
-            var expectedConfig = taurus.Config;
+            expectedConfig = taurus.Config;
             if (expectedConfig.ExpertServerUrl.Length == 0)
                 return await WithErrorAsync(
                     "Automatic carrier control requires the configured Expert Amp Server connection.",
@@ -53,8 +59,14 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
 
             // STANDBY is a mandatory safety boundary. This is deliberately
             // idempotent when the amplifier is already in STANDBY.
-            var standby = await amplifier.SetOperateAsync(false, cancellationToken)
+            var standbyTransition = await amplifier
+                .EnterStandbyForAutomaticTuneAsync(cancellationToken)
                 .ConfigureAwait(false);
+            var standby = standbyTransition.Status;
+            restoreOperate = standbyTransition.WasOperate;
+            log.LogInformation(
+                "spe-taurus automatic tune captured starting mode: {StartingMode}",
+                restoreOperate ? "OPERATE" : "STANDBY");
             if (standby.Error is not null)
                 return standby;
             if (standby.Amplifier is not { IsTaurus: true, Operate: false, Transmitting: false })
@@ -89,6 +101,7 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
                     () => tx.IsTunOn,
                     completion.Token)
                 .ConfigureAwait(false);
+            tuneCompleted = true;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -156,14 +169,18 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
 
                     try
                     {
-                        using var standbyCleanup = new CancellationTokenSource(CleanupTimeout);
-                        var safe = await amplifier.SetOperateAsync(false, standbyCleanup.Token)
+                        // This dedicated cleanup transaction is internally
+                        // bounded and grants a fresh confirmation window after
+                        // its one possible non-idempotent STANDBY toggle.
+                        var safe = await amplifier.EnsureStandbyAfterAutomaticTuneAsync(
+                                expectedConfig!,
+                                CancellationToken.None)
                             .ConfigureAwait(false);
-                        if (safe.Error is not null
-                            || safe.Amplifier is not { Operate: false, Transmitting: false })
+                        if (!safe.Verified)
                             failure = AppendFailure(
                                 failure,
-                                "Final Taurus STANDBY state could not be verified.");
+                                safe.Error
+                                ?? "Final Taurus STANDBY state could not be verified.");
                     }
                     catch (Exception ex)
                     {
@@ -171,6 +188,87 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
                             failure,
                             $"Final Taurus STANDBY verification failed: {ex.Message}");
                         log.LogError(ex, "spe-taurus automatic tune standby cleanup threw");
+                    }
+
+                    if (tuneCompleted
+                        && restoreOperate
+                        && failure is null
+                        && !cancellationToken.IsCancellationRequested)
+                    {
+                        // The Expert Amp Server confirms only that it wrote the
+                        // front-panel keystroke frame. The Taurus does not expose
+                        // that command ACK through the HTTP bridge, and real
+                        // hardware can ignore OPERATE while its ATU state machine
+                        // is still returning home. Leave a full status-poll window
+                        // after RF and TUNE have cleared before requesting OP.
+                        log.LogInformation(
+                            "spe-taurus automatic tune waiting {SettleMilliseconds} ms before OPERATE restoration",
+                            OperateRestoreSettle.TotalMilliseconds);
+                        await Task.Delay(OperateRestoreSettle, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (!ReferenceEquals(expectedConfig, taurus.Config))
+                        {
+                            failure = AppendFailure(
+                                failure,
+                                "Taurus OPERATE was not restored because the configuration changed.");
+                        }
+                        else
+                        {
+                            string? restorationFailure = null;
+                            var transmitIdle = tx.TryRunWithTransmitIdle(
+                                () =>
+                                {
+                                    if (cancellationToken.IsCancellationRequested)
+                                        return;
+
+                                    try
+                                    {
+                                        var restored = amplifier
+                                            .RestoreOperateAfterAutomaticTuneAsync(
+                                                expectedConfig,
+                                                cancellationToken)
+                                            .GetAwaiter().GetResult();
+                                        if (restored.Restored)
+                                        {
+                                            restoreCommitted = true;
+                                            committedStatus = restored.Status;
+                                            log.LogInformation(
+                                                "spe-taurus automatic tune restored OPERATE after confirmed OP/RX");
+                                            return;
+                                        }
+
+                                        restorationFailure = restored.Error;
+                                    }
+                                    catch (OperationCanceledException)
+                                        when (cancellationToken.IsCancellationRequested)
+                                    {
+                                        // No OP commit occurred. The control
+                                        // transaction compensates any write that
+                                        // reached the amplifier before cancellation.
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        restorationFailure =
+                                            $"Taurus OPERATE restoration failed: {ex.Message}";
+                                        log.LogError(
+                                            ex,
+                                            "spe-taurus automatic tune operate restoration threw");
+                                    }
+                                },
+                                out var transmitIdleError);
+
+                            if (!transmitIdle)
+                            {
+                                failure = AppendFailure(
+                                    failure,
+                                    $"Taurus OPERATE was not restored: {transmitIdleError}");
+                            }
+                            else if (restorationFailure is not null)
+                            {
+                                failure = AppendFailure(failure, restorationFailure);
+                            }
+                        }
                     }
                 }
             }
@@ -180,8 +278,10 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
             }
         }
 
-        if (cancellationToken.IsCancellationRequested)
+        if (cancellationToken.IsCancellationRequested && !restoreCommitted)
             cancellationToken.ThrowIfCancellationRequested();
+        if (failure is null && committedStatus is not null)
+            return committedStatus;
         return failure is null
             ? await amplifier.StatusAsync(cancellationToken).ConfigureAwait(false)
             : await WithErrorAsync(failure, cancellationToken).ConfigureAwait(false);

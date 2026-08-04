@@ -248,4 +248,5 @@ public enum ZeusMidiCommand
     MidiMessagesPerTuneStepDown,
     MidiMessagesPerTuneStepToggle,
     ESCFormOnOff,
+    D100hChangeFreqVfoA,
 }

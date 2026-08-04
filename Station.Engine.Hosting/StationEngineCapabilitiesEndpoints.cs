@@ -20,16 +20,20 @@ public static class StationEngineCapabilitiesEndpoints
 
 internal sealed class StationEngineCapabilitiesService
 {
-    public StationEngineCapabilitiesService(IConfiguration configuration)
+    public StationEngineCapabilitiesService(
+        IConfiguration configuration,
+        IReadOnlyList<string>? lanHttpsUrls = null)
     {
+        var advertisedLanHttpsUrls = lanHttpsUrls?.ToArray() ?? Array.Empty<string>();
         Snapshot = new StationEngineCapabilitiesSnapshot(
             Host: "server",
             Platform: DetectPlatform(),
             Architecture: RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant(),
             Version: StationProtocolEndpoints.EngineVersion,
-            LanHttpsUrls: Array.Empty<string>(),
+            LanHttpsUrls: advertisedLanHttpsUrls,
             DisplayPerformance: DisplayPerformanceOptions.Resolve(configuration),
-            Features: new StationEngineFeatureMatrix());
+            Features: new StationEngineFeatureMatrix(
+                LanBrowser: advertisedLanHttpsUrls.Length > 0));
     }
 
     public StationEngineCapabilitiesSnapshot Snapshot { get; }

@@ -343,6 +343,8 @@ public sealed class PsAutoAttenuateService : BackgroundService
         var p1 = _radio.ActiveClient;
         long blocksNow = p1?.PsFeedbackBlocksDelivered ?? 0;
         long blocksDelta = Math.Max(0, blocksNow - _stallStartFeedbackBlocks);
+        bool? clientPsEnabled = p1?.PsEnabled;
+        byte? requestedNumRxMinusOne = p1?.PsNumReceiversMinusOne;
         var lastFeedback = p1?.LastPsFeedbackObservation;
         long? lastFeedbackAgeMs = lastFeedback is { } observation
             ? Math.Max(0, (long)(DateTimeOffset.UtcNow - observation.ObservedAt).TotalMilliseconds)
@@ -356,17 +358,17 @@ public sealed class PsAutoAttenuateService : BackgroundService
         if (board == HpsdrBoardKind.HermesII && feedback <= 0)
         {
             _log.LogWarning(
-                "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — if blocks are flowing with near-zero peaks, run two-tone or single-cal with AutoAttenuate ON to recover the attenuation rail; if blocksDelta=0, check the DDC0/DDC1 wire/routing path.",
+                "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.clientEnabled={ClientPsEnabled} ps.numRxMinus1={RequestedNumRxMinusOne} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — if blocks are flowing with near-zero peaks, run two-tone or single-cal with AutoAttenuate ON to recover the attenuation rail; if blocksDelta=0, check the DDC0/DDC1 wire/routing path.",
                 feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
-                blocksNow, blocksDelta, lastRxPeak, lastTxPeak,
+                blocksNow, blocksDelta, clientPsEnabled, requestedNumRxMinusOne, lastRxPeak, lastTxPeak,
                 lastBlocksDelivered, lastFeedbackAgeMs);
             return;
         }
 
         _log.LogWarning(
-            "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
+            "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.clientEnabled={ClientPsEnabled} ps.numRxMinus1={RequestedNumRxMinusOne} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
             feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
-            blocksNow, blocksDelta, lastRxPeak, lastTxPeak,
+            blocksNow, blocksDelta, clientPsEnabled, requestedNumRxMinusOne, lastRxPeak, lastTxPeak,
             lastBlocksDelivered, lastFeedbackAgeMs);
     }
 

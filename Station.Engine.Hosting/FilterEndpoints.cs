@@ -76,13 +76,20 @@ public static class FilterEndpoints
 
         endpoints.MapPost("/api/filter/presets", (FilterPresetWriteRequest req, RadioService r) =>
         {
-            log.LogInformation("api.filter.presets mode={M} slot={S} low={L} high={H}", req.Mode, req.SlotName, req.LowHz, req.HighHz);
-            if (req.SlotName is not ("VAR1" or "VAR2"))
-                return Results.Conflict(new { error = "Fixed presets cannot be edited. Only VAR1 and VAR2 slots are writable." });
-            if (!Enum.IsDefined(req.Mode))
-                return Results.BadRequest(new { error = $"Unknown mode '{req.Mode}'." });
-            r.SetFilterPresetOverride(req.Mode, req.SlotName, req.LowHz, req.HighHz);
-            return Results.Ok(r.GetFilterPresets(req.Mode));
+            log.LogInformation(
+                "api.filter.presets mode={M} slot={S} low={L} high={H}",
+                req.Mode,
+                req.SlotName,
+                req.LowHz,
+                req.HighHz);
+            return WriteFilterPreset(req, r);
+        });
+
+        endpoints.MapPost("/api/filter/presets/reset", (FilterPresetResetRequest req, RadioService r) =>
+        {
+            log.LogInformation(
+                "api.filter.presets.reset mode={M} slot={S}", req.Mode, req.SlotName);
+            return ResetFilterPreset(req, r);
         });
 
         // Advanced-ribbon pane visibility. Persisted via FilterPresetStore so the
@@ -114,5 +121,44 @@ public static class FilterEndpoints
         });
 
         return endpoints;
+    }
+
+    internal static IResult WriteFilterPreset(FilterPresetWriteRequest req, RadioService radio)
+    {
+        if (!Enum.IsDefined(req.Mode))
+            return Results.BadRequest(new { error = $"Unknown mode '{req.Mode}'." });
+        try
+        {
+            radio.SetFilterPresetOverride(
+                req.Mode, req.SlotName, req.LowHz, req.HighHz, req.Label);
+            return Results.Ok(radio.GetFilterPresets(req.Mode));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Conflict(new { error = ex.Message });
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    internal static IResult ResetFilterPreset(FilterPresetResetRequest req, RadioService radio)
+    {
+        if (!Enum.IsDefined(req.Mode))
+            return Results.BadRequest(new { error = $"Unknown mode '{req.Mode}'." });
+        try
+        {
+            radio.ResetFilterPresetOverride(req.Mode, req.SlotName);
+            return Results.Ok(radio.GetFilterPresets(req.Mode));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Conflict(new { error = ex.Message });
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
 }

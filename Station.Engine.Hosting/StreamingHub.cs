@@ -80,6 +80,10 @@ public sealed class StreamingHub
     // [type:1][UTF-8 JSON {where,message,stack?,realm?}].
     private const byte MsgTypeClientDiagnosticLog = 0x23;
 
+    // Trusted loopback clients may request the native host microphone for
+    // friend PTT. Audio is returned only to the requesting session as 0x3D.
+    private const byte MsgTypeNativeMicStreamRequest = 0x24;
+
     // Largest client→server payload we'll reassemble. A mic PCM frame is
     // 1 + 960*4 = 3841 bytes; 16 KB leaves comfortable headroom if the
     // contract ever adds a control frame. Receives larger than this are
@@ -158,6 +162,7 @@ public sealed class StreamingHub
     // for control-only clients.
     private int _displayStreamRequests;
     private int _preferredDisplayStreamRequests;
+    private int _nativeMicStreamRequests;
 
     /// <summary>
     /// True when at least one connected client has requested the RX audio
@@ -170,6 +175,11 @@ public sealed class StreamingHub
     internal int DisplaySubscriberCount => Volatile.Read(ref _displayStreamRequests);
 
     internal int PreferredDisplaySubscriberCount => Volatile.Read(ref _preferredDisplayStreamRequests);
+
+    /// <summary>True while at least one trusted local client needs native mic PCM.</summary>
+    internal bool NativeMicStreamRequested => Volatile.Read(ref _nativeMicStreamRequests) > 0;
+
+    internal int NativeMicSubscriberCount => Volatile.Read(ref _nativeMicStreamRequests);
 
     public StreamingHub(
         ILogger<StreamingHub> log,
@@ -257,6 +267,7 @@ public sealed class StreamingHub
         switch (type)
         {
             case MsgType.AudioPcm:
+            case MsgType.NativeMicPcm:
                 Interlocked.Increment(ref _dropsAudio);
                 break;
             case MsgType.DisplayFrame:
@@ -364,7 +375,9 @@ public sealed class StreamingHub
         string? authKind = null,
         string? identity = null,
         int? displayRxId = null,
-        bool suppressAudio = false)
+        bool suppressAudio = false,
+        bool allowNativeMicStream = false,
+        Func<bool>? nativeMicStreamAuthorization = null)
     {
         if (displayRxId is < 1 or >= WireContract.MaxReceivers)
             throw new ArgumentOutOfRangeException(nameof(displayRxId));
@@ -378,7 +391,9 @@ public sealed class StreamingHub
             authKind,
             identity,
             displayRxId,
-            suppressAudio);
+            suppressAudio,
+            nativeMicStreamAuthorization
+                ?? (allowNativeMicStream ? static () => true : null));
         _clients[id] = session;
         _webSocketClients[id] = session;
         _log.LogInformation("ws.client.connected id={Id} total={Count}", id, _clients.Count);
@@ -406,6 +421,7 @@ public sealed class StreamingHub
             // disconnect/reload can't pin the desktop on-demand stream on.
             session.SetWantsAudio(false);
             session.SetWantsDisplay(false);
+            session.SetWantsNativeMic(false);
             _clients.TryRemove(id, out _);
             _webSocketClients.TryRemove(id, out _);
             _log.LogInformation("ws.client.disconnected id={Id} total={Count}", id, _clients.Count);
@@ -727,6 +743,35 @@ public sealed class StreamingHub
         }
     }
 
+    /// <summary>
+    /// Fan an already-sanitized 960-sample native capture block only to trusted
+    /// loopback sessions that explicitly requested it. The source buffer is
+    /// reused by NativeMicCapture, so this method takes one owned copy for all
+    /// requesting session queues.
+    /// </summary>
+    internal void BroadcastNativeMicPcm(ReadOnlySpan<byte> f32lePayload)
+    {
+        if (!NativeMicStreamRequested || f32lePayload.Length != MicPcmFrameBytes) return;
+
+        foreach (var session in _webSocketClients.Values)
+        {
+            if (!session.WantsNativeMic) continue;
+            if (!session.IsNativeMicStreamAuthorized())
+            {
+                // Product lease/origin trust can disappear after enable. Fail
+                // closed on the capture thread, clear the aggregate demand,
+                // and purge every queued native frame before sending more.
+                session.SetWantsNativeMic(false);
+                continue;
+            }
+            var payload = new byte[1 + sizeof(uint) + MicPcmFrameBytes];
+            payload[0] = (byte)MsgType.NativeMicPcm;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1, sizeof(uint)), session.NativeMicGeneration);
+            f32lePayload.CopyTo(payload.AsSpan(1 + sizeof(uint)));
+            if (!session.TryEnqueue(payload)) Interlocked.Increment(ref _dropsAudio);
+        }
+    }
+
     public void Broadcast(in CwEngineStatusFrame frame)
     {
         if (_clients.IsEmpty) return;
@@ -857,6 +902,7 @@ public sealed class StreamingHub
         private readonly string? _identity;
         public int? DisplayRxId { get; }
         public bool SuppressAudio { get; }
+        private readonly Func<bool>? _nativeMicStreamAuthorization;
 
         public ClientSession(
             Guid id,
@@ -866,13 +912,15 @@ public sealed class StreamingHub
             string? authKind,
             string? identity,
             int? displayRxId,
-            bool suppressAudio)
+            bool suppressAudio,
+            Func<bool>? nativeMicStreamAuthorization)
         {
             Id = id; _ws = ws; _log = log; _hub = hub;
             _authKind = authKind;
             _identity = identity;
             DisplayRxId = displayRxId;
             SuppressAudio = suppressAudio;
+            _nativeMicStreamAuthorization = nativeMicStreamAuthorization;
         }
 
         public bool Matches(string authKind, string identity) =>
@@ -924,6 +972,43 @@ public sealed class StreamingHub
             Interlocked.Add(ref _hub._audioStreamRequests, want ? 1 : -1);
         }
 
+        private int _wantsNativeMic;
+        private uint _nativeMicGeneration;
+        public bool WantsNativeMic => Volatile.Read(ref _wantsNativeMic) != 0;
+        public uint NativeMicGeneration => Volatile.Read(ref _nativeMicGeneration);
+
+        public bool IsNativeMicStreamAuthorized()
+        {
+            try
+            {
+                return _nativeMicStreamAuthorization?.Invoke() == true;
+            }
+            catch (Exception ex)
+            {
+                // Authorization callbacks sit on both the websocket receive
+                // and native-capture threads. Any unexpected service failure
+                // must revoke audio rather than fault either hot loop.
+                _log.LogWarning(ex, "ws.native-mic authorization evaluation failed id={Id}", Id);
+                return false;
+            }
+        }
+
+        public void SetWantsNativeMic(bool want, uint generation = 0)
+        {
+            // Authorization is intentionally evaluated on every enable edge.
+            // Zeus Link may attach its authenticated ProductAudioRingPort after
+            // this websocket connected, so a handshake-time bool would deny the
+            // session forever. Disable/cleanup never needs authorization.
+            if (want && !IsNativeMicStreamAuthorized())
+                want = false;
+            if (want) Volatile.Write(ref _nativeMicGeneration, generation);
+            int next = want ? 1 : 0;
+            int prev = Interlocked.Exchange(ref _wantsNativeMic, next);
+            if (prev != next)
+                Interlocked.Add(ref _hub._nativeMicStreamRequests, next - prev);
+            if (!want) _queue.RemoveType(MsgType.NativeMicPcm);
+        }
+
         // Whether this client currently has any mounted display-frame consumer
         // (panadapter / waterfall / mini-pan). Broadcast reads this from the
         // DSP thread, so store it as an int and use Volatile/Interlocked.
@@ -957,6 +1042,16 @@ public sealed class StreamingHub
             {
                 var level = frame.Length > 1 ? frame.Span[1] : (byte)0;
                 SetWantsDisplay(level != 0, preferred: level >= 2);
+                return;
+            }
+            if (frame.Length >= 1 && frame.Span[0] == MsgTypeNativeMicStreamRequest)
+            {
+                if (frame.Length == 2 + sizeof(uint))
+                {
+                    SetWantsNativeMic(
+                        frame.Span[1] != 0,
+                        BinaryPrimitives.ReadUInt32LittleEndian(frame.Span.Slice(2, sizeof(uint))));
+                }
                 return;
             }
             _hub.DispatchInbound(frame);

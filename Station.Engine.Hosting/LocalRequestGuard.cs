@@ -12,6 +12,14 @@ namespace Zeus.Server;
 
 internal static class LocalRequestGuard
 {
+    public static bool IsLoopbackRequest(HttpContext ctx)
+    {
+        var remote = ctx.Connection.RemoteIpAddress;
+        if (remote is null) return false;
+        if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
+        return IPAddress.IsLoopback(remote);
+    }
+
     public static bool IsLocalRequest(HttpContext ctx)
     {
         static IPAddress Normalize(IPAddress ip)
@@ -41,6 +49,30 @@ internal static class LocalRequestGuard
         return string.Equals(originUri.Scheme, ctx.Request.Scheme, StringComparison.OrdinalIgnoreCase)
             && string.Equals(originUri.Host, ctx.Request.Host.Host, StringComparison.OrdinalIgnoreCase)
             && originPort == requestPort;
+    }
+
+    /// <summary>
+    /// Strong browser privilege gate: unlike ordinary local app-control calls,
+    /// raw microphone access requires an explicit, single same-origin header.
+    /// This rejects non-browser/no-Origin callers and cross-site websocket
+    /// pages even when they can reach a loopback listener.
+    /// </summary>
+    public static bool IsLoopbackSameOriginBrowser(HttpContext ctx)
+    {
+        var origins = ctx.Request.Headers.Origin;
+        return IsLoopbackRequest(ctx)
+            && IsLoopbackHost(ctx.Request.Host.Host)
+            && origins.Count == 1
+            && !string.IsNullOrWhiteSpace(origins[0])
+            && IsSameOriginOrNoOrigin(ctx);
+    }
+
+    private static bool IsLoopbackHost(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!IPAddress.TryParse(host, out var address)) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return IPAddress.IsLoopback(address);
     }
 
     public static IResult? RejectIfNotLocalSameOrigin(HttpContext ctx, string action)

@@ -139,7 +139,8 @@ public sealed record ChatRoomDto(
     string Id,
     string Name,
     string Kind,
-    IReadOnlyList<string> Members);
+    IReadOnlyList<string> Members,
+    bool Net = false);
 
 /// <summary>
 /// The local operator's friend graph, mirrored from the relay. <paramref name="Accepted"/>
@@ -163,7 +164,8 @@ public sealed record ChatPttSignal(
     string From,
     string To,
     string SessionId,
-    string? Sdp = null)
+    string? Sdp = null,
+    string? Room = null)
 {
     /// <summary>Maximum accepted WebRTC SDP length, mirrored by the relay.</summary>
     public const int MaxSdpLength = 64_000;
@@ -194,7 +196,8 @@ public sealed record ChatPttRequest(
     string Type,
     string To,
     string SessionId,
-    string? Sdp = null);
+    string? Sdp = null,
+    string? Room = null);
 
 /// <summary>Send a direct message to <paramref name="To"/>.
 /// <paramref name="Attachment"/> is an optional inline photo — when present the
@@ -206,6 +209,9 @@ public sealed record ChatRoomCreateRequest(string Name);
 
 /// <summary>Admin: add/remove <paramref name="Callsign"/> to/from <paramref name="Room"/>.</summary>
 public sealed record ChatRoomMemberRequest(string Room, string Callsign);
+
+/// <summary>Admin: enable or disable room-wide PTT for a private group.</summary>
+public sealed record ChatRoomNetRequest(string Room, bool Enabled);
 
 /// <summary>Admin: delete a private group, or request history for a room.</summary>
 public sealed record ChatRoomRequest(string Room);

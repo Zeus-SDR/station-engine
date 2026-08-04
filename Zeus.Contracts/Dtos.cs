@@ -914,10 +914,11 @@ public static class WireContract
 {
     /// <summary>Broadcast contract version. v1 was the implicit pre-multi-DDC
     /// baseline (no <see cref="StateDto.Receivers"/>); v2 introduces the
-    /// per-receiver <see cref="StateDto.Receivers"/> array so the frontend can
-    /// feature-detect multi-DDC support. Surfaced on the wire via
+    /// per-receiver <see cref="StateDto.Receivers"/> array; v3 adds an
+    /// independent split-TX dial that does not consume a receiver/DDC.
+    /// Surfaced on the wire via
     /// <see cref="StateDto.WireVersion"/>.</summary>
-    public const int Version = 2;
+    public const int Version = 3;
 
     /// <summary>Maximum hardware receiver/DDC count the state contract can
     /// represent. Protocol 2 is lower on some boards because its DDC-enable byte
@@ -981,7 +982,12 @@ public sealed record ReceiverDto(
     // "Kiwi") for non-hardware software receivers such as the KiwiSDR slice that
     // occupy a reserved high index (WireContract.KiwiReceiverIndex). Defaulted so
     // pre-name wire frames deserialize unchanged.
-    string? Name = null);
+    string? Name = null,
+    // Per-receiver split dial. TX receiver ownership remains independent:
+    // TxReceiverIndex chooses the receiver whose mode/filter context is used,
+    // then these fields optionally place that receiver's carrier elsewhere.
+    bool SplitEnabled = false,
+    long TxVfoHz = 0);
 
 public sealed record StateDto(
     ConnectionStatus Status,
@@ -1387,7 +1393,12 @@ public sealed record StateDto(
     // Old-school end-of-over roger beep. Appended to avoid shifting older
     // positional StateDto construction sites. Default OFF preserves existing
     // transmit behaviour until the operator explicitly enables it.
-    bool RogerBeepEnabled = false);
+    bool RogerBeepEnabled = false,
+
+    // RX1's per-receiver split projection. RX2+ carry the same fields directly
+    // on ReceiverDto. Session-only: a process always starts in simplex.
+    bool SplitEnabled = false,
+    long SplitTxHz = 0);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both
@@ -1600,7 +1611,8 @@ public sealed record SpotsSettings(
     // alternative cluster that speaks the same JSON shape.
     public const string DefaultPotaUrl = "https://api.pota.app/spot/activator";
     public const string DefaultSotaUrl = "https://api2.sota.org.uk/api/spots/50/all";
-    public const string DefaultDxUrl = "https://www.dxsummit.fi/api/v1/spots?limit=50";
+    public const string DefaultDxUrl = "http://www.dxsummit.fi/api/v1/spots?limit=50";
+    private const string LegacyDefaultDxUrl = "https://www.dxsummit.fi/api/v1/spots?limit=50";
 
     /// <summary>Clamp numeric ranges and coerce CwSideband to a valid value, so a
     /// hand-crafted POST or a stale persisted row can't wedge the poller or feed
@@ -1618,7 +1630,7 @@ public sealed record SpotsSettings(
         DigiTuneOffsetHz = Math.Clamp(DigiTuneOffsetHz, -MaxTuneOffsetHz, MaxTuneOffsetHz),
         PotaUrl = NormalizeUrl(PotaUrl, DefaultPotaUrl),
         SotaUrl = NormalizeUrl(SotaUrl, DefaultSotaUrl),
-        DxUrl = NormalizeUrl(DxUrl, DefaultDxUrl),
+        DxUrl = NormalizeDxUrl(DxUrl),
         Watchlist = NormalizeCalls(Watchlist),
         ScanDwellSeconds = Math.Clamp(ScanDwellSeconds, MinScanDwellSeconds, MaxScanDwellSeconds),
     };
@@ -1633,6 +1645,14 @@ public sealed record SpotsSettings(
             && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps)
             ? u
             : fallback;
+    }
+
+    private static string NormalizeDxUrl(string? url)
+    {
+        var normalized = NormalizeUrl(url, DefaultDxUrl);
+        return string.Equals(normalized, LegacyDefaultDxUrl, StringComparison.OrdinalIgnoreCase)
+            ? DefaultDxUrl
+            : normalized;
     }
 
     private static IReadOnlyList<string>? NormalizeKeys(IReadOnlyList<string>? keys)
@@ -1671,12 +1691,13 @@ public sealed record SpotsSettings(
 /// units (POTA reports kHz, SOTA reports MHz) and both are converted to Hz by
 /// <c>ActivationSpotsService</c> so the frontend's click-to-tune can pass it
 /// straight to /api/vfo.</para>
-/// <para><see cref="Source"/> is "POTA" or "SOTA". <see cref="Reference"/> is
+/// <para><see cref="Source"/> is "POTA", "SOTA", or "DX". <see cref="Reference"/> is
 /// the park (e.g. US-2518) or summit (e.g. W4A/HR-001) code; <see cref="Name"/>
 /// is its human name. <see cref="Mode"/> is the raw upstream mode string
 /// (SSB / CW / FT8 / …) — the UI maps it to an <c>RxMode</c> with a
-/// band-aware sideband at tune time. This is the POTA/SOTA activation feed and
-/// is unrelated to the TCI DX-cluster <c>SpotManager</c>.</para></summary>
+/// band-aware sideband at tune time. DX Summit's <c>info</c> field is exposed
+/// through <see cref="Comments"/> and used to derive a mode when it contains an
+/// explicit mode token.</para></summary>
 public sealed record ActivationSpotDto(
     string Source,
     string Activator,
@@ -1732,6 +1753,13 @@ public sealed record TxVfoSetRequest(TxVfo TxVfo);
 /// receiver index (0 = RX1, 1 = RX2, >= 2 = an extra DDC). Generalises
 /// <see cref="TxVfoSetRequest"/> beyond the A/B pair.</summary>
 public sealed record TxReceiverSetRequest(int Index);
+
+/// <summary>Enable or disable the independent TX dial. Enabling with no saved
+/// split frequency seeds it from the selected receiver's current RX VFO.</summary>
+public sealed record SplitSetRequest(int Receiver, bool Enabled);
+
+/// <summary>Set the independent split-TX dial in Hz.</summary>
+public sealed record SplitFrequencySetRequest(int Receiver, long Hz);
 
 public sealed record DriveSetRequest(int Percent);
 
@@ -1859,11 +1887,10 @@ public sealed record AutoAttSetRequest(bool Enabled);
 // RX ADC protection policy. This is the operator-facing superset of the
 // legacy Auto-ATT toggle: existing /api/auto-att still maps to Enabled, while
 // /api/rx/adc-protection exposes the ramp timing, step size, maximum automatic
-// offset, warning threshold, release hold-off, and optional Protocol-2
-// max-magnitude soft limit. The 100 ms leaky overload qualification mirrors
-// Thetis' handleOverload loop. Zeus improves the recovery with a bounded 4 dB
-// first rescue, operator-configurable attack/release steps and ceiling, a 2 s
-// clean hold, and an optional predictive Protocol-2 magnitude threshold.
+// offset, warning threshold, release hold-off, and Protocol-2 max-magnitude
+// control. A magnitude limit of 0 selects adaptive automatic headroom; a
+// nonzero value is an explicit attack-threshold override. Hard overloads are
+// rescued immediately while the leaky overload level remains diagnostic.
 public sealed record AdcProtectionConfig(
     bool Enabled = true,
     int AttackMs = 100,
@@ -1983,6 +2010,25 @@ public sealed record BandMemorySetRequest(
     int? FilterLowHz = null,
     int? FilterHighHz = null,
     RxMode? FilterMode = null);
+
+// Five station-wide favorite slots. Empty slots are represented explicitly so
+// callers always receive a stable 1..5 array and can bind shortcut actions
+// without maintaining a second slot inventory. A favorite snapshots only the
+// tuning state needed for deterministic recall; applying it remains a client
+// action through the existing VFO/mode/filter command routes.
+public sealed record StationFavoriteDto(
+    int Slot,
+    long? FrequencyHz,
+    RxMode? Mode,
+    int? FilterLowHz,
+    int? FilterHighHz,
+    long? UpdatedUtcMs);
+
+public sealed record StationFavoriteSetRequest(
+    long FrequencyHz,
+    RxMode Mode,
+    int FilterLowHz,
+    int FilterHighHz);
 
 // Band stack entry (issue #179) — a named per-band preset that snapshots
 // frequency, mode, and (optionally) filter edges. A band can have any number of

@@ -40,6 +40,47 @@ public static class RadioTuningEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
+        endpoints.MapGet("/api/radio/transverter", (
+            string? radioKey,
+            string? layoutId,
+            TransverterSettingsStore store,
+            LayoutStore layouts) =>
+            Results.Ok(store.GetForLayout(
+                layouts,
+                radioKey ?? "default",
+                layoutId ?? "default")));
+
+        endpoints.MapPut("/api/radio/transverter", (
+            TransverterSettingsSetRequest req,
+            TransverterSettingsStore store,
+            LayoutStore layouts) =>
+        {
+            var settings = new TransverterSettingsDto(
+                req.Enabled,
+                req.IfFrequencyHz,
+                req.RfFrequencyHz);
+            if (!TransverterFrequencyConverter.TryValidate(settings, out var error))
+                return Results.BadRequest(new { error });
+
+            // Suppress intermediate notifications so TCI never observes the new
+            // workspace flag with the old IF/RF anchors (or vice versa).
+            if (!layouts.SetTransverterEnabled(
+                    req.RadioKey, req.LayoutId, req.Enabled, notifyChanged: false))
+                return Results.BadRequest(new { error = "radio/layout workspace not found" });
+
+            store.Set(settings, notifyChanged: false);
+            store.NotifyChanged();
+            var effective = store.GetForLayout(layouts, req.RadioKey, req.LayoutId);
+            log.LogInformation(
+                "api.radio.transverter radio={Radio} layout={Layout} enabled={Enabled} ifHz={IfHz} rfHz={RfHz}",
+                req.RadioKey,
+                req.LayoutId,
+                settings.Enabled,
+                settings.IfFrequencyHz,
+                settings.RfFrequencyHz);
+            return Results.Ok(effective);
+        });
+
         // VFO lock (Thetis chkVFOLock): blocks operator dial tuning; CAT/TCI
         // still tune. Pure software guard, no hardware effect.
         endpoints.MapPost("/api/radio/vfo-lock", (VfoLockSetRequest req, RadioService r) =>
@@ -102,6 +143,26 @@ public static class RadioTuningEndpoints
             return Results.Ok(r.SetTxReceiver(req.Index));
         });
 
+        endpoints.MapPost("/api/tx/split", (SplitSetRequest req, RadioService r) =>
+        {
+            var state = r.Snapshot();
+            if (!SplitReceiverAvailable(state, req.Receiver))
+                return Results.BadRequest(new { error = "split receiver is not exposed" });
+            log.LogInformation("api.tx.split receiver={Receiver} enabled={Enabled}", req.Receiver, req.Enabled);
+            return Results.Ok(r.SetSplit(req.Receiver, req.Enabled));
+        });
+
+        endpoints.MapPost("/api/tx/split/frequency", (SplitFrequencySetRequest req, RadioService r) =>
+        {
+            var state = r.Snapshot();
+            if (!SplitReceiverAvailable(state, req.Receiver))
+                return Results.BadRequest(new { error = "split receiver is not exposed" });
+            if (req.Hz <= 0 || req.Hz > 60_000_000)
+                return Results.BadRequest(new { error = "hz out of range [1, 60000000]" });
+            log.LogInformation("api.tx.split.frequency receiver={Receiver} hz={Hz}", req.Receiver, req.Hz);
+            return Results.Ok(r.SetSplitFrequency(req.Receiver, req.Hz));
+        });
+
         // Set the radio's hardware NCO (LO) frequency directly. Does not
         // move VfoHz — used by the panadapter pure-pan gesture when a drag
         // would carry the viewport outside the IQ capture window.
@@ -119,6 +180,11 @@ public static class RadioTuningEndpoints
 
         return endpoints;
     }
+
+    private static bool SplitReceiverAvailable(StateDto state, int receiver) =>
+        receiver == 0 || receiver > 0
+            && receiver < WireContract.MaxReceivers
+            && state.Receivers?.Any(item => item.Index == receiver && item.Enabled) == true;
 
     public static IEndpointRouteBuilder MapCtunEndpoint(
         this IEndpointRouteBuilder endpoints)

@@ -30,7 +30,9 @@ public sealed record SpeTaurusConfig(
     int ConnectTimeoutMs = 3000,
     string D2xxSerial = "",
     string ExpertServerUrl = "",
-    int TuneArmTimeoutMs = 2000);
+    int TuneArmTimeoutMs = 2000,
+    bool RemotePowerEnabled = false,
+    int RemotePowerOnTimeoutMs = 15000);
 
 internal sealed record SpeTaurusStatus(
     bool Enabled,
@@ -759,6 +761,7 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             D2xxSerial = SanitizeD2xxSerial(config.D2xxSerial),
             ExpertServerUrl = expertServerUrl,
             TuneArmTimeoutMs = Math.Clamp(config.TuneArmTimeoutMs, 500, 5000),
+            RemotePowerOnTimeoutMs = Math.Clamp(config.RemotePowerOnTimeoutMs, 3000, 30000),
         };
     }
 

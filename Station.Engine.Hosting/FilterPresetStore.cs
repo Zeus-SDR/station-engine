@@ -15,7 +15,7 @@ using Zeus.Contracts;
 
 namespace Zeus.Server;
 
-// Persists per-mode VAR1/VAR2 overrides and the last-selected preset slot
+// Persists per-mode filter-slot overrides and the last-selected preset slot
 // across server restarts. Lives in the shared station-engine.db file.
 //
 // On first run, USB and LSB VAR1 are seeded from the default SSB preset table
@@ -37,6 +37,7 @@ public sealed class FilterPresetStore : IDisposable
         lock (_mapperInitLock)
         {
             if (_mapperInitialized) return;
+            BsonMapper.Global.Entity<FilterSlotOverride>();
             BsonMapper.Global.Entity<FilterPresetStoreEntry>()
                 .Id(x => x.Id);
             _mapperInitialized = true;
@@ -72,22 +73,68 @@ public sealed class FilterPresetStore : IDisposable
     private FilterPresetStoreEntry? FindByMode(string key) =>
         _entries.FindOne("$.ModeKey = @0", key);
 
-    // Returns the stored override for a VAR slot, or null if not overridden.
-    public (int LowHz, int HighHz)? GetVarOverride(RxMode mode, string slotName)
+    // Returns the merged stored override for any slot. VAR1/VAR2 fall back to
+    // the legacy scalar columns when an older preferences DB has not yet
+    // acquired a SlotOverrides entry.
+    public FilterSlotOverride? GetSlotOverride(RxMode mode, string slotName)
     {
         lock (_sync)
         {
             var e = FindByMode(mode.ToString());
             if (e is null) return null;
-            return slotName == "VAR1"
-                ? (e.HasVar1 ? (e.Var1Lo, e.Var1Hi) : null)
-                : slotName == "VAR2"
-                    ? (e.HasVar2 ? (e.Var2Lo, e.Var2Hi) : null)
-                    : null;
+
+            var stored = e.SlotOverrides?
+                .FirstOrDefault(x => string.Equals(x.SlotName, slotName, StringComparison.OrdinalIgnoreCase));
+            bool legacyHasWidth = slotName switch
+            {
+                "VAR1" => e.HasVar1,
+                "VAR2" => e.HasVar2,
+                _ => false,
+            };
+            if (stored is null && !legacyHasWidth) return null;
+
+            int legacyLo = slotName == "VAR2" ? e.Var2Lo : e.Var1Lo;
+            int legacyHi = slotName == "VAR2" ? e.Var2Hi : e.Var1Hi;
+            return new FilterSlotOverride
+            {
+                SlotName = slotName,
+                HasWidth = stored?.HasWidth == true || legacyHasWidth,
+                LowHz = stored?.HasWidth == true ? stored.LowHz : legacyLo,
+                HighHz = stored?.HasWidth == true ? stored.HighHz : legacyHi,
+                Label = stored?.Label,
+            };
         }
     }
 
+    // Returns the stored override for a VAR slot, or null if not overridden.
+    public (int LowHz, int HighHz)? GetVarOverride(RxMode mode, string slotName)
+    {
+        if (slotName is not ("VAR1" or "VAR2")) return null;
+        var stored = GetSlotOverride(mode, slotName);
+        return stored?.HasWidth == true ? (stored.LowHz, stored.HighHz) : null;
+    }
+
     public void UpsertVarOverride(RxMode mode, string slotName, int loHz, int hiHz)
+    {
+        if (slotName is not ("VAR1" or "VAR2"))
+            throw new ArgumentException("Expected VAR1 or VAR2.", nameof(slotName));
+        UpsertSlotWidthOverride(mode, slotName, loHz, hiHz);
+    }
+
+    public void UpsertSlotWidthOverride(
+        RxMode mode,
+        string slotName,
+        int loHz,
+        int hiHz)
+        => UpsertSlotOverride(mode, slotName, loHz, hiHz, updateLabel: false, label: null);
+
+    public void UpsertSlotOverride(
+        RxMode mode,
+        string slotName,
+        int loHz,
+        int hiHz,
+        bool updateLabel,
+        string? label)
     {
         var key = mode.ToString();
         lock (_sync)
@@ -96,19 +143,109 @@ public sealed class FilterPresetStore : IDisposable
             if (existing is null)
             {
                 existing = new FilterPresetStoreEntry { ModeKey = key };
-                if (slotName == "VAR1") { existing.HasVar1 = true; existing.Var1Lo = loHz; existing.Var1Hi = hiHz; }
-                else                    { existing.HasVar2 = true; existing.Var2Lo = loHz; existing.Var2Hi = hiHz; }
+                UpsertWidth(existing, slotName, loHz, hiHz);
+                if (updateLabel)
+                    FindSlot(existing, slotName).Label = label;
                 existing.UpdatedUtc = DateTime.UtcNow;
                 _entries.Insert(existing);
             }
             else
             {
-                if (slotName == "VAR1") { existing.HasVar1 = true; existing.Var1Lo = loHz; existing.Var1Hi = hiHz; }
-                else                    { existing.HasVar2 = true; existing.Var2Lo = loHz; existing.Var2Hi = hiHz; }
+                UpsertWidth(existing, slotName, loHz, hiHz);
+                if (updateLabel)
+                    FindSlot(existing, slotName).Label = label;
                 existing.UpdatedUtc = DateTime.UtcNow;
                 _entries.Update(existing);
             }
         }
+    }
+
+    public void UpsertSlotLabelOverride(RxMode mode, string slotName, string? label)
+    {
+        var key = mode.ToString();
+        lock (_sync)
+        {
+            var existing = FindByMode(key) ?? new FilterPresetStoreEntry { ModeKey = key };
+            existing.SlotOverrides ??= [];
+            var slot = existing.SlotOverrides.FirstOrDefault(x =>
+                string.Equals(x.SlotName, slotName, StringComparison.OrdinalIgnoreCase));
+            if (slot is null)
+            {
+                slot = new FilterSlotOverride { SlotName = slotName };
+                existing.SlotOverrides.Add(slot);
+            }
+            slot.Label = label;
+            if (!slot.HasWidth && slot.Label is null)
+                existing.SlotOverrides.Remove(slot);
+            existing.UpdatedUtc = DateTime.UtcNow;
+            if (existing.Id == 0) _entries.Insert(existing);
+            else _entries.Update(existing);
+        }
+    }
+
+    public void ResetSlotOverride(RxMode mode, string slotName)
+    {
+        lock (_sync)
+        {
+            var existing = FindByMode(mode.ToString());
+            if (existing is null) return;
+            existing.SlotOverrides?.RemoveAll(x =>
+                string.Equals(x.SlotName, slotName, StringComparison.OrdinalIgnoreCase));
+            if (slotName == "VAR1")
+            {
+                existing.HasVar1 = false;
+                existing.Var1Lo = 0;
+                existing.Var1Hi = 0;
+            }
+            if (slotName == "VAR2")
+            {
+                existing.HasVar2 = false;
+                existing.Var2Lo = 0;
+                existing.Var2Hi = 0;
+            }
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _entries.Update(existing);
+        }
+    }
+
+    private static void UpsertWidth(
+        FilterPresetStoreEntry entry,
+        string slotName,
+        int loHz,
+        int hiHz)
+    {
+        var slot = FindSlot(entry, slotName);
+        slot.HasWidth = true;
+        slot.LowHz = loHz;
+        slot.HighHz = hiHz;
+
+        // Keep the old scalar schema current for compatibility with older
+        // readers and the long-standing GetVarOverride contract.
+        if (slotName == "VAR1")
+        {
+            entry.HasVar1 = true;
+            entry.Var1Lo = loHz;
+            entry.Var1Hi = hiHz;
+        }
+        else if (slotName == "VAR2")
+        {
+            entry.HasVar2 = true;
+            entry.Var2Lo = loHz;
+            entry.Var2Hi = hiHz;
+        }
+    }
+
+    private static FilterSlotOverride FindSlot(
+        FilterPresetStoreEntry entry,
+        string slotName)
+    {
+        entry.SlotOverrides ??= [];
+        var slot = entry.SlotOverrides.FirstOrDefault(x =>
+            string.Equals(x.SlotName, slotName, StringComparison.OrdinalIgnoreCase));
+        if (slot is not null) return slot;
+        slot = new FilterSlotOverride { SlotName = slotName };
+        entry.SlotOverrides.Add(slot);
+        return slot;
     }
 
     public string? GetLastSelectedPreset(RxMode mode)
@@ -286,6 +423,10 @@ public sealed class FilterPresetStore : IDisposable
         {
             existing.Var1Lo = loHz;
             existing.Var1Hi = hiHz;
+            var slot = existing.SlotOverrides?.FirstOrDefault(x =>
+                x.SlotName == "VAR1" && x.HasWidth
+                && x.LowHz == legacyLoHz && x.HighHz == legacyHiHz);
+            if (slot is not null) { slot.LowHz = loHz; slot.HighHz = hiHz; }
             existing.UpdatedUtc = DateTime.UtcNow;
             _entries.Update(existing);
         }
@@ -301,6 +442,10 @@ public sealed class FilterPresetStore : IDisposable
         {
             existing.Var2Lo = loHz;
             existing.Var2Hi = hiHz;
+            var slot = existing.SlotOverrides?.FirstOrDefault(x =>
+                x.SlotName == "VAR2" && x.HasWidth
+                && x.LowHz == legacyLoHz && x.HighHz == legacyHiHz);
+            if (slot is not null) { slot.LowHz = loHz; slot.HighHz = hiHz; }
             existing.UpdatedUtc = DateTime.UtcNow;
             _entries.Update(existing);
         }
@@ -318,6 +463,7 @@ public sealed class FilterPresetStoreEntry
     public int Var2Lo { get; set; }
     public int Var2Hi { get; set; }
     public bool HasVar2 { get; set; }
+    public List<FilterSlotOverride> SlotOverrides { get; set; } = [];
     public string? LastPreset { get; set; }
     // Ribbon-scope flag, only meaningful on the sentinel "__SETTINGS__" row.
     public bool AdvancedPaneOpen { get; set; }
@@ -325,4 +471,13 @@ public sealed class FilterPresetStoreEntry
     // e.g., "F6,F5,F4" for 2.7k, 2.9k, 3.3k in USB/LSB.
     public string? FavoriteSlots { get; set; }
     public DateTime UpdatedUtc { get; set; }
+}
+
+public sealed class FilterSlotOverride
+{
+    public string SlotName { get; set; } = string.Empty;
+    public bool HasWidth { get; set; }
+    public int LowHz { get; set; }
+    public int HighHz { get; set; }
+    public string? Label { get; set; }
 }

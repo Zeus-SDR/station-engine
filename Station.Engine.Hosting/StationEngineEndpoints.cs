@@ -4,6 +4,7 @@
 using System.Globalization;
 using System.Net;
 using Microsoft.AspNetCore.Cors.Infrastructure;
+using Microsoft.Extensions.Primitives;
 using Zeus.Contracts;
 using Zeus.Server.Diagnostics;
 using Zeus.Server.SpeTaurus;
@@ -13,6 +14,9 @@ namespace Zeus.Server;
 /// <summary>Maps the standalone station engine's HTTP and WebSocket surface.</summary>
 public static class StationEngineEndpoints
 {
+    internal const string NativeMicDevOriginEnvironmentVariable =
+        "ZEUS_NATIVE_MIC_DEV_ORIGIN";
+
     internal static readonly HashSet<string> AllowedBrowserOrigins = new(StringComparer.Ordinal)
     {
         "https://app.zeussdr.com",
@@ -28,6 +32,7 @@ public static class StationEngineEndpoints
     public static void ConfigureCors(
         CorsPolicyBuilder policy,
         bool allowLanSameHost = false,
+        bool allowLanHttpsSameHost = false,
         Func<string?>? requestHost = null)
     {
         ArgumentNullException.ThrowIfNull(policy);
@@ -35,6 +40,7 @@ public static class StationEngineEndpoints
             .SetIsOriginAllowed(origin => IsBrowserOriginAllowed(
                 origin,
                 allowLanSameHost,
+                allowLanHttpsSameHost,
                 requestHost?.Invoke()))
             .AllowAnyHeader()
             .AllowAnyMethod()
@@ -53,28 +59,124 @@ public static class StationEngineEndpoints
     /// Allows the pinned remote origins plus any plain-HTTP loopback origin.
     /// Loopback mode retains the Zeus Link desktop-webview rule: the bundle
     /// serves the app from 127.0.0.1 on a dynamic port. LAN mode additionally
-    /// accepts a plain-HTTP local/private origin whose host equals the engine
-    /// request's Host header, allowing a product-served SPA on another port of
-    /// the same appliance without trusting public DNS names that can be
-    /// rebound to the appliance.
+    /// accepts a local/private origin whose host equals the engine request's
+    /// Host header. Plain HTTP follows the existing LAN-bind behavior; HTTPS
+    /// is accepted only when the host explicitly enabled its second LAN HTTPS
+    /// listener. Public DNS names remain excluded to avoid trusting a
+    /// DNS-rebound origin.
     /// </summary>
     internal static bool IsBrowserOriginAllowed(
         string origin,
         bool allowLanSameHost = false,
+        bool allowLanHttpsSameHost = false,
         string? requestHost = null)
     {
+        if (NativeWrapperCorsPolicy.IsAllowedOrigin(origin)) return true;
         if (AllowedBrowserOrigins.Contains(origin)) return true;
         if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
-        if (uri.Scheme != Uri.UriSchemeHttp) return false;
-        if (IsLoopbackHost(uri.Host)) return true;
-        return allowLanSameHost
+        if (uri.Scheme == Uri.UriSchemeHttp && IsLoopbackHost(uri.Host)) return true;
+        var allowedScheme = uri.Scheme == Uri.UriSchemeHttp
+            ? allowLanSameHost
+            : uri.Scheme == Uri.UriSchemeHttps && allowLanHttpsSameHost;
+        return allowedScheme
             && HostsEqual(uri.Host, requestHost)
             && IsLanApplianceHost(uri.Host);
     }
 
+    /// <summary>
+    /// Narrow origin allowlist for the raw native-microphone websocket feed.
+    /// The ordinary engine CORS policy intentionally accepts arbitrary
+    /// loopback ports; microphone audio does not. It accepts the pinned remote
+    /// browser surfaces, the currently attached/authenticated product
+    /// process's advertised loopback HTTP port, or the exact development
+    /// origin supplied by the native launcher. A development origin is
+    /// trusted only while a product attachment exists.
+    /// </summary>
+    internal static bool IsNativeMicOriginAllowed(
+        string origin,
+        int? productPort,
+        string? configuredDevOrigin = null)
+    {
+        if (origin is "https://app.zeussdr.com"
+            or "https://staging.zeus-web-app-7ag.pages.dev") return true;
+        if (productPort is not > 0) return false;
+        if (origin is "http://localhost:5173"
+            or "http://127.0.0.1:5173") return true;
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+            || uri.Scheme != Uri.UriSchemeHttp
+            || !IsLoopbackHost(uri.Host))
+            return false;
+        return uri.Port == productPort
+            || IsConfiguredNativeMicDevOrigin(origin, configuredDevOrigin);
+    }
+
+    private static bool IsConfiguredNativeMicDevOrigin(
+        string origin,
+        string? configuredDevOrigin)
+    {
+        if (!string.Equals(origin, configuredDevOrigin, StringComparison.Ordinal)
+            || !Uri.TryCreate(configuredDevOrigin, UriKind.Absolute, out var configuredUri))
+            return false;
+        return configuredUri.Scheme == Uri.UriSchemeHttp
+            && IsLoopbackHost(configuredUri.Host);
+    }
+
+    private static Func<bool> CreateNativeMicStreamAuthorization(HttpContext context)
+    {
+        var productAudio = context.RequestServices.GetService<ProductAudioRingPort>();
+        return CreateNativeMicStreamAuthorization(
+            context.Connection.RemoteIpAddress,
+            context.Request.Headers.Origin,
+            productAudio,
+            Environment.GetEnvironmentVariable(NativeMicDevOriginEnvironmentVariable));
+    }
+
+    internal static Func<bool> CreateNativeMicStreamAuthorization(
+        IPAddress? remoteAddress,
+        StringValues origins,
+        ProductAudioRingPort? productAudio,
+        string? configuredDevOrigin = null)
+    {
+        // Copy request-owned values now; the returned evaluator must never
+        // retain HttpContext or its mutable header collection after handshake.
+        bool isLoopback = false;
+        if (remoteAddress is not null)
+        {
+            if (remoteAddress.IsIPv4MappedToIPv6) remoteAddress = remoteAddress.MapToIPv4();
+            isLoopback = IPAddress.IsLoopback(remoteAddress);
+        }
+        var origin = origins.Count == 1 ? origins[0] : null;
+
+        return () =>
+        {
+            int? productPort = productAudio is not null
+                && productAudio.TryGetActiveProductEndpoint(out var advertisedPort)
+                    ? advertisedPort
+                    : null;
+            return isLoopback
+                && origin is not null
+                && IsNativeMicOriginAllowed(origin, productPort, configuredDevOrigin);
+        };
+    }
+
+    internal static bool IsTrustedNativeMicRequest(
+        IPAddress? remoteAddress,
+        StringValues origins,
+        int? productPort,
+        string? configuredDevOrigin = null)
+    {
+        if (remoteAddress is null) return false;
+        if (remoteAddress.IsIPv4MappedToIPv6) remoteAddress = remoteAddress.MapToIPv4();
+        return IPAddress.IsLoopback(remoteAddress)
+            && origins.Count == 1
+            && origins[0] is { } origin
+            && IsNativeMicOriginAllowed(origin, productPort, configuredDevOrigin);
+    }
+
     public static IEndpointRouteBuilder MapStationEngineEndpoints(
         this IEndpointRouteBuilder endpoints,
-        bool allowLanSameHost = false)
+        bool allowLanSameHost = false,
+        bool allowLanHttpsSameHost = false)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
@@ -95,6 +197,7 @@ public static class StationEngineEndpoints
         endpoints.MapRadioConnectionEndpoints();
         endpoints.MapVfoEndpoints();
         endpoints.MapReceiverConfigurationEndpoints();
+        endpoints.MapKiwiEndpoints();
         endpoints.MapRadioTuningEndpoints();
         endpoints.MapReceiverLoEndpoint();
         endpoints.MapCtunEndpoint();
@@ -120,6 +223,7 @@ public static class StationEngineEndpoints
         endpoints.MapDigitalSettingsEndpoints();
         endpoints.MapWorkspaceLayoutEndpoints();
         endpoints.MapBandPlanEndpoints();
+        endpoints.MapStationFavoriteEndpoints();
         endpoints.MapPaSettingsEndpoints();
         endpoints.MapRadioSelectionEndpoints();
         endpoints.MapRadioCapabilitiesEndpoint();
@@ -130,6 +234,7 @@ public static class StationEngineEndpoints
         endpoints.MapRadioHardwareEndpoints();
         endpoints.MapRadioCalibrationEndpoints();
         endpoints.MapTciEndpoints();
+        endpoints.MapHfAutoEndpoints();
         endpoints.MapCatEndpoints();
         endpoints.MapSpeTaurusEndpoints();
         // Client-error beacon fallback transport (the /ws diagnostic frame is
@@ -160,13 +265,17 @@ public static class StationEngineEndpoints
 
         endpoints.Map(
             "/ws",
-            context => AttachWebSocketAsync(context, allowLanSameHost));
+            context => AttachWebSocketAsync(
+                context,
+                allowLanSameHost,
+                allowLanHttpsSameHost));
         return endpoints;
     }
 
     private static async Task AttachWebSocketAsync(
         HttpContext context,
-        bool allowLanSameHost)
+        bool allowLanSameHost,
+        bool allowLanHttpsSameHost)
     {
         if (!context.WebSockets.IsWebSocketRequest)
         {
@@ -185,6 +294,7 @@ public static class StationEngineEndpoints
                     || !IsBrowserOriginAllowed(
                         origin,
                         allowLanSameHost,
+                        allowLanHttpsSameHost,
                         context.Request.Host.Host))))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -209,7 +319,8 @@ public static class StationEngineEndpoints
             socket,
             context.RequestAborted,
             displayRxId: displayRxId,
-            suppressAudio: suppressAudio).ConfigureAwait(false);
+            suppressAudio: suppressAudio,
+            nativeMicStreamAuthorization: CreateNativeMicStreamAuthorization(context)).ConfigureAwait(false);
     }
 
     private static bool IsLoopbackHost(string host) =>

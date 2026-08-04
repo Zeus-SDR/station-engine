@@ -118,6 +118,28 @@ internal sealed class WebSocketSendQueue
         }
     }
 
+    public int RemoveType(MsgType type)
+    {
+        int removed = 0;
+        lock (_sync)
+        {
+            for (var node = _items.First; node is not null;)
+            {
+                var next = node.Next;
+                if (FrameType(node.Value) == type)
+                {
+                    _items.Remove(node);
+                    removed++;
+                    // Keep the semaphore count aligned when the consumer has
+                    // not already claimed this item's permit.
+                    _available.Wait(0);
+                }
+                node = next;
+            }
+        }
+        return removed;
+    }
+
     internal IReadOnlyList<byte[]> Snapshot()
     {
         lock (_sync) return _items.ToArray();
@@ -146,6 +168,7 @@ internal sealed class WebSocketSendQueue
         MsgType.RxMetersV2 or
         MsgType.PaTemp or
         MsgType.MicPeak or
+        MsgType.NativeMicPcm or
         MsgType.DiagnosticsHealth;
 
     private static bool TryGetDisplayStream(byte[] payload, out byte stream)

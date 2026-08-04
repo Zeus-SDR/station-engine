@@ -10,13 +10,13 @@ authoritative list; those headers are a reminder.
 
 **Scope note.** This document covers the Zeus project as a whole. It is also
 copied verbatim into the station-engine corresponding-source export, because
-every engine source file's header points a reader here. In that export some
-paths referenced below — the vendored native sources under `native/`, and
-product components such as `ZeusProduct/` — live in the full Zeus repository
-and are not part of the export; the native libraries they describe are
-conveyed there as built artefacts instead. The authoritative third-party
-inventory for the exported engine, with each component's preserved licence
-text, is `THIRD-PARTY-NOTICES.md` alongside this file.
+every engine source file's header points a reader here. That export includes
+the GPL and permissively licensed native source and build control files used by
+the engine. The proprietary VST3 and Audio Unit bridge sources are excluded and
+are not part of the station engine; product components such as `ZeusProduct/`
+are also outside the export. The authoritative third-party inventory for the
+exported engine, with each component's preserved licence text, is
+`THIRD-PARTY-NOTICES.md` alongside this file.
 
 ## License
 
@@ -27,9 +27,9 @@ the **GNU General Public License, version 2 or (at your option) any later
 version** (GPL-2.0-or-later). The full licence text is in [`LICENSE`](LICENSE).
 
 The Zeus SDR web client under [`zeus-web/`](zeus-web/) and the native VST3 and
-Audio Unit bridges are proprietary and carry the
-`SPDX-License-Identifier: LicenseRef-Proprietary` tag. Their in-tree
-proprietary notice is [`zeus-web/LICENSE`](zeus-web/LICENSE). The proprietary
+Audio Unit bridges are proprietary and carry proprietary per-file license
+identifiers. Their in-tree proprietary notice is
+[`zeus-web/LICENSE`](zeus-web/LICENSE). The proprietary
 client components and station engine are separate programs, and nothing in
 the proprietary notice limits the rights granted under the GPL for the
 station engine.

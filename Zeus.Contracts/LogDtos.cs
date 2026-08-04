@@ -99,7 +99,8 @@ public sealed record QrzSyncResponse(
     int DuplicateCount,
     int PageCount,
     bool FullSync,
-    string? Error = null);
+    string? Error = null,
+    int SkippedCount = 0);
 
 /// <summary>
 /// Partial QSO update. Null leaves a field unchanged; empty strings and empty

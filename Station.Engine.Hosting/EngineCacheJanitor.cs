@@ -13,6 +13,8 @@ internal sealed partial class EngineCacheJanitor
 {
     internal const string StationAccessTokenEnvironmentVariable = "ZEUS_STATION_ACCESS_TOKEN";
     private const string ChannelMarkerFileName = ".channel-v0.json";
+    private const string VerifiedCacheRecordFileName = "verified.json";
+    private const string MigratedVerifiedCacheRecordFileName = "verified-v1.json";
     // A freshly installed version, whether an upgrade or downgrade/rollback, must
     // survive the current cycle and be re-evaluated on a later engine start.
     private static readonly TimeSpan VerifiedInstallSettlingAge = TimeSpan.FromMinutes(15);
@@ -22,6 +24,9 @@ internal sealed partial class EngineCacheJanitor
     private readonly Action<string> _deleteDirectory;
     private readonly Func<string, bool> _hasSettledVerifiedEngineInstall;
     private readonly Func<string, DateTime> _getLastWriteTimeUtc;
+    private readonly Func<string?> _getProcessPath;
+    private readonly Func<string> _getBaseDirectory;
+    private readonly Func<string?> _getStationAccessToken;
 
     public EngineCacheJanitor(ILogger<EngineCacheJanitor> log)
         : this(
@@ -36,12 +41,19 @@ internal sealed partial class EngineCacheJanitor
         Action<string, string> moveDirectory,
         Action<string> deleteDirectory,
         Func<string, bool>? hasSettledVerifiedEngineInstall = null,
-        Func<string, DateTime>? getLastWriteTimeUtc = null)
+        Func<string, DateTime>? getLastWriteTimeUtc = null,
+        Func<string?>? getProcessPath = null,
+        Func<string>? getBaseDirectory = null,
+        Func<string?>? getStationAccessToken = null)
     {
         _log = log;
         _moveDirectory = moveDirectory;
         _deleteDirectory = deleteDirectory;
         _getLastWriteTimeUtc = getLastWriteTimeUtc ?? File.GetLastWriteTimeUtc;
+        _getProcessPath = getProcessPath ?? (() => Environment.ProcessPath);
+        _getBaseDirectory = getBaseDirectory ?? (() => AppContext.BaseDirectory);
+        _getStationAccessToken = getStationAccessToken ?? (() =>
+            Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable));
         _hasSettledVerifiedEngineInstall =
             hasSettledVerifiedEngineInstall ?? HasSettledVerifiedEngineInstall;
     }
@@ -50,9 +62,44 @@ internal sealed partial class EngineCacheJanitor
     {
         try
         {
+            var processPath = _getProcessPath();
+            var fallbackReason = processPath is null
+                ? "process-path-null"
+                : string.IsNullOrWhiteSpace(processPath)
+                    ? "process-path-blank"
+                    : IsDotnetMuxer(processPath)
+                        ? "dotnet-muxer"
+                        : null;
+            var locationSource = fallbackReason is null
+                ? "process-path"
+                : "base-directory-fallback";
+            var baseDirectory = fallbackReason is not null
+                ? _getBaseDirectory()
+                : Path.GetDirectoryName(processPath);
+            _log.LogDebug(
+                "engine.cache-prune resolved location processPath={ProcessPath} " +
+                "source={LocationSource} fallbackReason={FallbackReason} " +
+                "baseDirectory={BaseDirectory}",
+                processPath,
+                locationSource,
+                fallbackReason,
+                baseDirectory);
+            if (string.IsNullOrWhiteSpace(baseDirectory))
+            {
+                _log.LogDebug(
+                    "engine.cache-prune rejected gate=base-directory processPath={ProcessPath} " +
+                    "source={LocationSource} fallbackReason={FallbackReason} " +
+                    "baseDirectory={BaseDirectory}",
+                    processPath,
+                    locationSource,
+                    fallbackReason,
+                    baseDirectory);
+                return;
+            }
+
             RunForBaseDirectory(
-                Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable),
-                AppContext.BaseDirectory,
+                _getStationAccessToken(),
+                baseDirectory,
                 cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -69,20 +116,66 @@ internal sealed partial class EngineCacheJanitor
         string baseDirectory,
         CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(stationAccessToken)) return;
+        if (string.IsNullOrWhiteSpace(stationAccessToken))
+        {
+            _log.LogDebug(
+                "engine.cache-prune rejected gate=station-access-token tokenPresent=false " +
+                "baseDirectory={BaseDirectory}",
+                baseDirectory);
+            return;
+        }
 
         try
         {
             var targetDirectory = new DirectoryInfo(baseDirectory);
-            if (string.IsNullOrEmpty(targetDirectory.Name)) return;
+            if (string.IsNullOrEmpty(targetDirectory.Name))
+            {
+                _log.LogDebug(
+                    "engine.cache-prune rejected gate=target-directory-name " +
+                    "baseDirectory={BaseDirectory} targetDirectory={TargetDirectory} " +
+                    "targetDirectoryName={TargetDirectoryName}",
+                    baseDirectory,
+                    targetDirectory.FullName,
+                    targetDirectory.Name);
+                return;
+            }
 
             var ownVersionDirectory = targetDirectory.Parent;
-            if (ownVersionDirectory is null || !IsStrictSemVer(ownVersionDirectory.Name)) return;
+            if (ownVersionDirectory is null)
+            {
+                _log.LogDebug(
+                    "engine.cache-prune rejected gate=version-directory-parent " +
+                    "baseDirectory={BaseDirectory} targetDirectory={TargetDirectory} " +
+                    "candidateVersionDirectory=<null>",
+                    baseDirectory,
+                    targetDirectory.FullName);
+                return;
+            }
+            if (!IsStrictSemVer(ownVersionDirectory.Name))
+            {
+                _log.LogDebug(
+                    "engine.cache-prune rejected gate=version-directory-semver " +
+                    "baseDirectory={BaseDirectory} " +
+                    "candidateVersionDirectory={CandidateVersionDirectory} " +
+                    "candidateVersionDirectoryName={CandidateVersionDirectoryName} " +
+                    "requirement=strict SemVer",
+                    baseDirectory,
+                    ownVersionDirectory.FullName,
+                    ownVersionDirectory.Name);
+                return;
+            }
 
             var cacheDirectory = ownVersionDirectory.Parent;
-            if (cacheDirectory is null
-                || !File.Exists(Path.Combine(cacheDirectory.FullName, ChannelMarkerFileName)))
+            var channelMarkerPath = cacheDirectory is null
+                ? null
+                : Path.Combine(cacheDirectory.FullName, ChannelMarkerFileName);
+            if (cacheDirectory is null || !File.Exists(channelMarkerPath))
             {
+                _log.LogDebug(
+                    "engine.cache-prune rejected gate=channel-marker " +
+                    "cacheDirectory={CacheDirectory} channelMarkerPath={ChannelMarkerPath}",
+                    cacheDirectory?.FullName,
+                    channelMarkerPath);
                 return;
             }
 
@@ -308,7 +401,12 @@ internal sealed partial class EngineCacheJanitor
                      SearchOption.TopDirectoryOnly))
         {
             foundTargetDirectory = true;
-            var verifiedPath = Path.Combine(targetDirectory, "verified.json");
+            var migratedVerifiedPath = Path.Combine(
+                targetDirectory,
+                MigratedVerifiedCacheRecordFileName);
+            var verifiedPath = File.Exists(migratedVerifiedPath)
+                ? migratedVerifiedPath
+                : Path.Combine(targetDirectory, VerifiedCacheRecordFileName);
             if (!File.Exists(verifiedPath)) return false;
 
             var lastWriteTimeUtc = _getLastWriteTimeUtc(verifiedPath);
@@ -323,12 +421,35 @@ internal sealed partial class EngineCacheJanitor
         return foundTargetDirectory;
     }
 
+    private static bool IsDotnetMuxer(string processPath)
+    {
+        var fileName = Path.GetFileName(processPath);
+        return string.Equals(fileName, "dotnet", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(fileName, "dotnet.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool PathsEqual(string left, string right)
     {
-        return string.Equals(
-            Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
-            Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
-            FileSystemComparison);
+        try
+        {
+            var resolvedLeft = new DirectoryInfo(left)
+                                   .ResolveLinkTarget(returnFinalTarget: true)
+                                   ?.FullName
+                               ?? left;
+            var resolvedRight = new DirectoryInfo(right)
+                                    .ResolveLinkTarget(returnFinalTarget: true)
+                                    ?.FullName
+                                ?? right;
+            return string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(resolvedLeft)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(resolvedRight)),
+                FileSystemComparison);
+        }
+        catch
+        {
+            // An identity check that cannot be completed must preserve the candidate.
+            return true;
+        }
     }
 
     [GeneratedRegex(
@@ -343,36 +464,53 @@ internal sealed partial class EngineCacheJanitor
         string[] PreRelease);
 }
 
-/// <summary>Runs one delayed cache-pruning pass without extending engine startup.</summary>
-internal sealed class EngineCacheJanitorStartup : BackgroundService
+/// <summary>Runs one cache-pruning pass after startup without extending startup or shutdown.</summary>
+internal sealed class EngineCacheJanitorStartup : IHostedService, IDisposable
 {
-    // A previous engine may still be draining when the launcher starts its replacement.
-    // Windows locks the old executable, but POSIX permits deleting it while it runs. Slow
-    // devices such as Raspberry Pi SD cards can take longer to drain, so allow 60 seconds;
-    // the strictly-older gate and skip-on-failure behavior make residual overlap harmless.
-    private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(60);
     private readonly EngineCacheJanitor _janitor;
+    private readonly IHostApplicationLifetime _applicationLifetime;
     private readonly ILogger<EngineCacheJanitorStartup> _log;
+    private CancellationTokenRegistration _applicationStartedRegistration;
 
     public EngineCacheJanitorStartup(
         EngineCacheJanitor janitor,
+        IHostApplicationLifetime applicationLifetime,
         ILogger<EngineCacheJanitorStartup> log)
     {
         _janitor = janitor;
+        _applicationLifetime = applicationLifetime;
         _log = log;
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _applicationStartedRegistration = _applicationLifetime.ApplicationStarted.Register(
+            QueuePrunePass);
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    public void Dispose() => _applicationStartedRegistration.Dispose();
+
+    private void QueuePrunePass()
+    {
+        // Run as soon as the host is ready. The strictly-older gate and per-directory
+        // failure containment handle a previous engine that is still draining, while
+        // the detached pass cannot extend startup or shutdown.
+        _ = RunPrunePassAsync();
+    }
+
+    private async Task RunPrunePassAsync()
     {
         try
         {
-            await Task.Delay(InitialDelay, stoppingToken).ConfigureAwait(false);
             await Task.Run(
-                    () => _janitor.Run(stoppingToken),
-                    stoppingToken)
+                    () => _janitor.Run(_applicationLifetime.ApplicationStopping),
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             return;
         }

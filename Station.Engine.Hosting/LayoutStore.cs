@@ -43,6 +43,8 @@
 // License for details.
 
 using LiteDB;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Zeus.Contracts;
 
 namespace Zeus.Server;
@@ -68,6 +70,11 @@ public sealed class LayoutStore : IDisposable
     private readonly ILiteCollection<RadioSavedLayoutsEntry> _saved;
     private readonly ILogger<LayoutStore> _log;
     private readonly object _lock = new();
+    private readonly Dictionary<string, bool> _activeTransverterEnabled =
+        new(StringComparer.Ordinal);
+
+    /// <summary>Raised when a radio's effective active-workspace flag changes.</summary>
+    public event Action<string, bool>? ActiveTransverterEnabledChanged;
 
     // dbPathOverride mirrors the sibling engine stores: the product host keeps
     // the historical PrefsDbPath.Get() default (layouts stay in zeus-prefs.db,
@@ -184,6 +191,35 @@ public sealed class LayoutStore : IDisposable
         }
     }
 
+    /// <summary>Read one workspace's top-level transverter flag.</summary>
+    public bool GetTransverterEnabled(string radioKey, string layoutId)
+    {
+        radioKey = NormalizeRadioKey(radioKey);
+        layoutId = NormalizeLayoutId(layoutId);
+        lock (_lock)
+        {
+            var entry = _v2.FindOne(x => x.RadioKey == radioKey);
+            var layout = entry?.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
+            return ReadTransverterEnabled(layout?.LayoutJson);
+        }
+    }
+
+    /// <summary>Read the flag effective for a radio's active workspace.</summary>
+    public bool GetActiveTransverterEnabled(string radioKey)
+    {
+        radioKey = NormalizeRadioKey(radioKey);
+        lock (_lock)
+        {
+            if (_activeTransverterEnabled.TryGetValue(radioKey, out bool enabled))
+                return enabled;
+
+            enabled = GetActiveTransverterEnabled(
+                _v2.FindOne(x => x.RadioKey == radioKey));
+            _activeTransverterEnabled[radioKey] = enabled;
+            return enabled;
+        }
+    }
+
     /// <summary>
     /// Upsert one named layout. Creates the radio's row on first call.
     /// If there is no active layout yet, the new layout becomes active.
@@ -204,6 +240,9 @@ public sealed class LayoutStore : IDisposable
         var normalisedIcon = NormalizeIcon(icon);
         var normalisedDescription = NormalizeDescription(description);
 
+        RadioLayoutsDto result;
+        bool effectiveChanged;
+        bool effectiveEnabled;
         lock (_lock)
         {
             var entry = _v2.FindOne(x => x.RadioKey == radioKey) ?? new RadioLayoutsEntry
@@ -212,6 +251,7 @@ public sealed class LayoutStore : IDisposable
                 ActiveLayoutId = layoutId,
                 Layouts = new List<NamedLayoutEntry>(),
             };
+            bool previousEffective = GetActiveTransverterEnabled(entry);
 
             var existing = entry.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
             if (existing is null)
@@ -241,8 +281,53 @@ public sealed class LayoutStore : IDisposable
             if (entry.Id == 0) _v2.Insert(entry);
             else _v2.Update(entry);
 
-            return ToDto(entry);
+            effectiveEnabled = GetActiveTransverterEnabled(entry);
+            _activeTransverterEnabled[radioKey] = effectiveEnabled;
+            effectiveChanged = previousEffective != effectiveEnabled;
+            result = ToDto(entry);
         }
+
+        if (effectiveChanged)
+            ActiveTransverterEnabledChanged?.Invoke(radioKey, effectiveEnabled);
+        return result;
+    }
+
+    /// <summary>
+    /// Patch only the top-level transverter flag in an existing workspace.
+    /// Returns false for an absent workspace or malformed/non-object JSON.
+    /// </summary>
+    public bool SetTransverterEnabled(string radioKey, string layoutId, bool enabled)
+        => SetTransverterEnabled(radioKey, layoutId, enabled, notifyChanged: true);
+
+    internal bool SetTransverterEnabled(
+        string radioKey,
+        string layoutId,
+        bool enabled,
+        bool notifyChanged)
+    {
+        radioKey = NormalizeRadioKey(radioKey);
+        layoutId = NormalizeLayoutId(layoutId);
+        bool effectiveChanged;
+        lock (_lock)
+        {
+            var entry = _v2.FindOne(x => x.RadioKey == radioKey);
+            var layout = entry?.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
+            if (entry is null || layout is null
+                || !TrySetTransverterEnabled(layout.LayoutJson, enabled, out var patchedJson))
+                return false;
+
+            bool previousEffective = GetActiveTransverterEnabled(entry);
+            layout.LayoutJson = patchedJson;
+            layout.UpdatedUtc = DateTime.UtcNow;
+            _v2.Update(entry);
+            bool effectiveEnabled = GetActiveTransverterEnabled(entry);
+            _activeTransverterEnabled[radioKey] = effectiveEnabled;
+            effectiveChanged = previousEffective != effectiveEnabled;
+        }
+
+        if (notifyChanged && effectiveChanged)
+            ActiveTransverterEnabledChanged?.Invoke(radioKey, enabled);
+        return true;
     }
 
     /// <summary>
@@ -253,6 +338,9 @@ public sealed class LayoutStore : IDisposable
     {
         radioKey = NormalizeRadioKey(radioKey);
         layoutId = NormalizeLayoutId(layoutId);
+        RadioLayoutsDto result;
+        bool effectiveChanged;
+        bool effectiveEnabled;
         lock (_lock)
         {
             var entry = _v2.FindOne(x => x.RadioKey == radioKey);
@@ -260,10 +348,18 @@ public sealed class LayoutStore : IDisposable
                 return new RadioLayoutsDto(radioKey, Array.Empty<NamedLayoutDto>(), string.Empty);
             if (!entry.Layouts.Any(l => l.LayoutId == layoutId))
                 return ToDto(entry);
+            bool previousEffective = GetActiveTransverterEnabled(entry);
             entry.ActiveLayoutId = layoutId;
             _v2.Update(entry);
-            return ToDto(entry);
+            effectiveEnabled = GetActiveTransverterEnabled(entry);
+            _activeTransverterEnabled[radioKey] = effectiveEnabled;
+            effectiveChanged = previousEffective != effectiveEnabled;
+            result = ToDto(entry);
         }
+
+        if (effectiveChanged)
+            ActiveTransverterEnabledChanged?.Invoke(radioKey, effectiveEnabled);
+        return result;
     }
 
     /// <summary>
@@ -275,17 +371,28 @@ public sealed class LayoutStore : IDisposable
     {
         radioKey = NormalizeRadioKey(radioKey);
         layoutId = NormalizeLayoutId(layoutId);
+        RadioLayoutsDto result;
+        bool effectiveChanged;
+        bool effectiveEnabled;
         lock (_lock)
         {
             var entry = _v2.FindOne(x => x.RadioKey == radioKey);
             if (entry is null)
                 return new RadioLayoutsDto(radioKey, Array.Empty<NamedLayoutDto>(), string.Empty);
+            bool previousEffective = GetActiveTransverterEnabled(entry);
             entry.Layouts.RemoveAll(l => l.LayoutId == layoutId);
             if (entry.ActiveLayoutId == layoutId)
                 entry.ActiveLayoutId = entry.Layouts.FirstOrDefault()?.LayoutId ?? string.Empty;
             _v2.Update(entry);
-            return ToDto(entry);
+            effectiveEnabled = GetActiveTransverterEnabled(entry);
+            _activeTransverterEnabled[radioKey] = effectiveEnabled;
+            effectiveChanged = previousEffective != effectiveEnabled;
+            result = ToDto(entry);
         }
+
+        if (effectiveChanged)
+            ActiveTransverterEnabledChanged?.Invoke(radioKey, effectiveEnabled);
+        return result;
     }
 
     // -----------------------------------------------------------------
@@ -405,6 +512,48 @@ public sealed class LayoutStore : IDisposable
                 string.IsNullOrEmpty(l.Description) ? null : l.Description))
             .ToList(),
         e.ActiveLayoutId);
+
+    private static bool GetActiveTransverterEnabled(RadioLayoutsEntry? entry)
+    {
+        if (entry is null || string.IsNullOrEmpty(entry.ActiveLayoutId)) return false;
+        var active = entry.Layouts.FirstOrDefault(l => l.LayoutId == entry.ActiveLayoutId);
+        return ReadTransverterEnabled(active?.LayoutJson);
+    }
+
+    private static bool ReadTransverterEnabled(string? layoutJson)
+    {
+        if (string.IsNullOrWhiteSpace(layoutJson)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(layoutJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("transverterEnabled", out var value)
+                && value.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TrySetTransverterEnabled(
+        string layoutJson,
+        bool enabled,
+        out string patchedJson)
+    {
+        patchedJson = layoutJson;
+        try
+        {
+            if (JsonNode.Parse(layoutJson) is not JsonObject root) return false;
+            root["transverterEnabled"] = enabled;
+            patchedJson = root.ToJsonString();
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 
     // The radio key keeps to a small alphabet so it survives JSON round-trips
     // and URL query params without escaping. BoardKind values already match

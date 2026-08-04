@@ -127,6 +127,52 @@ public sealed class TxService
 
     public bool IsMoxOn { get { lock (_sync) return _moxOn; } }
     public bool IsTunOn { get { lock (_sync) return _tunOn; } }
+
+    /// <summary>
+    /// Runs a short safety-critical operation only when every Zeus transmit
+    /// intent is idle, while preventing a new MOX, TUN, or TwoTone transition
+    /// from beginning until that operation returns. This is intentionally
+    /// non-blocking: a concurrent transition wins and the caller must fail
+    /// closed instead of waiting to change external station equipment later.
+    /// </summary>
+    internal bool TryRunWithTransmitIdle(Action operation, out string? error)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (!Monitor.TryEnter(_transitionSync))
+        {
+            error = "A Zeus transmit transition is already in progress.";
+            return false;
+        }
+
+        try
+        {
+            TransmitIntent? activeIntent;
+            bool moxOn;
+            bool tunOn;
+            bool twoToneOn;
+            lock (_sync)
+            {
+                activeIntent = _activeIntent;
+                moxOn = _moxOn;
+                tunOn = _tunOn;
+                twoToneOn = IsTwoToneOn;
+            }
+
+            if (activeIntent is not null || moxOn || tunOn || twoToneOn || _radio.IsMox)
+            {
+                error = "The Zeus transmitter is not idle.";
+                return false;
+            }
+
+            operation();
+            error = null;
+            return true;
+        }
+        finally
+        {
+            Monitor.Exit(_transitionSync);
+        }
+    }
     /// <summary>Source that currently holds MOX, or null when MOX is off.
     /// Subscribers (e.g. <c>CwEngine</c>) read this on the
     /// <see cref="TxActiveChanged"/> falling edge to tell apart "I dropped
@@ -894,6 +940,7 @@ public sealed class TxService
                 // P2 SetTune itself emits a keyed high-priority packet, so align
                 // the NCO before publishing the TUN latch. RadioService.SetMox
                 // repeats this as an idempotent guard at the universal edge.
+                _radio.BeginTxFrequencyTransition();
                 _radio.AlignLoForTx();
                 _radio.NotifyTunActive(true);
                 _pipeline.SetMox(true);

@@ -35,7 +35,11 @@ public static class StationProtocolEndpoints
 
         endpoints.MapPost("/api/station/product-audio/attach", async (HttpContext context) =>
         {
-            if (!IsLoopback(context))
+            // Product attachment is an originless native-process seam. A web
+            // page must never be able to manufacture the endpoint trust used
+            // by the native microphone bridge, even if it can reach loopback
+            // and happens to possess a station token.
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
                 return Results.StatusCode(StatusCodes.Status403Forbidden);
 
             var port = context.RequestServices.GetService<ProductAudioRingPort>();
@@ -74,7 +78,7 @@ public static class StationProtocolEndpoints
             HttpContext context,
             string leaseId) =>
         {
-            if (!IsLoopback(context))
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 return;

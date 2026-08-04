@@ -82,6 +82,9 @@ public sealed class RadioService : IDisposable
     // are byte-identical; this is a panic floor, not a UI policy.
     internal const int MinFilterWidthHz = 10;
     internal const int MaxFilterEdgeHz = 10_000;
+    // Preset chips are intentionally compact; twelve characters keeps custom
+    // names useful without turning every filter surface into a label layout.
+    internal const int MaxFilterPresetLabelLength = 12;
 
     private readonly object _sync = new();
     private readonly ILoggerFactory _loggerFactory;
@@ -201,6 +204,10 @@ public sealed class RadioService : IDisposable
     // TxService whenever the MOX/TUN keying state changes so a drag on either
     // slider during a live TX picks the right source without polling.
     private bool _tunActive;
+    // Guards the pre-wire TUN window: LO alignment must happen before the P2
+    // TUN event emits a keyed packet, while split edits must remain frozen for
+    // that whole transition. Guarded by _sync.
+    private bool _txFrequencyTransition;
 
     // Deterministic test seam for changes landing after recall observes state
     // but before its guarded apply. Null in production.
@@ -226,6 +233,8 @@ public sealed class RadioService : IDisposable
         public double AfGainDb;
         public byte AdcSource;   // 0 = ADC0 (same antenna as RX1) by default
         public bool Muted;       // per-RX audio mute (RXOutputGain=0 equivalent)
+        public bool SplitEnabled;
+        public long TxVfoHz;
     }
     private readonly ExtraReceiver[] _extraReceivers = CreateExtraReceivers();
     // Current Zeus ordinary Protocol-1 ingest decodes one DDC stream and fans it
@@ -302,6 +311,8 @@ public sealed class RadioService : IDisposable
     private bool _overloadSeenInWindow;     // any overload since last tick
     private bool _hardOverloadSeenInWindow;
     private bool _softMagnitudeSeenInWindow;
+    private bool _validMagnitudeSeenInWindow;
+    private bool _predictiveMagnitudeControlActive;
     private ushort _maxMagnitudeSeenInWindow;
     private byte _lastAdcOverloadBits;
     private ushort? _lastAdc0MaxMagnitude;
@@ -311,8 +322,20 @@ public sealed class RadioService : IDisposable
     private DateTimeOffset? _lastAdcTelemetryUtc;
     private AdcProtectionConfig _adcProtection = new();
     private long _lastTickMs = long.MinValue;
+    private long _lastAttAttackMs = long.MinValue;  // monotonic timestamp of the last applied attack step
     private long _lastOverloadMs = long.MinValue;   // wall-clock of the last overload window (release hold-off)
+    private long _adcProtectionResumeAfterMs = long.MinValue;
     private int _lastAppliedEffectiveDb = -1;   // so the first send always fires
+
+    // P2 reports the peak absolute value of its raw signed-16 ADC samples.
+    // Keep enough headroom for an unexpected crest instead of operating at
+    // the 32768 full-scale rail: attack at -2 dBFS, settle at -4 dBFS, and do
+    // not release until the input is below -7 dBFS.
+    private const int AdcSigned16FullScale = 32_768;
+    private const int AdaptiveAttackMagnitude = 26_029;
+    private const int AdaptiveTargetMagnitude = 20_676;
+    private const int AdaptiveReleaseMagnitude = 14_638;
+    private const int PostMoxTelemetryGuardMs = 250;
 
     // Auto-AGC control-loop state. The band noise floor itself is estimated in
     // DspPipelineService by AutoAgcNoiseFloorTracker (a faithful port of
@@ -771,7 +794,9 @@ public sealed class RadioService : IDisposable
             CwPitchHz: CwOffset.CwPitchHz,
             CtunEnabled: rsSnap?.CtunEnabled ?? false,
             PreampOn: rsSnap?.PreampOn ?? false,
-            RogerBeepEnabled: rsSnap?.RogerBeepEnabled ?? false);
+            RogerBeepEnabled: rsSnap?.RogerBeepEnabled ?? false,
+            SplitEnabled: false,
+            SplitTxHz: 0);
 
         _state = _state with { TxPhaseRotator = persistedTxPhaseRotator };
 
@@ -1049,25 +1074,31 @@ public sealed class RadioService : IDisposable
         get { lock (_sync) return _mox; }
     }
 
-    /// <summary>Atomic CAT IF projection. Frequency, mode, and the transient
+    /// <summary>Atomic CAT IF projection. Frequency, mode, split, and the transient
     /// wire MOX latch must come from the same radio-state acquisition so an
     /// unsolicited status frame cannot mix opposite sides of a MOX edge.</summary>
-    internal (long VfoHz, RxMode Mode, bool Mox) SnapshotCatIfState()
-    {
-        lock (_sync) return (_state.VfoHz, _state.Mode, _mox);
-    }
-
-    public StateDto Snapshot()
+    internal (long VfoHz, RxMode Mode, bool Mox, bool Split) SnapshotCatIfState()
     {
         lock (_sync)
         {
-            return _state with
-            {
-                Receivers = ProjectReceivers(_state),
-                MaxReceivers = EffectiveMaxReceivers,
-                ConnectedProtocol = ConnectedProtocolLocked(),
-            };
+            var projected = ProjectedStateUnderLock();
+            return (_state.VfoHz, _state.Mode, _mox,
+                RadioFrequencyResolver.IsSplitEnabledForTx(projected));
         }
+    }
+
+    // Caller holds _sync. TX consumers need the same canonical receiver view
+    // Snapshot publishes, including session-only RX3+ split state.
+    private StateDto ProjectedStateUnderLock() => _state with
+    {
+        Receivers = ProjectReceivers(_state),
+        MaxReceivers = EffectiveMaxReceivers,
+        ConnectedProtocol = ConnectedProtocolLocked(),
+    };
+
+    public StateDto Snapshot()
+    {
+        lock (_sync) return ProjectedStateUnderLock();
     }
 
     /// <summary>Current operator preamp toggle. PreampOn isn't on the
@@ -1297,9 +1328,12 @@ public sealed class RadioService : IDisposable
             // Fresh connection — reset per-session auto-ATT state so a sticky
             // offset from a previous session doesn't leak onto new hardware.
             _attOffsetDb = 0;
+            _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
             ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
+            _lastAttAttackMs = long.MinValue;
+            _adcProtectionResumeAfterMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
         }
@@ -1726,6 +1760,72 @@ public sealed class RadioService : IDisposable
         return snap;
     }
 
+    /// <summary>Enable or disable the independent split-TX dial. The selected
+    /// receiver remains the RX/mode context; split only overrides the carrier
+    /// frequency, matching Thetis VFO-A RX / VFO-B TX with RX2 disabled.</summary>
+    public StateDto SetSplit(int receiverIndex, bool enabled)
+    {
+        long previousTx = 0;
+        Mutate(s =>
+        {
+            // This check runs inside Mutate's _sync critical section so key-on
+            // cannot slip between admission and the frequency-state edit.
+            if (_mox || _tunActive || _txFrequencyTransition) return null;
+            previousTx = TxFrequencyHzLocked(s);
+            ValidateReceiverIndexUnderLock(receiverIndex);
+            long receiverHz = ReceiverFrequencyHzLocked(s, receiverIndex);
+            if (receiverIndex <= 0)
+            {
+                long txHz = s.SplitTxHz > 0 ? s.SplitTxHz : receiverHz;
+                return s with { SplitEnabled = enabled, SplitTxHz = txHz };
+            }
+            if (receiverIndex == 1)
+                return WithRx2(s, r => r with
+                {
+                    SplitEnabled = enabled,
+                    TxVfoHz = r.TxVfoHz > 0 ? r.TxVfoHz : receiverHz,
+                });
+
+            var e = _extraReceivers[receiverIndex] ??= new ExtraReceiver();
+            e.SplitEnabled = enabled;
+            if (e.TxVfoHz <= 0) e.TxVfoHz = receiverHz;
+            return s;
+        }, out bool applied);
+        if (!applied) return Snapshot();
+        var snap = Snapshot();
+        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(snap)))
+            RecomputePaAndPush();
+        return snap;
+    }
+
+    /// <summary>Move the independent split-TX dial without moving any RX VFO
+    /// or hardware receive LO.</summary>
+    public StateDto SetSplitFrequency(int receiverIndex, long hz)
+    {
+        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long previousTx = 0;
+        Mutate(s =>
+        {
+            // Atomic with key-on for the same reason as SetSplit above.
+            if (_mox || _tunActive || _txFrequencyTransition) return null;
+            previousTx = TxFrequencyHzLocked(s);
+            ValidateReceiverIndexUnderLock(receiverIndex);
+            if (receiverIndex <= 0)
+                return s with { SplitTxHz = clamped };
+            if (receiverIndex == 1)
+                return WithRx2(s, r => r with { TxVfoHz = clamped });
+
+            var e = _extraReceivers[receiverIndex] ??= new ExtraReceiver();
+            e.TxVfoHz = clamped;
+            return s;
+        }, out bool applied);
+        if (!applied) return Snapshot();
+        var snap = Snapshot();
+        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(snap)))
+            RecomputePaAndPush();
+        return snap;
+    }
+
     // Caller holds _sync. A secondary receiver is a valid TX target only while
     // exposed/enabled — otherwise fall back to RX1 so TX never points at a
     // receiver that isn't streaming.
@@ -1738,15 +1838,40 @@ public sealed class RadioService : IDisposable
         return _extraReceivers[index] is { Enabled: true } ? index : 0;
     }
 
+    private void ValidateReceiverIndexUnderLock(int index)
+    {
+        if (index == 0) return;
+        if (ClampTxReceiverIndexUnderLock(index) != index)
+            throw new ArgumentOutOfRangeException(
+                nameof(index), index, "receiver is not enabled or cannot transmit");
+    }
+
     // Caller holds _sync. Like TxFrequencyHz but resolves an extra-DDC TX target
     // (index >= 2) from _extraReceivers, which the internal _state can't carry
     // (its Receivers list is null until ProjectReceivers runs at Snapshot time).
-    private long TxFrequencyHzLocked(StateDto state) => state.TxReceiverIndex switch
+    private long ReceiverFrequencyHzLocked(StateDto state, int receiverIndex) => receiverIndex switch
     {
         <= 0 => state.VfoHz,
         1 => state.Rx2().VfoHz,
         int i => i < _extraReceivers.Length && _extraReceivers[i] is { } e ? e.VfoHz : state.VfoHz,
     };
+
+    private long TxFrequencyHzLocked(StateDto state)
+    {
+        int index = state.TxReceiverIndex;
+        if (index <= 0)
+            return state.SplitEnabled && state.SplitTxHz > 0
+                ? state.SplitTxHz
+                : state.VfoHz;
+        if (index == 1)
+        {
+            var rx2 = state.Rx2();
+            return rx2.SplitEnabled && rx2.TxVfoHz > 0 ? rx2.TxVfoHz : rx2.VfoHz;
+        }
+
+        var e = index < _extraReceivers.Length ? _extraReceivers[index] : null;
+        return e is { SplitEnabled: true, TxVfoHz: > 0 } ? e.TxVfoHz : e?.VfoHz ?? state.VfoHz;
+    }
 
     /// <summary>TX carrier frequency including any active XIT offset. The
     /// displayed VFO is unchanged; only the transmitted carrier moves (Thetis
@@ -1755,7 +1880,7 @@ public sealed class RadioService : IDisposable
         RadioFrequencyResolver.TxFrequencyHz(state) + (state.XitEnabled ? state.XitHz : 0);
 
     public static long TxEffectiveLoHz(StateDto state) =>
-        CwOffset.EffectiveLoHz(state.Mode, TxCarrierHz(state));
+        CwOffset.EffectiveLoHz(RadioFrequencyResolver.TxMode(state), TxCarrierHz(state));
 
     public StateDto SwapVfos()
     {
@@ -2128,8 +2253,10 @@ public sealed class RadioService : IDisposable
             // centre in ONE critical section: a concurrent state change
             // between read and record would otherwise snap to a stale target
             // or park the restore centre on the wrong frequency.
-            if (_state.Mode != RxMode.CWU && _state.Mode != RxMode.CWL) return false;
-            targetLo = CwOffset.EffectiveLoHz(_state.Mode, TxCarrierHz(_state));
+            var projected = ProjectedStateUnderLock();
+            var txMode = RadioFrequencyResolver.TxMode(projected);
+            if (txMode != RxMode.CWU && txMode != RxMode.CWL) return false;
+            targetLo = CwOffset.EffectiveLoHz(txMode, TxCarrierHz(projected));
             if (targetLo == _state.RadioLoHz) return false;
             RememberFrozenLoUnderLock();
         }
@@ -2159,6 +2286,11 @@ public sealed class RadioService : IDisposable
         long targetLo;
         lock (_sync)
         {
+            // True split uses the established key-down move/restore path on all
+            // protocols. P2/P3 also program their independent TX DUC, but the
+            // shared RF reference moves with it so every hardware path remains
+            // phase-aligned; un-key restores the parked RX centre.
+            var projected = ProjectedStateUnderLock();
             // Dual-RX split TX on Protocol 2: the TX carrier is placed by the
             // INDEPENDENT TX DUC (DspPipelineService.OnRadioStateChanged →
             // Protocol2Client.SetTxDucFrequency), not by dragging the shared
@@ -2166,12 +2298,13 @@ public sealed class RadioService : IDisposable
             // the tune carrier showed on BOTH receivers (the two-carrier bug).
             // Skip the drag for this case; CTUN and P1 split still drag (P1 has
             // no independent DUC, and CTUN must move the shared LO).
-            if (_state.TxReceiverIndex >= 1 && _state.Rx2Enabled
+            if (!RadioFrequencyResolver.IsSplitEnabledForTx(projected)
+                && _state.TxReceiverIndex >= 1 && _state.Rx2Enabled
                 && ConnectedBoardKind == HpsdrBoardKind.OrionMkII)
                 return false;
             // Read state, compute the target, decide, and record the frozen
             // centre in ONE critical section (see AlignLoForCwTx).
-            targetLo = CwOffset.EffectiveLoHz(_state.Mode, TxCarrierHz(_state));
+            targetLo = TxEffectiveLoHz(projected);
             if (targetLo == _state.RadioLoHz) return false;
             RememberFrozenLoUnderLock();
         }
@@ -2672,27 +2805,131 @@ public sealed class RadioService : IDisposable
         var defaults = FilterPresets.DefaultsForMode(mode);
         return defaults.Select(e =>
         {
-            if (e.IsVar && _filterPresetStore != null)
+            var stored = _filterPresetStore?.GetSlotOverride(mode, e.SlotName);
+            int lowHz = e.LowHz;
+            int highHz = e.HighHz;
+            if (stored?.HasWidth == true)
             {
-                var stored = _filterPresetStore.GetVarOverride(mode, e.SlotName);
-                if (stored.HasValue)
-                {
-                    var normalized = NormalizeLegacyDigitalFilter(
-                        mode, stored.Value.LowHz, stored.Value.HighHz);
-                    return new FilterPresetDto(
-                        e.SlotName, e.Label, normalized.low, normalized.high, true);
-                }
+                var normalized = NormalizeLegacyDigitalFilter(
+                    mode, stored.LowHz, stored.HighHz);
+                lowHz = normalized.low;
+                highHz = normalized.high;
             }
-            return new FilterPresetDto(e.SlotName, e.Label, e.LowHz, e.HighHz, e.IsVar);
+            string label = e.IsVar ? e.Label : stored?.Label ?? e.Label;
+            bool customized = lowHz != e.LowHz
+                || highHz != e.HighHz
+                || !string.Equals(label, e.Label, StringComparison.Ordinal);
+            return new FilterPresetDto(
+                e.SlotName, label, lowHz, highHz, e.IsVar, customized);
         }).ToList();
     }
 
-    public StateDto SetFilterPresetOverride(RxMode mode, string slotName, int loHz, int hiHz)
+    public StateDto SetFilterPresetOverride(
+        RxMode mode,
+        string slotName,
+        int loHz,
+        int hiHz,
+        string? label = null)
     {
-        if (slotName is not ("VAR1" or "VAR2"))
-            throw new InvalidOperationException("Only VAR1 and VAR2 slots can be overridden.");
-        _filterPresetStore?.UpsertVarOverride(mode, slotName, loHz, hiHz);
+        var factory = GetFactoryFilterPreset(mode, slotName);
+        if (factory.IsVar && label is not null)
+            throw new ArgumentException(
+                "VAR1 and VAR2 filter presets cannot be renamed.",
+                nameof(label));
+
+        (loHz, hiHz) = ValidateAndNormalizeFilterPresetWidth(mode, loHz, hiHz);
+        bool updateLabel = label is not null;
+        string? normalizedLabel = updateLabel
+            ? NormalizeFilterPresetLabel(label!, factory.Label)
+            : null;
+        var stored = _filterPresetStore?.GetSlotOverride(mode, factory.SlotName);
+        int currentLowHz = factory.LowHz;
+        int currentHighHz = factory.HighHz;
+        if (stored?.HasWidth == true)
+        {
+            (currentLowHz, currentHighHz) = NormalizeLegacyDigitalFilter(
+                mode, stored.LowHz, stored.HighHz);
+        }
+
+        bool updateWidth = loHz != currentLowHz || hiHz != currentHighHz;
+        if (updateWidth && updateLabel)
+        {
+            _filterPresetStore?.UpsertSlotOverride(
+                mode, factory.SlotName, loHz, hiHz, updateLabel: true, label: normalizedLabel);
+        }
+        else if (updateWidth)
+        {
+            _filterPresetStore?.UpsertSlotWidthOverride(
+                mode, factory.SlotName, loHz, hiHz);
+        }
+        else if (updateLabel)
+        {
+            _filterPresetStore?.UpsertSlotLabelOverride(
+                mode, factory.SlotName, normalizedLabel);
+        }
         return Snapshot();
+    }
+
+    public StateDto ResetFilterPresetOverride(RxMode mode, string slotName)
+    {
+        var factory = GetFactoryFilterPreset(mode, slotName);
+        _filterPresetStore?.ResetSlotOverride(mode, factory.SlotName);
+        return Snapshot();
+    }
+
+    private static FilterPresetEntry GetFactoryFilterPreset(RxMode mode, string slotName)
+    {
+        if (!Enum.IsDefined(mode))
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown RX mode.");
+        if (string.IsNullOrWhiteSpace(slotName))
+            throw new InvalidOperationException("A filter slot name is required.");
+        string candidate = slotName.Trim();
+        return FilterPresets.DefaultsForMode(mode).FirstOrDefault(e =>
+            string.Equals(e.SlotName, candidate, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException(
+                $"Filter slot '{slotName}' is not available for mode {mode}.");
+    }
+
+    private static (int low, int high) ValidateAndNormalizeFilterPresetWidth(
+        RxMode mode,
+        int lowHz,
+        int highHz)
+    {
+        if (highHz <= lowHz)
+            throw new ArgumentException("Filter high edge must be greater than the low edge.");
+        if (lowHz < -MaxFilterEdgeHz || highHz > MaxFilterEdgeHz)
+            throw new ArgumentOutOfRangeException(
+                nameof(lowHz),
+                $"Filter edges must be between {-MaxFilterEdgeHz} and {MaxFilterEdgeHz} Hz.");
+
+        (lowHz, highHz) = ClampMinFilterWidth(lowHz, highHz);
+        if (lowHz < -MaxFilterEdgeHz)
+        {
+            highHz += -MaxFilterEdgeHz - lowHz;
+            lowHz = -MaxFilterEdgeHz;
+        }
+        if (highHz > MaxFilterEdgeHz)
+        {
+            lowHz -= highHz - MaxFilterEdgeHz;
+            highHz = MaxFilterEdgeHz;
+        }
+        return NormalizeLegacyDigitalFilter(mode, lowHz, highHz);
+    }
+
+    private static string? NormalizeFilterPresetLabel(string label, string factoryLabel)
+    {
+        string trimmed = label.Trim();
+        if (trimmed.Length == 0 || string.Equals(trimmed, factoryLabel, StringComparison.Ordinal))
+            return null;
+        if (trimmed.Length > MaxFilterPresetLabelLength)
+            throw new ArgumentException(
+                $"Filter preset names may contain at most {MaxFilterPresetLabelLength} characters.",
+                nameof(label));
+        if (trimmed.Any(char.IsControl))
+            throw new ArgumentException(
+                "Filter preset names cannot contain control characters.",
+                nameof(label));
+        return trimmed;
     }
 
     public string[] GetFavoriteFilterSlots(RxMode mode)
@@ -2987,8 +3224,11 @@ public sealed class RadioService : IDisposable
                 // warning lamp doesn't linger and reset the offset to zero so
                 // the hardware comes back to the user's baseline immediately.
                 _attOffsetDb = 0;
+                _predictiveMagnitudeControlActive = false;
                 _adcOverloadLevel = 0;
                 ResetAdcProtectionWindowNoLock();
+                _lastAttAttackMs = long.MinValue;
+                _adcProtectionResumeAfterMs = long.MinValue;
                 _lastOverloadMs = long.MinValue;
                 _state = _state with { AttOffsetDb = 0, AdcOverloadWarning = false };
                 int baseline = _atten.ClampedDb;
@@ -3001,6 +3241,8 @@ public sealed class RadioService : IDisposable
             else
             {
                 _lastTickMs = long.MinValue;
+                _lastAttAttackMs = long.MinValue;
+                _adcProtectionResumeAfterMs = long.MinValue;
             }
         }
         var snap = Snapshot();
@@ -3041,6 +3283,7 @@ public sealed class RadioService : IDisposable
             {
                 _adcProtection = next;
                 _lastTickMs = long.MinValue;
+                _lastAttAttackMs = long.MinValue;
                 _stateDirty = true;
             }
 
@@ -3054,8 +3297,11 @@ public sealed class RadioService : IDisposable
             if (!next.Enabled)
             {
                 _attOffsetDb = 0;
+                _predictiveMagnitudeControlActive = false;
                 _adcOverloadLevel = 0;
                 ResetAdcProtectionWindowNoLock();
+                _lastAttAttackMs = long.MinValue;
+                _adcProtectionResumeAfterMs = long.MinValue;
                 _lastOverloadMs = long.MinValue;
                 if (_state.AttOffsetDb != 0 || _state.AdcOverloadWarning)
                 {
@@ -3126,7 +3372,7 @@ public sealed class RadioService : IDisposable
         // The overload counter caps at 5, so the gate (level > threshold) must
         // stay reachable — clamp to 4 so it can never silently disable the ramp.
         WarningThreshold = Math.Clamp(config.WarningThreshold, 0, 4),
-        MagnitudeSoftLimit = Math.Clamp(config.MagnitudeSoftLimit, 0, ushort.MaxValue),
+        MagnitudeSoftLimit = Math.Clamp(config.MagnitudeSoftLimit, 0, AdcSigned16FullScale),
         ReleaseHoldMs = Math.Clamp(config.ReleaseHoldMs, 0, 10_000),
     };
 
@@ -3135,15 +3381,31 @@ public sealed class RadioService : IDisposable
         _overloadSeenInWindow = false;
         _hardOverloadSeenInWindow = false;
         _softMagnitudeSeenInWindow = false;
+        _validMagnitudeSeenInWindow = false;
         _maxMagnitudeSeenInWindow = 0;
     }
 
-    internal static int MagnitudeAttackStepDb(ushort maxMagnitude, int softLimit, int minimumStepDb)
+    internal static int MagnitudeAttackStepDb(ushort maxMagnitude, int targetMagnitude, int minimumStepDb)
     {
         int floor = Math.Clamp(minimumStepDb, 1, 6);
-        if (softLimit <= 0 || maxMagnitude <= softLimit) return floor;
-        double excessDb = 20.0 * Math.Log10(maxMagnitude / (double)softLimit);
-        return Math.Clamp(Math.Max(floor, (int)Math.Ceiling(excessDb)), 1, 6);
+        if (targetMagnitude <= 0 || maxMagnitude <= targetMagnitude) return floor;
+        double excessDb = 20.0 * Math.Log10(maxMagnitude / (double)targetMagnitude);
+        return Math.Max(floor, (int)Math.Ceiling(excessDb));
+    }
+
+    private static (int Attack, int Target, int Release) AdcMagnitudeZones(int configuredSoftLimit)
+    {
+        if (configuredSoftLimit <= 0)
+            return (AdaptiveAttackMagnitude, AdaptiveTargetMagnitude, AdaptiveReleaseMagnitude);
+
+        // An explicit threshold remains an operator override. Hysteresis is
+        // expressed in dB so it scales correctly over the complete ADC range.
+        int attack = configuredSoftLimit;
+        // Round upward so integer quantization never turns an exact 2 dB or
+        // 5 dB boundary into a spurious extra whole-dB attenuation step.
+        int target = Math.Max(1, (int)Math.Ceiling(attack * Math.Pow(10.0, -2.0 / 20.0)));
+        int release = Math.Max(1, (int)Math.Ceiling(attack * Math.Pow(10.0, -5.0 / 20.0)));
+        return (attack, target, release);
     }
 
     public StateDto SetAutoAgc(bool enabled)
@@ -3320,7 +3582,13 @@ public sealed class RadioService : IDisposable
     // reads back; this method is the P1-side fan-out only. We also stash the
     // bit locally so the auto-ATT loop can pause itself during TX (Thetis
     // console.cs:22188 — TX uses its own TxAttenData path, not the RX ramp).
-    internal void SetMox(bool on)
+    internal void SetMox(bool on) => SetMoxCore(on, Environment.TickCount64);
+
+    // Distinctly named test seam preserves the single SetMox method required
+    // by the TX safety reflection audit while making the boundary deterministic.
+    internal void SetMoxAtForTest(bool on, long nowMs) => SetMoxCore(on, nowMs);
+
+    private void SetMoxCore(bool on, long nowMs)
     {
         // The hardware NCO can sit off the dial for RX (CTUN freeze, or an
         // autopan/pure-pan offset). Snap it to the dial before the wire MOX
@@ -3334,7 +3602,24 @@ public sealed class RadioService : IDisposable
         // below.)
         // Latch _mox before AlignLoForTx so a concurrent guarded SetRadioLo
         // (the frontend LO heartbeat) cannot slip between the snap and guard.
-        lock (_sync) _mox = on;
+        lock (_sync)
+        {
+            if (_mox != on)
+            {
+                _mox = on;
+                // Telemetry arriving around a TX/RX transition can describe
+                // the old signal path. Start a fresh sample window on both
+                // MOX edges so it can neither attack nor release RX S-ATT.
+                // A one-status-cycle guard after unkey rejects queued software-
+                // MOX packets; the P2 physical-PTT bit is an additional guard.
+                ResetAdcProtectionWindowNoLock();
+                _lastTickMs = long.MinValue;
+                _lastAttAttackMs = long.MinValue;
+                _adcProtectionResumeAfterMs = on
+                    ? long.MinValue
+                    : nowMs + PostMoxTelemetryGuardMs;
+            }
+        }
         if (on) AlignLoForTx();
         ActiveClient?.SetMox(on);
         MoxChanged?.Invoke(on);
@@ -3713,7 +3998,11 @@ public sealed class RadioService : IDisposable
     // just-applied keying state (Thetis PreviousPWR swap, `console.cs:30094`).
     internal void NotifyTunActive(bool on)
     {
-        lock (_sync) _tunActive = on;
+        lock (_sync)
+        {
+            _tunActive = on;
+            _txFrequencyTransition = false;
+        }
         // Latch the TUN flag on the P1 client so its ControlFrame OC composition
         // ORs the OcTune mask on top of OcTx only during TUN (issue #1325). P1's
         // wire MOX bit rises for both TUN and regular TX, so the client needs a
@@ -3726,9 +4015,18 @@ public sealed class RadioService : IDisposable
 
     internal void ClearTunActiveForSafety()
     {
-        lock (_sync) _tunActive = false;
+        lock (_sync)
+        {
+            _tunActive = false;
+            _txFrequencyTransition = false;
+        }
         (ActiveClient as Zeus.Protocol1.Protocol1Client)?.SetTune(false);
         TunActiveChanged?.Invoke(false);
+    }
+
+    internal void BeginTxFrequencyTransition()
+    {
+        lock (_sync) _txFrequencyTransition = true;
     }
 
     internal void SetTxSafetyAuthority(bool granted) =>
@@ -5096,7 +5394,7 @@ public sealed class RadioService : IDisposable
         FilterLowHz: s.FilterLowHz, FilterHighHz: s.FilterHighHz,
         FilterPresetName: s.FilterPresetName,
         AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
-        Muted: s.Rx1Muted);
+        Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled, TxVfoHz: s.SplitTxHz);
 
     private static StateDto WithReceiverAdcSource(StateDto s, int index, byte adcSource)
     {
@@ -5151,7 +5449,8 @@ public sealed class RadioService : IDisposable
                 FilterLowHz: s.FilterLowHz, FilterHighHz: s.FilterHighHz,
                 FilterPresetName: s.FilterPresetName,
                 AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
-                Muted: s.Rx1Muted),
+                Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
+                TxVfoHz: s.SplitTxHz),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
             // in the array itself (the flat VFO-B fields are gone). Carry the
             // existing tuning forward and overlay the flat RX2 control fields
@@ -5182,7 +5481,8 @@ public sealed class RadioService : IDisposable
                 FilterLowHz: e.FilterLowHz, FilterHighHz: e.FilterHighHz,
                 FilterPresetName: e.FilterPresetName,
                 AfGainDb: e.AfGainDb, SampleRateHz: s.SampleRate,
-                Muted: e.Muted));
+                Muted: e.Muted, SplitEnabled: e.SplitEnabled,
+                TxVfoHz: e.TxVfoHz));
         }
         // Non-hardware KiwiSDR slice (reserved index KiwiReceiverIndex). Appended
         // out of the contiguous DDC run — it is a remote receiver, not a DDC, so
@@ -5322,9 +5622,12 @@ public sealed class RadioService : IDisposable
             // Record the discovered firmware for the diagnostics snapshot.
             _connectedFirmware = firmware;
             _attOffsetDb = 0;
+            _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
             ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
+            _lastAttAttackMs = long.MinValue;
+            _adcProtectionResumeAfterMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
             _lastAdcOverloadBits = 0;
@@ -5391,9 +5694,12 @@ public sealed class RadioService : IDisposable
             _p2BoardKind = HpsdrBoardKind.Unknown;
             _connectedFirmware = null;
             _attOffsetDb = 0;
+            _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
             ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
+            _lastAttAttackMs = long.MinValue;
+            _adcProtectionResumeAfterMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
         }
@@ -5433,9 +5739,12 @@ public sealed class RadioService : IDisposable
             _p3MaxReceivers = Math.Clamp(maxReceivers, 1, Zeus.Contracts.WireContract.MaxReceivers);
             _connectedFirmware = firmware;
             _attOffsetDb = 0;
+            _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
             ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
+            _lastAttAttackMs = long.MinValue;
+            _adcProtectionResumeAfterMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
             _lastAdcOverloadBits = 0;
@@ -5465,9 +5774,12 @@ public sealed class RadioService : IDisposable
             _p3MaxReceivers = Zeus.Contracts.WireContract.MaxReceivers;
             _connectedFirmware = null;
             _attOffsetDb = 0;
+            _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
             ResetAdcProtectionWindowNoLock();
             _lastTickMs = long.MinValue;
+            _lastAttAttackMs = long.MinValue;
+            _adcProtectionResumeAfterMs = long.MinValue;
             _lastOverloadMs = long.MinValue;
             _lastAppliedEffectiveDb = -1;
         }
@@ -5734,7 +6046,7 @@ public sealed class RadioService : IDisposable
     internal void HandleAdcOverload(AdcOverloadStatus status, long nowMs)
     {
         byte bits = (byte)((status.Adc0 ? 0x01 : 0) | (status.Adc1 ? 0x02 : 0));
-        HandleAdcProtection(bits, null, null, nowMs);
+        HandleAdcProtection(bits, null, null, transmitterActive: false, nowMs: nowMs);
     }
 
     /// <summary>
@@ -5748,19 +6060,20 @@ public sealed class RadioService : IDisposable
             reading.AdcOverloadBits,
             reading.Adc0MaxMagnitude,
             reading.Adc1MaxMagnitude,
+            reading.PttIn,
             nowMs);
     }
 
     /// <summary>
-    /// Port of Thetis' handleOverload (console.cs:22167) plus the
-    /// <c>_adc_overload_level</c> counter (console.cs:22093-22113), extended
-    /// for G2/P2 telemetry and user-configurable attack/release. Applies at
-    /// most one policy step per attack/release window so the ramp is bounded.
+    /// Adaptive three-zone ADC protection. Protocol 2 magnitude telemetry
+    /// provides predictive attack/hold/release control; Protocol 1 and missing
+    /// or zero P2 magnitude data retain hard-overload-only protection.
     /// </summary>
     private void HandleAdcProtection(
         byte overloadBits,
         ushort? adc0MaxMagnitude,
         ushort? adc1MaxMagnitude,
+        bool transmitterActive,
         long nowMs)
     {
         bool changedWarning = false;
@@ -5780,7 +6093,19 @@ public sealed class RadioService : IDisposable
                 _adc1MaxMagnitudeAtOverload = adc1;
 
             if (!_state.AutoAttEnabled) return;
-            if (_mox) return;   // TX-side ATT is owned by a different code path
+            // Local MOX and the radio-reported PTT bit are both authoritative.
+            // The latter rejects already-queued TX telemetry after local
+            // unkeying, before the first confirmed RX status packet arrives.
+            if (_mox
+                || transmitterActive
+                || (_adcProtectionResumeAfterMs != long.MinValue
+                    && nowMs < _adcProtectionResumeAfterMs))
+            {
+                ResetAdcProtectionWindowNoLock();
+                _lastTickMs = long.MinValue;
+                return;
+            }
+            _adcProtectionResumeAfterMs = long.MinValue;
 
             var cfg = _adcProtection;
             // The single front-panel S-ATT control belongs to the primary RX.
@@ -5791,8 +6116,10 @@ public sealed class RadioService : IDisposable
             ushort? protectedMagnitude = protectedAdc == 1
                 ? adc1MaxMagnitude
                 : adc0MaxMagnitude;
-            bool magnitudeSoftHit = cfg.MagnitudeSoftLimit > 0
-                && (protectedMagnitude ?? 0) >= cfg.MagnitudeSoftLimit;
+            bool validMagnitude = protectedMagnitude is > 0;
+            var zones = AdcMagnitudeZones(cfg.MagnitudeSoftLimit);
+            bool magnitudeSoftHit = validMagnitude
+                && protectedMagnitude!.Value >= zones.Attack;
 
             if (protectedHardOverload)
             {
@@ -5804,62 +6131,95 @@ public sealed class RadioService : IDisposable
                 _overloadSeenInWindow = true;
                 _softMagnitudeSeenInWindow = true;
             }
+            if (validMagnitude)
+                _validMagnitudeSeenInWindow = true;
             _maxMagnitudeSeenInWindow = Math.Max(
                 _maxMagnitudeSeenInWindow,
                 protectedMagnitude ?? 0);
 
+            // The first threat after a quiet period is handled immediately,
+            // but every actual attack step shares one cooldown. This prevents
+            // threshold chatter (high/low/high packets) from masquerading as
+            // repeated first observations and railing the attenuator.
+            bool attackCooldownElapsed = _lastAttAttackMs == long.MinValue
+                || nowMs - _lastAttAttackMs >= cfg.AttackMs;
+            bool immediateAttackDue = (protectedHardOverload || magnitudeSoftHit)
+                && attackCooldownElapsed;
             if (_lastTickMs == long.MinValue)
             {
                 _lastTickMs = nowMs;
-                return;
+                if (!immediateAttackDue) return;
+            }
+            else if (!immediateAttackDue)
+            {
+                int intervalMs = _overloadSeenInWindow ? cfg.AttackMs : cfg.ReleaseMs;
+                if (nowMs - _lastTickMs < intervalMs) return;
+                _lastTickMs = nowMs;
+            }
+            else
+            {
+                _lastTickMs = nowMs;
             }
 
-            int intervalMs = _overloadSeenInWindow ? cfg.AttackMs : cfg.ReleaseMs;
-            if (nowMs - _lastTickMs < intervalMs) return;
-            _lastTickMs = nowMs;
-
-            bool seen = _overloadSeenInWindow;
             bool hardSeen = _hardOverloadSeenInWindow;
             bool softSeen = _softMagnitudeSeenInWindow;
+            bool validMagnitudeSeen = _validMagnitudeSeenInWindow;
             ushort maxMagnitudeSeen = _maxMagnitudeSeenInWindow;
             ResetAdcProtectionWindowNoLock();
 
-            if (seen)
+            bool attackZone = hardSeen || softSeen;
+            bool holdZone = !attackZone
+                && validMagnitudeSeen
+                && maxMagnitudeSeen >= zones.Release;
+
+            if (attackZone)
             {
                 _lastOverloadMs = nowMs;
+                if (validMagnitudeSeen)
+                    _predictiveMagnitudeControlActive = true;
                 // Thetis counts +1 per overload poll (console.cs:22107), capped
                 // at 5, and decays -1 per clean poll. _adcOverloadLevel mirrors
                 // that counter exactly so the gate below matches its >3 timing.
                 _adcOverloadLevel = Math.Min(5, _adcOverloadLevel + 1);
 
-                // Hard-overload qualification is Thetis-faithful: wait until
-                // the leaky counter crosses the warning threshold. Its separate
-                // step-shift counter is normally 4 at that first action, so use
-                // the same 4 dB rescue instead of leaving the ADC clipped while
-                // a 1 dB/s-style ramp catches up. Subsequent windows stay at the
-                // configured bounded step, avoiding Thetis's increasingly large
-                // 5/6/7... dB overshoot.
-                bool qualifiedHard = hardSeen && _adcOverloadLevel > cfg.WarningThreshold;
-                // A configured P2 magnitude limit is predictive headroom data,
-                // not a clipped-bit transient. It may act immediately and picks
-                // the smallest whole-dB step that brings the observed peak back
-                // under the requested limit.
-                bool qualifiedSoft = softSeen;
                 int maxDynamicOffset = Math.Min(
                     cfg.MaxOffsetDb,
                     HpsdrAtten.MaxDb - _atten.ClampedDb);
-                if ((qualifiedHard || qualifiedSoft) && _attOffsetDb < maxDynamicOffset)
+                if (_attOffsetDb < maxDynamicOffset)
                 {
+                    int previousOffset = _attOffsetDb;
                     int attackDb = cfg.AttackStepDb;
-                    if (qualifiedHard && _attOffsetDb == 0)
-                        attackDb = Math.Max(attackDb, Math.Min(4, _adcOverloadLevel));
-                    if (qualifiedSoft)
+                    if (validMagnitudeSeen)
                         attackDb = MagnitudeAttackStepDb(
                             maxMagnitudeSeen,
-                            cfg.MagnitudeSoftLimit,
+                            zones.Target,
                             attackDb);
+                    if (hardSeen)
+                        attackDb = Math.Max(4, attackDb);
                     _attOffsetDb = Math.Min(maxDynamicOffset, _attOffsetDb + attackDb);
+                    if (_attOffsetDb > previousOffset)
+                        _lastAttAttackMs = nowMs;
                 }
+            }
+            else if (holdZone)
+            {
+                // Hysteresis band: do not pump the attenuator around the attack
+                // point. Every in-band observation restarts the release hold.
+                _lastOverloadMs = nowMs;
+                if (_attOffsetDb > 0)
+                    _predictiveMagnitudeControlActive = true;
+                if (_adcOverloadLevel > 0) _adcOverloadLevel--;
+            }
+            else if (!validMagnitudeSeen
+                && _predictiveMagnitudeControlActive
+                && _attOffsetDb > 0)
+            {
+                // Once valid P2 magnitude established predictive control, a
+                // zero/missing word is loss of telemetry, not evidence of a
+                // quiet ADC. Freeze the offset until a valid below-release
+                // sample permits controlled release. P1/hard-only offsets do
+                // not enter this state and retain their clean-bit fallback.
+                if (_adcOverloadLevel > 0) _adcOverloadLevel--;
             }
             else
             {
@@ -5874,6 +6234,8 @@ public sealed class RadioService : IDisposable
                     || (nowMs - _lastOverloadMs) >= cfg.ReleaseHoldMs;
                 if (holdElapsed && _attOffsetDb > 0)
                     _attOffsetDb = Math.Max(0, _attOffsetDb - cfg.ReleaseStepDb);
+                if (_attOffsetDb == 0)
+                    _predictiveMagnitudeControlActive = false;
             }
 
             int effective = Math.Clamp(_atten.ClampedDb + _attOffsetDb, HpsdrAtten.MinDb, HpsdrAtten.MaxDb);
@@ -5883,7 +6245,10 @@ public sealed class RadioService : IDisposable
                 effectiveToApply = effective;
             }
 
-            bool warn = _adcOverloadLevel > cfg.WarningThreshold;
+            // Protection is operator-visible for as long as automatic
+            // attenuation remains applied, even after the diagnostic leaky
+            // overload counter has decayed.
+            bool warn = _attOffsetDb > 0 || _adcOverloadLevel > cfg.WarningThreshold;
             if (warn != _state.AdcOverloadWarning || _attOffsetDb != _state.AttOffsetDb)
             {
                 _state = _state with { AttOffsetDb = _attOffsetDb, AdcOverloadWarning = warn };

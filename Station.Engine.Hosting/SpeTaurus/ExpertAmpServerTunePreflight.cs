@@ -206,9 +206,11 @@ internal sealed class ExpertAmpServerTunePreflight(
     }
 
     private static bool HasAuthoritativeStatus(ExpertStatus status) =>
-        string.Equals(status.Source, "serial", StringComparison.OrdinalIgnoreCase)
-        && string.Equals(status.Confidence, "protocol-native", StringComparison.OrdinalIgnoreCase)
-        && string.Equals(status.Provenance, "status-poll", StringComparison.OrdinalIgnoreCase);
+        ExpertAmpServerEvidence.HasFreshProtocolStatus(
+            status.Source,
+            status.Confidence,
+            status.Provenance,
+            status.LastContactAt);
 
     private static bool IsExpectedTaurus(ExpertStatus status) =>
         status.ModelName?.Contains("TAURUS", StringComparison.OrdinalIgnoreCase) == true;
@@ -256,7 +258,8 @@ internal sealed class ExpertAmpServerTunePreflight(
         [property: JsonPropertyName("source")] string? Source,
         [property: JsonPropertyName("confidence")] string? Confidence,
         [property: JsonPropertyName("provenance")] string? Provenance,
-        [property: JsonPropertyName("recentContact")] bool RecentContact);
+        [property: JsonPropertyName("recentContact")] bool RecentContact,
+        [property: JsonPropertyName("lastContactAt")] string? LastContactAt);
 
     private sealed record ExpertButtonResult(
         [property: JsonPropertyName("name")] string? Name,

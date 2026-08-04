@@ -72,6 +72,7 @@ internal static class EnginePrefsDbMigration
             "radio_speaker_settings",
             "radio_state",
             "rf_filter_settings",
+            StationFavoriteStore.CollectionName,
             "tx_fidelity_policy",
         ]);
 

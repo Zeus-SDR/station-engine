@@ -208,9 +208,12 @@ public sealed class CatServer : IHostedService, IDisposable
         if (_clients.IsEmpty) return;
         // VFO can fire rapidly during tuning → rate-limit FA and IF.
         BroadcastRateLimited("FA", CatProtocol.Response("FA", CatProtocol.FormatFreq(state.VfoHz)));
+        BroadcastRateLimited("FB", CatProtocol.Response("FB",
+            CatProtocol.FormatFreq(RadioFrequencyResolver.CatVfoBHz(state))));
         Broadcast(CatProtocol.Response("MD", CatProtocol.ModeDigit(state.Mode)));
         BroadcastRateLimited("IF",
-            CatProtocol.Response("IF", CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn, split: false)));
+            CatProtocol.Response("IF", CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn,
+                RadioFrequencyResolver.IsSplitEnabledForTx(state))));
     }
 
     internal void BroadcastStateForTest(StateDto state) => OnRadioStateChanged(state);

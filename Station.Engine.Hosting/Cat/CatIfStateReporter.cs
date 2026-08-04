@@ -94,7 +94,7 @@ internal sealed class CatIfStateReporter : IDisposable
                 state.VfoHz,
                 state.Mode,
                 state.Mox,
-                split: false)));
+                state.Split)));
     }
 
     private void LogFailure(Exception ex, bool deferred)

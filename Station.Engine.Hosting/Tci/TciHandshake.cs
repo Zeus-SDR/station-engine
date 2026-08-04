@@ -56,8 +56,15 @@ namespace Zeus.Server.Tci;
 /// </summary>
 public static class TciHandshake
 {
-    public static IReadOnlyList<string> BuildHandshake(StateDto state, int sampleRate, bool moxOn, bool tunOn, int drivePercent)
+    public static IReadOnlyList<string> BuildHandshake(
+        StateDto state,
+        int sampleRate,
+        bool moxOn,
+        bool tunOn,
+        int drivePercent,
+        TransverterSettingsDto? transverterSettings = null)
     {
+        var transverter = transverterSettings ?? new TransverterSettingsDto();
         var cmds = new List<string>(40);
 
         cmds.Add(TciProtocol.Command("protocol", TciProtocol.ProtocolName, TciProtocol.ProtocolVersion));
@@ -67,7 +74,12 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("trx_count", 1));
         cmds.Add(TciProtocol.Command("channels_count", 1));
 
-        cmds.Add(TciProtocol.Command("vfo_limits", 0, 61_440_000));
+        cmds.Add(TciProtocol.Command(
+            "vfo_limits",
+            TransverterFrequencyConverter.ToRfHz(
+                TransverterFrequencyConverter.MinimumRadioFrequencyHz, transverter),
+            TransverterFrequencyConverter.ToRfHz(
+                TransverterFrequencyConverter.MaximumRadioFrequencyHz, transverter)));
 
         int halfRate = sampleRate / 2;
         cmds.Add(TciProtocol.Command("if_limits", -halfRate, halfRate));
@@ -96,17 +108,27 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("mon_volume", -20));
         cmds.Add(TciProtocol.Command("mon_enable", false));
 
-        cmds.Add(TciProtocol.Command("dds", 0, CwOffset.EffectiveLoHz(state)));
+        cmds.Add(TciProtocol.Command(
+            "dds",
+            0,
+            TransverterFrequencyConverter.ToRfHz(CwOffset.EffectiveLoHz(state), transverter)));
         cmds.Add(TciProtocol.Command("if", 0, 0, 0));
         cmds.Add(TciProtocol.Command("if", 0, 1, 0));
-        cmds.Add(TciProtocol.Command("vfo", 0, 0, state.VfoHz));
-        cmds.Add(TciProtocol.Command("vfo", 0, 1, state.VfoHz));
+        cmds.Add(TciProtocol.Command(
+            "vfo", 0, 0, TransverterFrequencyConverter.ToRfHz(state.VfoHz, transverter)));
+        cmds.Add(TciProtocol.Command(
+            "vfo",
+            0,
+            1,
+            TransverterFrequencyConverter.ToRfHz(
+                RadioFrequencyResolver.TxDialFrequencyHz(state), transverter)));
 
         string tciMode = TciProtocol.ModeToTci(state.Mode);
         cmds.Add(TciProtocol.Command("modulation", 0, tciMode));
 
         cmds.Add(TciProtocol.Command("rx_enable", 0, true));
-        cmds.Add(TciProtocol.Command("split_enable", 0, false));
+        cmds.Add(TciProtocol.Command("split_enable", 0,
+            RadioFrequencyResolver.IsSplitEnabledForTx(state)));
         cmds.Add(TciProtocol.Command("tx_enable", 0, moxOn || tunOn));
         cmds.Add(TciProtocol.Command("trx", 0, moxOn));
         cmds.Add(TciProtocol.Command("tune", 0, tunOn));
@@ -133,7 +155,13 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("drive", 0, drivePercent));
         cmds.Add(TciProtocol.Command("tune_drive", 0, drivePercent));
 
-        cmds.Add(TciProtocol.Command("tx_frequency", state.VfoHz));
+        var txFrequencyHz = TransverterFrequencyConverter.ToRfHz(
+            RadioFrequencyResolver.TxFrequencyHz(state), transverter);
+        cmds.Add(TciProtocol.Command("tx_frequency", txFrequencyHz));
+        cmds.Add(TciExtendedFrequency.Command(
+            txFrequencyHz,
+            state.Rx2Enabled,
+            TciExtendedFrequency.TxUsesVfoB(state)));
 
         cmds.Add(TciProtocol.Command("start"));
         cmds.Add(TciProtocol.Command("ready"));

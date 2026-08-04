@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using Zeus.Contracts;
+using Zeus.Hosting;
 using Zeus.Server;
 using Zeus.Server.Cat;
 using Zeus.Server.Diagnostics;
@@ -51,6 +52,7 @@ public partial class Program
             Console.Error.WriteLine($"StationEngine: {ex.Message}");
             Console.Error.WriteLine(
                 "usage: StationEngine --port <1..65535> [--bind <loopback|lan>] " +
+                "[--lan-https-port <1..65535> --product-lan-https-port <1..65535>] " +
                 "[--native-audio-output <true|false>]");
             diagnosticLogFileSink.Dispose();
             return 2;
@@ -116,6 +118,18 @@ public partial class Program
     {
         var options = ParseOptions(args);
         var port = options.Port;
+        var lanCertificate = options.LanHttpsPort is not null
+            ? LanCertificate.GetOrCreate()
+            : null;
+        var lanHttpsUrls = options.LanHttpsPort is { } lanHttpsPort
+            && options.ProductLanHttpsPort is { } productLanHttpsPort
+            ? LanCertificate.GetLanIps()
+                .Select(address =>
+                    $"https://{address}:{productLanHttpsPort}/?attach=local" +
+                    $"&port={lanHttpsPort}&productPort={productLanHttpsPort}" +
+                    "&transport=https")
+                .ToArray()
+            : Array.Empty<string>();
         PrepareEnginePreferences();
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -167,10 +181,12 @@ public partial class Program
             options.ShutdownTimeout = TimeSpan.FromSeconds(3));
         builder.WebHost.ConfigureKestrel(server =>
         {
-            if (ListenOnAllInterfaces(options.BindMode))
+            if (ListenOnAllInterfaces(options.BindMode, options.LanHttpsPort))
                 server.ListenAnyIP(port);
             else
                 server.Listen(IPAddress.Loopback, port);
+            if (options.LanHttpsPort is { } httpsPort && lanCertificate is not null)
+                server.ListenAnyIP(httpsPort, listener => listener.UseHttps(lanCertificate));
             server.ConfigureTciListener(tciEnabled, tciBindAddress, tciPort);
         });
 
@@ -205,7 +221,10 @@ public partial class Program
             CorsPolicyName,
             policy => StationEngineEndpoints.ConfigureCors(
                 policy,
-                allowLanSameHost: options.BindMode == StationEngineBindMode.Lan,
+                allowLanSameHost: ListenOnAllInterfaces(
+                    options.BindMode,
+                    options.LanHttpsPort),
+                allowLanHttpsSameHost: options.LanHttpsPort is not null,
                 requestHost: () => httpContextAccessor.HttpContext?.Request.Host.Host)));
         var p2AutoConnectEndpoint = Environment.GetEnvironmentVariable(
             P2AutoConnectService.EndpointEnvironmentVariable);
@@ -213,7 +232,8 @@ public partial class Program
             NativeAudioOutputEnabled: options.NativeAudioOutputEnabled,
             P2AutoConnectEndpoint: string.IsNullOrWhiteSpace(p2AutoConnectEndpoint)
                 ? null
-                : p2AutoConnectEndpoint));
+                : p2AutoConnectEndpoint,
+            LanHttpsUrls: lanHttpsUrls));
         builder.Services.AddZeusPlugins(
             prefsDbPathProvider: PrefsDbPath.EngineGet,
             options: new PluginManagerOptions
@@ -227,7 +247,7 @@ public partial class Program
         builder.Services.AddSingleton<IInstalledFeatureState, PluginFeatureState>();
 
         var app = builder.Build();
-        if (options.BindMode == StationEngineBindMode.Lan)
+        if (options.BindMode == StationEngineBindMode.Lan && options.LanHttpsPort is null)
         {
             app.Logger.LogInformation(
                 "station-engine --bind lan opens only the HTTP engine listener; " +
@@ -246,7 +266,11 @@ public partial class Program
 
         AnchorWdspDataFiles(app);
         WireEngineBroadcasts(app);
-        app.MapStationEngineEndpoints(options.BindMode == StationEngineBindMode.Lan);
+        app.MapStationEngineEndpoints(
+            allowLanSameHost: ListenOnAllInterfaces(
+                options.BindMode,
+                options.LanHttpsPort),
+            allowLanHttpsSameHost: options.LanHttpsPort is not null);
         var pluginManager = app.Services.GetRequiredService<PluginManager>();
         pluginManager.StartAsync(default).GetAwaiter().GetResult();
         PluginEndpoints.MapAll(app, pluginManager);
@@ -284,6 +308,8 @@ public partial class Program
     internal static StationEngineCommandLineOptions ParseOptions(IReadOnlyList<string> args)
     {
         int? port = null;
+        int? lanHttpsPort = null;
+        int? productLanHttpsPort = null;
         StationEngineBindMode? bindMode = null;
         bool? nativeAudioOutputEnabled = null;
         for (var index = 0; index < args.Count; index++)
@@ -299,6 +325,27 @@ public partial class Program
                         throw new ArgumentException(
                             "--port requires an integer from 1 through 65535");
                     port = parsed;
+                    break;
+                case "--lan-https-port":
+                    if (lanHttpsPort is not null)
+                        throw new ArgumentException("--lan-https-port may be specified only once");
+                    if (++index >= args.Count
+                        || !int.TryParse(args[index], out var parsedHttpsPort)
+                        || parsedHttpsPort is < 1 or > 65_535)
+                        throw new ArgumentException(
+                            "--lan-https-port requires an integer from 1 through 65535");
+                    lanHttpsPort = parsedHttpsPort;
+                    break;
+                case "--product-lan-https-port":
+                    if (productLanHttpsPort is not null)
+                        throw new ArgumentException(
+                            "--product-lan-https-port may be specified only once");
+                    if (++index >= args.Count
+                        || !int.TryParse(args[index], out var parsedProductHttpsPort)
+                        || parsedProductHttpsPort is < 1 or > 65_535)
+                        throw new ArgumentException(
+                            "--product-lan-https-port requires an integer from 1 through 65535");
+                    productLanHttpsPort = parsedProductHttpsPort;
                     break;
                 case "--bind":
                     if (bindMode is not null)
@@ -326,18 +373,39 @@ public partial class Program
             }
         }
 
+        var resolvedPort = port ?? throw new ArgumentException("--port is required");
+        var resolvedBindMode = bindMode ?? StationEngineBindMode.Loopback;
+        if ((lanHttpsPort is null) != (productLanHttpsPort is null))
+            throw new ArgumentException(
+                "--lan-https-port and --product-lan-https-port must be specified together");
+        if (lanHttpsPort is not null && resolvedBindMode != StationEngineBindMode.Lan)
+            throw new ArgumentException("LAN HTTPS ports require --bind lan");
+        if (lanHttpsPort == resolvedPort)
+            throw new ArgumentException("--lan-https-port must differ from --port");
+        if (productLanHttpsPort == resolvedPort)
+            throw new ArgumentException("--product-lan-https-port must differ from --port");
+        if (lanHttpsPort is not null && lanHttpsPort == productLanHttpsPort)
+            throw new ArgumentException(
+                "--lan-https-port must differ from --product-lan-https-port");
+
         return new StationEngineCommandLineOptions(
-            Port: port ?? throw new ArgumentException("--port is required"),
-            BindMode: bindMode ?? StationEngineBindMode.Loopback,
+            Port: resolvedPort,
+            BindMode: resolvedBindMode,
+            LanHttpsPort: lanHttpsPort,
+            ProductLanHttpsPort: productLanHttpsPort,
             NativeAudioOutputEnabled: nativeAudioOutputEnabled ?? false);
     }
 
-    internal static bool ListenOnAllInterfaces(StationEngineBindMode options) =>
-        options == StationEngineBindMode.Lan;
+    internal static bool ListenOnAllInterfaces(
+        StationEngineBindMode bindMode,
+        int? lanHttpsPort = null) =>
+        bindMode == StationEngineBindMode.Lan && lanHttpsPort is null;
 
     internal sealed record StationEngineCommandLineOptions(
         int Port,
         StationEngineBindMode BindMode,
+        int? LanHttpsPort,
+        int? ProductLanHttpsPort,
         bool NativeAudioOutputEnabled);
 
     private static void PrepareEnginePreferences()

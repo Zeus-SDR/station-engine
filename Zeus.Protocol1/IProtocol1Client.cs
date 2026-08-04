@@ -266,6 +266,10 @@ public interface IProtocol1Client : IDisposable
     /// </summary>
     bool PsEnabled { get; }
 
+    /// <summary>Receiver-count request currently carried by the Protocol-1
+    /// Config frame. Exposed for PS feedback-path diagnostics.</summary>
+    byte PsNumReceiversMinusOne => 0;
+
     /// <summary>
     /// Fires (at most once per stall, on the RX thread) when PS is armed on a
     /// HermesC10 P1 stream and zero 4-DDC packets have parsed for ~2 s while

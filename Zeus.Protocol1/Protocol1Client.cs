@@ -1281,6 +1281,8 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _psEnabled, on ? 1 : 0);
     }
 
+    public byte PsNumReceiversMinusOne => SnapshotState().NumReceiversMinusOne;
+
     /// <summary>
     /// Arm or disarm PureSignal, routing through the HermesC10 safe
     /// transition when required (#1302). Idempotent: no transition (and no
@@ -1334,7 +1336,20 @@ public sealed class Protocol1Client : IProtocol1Client
         // that would leave the radio streaming ~5 k pkt/s at an abandoned
         // port, recreating the #1302 reconnect failure.
         var loopCts = _loopCts;
-        if (loopCts is null) return;
+        if (loopCts is null)
+        {
+            // The caller's liveness check and this method normally run under
+            // the same transition gate, so this is defensive. Never leave a
+            // requested state unapplied if teardown/startup changes later
+            // introduce another path to this seam.
+            Interlocked.Exchange(ref _psEnabled, enable ? 1 : 0);
+            _log.LogWarning(
+                "p1.ps.transition target={On} board={Board} clientLive={ClientLive} — no RX loop; applied flag without restart",
+                enable,
+                BoardKind,
+                false);
+            return;
+        }
         // A still-running F3 start-handshake watchdog belongs to the OLD
         // stream; if it re-sent `start` inside our stop/drain window the
         // radio would resume with the old receiver count and our

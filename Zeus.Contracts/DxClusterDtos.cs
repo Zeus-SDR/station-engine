@@ -60,3 +60,15 @@ public sealed record DxClusterStatus(
     int SpotsReceived,
     string? LastSpotCallsign,
     string? Error);
+
+/// <summary>Create/update body for one named native Telnet cluster source.</summary>
+public sealed record DxClusterSourceWrite(
+    string Name,
+    DxClusterConfig Config,
+    bool ClearPassword = false);
+
+/// <summary>Persistent source identity plus its config echo and live state.</summary>
+public sealed record DxClusterSourceStatus(
+    string Id,
+    string Name,
+    DxClusterStatus Status);

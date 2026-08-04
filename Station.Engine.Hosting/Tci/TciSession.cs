@@ -83,6 +83,8 @@ public sealed class TciSession : IDisposable
     private readonly TciRxAudioResampler _rxAudioResampler = new();
     private readonly CwEngine _cwEngine;
     private readonly CwSettingsStore _cwSettings;
+    private readonly TransverterSettingsStore? _transverterSettings;
+    private readonly LayoutStore? _layouts;
 
     // TCI 2.0 TRX 3rd arg: when "tci" we route inbound binary TX audio frames
     // into the WDSP TX path; otherwise the radio's local mic source is used
@@ -116,6 +118,11 @@ public sealed class TciSession : IDisposable
     private int _audioSampleRate = 48000;
 
     public Guid Id => _id;
+
+    private TransverterSettingsDto CurrentTransverterSettings =>
+        _transverterSettings is not null && _layouts is not null
+            ? _transverterSettings.GetForConnectedRadio(_layouts, _radio)
+            : new TransverterSettingsDto();
 
     /// <summary>True if this session has subscribed to IQ for the given receiver.</summary>
     public bool WantsIqStream(int receiver)
@@ -176,7 +183,9 @@ public sealed class TciSession : IDisposable
         CwEngine cwEngine,
         CwSettingsStore cwSettings,
         TxAudioIngest? txAudioIngest = null,
-        TciServer? tciServer = null)
+        TciServer? tciServer = null,
+        TransverterSettingsStore? transverterSettings = null,
+        LayoutStore? layouts = null)
     {
         _id = id;
         _ws = ws;
@@ -188,6 +197,8 @@ public sealed class TciSession : IDisposable
         _options = options;
         _cwEngine = cwEngine;
         _cwSettings = cwSettings;
+        _transverterSettings = transverterSettings;
+        _layouts = layouts;
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
         _txAudioIngest = txAudioIngest;
         _txAudioReceiver = txAudioIngest is not null
@@ -318,7 +329,8 @@ public sealed class TciSession : IDisposable
             state.SampleRate,
             _tx.IsMoxOn,
             _tx.IsTunOn,
-            _lastDrivePercent);
+            _lastDrivePercent,
+            CurrentTransverterSettings);
 
         // One TCI command per WebSocket text frame — Thetis TCIServer.sendTextFrame
         // convention. Some clients only parse the first command in a frame.
@@ -793,6 +805,9 @@ public sealed class TciSession : IDisposable
                 case "tx_profiles_ex":
                     HandleTxProfilesEx(args);
                     break;
+                case "tx_frequency_ex":
+                    HandleTxFrequencyEx(args);
+                    break;
 
                 // --- VFO lock / swap / RX2 enable / TX filter band ---
                 case "vfo_lock":
@@ -867,12 +882,17 @@ public sealed class TciSession : IDisposable
         if (args.Length < 2) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (!TciProtocol.TryParseInt(args[1], out int chan)) return;
+        if (chan is not (0 or 1)) return;
 
         if (args.Length == 2)
         {
             // Query: echo current VFO
             var state = _radio.Snapshot();
-            Send(TciProtocol.Command("vfo", rx, chan, state.VfoHz));
+            Send(TciProtocol.Command(
+                "vfo",
+                rx,
+                chan,
+                ResolveVfoChannelHz(state, chan, CurrentTransverterSettings)));
         }
         else if (args.Length >= 3 && TciProtocol.TryParseLong(args[2], out long hz))
         {
@@ -883,9 +903,48 @@ public sealed class TciSession : IDisposable
             // auto-recenter heuristic so the hardware tracks the commanded
             // frequency absolutely. Mirrors Thetis CATChangesCenterFreq
             // default. Issue #461.
-            _radio.SetVfo(hz, fromExternal: true);
+            SetVfoChannel(_radio, chan, hz, CurrentTransverterSettings);
             // Don't echo back immediately — the StateChanged event will broadcast it
         }
+    }
+
+    internal static long ResolveVfoChannelHz(
+        StateDto state,
+        int channel,
+        TransverterSettingsDto? transverterSettings = null)
+    {
+        long ifHz = channel switch
+        {
+            0 => state.VfoHz,
+            1 => RadioFrequencyResolver.TxDialFrequencyHz(state),
+            _ => throw new ArgumentOutOfRangeException(nameof(channel)),
+        };
+        return TransverterFrequencyConverter.ToRfHz(
+            ifHz, transverterSettings ?? new TransverterSettingsDto());
+    }
+
+    internal static void SetVfoChannel(
+        RadioService radio,
+        int channel,
+        long rfHz,
+        TransverterSettingsDto? transverterSettings = null)
+    {
+        if (!TransverterFrequencyConverter.TryToIfHz(
+                rfHz, transverterSettings ?? new TransverterSettingsDto(), out long ifHz))
+            return;
+
+        if (channel == 0)
+        {
+            radio.SetVfo(ifHz, fromExternal: true);
+            return;
+        }
+        if (channel == 1)
+        {
+            var state = radio.Snapshot();
+            radio.SetSplitFrequency(state.TxReceiverIndex, ifHz);
+            return;
+        }
+        throw new ArgumentOutOfRangeException(nameof(channel));
     }
 
     private void HandleDds(string[] args)
@@ -898,12 +957,18 @@ public sealed class TciSession : IDisposable
         {
             // Query
             var state = _radio.Snapshot();
-            Send(TciProtocol.Command("dds", rx, CwOffset.EffectiveLoHz(state)));
+            Send(TciProtocol.Command(
+                "dds",
+                rx,
+                TransverterFrequencyConverter.ToRfHz(
+                    CwOffset.EffectiveLoHz(state), CurrentTransverterSettings)));
         }
         else if (args.Length >= 2 && TciProtocol.TryParseLong(args[1], out long hz))
         {
             // Set DDS (same as VFO for single-RX). External source — see HandleVfo.
-            _radio.SetVfo(hz, fromExternal: true);
+            if (TransverterFrequencyConverter.TryToIfHz(
+                    hz, CurrentTransverterSettings, out long ifHz))
+                _radio.SetVfo(ifHz, fromExternal: true);
         }
     }
 
@@ -1353,9 +1418,21 @@ public sealed class TciSession : IDisposable
 
         if (args.Length == 1)
         {
-            Send(TciProtocol.Command("split_enable", rx, false));
+            var state = _radio.Snapshot();
+            Send(TciProtocol.Command("split_enable", rx, ResolveSplitEnabled(state)));
+            return;
         }
-        // Ignore set — split not implemented
+        if (TciProtocol.TryParseBool(args[1], out bool splitEnabled))
+            SetSplitEnabled(_radio, splitEnabled);
+    }
+
+    internal static bool ResolveSplitEnabled(StateDto state) =>
+        RadioFrequencyResolver.IsSplitEnabledForTx(state);
+
+    internal static void SetSplitEnabled(RadioService radio, bool enabled)
+    {
+        var state = radio.Snapshot();
+        radio.SetSplit(state.TxReceiverIndex, enabled);
     }
 
     private void HandleRitEnable(string[] args)
@@ -1702,6 +1779,17 @@ public sealed class TciSession : IDisposable
         // tx_profiles_ex             — GET list of all configured profiles
         // Zeus doesn't have a profile system; return a single-entry list.
         Send(TciProtocol.Command("tx_profiles_ex", "Default"));
+    }
+
+    private void HandleTxFrequencyEx(string[] args)
+    {
+        // HF-AUTO consumes this extension as telemetry. Keep it read-only so
+        // an accessory cannot collapse or retarget split operation.
+        if (args.Length == 0)
+        {
+            var state = _radio.Snapshot();
+            Send(TciExtendedFrequency.Command(state, CurrentTransverterSettings));
+        }
     }
 
     private void HandleRunCatEx(string[] args)

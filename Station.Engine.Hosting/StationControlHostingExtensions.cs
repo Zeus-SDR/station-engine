@@ -16,10 +16,14 @@ public static class StationControlHostingExtensions
         ArgumentNullException.ThrowIfNull(services);
 
         services.AddSingleton<TciConfigStore>();
+        services.AddSingleton<TransverterSettingsStore>();
         services.AddSingleton<SpotManager>();
         services.AddSingleton<TciServer>();
         services.AddHostedService(sp => sp.GetRequiredService<TciServer>());
         services.AddSingleton<TciManagementService>();
+        services.AddSingleton<HfAutoConfigStore>();
+        services.AddSingleton<HfAutoService>();
+        services.AddHostedService(sp => sp.GetRequiredService<HfAutoService>());
         return services;
     }
 

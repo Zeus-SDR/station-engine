@@ -16,10 +16,62 @@ public static class RadioFrequencyResolver
     // populated); internal callers holding RadioService._sync on the
     // un-projected state must use RadioService.TxFrequencyHzLocked, which
     // resolves >= 2 from RadioService._extraReceivers.
-    public static long TxFrequencyHz(StateDto state) => state.TxReceiverIndex switch
+    public static ReceiverDto TxReceiver(StateDto state)
     {
-        <= 0 => state.VfoHz,
-        1 => state.Rx2().VfoHz,
-        int i => state.Receivers is { } rs && i < rs.Count ? rs[i].VfoHz : state.VfoHz,
-    };
+        if (state.TxReceiverIndex <= 0)
+            return new ReceiverDto(
+                0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
+                state.Mode, state.FilterLowHz, state.FilterHighHz,
+                state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+                state.Rx1Muted, SplitEnabled: state.SplitEnabled,
+                TxVfoHz: state.SplitTxHz);
+
+        if (state.TxReceiverIndex == 1)
+            return state.Rx2();
+
+        if (state.Receivers is { } receivers)
+        {
+            for (int i = 0; i < receivers.Count; i++)
+                if (receivers[i].Index == state.TxReceiverIndex)
+                    return receivers[i];
+        }
+
+        return new ReceiverDto(
+            0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
+            state.Mode, state.FilterLowHz, state.FilterHighHz,
+            state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+            state.Rx1Muted, SplitEnabled: state.SplitEnabled,
+            TxVfoHz: state.SplitTxHz);
+    }
+
+    public static long TxFrequencyHz(StateDto state)
+    {
+        var receiver = TxReceiver(state);
+        return receiver.SplitEnabled && receiver.TxVfoHz > 0
+            ? receiver.TxVfoHz
+            : receiver.VfoHz;
+    }
+
+    public static long TxDialFrequencyHz(StateDto state)
+    {
+        var receiver = TxReceiver(state);
+        return receiver.TxVfoHz > 0 ? receiver.TxVfoHz : receiver.VfoHz;
+    }
+
+    public static RxMode TxMode(StateDto state) => TxReceiver(state).Mode;
+
+    public static bool IsSplitEnabledForTx(StateDto state)
+    {
+        var receiver = TxReceiver(state);
+        return receiver.SplitEnabled && receiver.TxVfoHz > 0;
+    }
+
+    /// <summary>Kenwood/Thetis VFO-B projection: RX2 owns B while exposed;
+    /// otherwise B is RX1's independent split-TX dial.</summary>
+    public static long CatVfoBHz(StateDto state)
+    {
+        if (state.Rx2Enabled && state.Receivers is { Count: > 1 })
+            return state.Receivers[1].VfoHz;
+        return state.SplitTxHz > 0 ? state.SplitTxHz : state.VfoHz;
+    }
 }

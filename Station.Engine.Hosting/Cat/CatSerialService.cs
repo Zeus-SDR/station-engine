@@ -221,9 +221,12 @@ public sealed class CatSerialService : BackgroundService
     {
         if (!AnyOpen) return;
         BroadcastRateLimited("FA", CatProtocol.Response("FA", CatProtocol.FormatFreq(state.VfoHz)));
+        BroadcastRateLimited("FB", CatProtocol.Response("FB",
+            CatProtocol.FormatFreq(RadioFrequencyResolver.CatVfoBHz(state))));
         Broadcast(CatProtocol.Response("MD", CatProtocol.ModeDigit(state.Mode)));
         BroadcastRateLimited("IF",
-            CatProtocol.Response("IF", CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn, split: false)));
+            CatProtocol.Response("IF", CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn,
+                RadioFrequencyResolver.IsSplitEnabledForTx(state))));
     }
 
     private void OnMoxChanged(bool moxOn)

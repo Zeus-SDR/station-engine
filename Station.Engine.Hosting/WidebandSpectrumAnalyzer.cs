@@ -18,9 +18,11 @@ internal sealed class WidebandSpectrumAnalyzer
     public const long DisplayCenterHz = 30_000_000;
     public const float HzPerPixel = (float)(DisplaySpanHz / DisplayWidth);
     public const int MaxZoomLevel = 256;
-    public const int AnalysisFftSize = Protocol2Client.WidebandFrameSamples * 64;
+    // One native radix-2 transform for the 32,736-sample Saturn capture. The
+    // remaining 32 slots are padding for the FFT algorithm, not a 64x
+    // interpolated spectrum presented as additional RF resolution.
+    public const int AnalysisFftSize = 32_768;
 
-    private const int InputSampleCount = Protocol2Client.WidebandFrameSamples;
     private const int FftSize = AnalysisFftSize;
     private const double MinAmplitude = 1e-12;
     private const double SpectrumEmaAlpha = 0.38;
@@ -30,13 +32,14 @@ internal sealed class WidebandSpectrumAnalyzer
 
     private readonly double[] _real = new double[FftSize];
     private readonly double[] _imag = new double[FftSize];
-    private readonly double[] _window = new double[InputSampleCount];
+    private readonly double[] _window = new double[Protocol2Client.WidebandMaxFrameSamples];
     private readonly int[] _bitReverse = new int[FftSize];
     private readonly double[] _stageCos;
     private readonly double[] _stageSin;
     private readonly double[] _binPower = new double[(FftSize / 2) + 1];
     private readonly float[] _smoothedDb = new float[DisplayWidth];
-    private readonly double _windowSum;
+    private double _windowSum;
+    private int _windowSampleCount;
     private int _sampleRateHz;
     private long _viewportCenterHz;
     private float _viewportHzPerPixel;
@@ -44,20 +47,6 @@ internal sealed class WidebandSpectrumAnalyzer
 
     public WidebandSpectrumAnalyzer()
     {
-        double windowSum = 0.0;
-        for (int i = 0; i < InputSampleCount; i++)
-        {
-            double phase = 2.0 * Math.PI * i / (InputSampleCount - 1);
-            double w =
-                0.35875 -
-                0.48829 * Math.Cos(phase) +
-                0.14128 * Math.Cos(2.0 * phase) -
-                0.01168 * Math.Cos(3.0 * phase);
-            _window[i] = w;
-            windowSum += w;
-        }
-        _windowSum = windowSum;
-
         int bits = 0;
         for (int n = FftSize; n > 1; n >>= 1) bits++;
         for (int i = 0; i < FftSize; i++)
@@ -83,10 +72,15 @@ internal sealed class WidebandSpectrumAnalyzer
     {
         if (panDb.Length < DisplayWidth || wfDb.Length < DisplayWidth)
             throw new ArgumentException("Output spans must be at least DisplayWidth samples long.");
+        if (samples.Length < 2 || samples.Length > Protocol2Client.WidebandMaxFrameSamples)
+            throw new ArgumentException(
+                $"Input must contain between 2 and {Protocol2Client.WidebandMaxFrameSamples} samples.",
+                nameof(samples));
 
         if (sampleRateHz <= 0) sampleRateHz = Protocol2Client.WidebandAdcSampleRateHz;
         var viewport = ResolveViewport(zoomLevel, targetCenterHz);
         if (sampleRateHz != _sampleRateHz ||
+            samples.Length != _windowSampleCount ||
             viewport.CenterHz != _viewportCenterHz ||
             Math.Abs(viewport.HzPerPixel - _viewportHzPerPixel) > Math.Max(1e-6f, viewport.HzPerPixel * 1e-6f))
         {
@@ -96,7 +90,8 @@ internal sealed class WidebandSpectrumAnalyzer
             _smoothedValid = false;
         }
 
-        int copy = Math.Min(samples.Length, InputSampleCount);
+        int copy = samples.Length;
+        PrepareWindow(copy);
         for (int i = 0; i < copy; i++)
             _real[i] = samples[i] * _window[i];
         if (copy < FftSize) Array.Clear(_real, copy, FftSize - copy);
@@ -157,6 +152,27 @@ internal sealed class WidebandSpectrumAnalyzer
         }
 
         return viewport;
+    }
+
+    private void PrepareWindow(int sampleCount)
+    {
+        if (_windowSampleCount == sampleCount) return;
+
+        double windowSum = 0.0;
+        for (int i = 0; i < sampleCount; i++)
+        {
+            double phase = 2.0 * Math.PI * i / (sampleCount - 1);
+            double w =
+                0.35875 -
+                0.48829 * Math.Cos(phase) +
+                0.14128 * Math.Cos(2.0 * phase) -
+                0.01168 * Math.Cos(3.0 * phase);
+            _window[i] = w;
+            windowSum += w;
+        }
+
+        _windowSum = windowSum;
+        _windowSampleCount = sampleCount;
     }
 
     public static WidebandSpectrumViewport ResolveViewport(int zoomLevel, long targetCenterHz)

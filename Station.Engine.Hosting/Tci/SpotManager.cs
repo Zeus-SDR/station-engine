@@ -72,10 +72,11 @@ public sealed class SpotManager
 
     private readonly object _sync = new();
     private readonly TimeProvider _timeProvider;
-    // LRU ordering: head = least-recently-spotted, tail = most-recent. The
-    // dictionary indexes nodes by callsign for O(1) add/update/remove.
-    private readonly LinkedList<StoredSpot> _order = new();
-    private readonly Dictionary<string, LinkedListNode<StoredSpot>> _index = new();
+    private readonly Dictionary<ObservationKey, StoredSpot> _observations = new();
+    private long _sequence;
+
+    public const string DefaultTciOwnerId = "tci";
+    public const string DefaultDxClusterOwnerId = "legacy";
 
     /// <summary>Maximum number of distinct callsigns retained before the
     /// least-recently-spotted is evicted.</summary>
@@ -109,28 +110,38 @@ public sealed class SpotManager
         long freqHz,
         uint argb,
         string? comment = null,
-        SpotSource source = SpotSource.Tci)
+        SpotSource source = SpotSource.Tci,
+        string? ownerId = null,
+        string? ownerName = null,
+        string? spotter = null,
+        DateTime? receivedUtc = null)
     {
         lock (_sync)
         {
-            var spot = new Spot(callsign, mode, freqHz, argb, comment, source);
-            var stored = new StoredSpot(spot, _timeProvider.GetTimestamp());
-            if (_index.TryGetValue(callsign, out var existing))
+            var normalizedCall = (callsign ?? "").Trim().ToUpperInvariant();
+            var normalizedOwner = NormalizeOwner(source, ownerId);
+            var spot = new Spot(
+                callsign ?? "",
+                mode,
+                freqHz,
+                argb,
+                comment,
+                source,
+                normalizedOwner,
+                string.IsNullOrWhiteSpace(ownerName) ? normalizedOwner : ownerName.Trim(),
+                string.IsNullOrWhiteSpace(spotter) ? null : spotter.Trim().ToUpperInvariant(),
+                receivedUtc ?? _timeProvider.GetUtcNow().UtcDateTime);
+            _observations[new ObservationKey(normalizedCall, source, normalizedOwner)] =
+                new StoredSpot(spot, _timeProvider.GetTimestamp(), ++_sequence);
+
+            while (_observations.Keys.Select(x => x.Callsign).Distinct(StringComparer.Ordinal).Count() > MaxSpots)
             {
-                // Update in place and move to the MRU end.
-                existing.Value = stored;
-                _order.Remove(existing);
-                _order.AddLast(existing);
-            }
-            else
-            {
-                _index[callsign] = _order.AddLast(stored);
-                if (_index.Count > MaxSpots)
-                {
-                    var oldest = _order.First!; // count > cap >= 1 ⇒ non-null
-                    _order.RemoveFirst();
-                    _index.Remove(oldest.Value.Spot.Callsign);
-                }
+                var oldestCall = _observations
+                    .GroupBy(x => x.Key.Callsign, StringComparer.Ordinal)
+                    .OrderBy(x => x.Max(y => y.Value.Sequence))
+                    .First().Key;
+                foreach (var key in _observations.Keys.Where(x => x.Callsign == oldestCall).ToArray())
+                    _observations.Remove(key);
             }
         }
         SpotsChanged?.Invoke();
@@ -143,11 +154,10 @@ public sealed class SpotManager
     {
         lock (_sync)
         {
-            if (_index.TryGetValue(callsign, out var node))
-            {
-                _order.Remove(node);
-                _index.Remove(callsign);
-            }
+            _observations.Remove(new ObservationKey(
+                (callsign ?? "").Trim().ToUpperInvariant(),
+                SpotSource.Tci,
+                DefaultTciOwnerId));
         }
         SpotsChanged?.Invoke();
     }
@@ -159,8 +169,7 @@ public sealed class SpotManager
     {
         lock (_sync)
         {
-            _order.Clear();
-            _index.Clear();
+            _observations.Clear();
         }
         SpotsChanged?.Invoke();
     }
@@ -172,17 +181,23 @@ public sealed class SpotManager
     {
         lock (_sync)
         {
-            var node = _order.First;
-            while (node is not null)
-            {
-                var next = node.Next;
-                if (node.Value.Spot.Source == source)
-                {
-                    _order.Remove(node);
-                    _index.Remove(node.Value.Spot.Callsign);
-                }
-                node = next;
-            }
+            foreach (var key in _observations.Keys.Where(x => x.Source == source).ToArray())
+                _observations.Remove(key);
+        }
+        SpotsChanged?.Invoke();
+    }
+
+    /// <summary>Clear only one connection's observations. A still-live report
+    /// from another owner immediately becomes the rendered winner.</summary>
+    public void ClearByOwner(SpotSource source, string ownerId)
+    {
+        var normalizedOwner = NormalizeOwner(source, ownerId);
+        lock (_sync)
+        {
+            foreach (var key in _observations.Keys
+                .Where(x => x.Source == source && x.OwnerId == normalizedOwner)
+                .ToArray())
+                _observations.Remove(key);
         }
         SpotsChanged?.Invoke();
     }
@@ -201,17 +216,13 @@ public sealed class SpotManager
         long now = _timeProvider.GetTimestamp();
         lock (_sync)
         {
-            var node = _order.First;
-            while (node is not null)
+            foreach (var pair in _observations.ToArray())
             {
-                var next = node.Next;
-                if (_timeProvider.GetElapsedTime(node.Value.LastSeenTimestamp, now) >= lifetime)
+                if (_timeProvider.GetElapsedTime(pair.Value.LastSeenTimestamp, now) >= lifetime)
                 {
-                    _order.Remove(node);
-                    _index.Remove(node.Value.Spot.Callsign);
+                    _observations.Remove(pair.Key);
                     removed++;
                 }
-                node = next;
             }
         }
 
@@ -227,15 +238,27 @@ public sealed class SpotManager
     {
         lock (_sync)
         {
-            var arr = new Spot[_order.Count];
-            int i = 0;
-            foreach (var s in _order)
-                arr[i++] = s.Spot;
-            return arr;
+            return _observations
+                .GroupBy(x => x.Key.Callsign, StringComparer.Ordinal)
+                .Select(x => x
+                    .OrderByDescending(y => y.Value.Spot.ReceivedUtc)
+                    .ThenByDescending(y => y.Value.Sequence)
+                    .First().Value)
+                .OrderBy(x => x.Sequence)
+                .Select(x => x.Spot)
+                .ToArray();
         }
     }
 
-    private readonly record struct StoredSpot(Spot Spot, long LastSeenTimestamp);
+    private static string NormalizeOwner(SpotSource source, string? ownerId)
+    {
+        var value = ownerId?.Trim();
+        if (!string.IsNullOrEmpty(value)) return value;
+        return source == SpotSource.Tci ? DefaultTciOwnerId : DefaultDxClusterOwnerId;
+    }
+
+    private readonly record struct ObservationKey(string Callsign, SpotSource Source, string OwnerId);
+    private readonly record struct StoredSpot(Spot Spot, long LastSeenTimestamp, long Sequence);
 
     public sealed record Spot(
         string Callsign,
@@ -243,5 +266,9 @@ public sealed class SpotManager
         long FreqHz,
         uint Argb,
         string? Comment,
-        SpotSource Source);
+        SpotSource Source,
+        string OwnerId = "",
+        string OwnerName = "",
+        string? Spotter = null,
+        DateTime ReceivedUtc = default);
 }

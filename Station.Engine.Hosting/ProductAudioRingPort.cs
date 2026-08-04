@@ -158,6 +158,26 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Returns the product HTTP endpoint only after the bearer-token-protected
+    /// lease has been claimed and while that lease remains connected. Pending
+    /// attachment negotiations are intentionally not sufficient to authorize
+    /// privileged browser access such as the native microphone bridge.
+    /// </summary>
+    public bool TryGetActiveProductEndpoint(out int port)
+    {
+        lock (_gate)
+        {
+            if (_session is { IsLeased: true, HttpPort: int advertisedPort })
+            {
+                port = advertisedPort;
+                return true;
+            }
+        }
+        port = 0;
+        return false;
+    }
+
     public async Task HoldLeaseAsync(string leaseId, HttpContext context)
     {
         Session? session;

@@ -40,13 +40,14 @@ public sealed record MidiMappingDto(
     int Max = 127,
     bool Toggle = false);
 
-/// <summary>A connected Elgato Stream Deck (HID), as enumerated by the engine.
-/// <paramref name="ButtonCount"/> lets the UI render the right key grid.</summary>
+/// <summary>A connected Stream Deck-compatible HID controller. Counts let the
+/// UI render its keys and rotary controls.</summary>
 public sealed record StreamDeckDeviceDto(
     string Name,
     string Serial,
     int ButtonCount,
-    bool Connected);
+    bool Connected,
+    int DialCount = 0);
 
 /// <summary>One Stream Deck button → command binding, keyed by device serial
 /// and zero-based button index.</summary>
@@ -76,8 +77,9 @@ public sealed record MidiBindingsDoc(
 /// it. <paramref name="ControlType"/> is the engine's best guess from the wire
 /// shape; <paramref name="Value"/> is the absolute 0..127 reading (or button
 /// velocity); <paramref name="Delta"/> the relative encoder step when known.
-/// Stream Deck presses arrive with <paramref name="ControlType"/> = Button and
-/// a "sd:&lt;serial&gt;:&lt;index&gt;" <paramref name="ControlId"/>.</summary>
+/// Stream Deck buttons arrive with <paramref name="ControlType"/> = Button and
+/// a "sd:&lt;serial&gt;:&lt;index&gt;" <paramref name="ControlId"/>; dials use
+/// Wheel controls named "sd:&lt;serial&gt;:dial:&lt;index&gt;".</summary>
 public sealed record MidiLearnFrame(
     string DeviceName,
     string ControlId,

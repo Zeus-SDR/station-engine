@@ -174,9 +174,15 @@ public static class TxControlEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
-        static IResult GetAudioSuitePreview(RadioService radio)
+        static IResult GetAudioSuitePreview(RadioService radio, DspPipelineService pipe)
         {
-            return Results.Ok(new { supported = true, enabled = radio.Snapshot().TxMonitorEnabled });
+            var enabled = radio.Snapshot().TxMonitorEnabled;
+            return Results.Ok(new
+            {
+                supported = true,
+                enabled,
+                meterOnly = enabled && pipe.TxMonitorMeterOnly,
+            });
         }
 
         static IResult SetAudioSuitePreview(

@@ -63,22 +63,28 @@ public sealed record FilterSetRequest(
     string? PresetName = null,
     int Receiver = 0);
 
-// Request to write a VAR1 or VAR2 slot. Server rejects SlotName values
-// outside {VAR1, VAR2} with HTTP 409.
+// Request to customize a filter preset slot. Omitting Label preserves the
+// current rename; an empty label clears it back to the factory label.
 public sealed record FilterPresetWriteRequest(
     RxMode Mode,
     string SlotName,
     int LowHz,
-    int HighHz);
+    int HighHz,
+    string? Label = null);
 
-// DTO returned by GET /api/filter/presets. Carries the merged Thetis default
-// plus any operator VAR1/VAR2 overrides for a given mode.
+public sealed record FilterPresetResetRequest(
+    RxMode Mode,
+    string SlotName);
+
+// DTO returned by GET /api/filter/presets. Carries the merged factory default
+// plus any operator overrides for a given mode.
 public sealed record FilterPresetDto(
     string SlotName,
     string Label,
     int LowHz,
     int HighHz,
-    bool IsVar);
+    bool IsVar,
+    bool IsCustomized = false);
 
 // Advanced-ribbon pane visibility toggle.
 public sealed record FilterAdvancedPaneRequest(bool Open);

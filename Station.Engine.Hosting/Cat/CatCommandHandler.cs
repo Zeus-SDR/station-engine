@@ -81,8 +81,8 @@ internal sealed class CatCommandHandler
             case "RX":
                 await _tx.TrySetMoxFromCatAsync(false, cancellationToken);
                 break;
-            case "FR": HandleFrFt(args, "FR"); break;                     // RX VFO / split (report-only Tier-1)
-            case "FT": HandleFrFt(args, "FT"); break;
+            case "FR": HandleFr(args); break;
+            case "FT": HandleFt(args); break;
             case "SM": HandleSmeter(); break;
             case "PC": HandlePc(args); break;
             default: _send(CatProtocol.Error); break;                     // "?;" — Kenwood unknown/unsupported
@@ -112,15 +112,9 @@ internal sealed class CatCommandHandler
         if (args.Length == 0)
         {
             var state = _radio.Snapshot();
-            // VFO B lives in the Receivers projection at index 1 (the flat
-            // VFO-B fields were retired in the A/B wire collapse); fall back to
-            // VFO A when there is no second receiver.
-            long f = state.VfoHz;
-            if (vfoB)
-            {
-                var rxs = state.Receivers;
-                f = rxs is not null && rxs.Count > 1 ? rxs[1].VfoHz : state.VfoHz;
-            }
+            // Match Thetis: with RX2 exposed, VFO B remains RX2. In the
+            // single-receiver layout it is RX1's independent split-TX dial.
+            long f = vfoB ? RadioFrequencyResolver.CatVfoBHz(state) : state.VfoHz;
             _send(CatProtocol.Response(cmd, CatProtocol.FormatFreq(f)));
             return;
         }
@@ -129,7 +123,8 @@ internal sealed class CatCommandHandler
             // External source — bypass the frozen-NCO recenter heuristic so the
             // hardware tracks the commanded frequency absolutely (issue #461,
             // same as TCI). Kenwood set commands have no reply.
-            if (vfoB) _radio.SetVfoB(hz);
+            if (vfoB && _radio.Snapshot().Rx2Enabled) _radio.SetVfoB(hz);
+            else if (vfoB) _radio.SetSplitFrequency(0, hz);
             else _radio.SetVfo(hz, fromExternal: true);
         }
     }
@@ -149,15 +144,29 @@ internal sealed class CatCommandHandler
     {
         var state = _radio.Snapshot();
         _send(CatProtocol.Response("IF",
-            CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn, split: false)));
+            CatProtocol.BuildIfBody(state.VfoHz, state.Mode, _tx.IsMoxOn,
+                RadioFrequencyResolver.IsSplitEnabledForTx(state))));
     }
 
-    private void HandleFrFt(string args, string cmd)
+    private void HandleFr(string args)
     {
-        // Zeus has no true split seam yet (RIT/XIT/split are Tier-2). Report RX
-        // and TX both on VFO A (no split); accept a set without error so clients
-        // that probe split don't choke. WSJT-X "Fake It" needs no split.
-        if (args.Length == 0) _send(CatProtocol.Response(cmd, "0"));
+        // The primary receive dial is always Kenwood VFO A.
+        if (args.Length == 0) _send(CatProtocol.Response("FR", "0"));
+    }
+
+    private void HandleFt(string args)
+    {
+        if (args.Length == 0)
+        {
+            _send(CatProtocol.Response("FT",
+                RadioFrequencyResolver.IsSplitEnabledForTx(_radio.Snapshot()) ? "1" : "0"));
+            return;
+        }
+        if (args[0] is '0' or '1')
+        {
+            var state = _radio.Snapshot();
+            _radio.SetSplit(state.TxReceiverIndex, args[0] == '1');
+        }
     }
 
     private void HandleSmeter()

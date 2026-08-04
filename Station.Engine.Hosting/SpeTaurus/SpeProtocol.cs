@@ -54,7 +54,8 @@ internal sealed record SpeAmplifierStatus(
     string WarningCode,
     string Warning,
     string AlarmCode,
-    string Alarm);
+    string Alarm,
+    string CatInterface = "");
 
 internal static class SpeProtocol
 {

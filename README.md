@@ -32,6 +32,17 @@ This repository is the **complete corresponding source** for the station engine
 binary distributed with Zeus SDR. Each release tag here matches the engine
 shipped in the corresponding Zeus release.
 
+## Native libraries
+
+The native source used by the station engine is included under `native/`:
+Zeus-modified WDSP, its statically embedded libspecbleach and RNNoise sources,
+miniaudio, the pinned codec2 fetch recipe and patch, and the RADE build glue,
+shim, and pinned upstream provenance. Artifact-to-source mapping and the exact
+per-platform build commands are in [`NATIVE-BUILD.md`](NATIVE-BUILD.md).
+The proprietary VST3 and Audio Unit bridge binaries are not part of the station
+engine and are not included; the published tree builds against
+`Zeus.Plugins.VstHostStub` instead.
+
 `Station.AudioRing` is first-party code additionally published under the MIT
 license so it can be reused outside Zeus. Third-party components carry their own
 licences — see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).

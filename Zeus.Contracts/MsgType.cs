@@ -81,6 +81,15 @@ public enum MsgType : byte
     // "webview.error" warning tag.
     ClientDiagnosticLog = 0x23,
 
+    // Client → server (control). Requests an on-demand copy of the native
+    // host microphone for this loopback websocket session. The host accepts
+    // this only for explicitly trusted local sessions and automatically
+    // releases the request when the socket disconnects.
+    // Payload: [type:1][enable:u8][generation:u32 LE]. The server echoes the
+    // generation on PCM frames so a rapid release/re-press can discard bytes
+    // already in flight from the previous press.
+    NativeMicStreamRequest = 0x24,
+
     // Server → client (TX telemetry + protection)
     TxMeters = 0x11,
     TxStatus = 0x12,
@@ -290,4 +299,12 @@ public enum MsgType : byte
     // consumed-sequence watermark prevents commands received while the
     // workspace is closed from replaying on mount. See WsjtxInboundReplyFrame.cs.
     WsjtxReply = 0x3C,
+
+    // Server → client (desktop/local-attach friend PTT microphone). Emitted
+    // only to a trusted loopback websocket session while that session holds a
+    // NativeMicStreamRequest. Payload: [type:1][generation:u32 LE]
+    // [960 × f32 LE mono @ 48 kHz].
+    // This is a private host-to-webview transport; friend-to-friend audio
+    // continues to travel peer-to-peer as WebRTC Opus.
+    NativeMicPcm = 0x3D,
 }

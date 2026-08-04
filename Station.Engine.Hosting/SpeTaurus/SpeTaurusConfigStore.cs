@@ -45,7 +45,9 @@ internal sealed class SpeTaurusConfigStore : IDisposable
                 ConnectTimeoutMs: entry.ConnectTimeoutMs,
                 D2xxSerial: entry.D2xxSerial,
                 ExpertServerUrl: entry.ExpertServerUrl,
-                TuneArmTimeoutMs: entry.TuneArmTimeoutMs);
+                TuneArmTimeoutMs: entry.TuneArmTimeoutMs,
+                RemotePowerEnabled: entry.RemotePowerEnabled,
+                RemotePowerOnTimeoutMs: entry.RemotePowerOnTimeoutMs);
         }
     }
 
@@ -68,6 +70,8 @@ internal sealed class SpeTaurusConfigStore : IDisposable
             entry.D2xxSerial = config.D2xxSerial;
             entry.ExpertServerUrl = config.ExpertServerUrl;
             entry.TuneArmTimeoutMs = config.TuneArmTimeoutMs;
+            entry.RemotePowerEnabled = config.RemotePowerEnabled;
+            entry.RemotePowerOnTimeoutMs = config.RemotePowerOnTimeoutMs;
             entry.UpdatedUtc = DateTime.UtcNow;
             if (entry.Id == 0) _entries.Insert(entry);
             else _entries.Update(entry);
@@ -94,5 +98,7 @@ internal sealed class SpeTaurusConfigEntry
     public string D2xxSerial { get; set; } = "";
     public string ExpertServerUrl { get; set; } = "";
     public int TuneArmTimeoutMs { get; set; } = 2000;
+    public bool RemotePowerEnabled { get; set; }
+    public int RemotePowerOnTimeoutMs { get; set; } = 15000;
     public DateTime UpdatedUtc { get; set; }
 }

@@ -98,6 +98,41 @@ public static class SpeTaurusEndpoints
             Results.Ok(await control.CycleAsync(SpeCommand.Antenna, ct).ConfigureAwait(false)));
         group.MapPost("/input", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
             Results.Ok(await control.CycleAsync(SpeCommand.Input, ct).ConfigureAwait(false)));
+        group.MapPost("/power/on", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.WakeAsync(ct).ConfigureAwait(false)));
+        group.MapPost("/power/off", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.PowerOffAsync(ct).ConfigureAwait(false)));
+        group.MapGet("/display", async Task<IResult> (
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                return Results.Ok(await control.DisplayAsync(ct).ConfigureAwait(false));
+            }
+            catch (InvalidDataException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (HttpRequestException ex)
+            {
+                return Results.Problem(
+                    statusCode: StatusCodes.Status502BadGateway,
+                    title: "Expert Amp Server display unavailable",
+                    detail: ex.Message);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return Results.Problem(
+                    statusCode: StatusCodes.Status504GatewayTimeout,
+                    title: "Expert Amp Server display timed out",
+                    detail: "Timed out reading the Taurus display from Expert Amp Server.");
+            }
+        });
+        group.MapPost("/display/page", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.CycleDisplayPageAsync(ct).ConfigureAwait(false)));
+        group.MapPost("/cat/page", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
+            Results.Ok(await control.CycleCatPageAsync(ct).ConfigureAwait(false)));
         group.MapPost("/atu/tune", async (
             [Microsoft.AspNetCore.Mvc.FromServices] SpeTaurusAutomaticTuneCoordinator coordinator,
             CancellationToken ct) => Results.Ok(
