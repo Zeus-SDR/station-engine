@@ -65,6 +65,32 @@ public sealed class VstDirectoryScanService
     // oracle for that platform's binaries, so it is still used.
     private readonly bool _skipInProcessScan;
 
+    // Per-file probe cache keyed by absolute path: skips re-running the PE
+    // heuristic / in-process bridge probe for a .vst3 whose mtime hasn't
+    // changed since the last scan. Backed by a disk-persisted catalog
+    // (.vst-probe-cache.json next to the scanned packages) so the cache —
+    // INCLUDING negative "incompatible" verdicts, Zeus's scan blacklist —
+    // survives restarts and a rescan never re-reads hundreds of MB of plugin
+    // binaries. Cached negative verdicts are still REPORTED on every scan
+    // (from the cache), so error visibility for a genuinely bad file is never
+    // suppressed; an mtime change re-probes. Concurrent-safe since scans can
+    // run from more than one HTTP request.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedProbe> _probeCache =
+        new(PathComparer());
+
+    // Disk-catalog state. Loaded lazily on the first probe, saved after a scan
+    // that probed anything new (atomic temp-file + move; best-effort).
+    private readonly object _cacheFileLock = new();
+    private int _cacheLoaded;
+    private int _cacheDirty;
+    internal const string CacheFileName = ".vst-probe-cache.json";
+    private string CacheFilePath => Path.Combine(_pluginRoot, CacheFileName);
+
+    private sealed record CachedProbe(
+        DateTime Mtime,
+        IReadOnlyList<VstCandidate> Candidates,
+        string? IncompatibleReason);
+
     public VstDirectoryScanService(
         PluginManager manager,
         string pluginRoot,
@@ -120,32 +146,41 @@ public sealed class VstDirectoryScanService
 
     public async Task<ScanResult> ScanAsync(string directory, string? route, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(directory))
-            throw new ArgumentException("directory is required", nameof(directory));
-        if (string.Equals(directory, DefaultDirectorySentinel, StringComparison.OrdinalIgnoreCase))
-            return await ScanDefaultDirectoriesAsync(route, ct).ConfigureAwait(false);
-        var exactEntry = ResolveExactVst3Entry(directory);
-        if (exactEntry is null && !Directory.Exists(directory))
-            throw new DirectoryNotFoundException($"directory or .vst3 path not found: {directory}");
-        var routes = ResolveRoutes(route);
+        try
+        {
+            if (string.IsNullOrWhiteSpace(directory))
+                throw new ArgumentException("directory is required", nameof(directory));
+            if (string.Equals(directory, DefaultDirectorySentinel, StringComparison.OrdinalIgnoreCase))
+                return await ScanDefaultDirectoriesAsync(route, ct).ConfigureAwait(false);
+            var exactEntry = ResolveExactVst3Entry(directory);
+            if (exactEntry is null && !Directory.Exists(directory))
+                throw new DirectoryNotFoundException($"directory or .vst3 path not found: {directory}");
+            var routes = ResolveRoutes(route);
 
-        var root = _pluginRoot;
-        Directory.CreateDirectory(root);
+            var root = _pluginRoot;
+            Directory.CreateDirectory(root);
 
-        if (exactEntry is not null)
-            return await ScanViaFileWalkAsync(directory, root, routes, ct, [exactEntry]).ConfigureAwait(false);
+            if (exactEntry is not null)
+                return await ScanViaFileWalkAsync(directory, root, routes, ct, [exactEntry]).ConfigureAwait(false);
 
-        // Engine-driven enumeration when the out-of-process engine is live: it
-        // uses JUCE's scanner, which expands "shell" VST3s (e.g. Waves WaveShell)
-        // into their hosted sub-plugins — each with a stable uid we pass back in
-        // load_chain to load that exact plugin. It also reports only plugins that
-        // actually load (and blacklists crashers), so incompatible files never
-        // enter the rack. Falls back to a static file walk when the engine is off
-        // (Native mode), which can only see whole-file single plugins.
-        if (_engine is { IsActive: true })
-            return await ScanViaEngineAsync(directory, root, routes, ct).ConfigureAwait(false);
+            // Engine-driven enumeration when the out-of-process engine is live: it
+            // uses JUCE's scanner, which expands "shell" VST3s (e.g. Waves WaveShell)
+            // into their hosted sub-plugins — each with a stable uid we pass back in
+            // load_chain to load that exact plugin. It also reports only plugins that
+            // actually load (and blacklists crashers), so incompatible files never
+            // enter the rack. Falls back to a static file walk when the engine is off
+            // (Native mode), which can only see whole-file single plugins.
+            if (_engine is { IsActive: true })
+                return await ScanViaEngineAsync(directory, root, routes, ct).ConfigureAwait(false);
 
-        return await ScanViaFileWalkAsync(directory, root, routes, ct).ConfigureAwait(false);
+            return await ScanViaFileWalkAsync(directory, root, routes, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Persist any newly-probed verdicts (positive and negative) so the
+            // next scan — even after a restart — skips re-reading those files.
+            SaveCacheIfDirty();
+        }
     }
 
     private async Task<ScanResult> ScanDefaultDirectoriesAsync(
@@ -230,8 +265,32 @@ public sealed class VstDirectoryScanService
                 activeKeys.Add(EngineKey(f, a.Vst3Uid, a.Slot));
         }
 
-        var plugins = await _engine!.ScanPluginsAsync(
+        var scan = await _engine!.ScanPluginsAsync(
             new[] { directory }, TimeSpan.FromMinutes(2), ct).ConfigureAwait(false);
+
+        // A probing plugin can kill the engine mid-scan on the pinned engine
+        // build (no sacrificial-child --probe scanner — see EngineScanResult).
+        // The supervisor relaunches the engine and the dead-man's pedal
+        // blacklists the offender, so the NEXT scan makes progress — say so
+        // instead of returning a bare empty list.
+        if (scan.EngineDied)
+        {
+            _log.LogWarning("VST engine stopped mid-scan of {Directory} — a plugin likely crashed it while probing.", directory);
+            errors.Add(new ScanError(directory,
+                "VST engine stopped mid-scan (a plugin likely crashed it while probing). "
+                + "The engine was relaunched and the offender is now blacklisted — run the scan again to continue."));
+        }
+
+        // Files the engine blacklisted (crashed/hung while being probed) are
+        // absent from the plugin list — surface them as scan errors so a bad
+        // plugin is never silently missing (the engine-health RCA's lesson).
+        foreach (var blacklisted in scan.BlacklistedFiles)
+        {
+            _log.LogWarning("VST engine-blacklisted {File} (crashed or hung while probing)", blacklisted);
+            errors.Add(new ScanError(blacklisted, "skipped (engine-blacklisted: crashed or hung while loading)"));
+        }
+
+        var plugins = scan.Plugins;
 
         // De-duplicate plugins that the engine reports more than once — the same
         // Waves plugin is exposed by EVERY installed WaveShell version (16.6 /
@@ -330,7 +389,7 @@ public sealed class VstDirectoryScanService
                 Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             try
             {
-                var candidates = EnumerateVstCandidates(entry, bridge, errors, fileName);
+                var candidates = ProbeWithCache(entry, bridge, errors, fileName);
                 if (candidates.Count == 0)
                 {
                     _log.LogInformation("Skipped VST '{Name}' (not hostable on this platform)", fileName);
@@ -385,6 +444,153 @@ public sealed class VstDirectoryScanService
 
     private sealed record VstCandidate(string Vst3Abs, string Name, string? Uid);
 
+    /// <summary>
+    /// <see cref="EnumerateVstCandidates"/>, skipping the PE-heuristic / bridge
+    /// probe when <paramref name="entry"/>'s mtime matches the cached probe.
+    /// Both positive AND negative verdicts are cached (memory + disk catalog):
+    /// a cached "incompatible" verdict still emits its <see cref="ScanError"/>
+    /// here on every scan, so error reporting for a genuinely bad file is
+    /// never suppressed — it just doesn't re-read the file. An unreadable
+    /// mtime (or an mtime change, e.g. the operator replaced the plugin) falls
+    /// through to a fresh probe and is never served from cache.
+    /// </summary>
+    private IReadOnlyList<VstCandidate> ProbeWithCache(
+        string entry, IVstBridgeNative? bridge, List<ScanError> errors, string fileName)
+    {
+        var abs = Path.GetFullPath(entry);
+        DateTime mtime;
+        try
+        {
+            mtime = File.Exists(abs) ? File.GetLastWriteTimeUtc(abs) : Directory.GetLastWriteTimeUtc(abs);
+        }
+        catch
+        {
+            mtime = default; // unreadable — fall through to a fresh probe, don't cache
+        }
+
+        EnsureCacheLoaded();
+        if (mtime != default && _probeCache.TryGetValue(abs, out var cached) && cached.Mtime == mtime)
+        {
+            if (cached.IncompatibleReason is not null)
+                errors.Add(new ScanError(entry, $"skipped (incompatible): {cached.IncompatibleReason}"));
+            return cached.Candidates;
+        }
+
+        var (candidates, incompatibleReason) = EnumerateVstCandidates(entry, bridge, fileName);
+        if (incompatibleReason is not null)
+            errors.Add(new ScanError(entry, $"skipped (incompatible): {incompatibleReason}"));
+        if (mtime != default)
+        {
+            _probeCache[abs] = new CachedProbe(mtime, candidates, incompatibleReason);
+            Volatile.Write(ref _cacheDirty, 1);
+        }
+        return candidates;
+    }
+
+    // ── Disk-persisted probe catalog (scan blacklist / fast rescan) ───────────
+    /// <summary>
+    /// Merge the on-disk probe catalog into the in-memory cache, once. A
+    /// corrupt or unreadable catalog degrades to "re-probe everything" — the
+    /// cache is an optimization, never an authority. Fresher in-memory probes
+    /// win over disk entries.
+    /// </summary>
+    private void EnsureCacheLoaded()
+    {
+        if (Volatile.Read(ref _cacheLoaded) != 0) return;
+        lock (_cacheFileLock)
+        {
+            if (_cacheLoaded != 0) return;
+            try
+            {
+                var path = CacheFilePath;
+                if (File.Exists(path))
+                {
+                    var file = JsonSerializer.Deserialize<ProbeCacheFile>(File.ReadAllText(path));
+                    if (file is { Version: ProbeCacheFile.CurrentVersion })
+                    {
+                        foreach (var (key, e) in file.Entries)
+                        {
+                            var mtime = new DateTime(e.MtimeUtcTicks, DateTimeKind.Utc);
+                            IReadOnlyList<VstCandidate> candidates = (e.Candidates ?? [])
+                                .Select(c => new VstCandidate(
+                                    c.Abs ?? key, c.Name ?? Path.GetFileNameWithoutExtension(key), c.Uid))
+                                .ToArray();
+                            _probeCache.TryAdd(key, new CachedProbe(mtime, candidates, e.IncompatibleReason));
+                        }
+                    }
+                }
+            }
+            catch { /* corrupt/unreadable catalog — re-probe everything */ }
+            Volatile.Write(ref _cacheLoaded, 1);
+        }
+    }
+
+    /// <summary>
+    /// Write the probe catalog after a scan that probed anything new. Atomic
+    /// (temp file + move) and best-effort: a lost write only costs re-probes
+    /// on the next scan, never a failed scan. Internal for tests.
+    /// </summary>
+    internal void SaveCacheIfDirty()
+    {
+        if (Interlocked.Exchange(ref _cacheDirty, 0) == 0) return;
+        lock (_cacheFileLock)
+        {
+            try
+            {
+                Directory.CreateDirectory(_pluginRoot);
+                var file = new ProbeCacheFile
+                {
+                    Version = ProbeCacheFile.CurrentVersion,
+                    Entries = _probeCache.ToDictionary(
+                        kv => kv.Key,
+                        kv => new ProbeCacheEntry
+                        {
+                            MtimeUtcTicks = kv.Value.Mtime.Ticks,
+                            Candidates = kv.Value.Candidates
+                                .Select(c => new ProbeCacheCandidate
+                                {
+                                    Abs = c.Vst3Abs,
+                                    Name = c.Name,
+                                    Uid = c.Uid,
+                                })
+                                .ToList(),
+                            IncompatibleReason = kv.Value.IncompatibleReason,
+                        },
+                        PathComparer()),
+                };
+                var path = CacheFilePath;
+                var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllText(tmp, JsonSerializer.Serialize(file));
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch { /* best effort — a lost catalog only costs re-probes */ }
+        }
+    }
+
+    // Catalog DTOs. Property names serialize as-is; mtime as UTC ticks for an
+    // exact round-trip (ISO text loses sub-second resolution the mtime match
+    // depends on).
+    private sealed class ProbeCacheFile
+    {
+        public const int CurrentVersion = 1;
+        public int Version { get; set; }
+        public Dictionary<string, ProbeCacheEntry> Entries { get; set; } = new(PathComparer());
+    }
+
+    private sealed class ProbeCacheEntry
+    {
+        public long MtimeUtcTicks { get; set; }
+        public List<ProbeCacheCandidate>? Candidates { get; set; }
+        public string? IncompatibleReason { get; set; }
+    }
+
+    private sealed class ProbeCacheCandidate
+    {
+        public string? Abs { get; set; }
+        public string? Name { get; set; }
+        public string? Uid { get; set; }
+    }
+
     private static IVstBridgeNative? TryCreateDefaultScanBridge()
     {
         try
@@ -399,21 +605,21 @@ public sealed class VstDirectoryScanService
     }
 
     /// <summary>
-    /// Hostable plugin candidates for one <c>.vst3</c> entry. Two layered checks:
+    /// Hostable plugin candidates for one <c>.vst3</c> entry, plus the reason it
+    /// was rejected when it isn't hostable (null on success). Two layered checks:
     /// the cheap static Windows-PE heuristic accepts a 64-bit Windows VST3 without
-    /// loading anything (and gives the skip reason for incompatible Windows files);
-    /// when it rejects a binary — which it always does for a Linux ELF / macOS
-    /// dylib VST3 — the in-process bridge (the actual host) is asked to describe
-    /// the file, and a non-empty result both confirms it is hostable on THIS
-    /// platform/arch and yields the real plugin name. The bridge is only supplied
-    /// on non-Windows platforms; on Windows the caller passes null so a crashing
-    /// plugin can't take Zeus down inside <c>GetPluginFactory</c> (issue #190).
-    /// The in-process loader instantiates the first audio-effect class, so a file
-    /// yields one candidate (uid null = "load the first class"; shell sub-plugin
-    /// selection awaits a load-by-uid ABI).
+    /// loading anything; when it rejects a binary — which it always does for a
+    /// Linux ELF / macOS dylib VST3 — the in-process bridge (the actual host) is
+    /// asked to describe the file, and a non-empty result both confirms it is
+    /// hostable on THIS platform/arch and yields the real plugin name. The bridge
+    /// is only supplied on non-Windows platforms; on Windows the caller passes
+    /// null so a crashing plugin can't take Zeus down inside <c>GetPluginFactory</c>
+    /// (issue #190). The in-process loader instantiates the first audio-effect
+    /// class, so a file yields one candidate (uid null = "load the first class";
+    /// shell sub-plugin selection awaits a load-by-uid ABI).
     /// </summary>
-    private IReadOnlyList<VstCandidate> EnumerateVstCandidates(
-        string entry, IVstBridgeNative? bridge, List<ScanError> errors, string fileName)
+    private (IReadOnlyList<VstCandidate> Candidates, string? IncompatibleReason) EnumerateVstCandidates(
+        string entry, IVstBridgeNative? bridge, string fileName)
     {
         var vst3Abs = Path.GetFullPath(entry);
 
@@ -425,7 +631,7 @@ public sealed class VstDirectoryScanService
                 var d = VstBridgeNative.Scan(bridge, vst3Abs);
                 if (d.Count > 0 && !string.IsNullOrWhiteSpace(d[0].Name)) name = d[0].Name;
             }
-            return [new VstCandidate(vst3Abs, name, null)];
+            return ([new VstCandidate(vst3Abs, name, null)], null);
         }
 
         // PE heuristic rejected it — but it may be a Linux/macOS VST3 the bridge
@@ -437,12 +643,11 @@ public sealed class VstDirectoryScanService
             if (descs.Count > 0)
             {
                 var name = string.IsNullOrWhiteSpace(descs[0].Name) ? fileName : descs[0].Name;
-                return [new VstCandidate(vst3Abs, name, null)];
+                return ([new VstCandidate(vst3Abs, name, null)], null);
             }
         }
 
-        errors.Add(new ScanError(entry, $"skipped (incompatible): {reason}"));
-        return [];
+        return ([], reason);
     }
 
     /// <summary>

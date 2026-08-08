@@ -143,54 +143,25 @@ public sealed class TciManagementService
     }
 
     public TciTestResult TestPort(string bindAddress, int port)
+        => TestPortCore(bindAddress, port, PortBindDiagnostics.ProbeTcp);
+
+    internal static TciTestResult TestPortCore(
+        string bindAddress,
+        int port,
+        Func<IPAddress, int, SocketError?> probe)
     {
         if (port is <= 0 or >= 65536)
             return new TciTestResult(Ok: false, Error: "Port must be between 1 and 65535");
 
         var addr = string.IsNullOrWhiteSpace(bindAddress) ? "127.0.0.1" : bindAddress.Trim();
 
-        if (!IsPortAvailable(addr, port))
-        {
-            return new TciTestResult(
-                Ok: false,
-                Error: $"Port {port} is already in use on {addr}");
-        }
+        if (!PortBindDiagnostics.TryResolveBindAddress(addr, out var ip))
+            return new TciTestResult(Ok: false, Error: $"Bind address '{addr}' is not a valid IP address, localhost, or *.");
 
-        return new TciTestResult(Ok: true, Error: null);
+        var error = probe(ip!, port);
+        if (error is null or SocketError.Success)
+            return new TciTestResult(Ok: true, Error: null);
+
+        return new TciTestResult(Ok: false, Error: PortBindDiagnostics.Describe(error.Value, addr, port, "TCP"));
     }
-
-    private bool IsPortAvailable(string bindAddress, int port)
-    {
-        try
-        {
-            // Normalize bind address
-            IPAddress ip;
-            if (bindAddress is "0.0.0.0" or "*" or "")
-            {
-                ip = IPAddress.Any;
-            }
-            else if (string.Equals(bindAddress, "localhost", StringComparison.OrdinalIgnoreCase))
-            {
-                ip = IPAddress.Loopback;
-            }
-            else if (!IPAddress.TryParse(bindAddress, out var parsed))
-            {
-                return false; // Invalid address
-            }
-            else
-            {
-                ip = parsed;
-            }
-
-            // Try to bind to the port
-            using var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            socket.Bind(new IPEndPoint(ip, port));
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
 }

@@ -23,6 +23,8 @@ internal enum TransmitSafetyReasonCode
     UnknownBoard,
     UnknownBoardVariant,
     OutOfBand,
+    TransverterProfile,
+    ReceiveOnly,
     CrossIntentActive,
     FaultLatched,
     SwrTrip,
@@ -51,7 +53,9 @@ internal sealed record TransmitSafetySnapshot(
     IReadOnlyList<BandSegment> Plan,
     bool RegulatoryOverride,
     TransmitIntent? ActiveIntent,
-    MoxSource? Source = null);
+    MoxSource? Source = null,
+    bool TransverterProfileRequired = false,
+    TransverterBandDto? TransverterBand = null);
 
 internal readonly record struct TransmitSafetyDecision(
     bool Allowed,
@@ -133,6 +137,33 @@ internal sealed class EngineTransmitSafetyModule
                 $"TX blocked: {active} is active; unkey before starting {intent}",
                 envelope);
 
+        // A transverter selection is an equipment-safety gate, not a
+        // regulatory preference. TxGuardIgnore must never bypass a missing
+        // profile, a receive-only profile, or a filter/XIT envelope that
+        // leaves the configured RF range.
+        if (snapshot.TransverterProfileRequired)
+        {
+            if (snapshot.TransverterBand is not { } xvtr)
+                return TransmitSafetyDecision.Deny(
+                    TransmitSafetyReasonCode.TransverterProfile,
+                    "TX blocked: no active transverter profile covers the transmit frequency",
+                    envelope);
+            if (xvtr.RxOnly)
+                return TransmitSafetyDecision.Deny(
+                    TransmitSafetyReasonCode.ReceiveOnly,
+                    $"TX blocked: transverter profile {xvtr.ButtonText} is receive-only",
+                    envelope);
+            var normalized = envelope.Normalize();
+            if (normalized.LowHz < xvtr.BeginFrequencyHz
+                || normalized.HighHz > xvtr.EndFrequencyHz)
+            {
+                return TransmitSafetyDecision.Deny(
+                    TransmitSafetyReasonCode.TransverterProfile,
+                    $"TX blocked: emission envelope leaves transverter profile {xvtr.ButtonText}",
+                    envelope);
+            }
+        }
+
         // TxGuardIgnore is deliberately regulatory-only. It never bypasses
         // connection, identity, source ownership, protection, or fault policy.
         if (!snapshot.RegulatoryOverride && !EnvelopeAllowed(snapshot, envelope))
@@ -170,7 +201,15 @@ internal sealed class EngineTransmitSafetyModule
     /// unknown identities resolve to zero and PA-off at the executor boundary.
     /// </summary>
     public TransmitSafetyDecision ResolveEffectiveDrive(int requestedPercent, TransmitSafetySnapshot snapshot)
-        => ResolveEffectiveDrive(requestedPercent, snapshot.Board, snapshot.Variant);
+    {
+        var decision = ResolveEffectiveDrive(requestedPercent, snapshot.Board, snapshot.Variant);
+        if (!decision.Allowed || snapshot.TransverterBand is not { } xvtr)
+            return decision;
+        return decision with
+        {
+            EffectiveDrivePercent = Math.Min(decision.EffectiveDrivePercent, xvtr.Power),
+        };
+    }
 
     internal static TransmitSafetyDecision ResolveEffectiveDrive(
         int requestedPercent,

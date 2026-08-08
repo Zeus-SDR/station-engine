@@ -117,6 +117,7 @@ public sealed class TxService
         _stopwatchTicks = stopwatchTicks;
         _radio.Disconnected += OnRadioDisconnected;
         _radio.P2Disconnected += OnRadioDisconnected;
+        _hub.LastClientDisconnected += OnLastClientDisconnected;
         _radio.TransmitSafetyStateChanging = OnTransmitSafetyStateChanging;
         _radio.ConfigureHardwareCwArmSafety(EvaluateHardwareCwArm);
         _radio.ConfigureTxDriveSafety(EvaluateDriveRequest);
@@ -250,6 +251,53 @@ public sealed class TxService
         }
     }
 
+    /// <summary>
+    /// Every UI client is gone. Release a UI-owned MOX so the radio cannot be
+    /// left keyed with nobody able to unkey it.
+    ///
+    /// This closes a genuine dead-carrier hole: on a websocket drop the browser
+    /// reverts its own indicator to RX and stops the mic uplink, on the belief
+    /// (stated in ws-client.ts) that the hub unkeys server-side. It did not — so
+    /// a blip mid-over left the radio transmitting silence into the amp until
+    /// the TX timeout eventually caught it.
+    ///
+    /// Deliberately narrow on two axes:
+    /// <list type="bullet">
+    /// <item>Only when the LAST client leaves. With another browser still
+    /// attached somebody can see the TX state and unkey it, and yanking MOX
+    /// because a second tab closed would be its own surprise.</item>
+    /// <item>Only when <see cref="MoxSource.UI"/> owns MOX. Hardware PTT, TCI,
+    /// CAT, CW and plugin keying do not belong to the browser and must survive
+    /// it closing — a footswitch-held transmission must not end because a
+    /// webview died.</item>
+    /// </list>
+    /// TUN is left alone: it is not reachable from a disconnected UI either, but
+    /// it is an operator-explicit carrier that the TX timeout already bounds.
+    /// </summary>
+    internal void OnLastClientDisconnected()
+    {
+        // Held across the check AND the release: UI is the master override, so a
+        // hardware PTT that grabbed MOX in a gap between the two would be
+        // unkeyed by this. _transitionSync is reentrant and TrySetMox takes it
+        // itself, with the same _transitionSync -> _sync ordering used
+        // throughout, so nesting here is safe.
+        lock (_transitionSync)
+        {
+            MoxSource? owner;
+            bool moxOn;
+            lock (_sync)
+            {
+                owner = _moxOwner;
+                moxOn = _activeIntent == TransmitIntent.Mox;
+            }
+            if (!moxOn || owner != MoxSource.UI) return;
+            _log.LogWarning(
+                "tx.ui.gone releasing UI-owned MOX — last websocket client disconnected while keyed");
+            if (!TrySetMox(false, MoxSource.UI, out var error) && error is not null)
+                _log.LogWarning("tx.ui.gone MOX release failed: {Error}", error);
+        }
+    }
+
     private void OnRadioDisconnected()
     {
         lock (_transitionSync)
@@ -300,7 +348,15 @@ public sealed class TxService
     private TransmitSafetySnapshot CaptureSafetySnapshot(
         StateDto state,
         TransmitIntent? activeIntent,
-        MoxSource? source = null) => new(
+        MoxSource? source = null)
+    {
+        long txHz = RadioFrequencyResolver.TxFrequencyHz(state);
+        TransverterBandDto? profile = _radio.TryResolveTransverterBand(txHz, out var resolved)
+            ? resolved
+            : null;
+        bool profileRequired = profile is not null
+            || txHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        return new TransmitSafetySnapshot(
             state,
             _radio.IsConnected,
             _radio.ConnectedBoardKind,
@@ -309,7 +365,10 @@ public sealed class TxService
             _bandPlan.CurrentPlan,
             _bandPlan.TxGuardIgnore,
             activeIntent,
-            source);
+            source,
+            profileRequired,
+            profile);
+    }
 
     private bool EvaluateAdmission(TransmitIntent intent, MoxSource? source, out string? error)
     {
@@ -357,7 +416,17 @@ public sealed class TxService
     private bool EvaluateHardwareCwArm(StateDto state)
     {
         TransmitIntent? active;
-        lock (_sync) active = _activeIntent;
+        MoxSource? owner;
+        lock (_sync)
+        {
+            active = _activeIntent;
+            owner = _moxOwner;
+        }
+        // Hardware-owned MOX is the FPGA keyer's own transmission, not a
+        // competing intent. Mirror TrySetMox's source-aware block exemption so
+        // a settings re-push cannot disarm the keyer that currently owns TX.
+        if (active == TransmitIntent.Mox && owner == MoxSource.Hardware)
+            active = null;
         return _safety.EvaluateHardwareCwArm(
             CaptureSafetySnapshot(state, active)).Allowed;
     }
@@ -637,7 +706,13 @@ public sealed class TxService
             long preKeyDelayTicks = armPreKey ? DelayMsToStopwatchTicks(preKeyMs) : 0;
             long revision = NextTransitionRevision();
             _safety.AdmitExplicitRequest();
-            _radio.SetHardwareCwSafetyBlocked(true);
+            // A hardware-owned MOX rise is the FPGA keyer's own transmission;
+            // disarming it here makes PTT fall, then re-arm, and oscillate.
+            // This is the same invariant documented by
+            // RadioService.SetHostCwKeying. Host-driven sources must still
+            // block the competing hardware keyer.
+            if (source != MoxSource.Hardware)
+                _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
                 ClearTxMonitorForTransmitStart();
@@ -648,6 +723,8 @@ public sealed class TxService
                 _radio.NotifyTunActive(false);
                 _pipeline.SetMox(true);
                 _pipeline.PrimeTxDspForKeyDown();
+                if (!_pipeline.SanitizeProtocol2TxBeforeKeyDown())
+                    throw new InvalidOperationException("Protocol 2 pre-key TX-IQ sanitization failed");
                 if (!EvaluateAdmission(TransmitIntent.Mox, source, out error))
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
                 _log.LogInformation("tx.mox.on.recv ts={Ts}",
@@ -658,7 +735,7 @@ public sealed class TxService
                 CommitActiveIntent(TransmitIntent.Mox, source, revision, armPreKey);
                 RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
                 _log.LogInformation("tx.mox on=true revision={Revision}", revision);
-                _hub.Broadcast(new MoxStateFrame(MoxOn: true, TunOn: false));
+                _hub.Broadcast(new MoxStateFrame(MoxOn: true, TunOn: false, Source: source));
                 error = null;
                 return true;
             }

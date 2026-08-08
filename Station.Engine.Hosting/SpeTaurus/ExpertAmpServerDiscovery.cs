@@ -93,8 +93,7 @@ internal sealed class ExpertAmpServerDiscovery(
                 || !string.Equals(status.Confidence, "protocol-native", StringComparison.OrdinalIgnoreCase)
                 || !string.Equals(status.Provenance, "status-poll", StringComparison.OrdinalIgnoreCase))
                 return null;
-            if (string.IsNullOrWhiteSpace(model)
-                || !model.Contains("TAURUS", StringComparison.OrdinalIgnoreCase))
+            if (!ExpertAmpServerEvidence.MentionsTaurus(model))
             {
                 if (!CanUseDisplayIdentityFallback(model)) return null;
                 using var displayResponse = await client.GetAsync(
@@ -108,11 +107,9 @@ internal sealed class ExpertAmpServerDiscovery(
                 if (displayEnvelope?.Success != true
                     || display?.LcdFlags?.ChecksumPresent != true
                     || display.LcdFlags.ChecksumValid != true
-                    || display.ScreenText?.Contains(
-                        "EXPERT 1.5K TAURUS",
-                        StringComparison.OrdinalIgnoreCase) != true)
+                    || !ExpertAmpServerEvidence.HasTaurusDisplayBanner(display.ScreenText))
                     return null;
-                model = "EXPERT 1.5K TAURUS";
+                model = ExpertAmpServerEvidence.TaurusDisplayBanner;
             }
             return new(order, url, model, source);
         }
@@ -151,8 +148,7 @@ internal sealed class ExpertAmpServerDiscovery(
         [property: JsonPropertyName("checksumValid")] bool ChecksumValid);
 
     private static bool CanUseDisplayIdentityFallback(string? modelName) =>
-        string.IsNullOrWhiteSpace(modelName)
-        || modelName.Contains("1.5K-FA", StringComparison.OrdinalIgnoreCase);
+        ExpertAmpServerEvidence.CanUseDisplayIdentityFallback(modelName);
 
     private sealed record ProbeResult(int Order, string Url, string ModelName, string Source);
 }

@@ -52,16 +52,32 @@ namespace Zeus.Contracts;
 // names serialise camelCase on the wire (JsonSerializerDefaults.Web).
 
 /// <summary>
-/// An inline media attachment carried alongside a chat message. Photos and voice
-/// snippets are sent "like a text message": the bytes ride inside the message as
-/// a base64 data URL (<paramref name="DataUrl"/>, e.g. <c>data:image/jpeg;base64,…</c>
-/// or <c>data:audio/webm;base64,…</c>) rather than via out-of-band blob storage.
-/// The web client downscales/compresses photos and records voice at a low Opus
-/// bitrate before sending so the encoded size stays within
-/// <see cref="MaxDataUrlLength"/> — the relay persists the whole message in a
-/// single Durable-Object value (128 KiB cap), so the attachment must comfortably
-/// fit under that with room to spare. <paramref name="Kind"/> is "image" or
-/// "audio"; unknown kinds are ignored by clients so future kinds stay compatible.
+/// A media or file attachment carried alongside a chat message. There are two
+/// transports and exactly one of them is populated on any given attachment:
+/// <list type="bullet">
+/// <item><description><b>Inline</b> — the bytes ride inside the message as a
+/// base64 data URL (<paramref name="DataUrl"/>, e.g. <c>data:image/jpeg;base64,…</c>
+/// or <c>data:audio/webm;base64,…</c>). Small photos and voice snippets go this
+/// way, sent "like a text message". <paramref name="BlobKey"/> is null.</description></item>
+/// <item><description><b>Blob-backed</b> — only a descriptor rides in the message
+/// and the bytes live in relay object storage under <paramref name="BlobKey"/>.
+/// <paramref name="DataUrl"/> is empty and <paramref name="Size"/> is required.</description></item>
+/// </list>
+/// The split exists because the relay persists a whole message in ONE Durable
+/// Object value, and Cloudflare caps that value at 128 KiB. Inline is therefore
+/// hard-limited to <see cref="MaxDataUrlLength"/> characters; anything larger has
+/// to move its bytes out of the message, which is what the blob path is for (up
+/// to <see cref="MaxBlobBytes"/> decoded bytes). Keeping the inline path
+/// byte-identical to what shipped before means old clients — which know nothing
+/// of <paramref name="BlobKey"/> — keep working, and merely degrade a blob-backed
+/// attachment to text-only because they see an empty data URL.
+/// <para>
+/// <paramref name="Kind"/> is "image", "audio", or "file"; unknown kinds are
+/// ignored by clients so future kinds stay compatible. <paramref name="Mime"/> is
+/// the client-declared type and is ADVISORY only — blob bytes are always served
+/// as <c>application/octet-stream</c>, and the client re-types them from its own
+/// render allowlist. Never trust it to decide how to render.
+/// </para>
 /// </summary>
 public sealed record ChatAttachment(
     string Kind,
@@ -70,7 +86,8 @@ public sealed record ChatAttachment(
     string? Name = null,
     int? Width = null,
     int? Height = null,
-    int? Size = null)
+    int? Size = null,
+    string? BlobKey = null)
 {
     /// <summary>
     /// Maximum accepted length of <see cref="DataUrl"/> (characters). Sized to
@@ -79,6 +96,21 @@ public sealed record ChatAttachment(
     /// backend and the relay; the web client compresses to stay under it.
     /// </summary>
     public const int MaxDataUrlLength = 120_000;
+
+    /// <summary>
+    /// Maximum accepted size of a blob-backed attachment, in DECODED bytes.
+    /// Always enforce against the decoded length — base64 inflates by ~4/3, so
+    /// checking the encoded string would silently cap real files at ~768 KiB.
+    /// </summary>
+    public const int MaxBlobBytes = 1_048_576;
+
+    /// <summary>
+    /// The only shape a <see cref="BlobKey"/> may take: 32 lowercase hex digits
+    /// (128 bits of relay-generated randomness). Clients never construct keys.
+    /// Every layer re-validates against this before putting a key into a URL —
+    /// that, not string escaping, is what makes path traversal impossible.
+    /// </summary>
+    public const string BlobKeyPattern = "^[a-f0-9]{32}$";
 }
 
 /// <summary>
@@ -186,6 +218,30 @@ public sealed record ChatVisibleRequest(bool Visible);
 /// <paramref name="Attachment"/> is an optional inline photo — when present the
 /// <paramref name="Text"/> may be empty (image-only message).</summary>
 public sealed record ChatSendRequest(string Text, string? Room = null, ChatAttachment? Attachment = null);
+
+/// <summary>
+/// Uploads one blob-backed attachment's bytes ahead of the message that will
+/// reference them. <paramref name="DataUrl"/> is a base64 data URL purely because
+/// that is what the browser already has in hand from FileReader; the backend
+/// decodes it and forwards raw bytes to the relay, so the ~4/3 base64 inflation
+/// never reaches storage. The caller then sends the message with an attachment
+/// carrying the returned key and an empty data URL.
+/// </summary>
+public sealed record ChatAttachmentUploadRequest(
+    string DataUrl,
+    string? Name = null,
+    string? Mime = null);
+
+/// <summary>
+/// Result of a blob upload. <paramref name="Size"/> is the DECODED byte count the
+/// relay stored — the caller must copy it into the attachment, because the
+/// message descriptor carries no bytes of its own to measure.
+/// <paramref name="ExpiresUtc"/> is when the relay will prune the object.
+/// </summary>
+public sealed record ChatAttachmentUploadResponse(
+    string BlobKey,
+    int Size,
+    DateTimeOffset? ExpiresUtc);
 
 /// <summary>A single-callsign request body for the friend endpoints
 /// (request / accept / deny / remove) and admin ban/unban.</summary>

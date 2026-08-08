@@ -79,7 +79,12 @@ public sealed class SyntheticDspEngine : IDspEngine
         return id;
     }
 
+    public int OpenRxDisplayChannel(int sampleRateHz, int pixelWidth) =>
+        OpenChannel(sampleRateHz, pixelWidth);
+
     public void CloseChannel(int channelId) => _channels.TryRemove(channelId, out _);
+
+    public void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
 
     public void FeedIq(int channelId, ReadOnlySpan<double> interleavedIqSamples) { /* no-op for Phase 0 */ }
 
@@ -168,6 +173,8 @@ public sealed class SyntheticDspEngine : IDspEngine
     {
         ValidateZoomLevel(level);
     }
+
+    public void SetRxDisplayZoom(int channelId, int level) => SetZoom(channelId, level);
 
     public void ResetDisplayPixelBuffers() { }
 

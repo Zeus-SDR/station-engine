@@ -118,7 +118,8 @@ internal sealed class CatCommandHandler
             _send(CatProtocol.Response(cmd, CatProtocol.FormatFreq(f)));
             return;
         }
-        if (CatProtocol.TryParseFreq(args, out long hz) && hz > 0)
+        if (CatProtocol.TryParseFreq(args, out long hz)
+            && _radio.IsExternalFrequencyAvailable(hz))
         {
             // External source — bypass the frozen-NCO recenter heuristic so the
             // hardware tracks the commanded frequency absolutely (issue #461,

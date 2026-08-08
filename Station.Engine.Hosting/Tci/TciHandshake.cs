@@ -74,12 +74,15 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("trx_count", 1));
         cmds.Add(TciProtocol.Command("channels_count", 1));
 
-        cmds.Add(TciProtocol.Command(
-            "vfo_limits",
-            TransverterFrequencyConverter.ToRfHz(
-                TransverterFrequencyConverter.MinimumRadioFrequencyHz, transverter),
-            TransverterFrequencyConverter.ToRfHz(
-                TransverterFrequencyConverter.MaximumRadioFrequencyHz, transverter)));
+        long minimumVfoHz = TransverterFrequencyConverter.MinimumRadioFrequencyHz;
+        long maximumVfoHz = TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        if (transverter.Enabled
+            && TransverterFrequencyConverter.TryResolveActiveBand(transverter, out var activeBand))
+        {
+            minimumVfoHz = activeBand.BeginFrequencyHz;
+            maximumVfoHz = activeBand.EndFrequencyHz;
+        }
+        cmds.Add(TciProtocol.Command("vfo_limits", minimumVfoHz, maximumVfoHz));
 
         int halfRate = sampleRate / 2;
         cmds.Add(TciProtocol.Command("if_limits", -halfRate, halfRate));
@@ -111,17 +114,16 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command(
             "dds",
             0,
-            TransverterFrequencyConverter.ToRfHz(CwOffset.EffectiveLoHz(state), transverter)));
+            CwOffset.EffectiveLoHz(state)));
         cmds.Add(TciProtocol.Command("if", 0, 0, 0));
         cmds.Add(TciProtocol.Command("if", 0, 1, 0));
         cmds.Add(TciProtocol.Command(
-            "vfo", 0, 0, TransverterFrequencyConverter.ToRfHz(state.VfoHz, transverter)));
+            "vfo", 0, 0, state.VfoHz));
         cmds.Add(TciProtocol.Command(
             "vfo",
             0,
             1,
-            TransverterFrequencyConverter.ToRfHz(
-                RadioFrequencyResolver.TxDialFrequencyHz(state), transverter)));
+            RadioFrequencyResolver.TxDialFrequencyHz(state)));
 
         string tciMode = TciProtocol.ModeToTci(state.Mode);
         cmds.Add(TciProtocol.Command("modulation", 0, tciMode));
@@ -155,8 +157,7 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("drive", 0, drivePercent));
         cmds.Add(TciProtocol.Command("tune_drive", 0, drivePercent));
 
-        var txFrequencyHz = TransverterFrequencyConverter.ToRfHz(
-            RadioFrequencyResolver.TxFrequencyHz(state), transverter);
+        var txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(state);
         cmds.Add(TciProtocol.Command("tx_frequency", txFrequencyHz));
         cmds.Add(TciExtendedFrequency.Command(
             txFrequencyHz,

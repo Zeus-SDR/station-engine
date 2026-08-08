@@ -23,10 +23,11 @@ license. Its full license text is preserved in
 | RNNoise | commit `70f1d256acd4b34a572f999a05c87bf00b67730d` | BSD-3-Clause | Statically embedded in WDSP for NR3. Source: `native/rnnoise/`. The bundled `rnnoise-default.bin` model uses the same license. | `RNNoise-COPYING` |
 | miniaudio | 0.11.25 | MIT-0 or public domain | `Zeus.Dsp/runtimes/**/native/{lib,}miniaudio.*`; loaded by the local-audio interop layer. Source: `native/miniaudio/`. This distribution uses the MIT-0 option. | `Miniaudio-LICENSE` |
 | codec2 | 1.2.0, commit `06d4c11e699b0351765f10398abb4f663a984f36` | LGPL-2.1 | `Zeus.Dsp/runtimes/**/native/{lib,}codec2.*`; conveyed by the exported DSP project. The pinned fetch recipe and Zeus build patch are in `native/codec2/`. | `Codec2-COPYING` |
-| RADE C modem | Thetis-RADE commit `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` | BSD-2-Clause | Compiled into `libzeus_rade` / `zeus_rade.dll`, which is conveyed by the exported DSP project. Build glue and pinned source provenance: `native/radae/`. | `RADE-radae_c-LICENSE` |
+| RADE C modem | Thetis-RADE commit `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` | BSD-2-Clause | Compiled into `libzeus_rade.so`, `libzeus_rade.dylib`, or `zeus_rade.dll`, which is conveyed by the exported DSP project for four RIDs including osx-arm64. Build glue and pinned source provenance: `native/radae/`. | `RADE-radae_c-LICENSE` |
 | Opus DNN/FARGAN | Opus commit `940d4e5af64351ca8ba8390df3f555484c567fbb` through the pinned Thetis-RADE composition | BSD-3-Clause | Compiled into the RADE shared library; source provenance is in `native/radae/vendor/PROVENANCE.md`. | `RADE-opus_dnn-COPYING` |
 | FreeDV reliable text | pinned Thetis-RADE composition above | BSD | `rade_text.c` / `rade_text.h` are compiled into the RADE shared library; source provenance is in `native/radae/vendor/PROVENANCE.md`. | `RADE-rade_text-NOTICE` |
-| codec2 LDPC primitives in RADE | pinned Thetis-RADE composition above | LGPL-2.1-or-later | Five codec2 LDPC source units are compiled into the RADE shared library for the end-of-over text path; source provenance is in `native/radae/vendor/PROVENANCE.md`. | `Codec2-COPYING` |
+| Zeus RADE shim | release-matched source under `native/radae/shim/` | BSD-2-Clause | First-party C ABI shim compiled into the RADE shared library; the exact shim inputs and hashes are recorded in `native/radae/vendor/BINARY-SOURCE-BINDING.json`. | `RADE-zeus-shim-LICENSE` |
+| codec2 LDPC primitives in RADE | pinned Thetis-RADE composition above | Mixed per-file; composite LGPL-2.1-only, with LGPL-2.1 section 3 election to GPL-2.0-or-later for the conveyed copies | Five units are compiled into the RADE shared library for the end-of-over text path. `gp_interleaver.c` is LGPL-2.1-only; the Iterative Solutions portion of `mpdecode_core.c` is LGPL-2.1-or-later; `HRA_56_56.c`, `ldpc_codes.c`, and `phi0.c` carry no per-file grant and inherit Codec2 1.2.0's LGPL-2.1. Original provenance and the election are preserved in `RADE-LGPL-SECTION-3-NOTICE.md`; exact source is materialized under `native/radae/vendor/`. | `Codec2-COPYING` |
 | LiteDB | 5.0.20, package commit `9843a4e38b4d46d544a3261f9711dbc559c4c4fc` | MIT | Direct NuGet dependency of `Station.Engine.Hosting`; used for local engine preferences. | `LiteDB-LICENSE` |
 | System.IO.Ports and platform runtime packages | 10.0.0, package commit `b0f34d51fccc69fd334253924abd8d6853fad7aa` | MIT | Direct NuGet dependency of `Station.Engine.Hosting` for migrated CAT serial-port support. The package resolves the matching native runtime packages for supported platforms. | `Microsoft-dotnet-LICENSE`; `Microsoft-dotnet-THIRD-PARTY-NOTICES` |
 | Microsoft.Extensions.Logging.Abstractions | 10.0.0, package commit `b0f34d51fccc69fd334253924abd8d6853fad7aa` | MIT | Direct NuGet dependency of the Protocol 1, Protocol 2, and DSP projects. | `Microsoft-dotnet-LICENSE`; `Microsoft-dotnet-THIRD-PARTY-NOTICES` |
@@ -51,7 +52,9 @@ license. Its full license text is preserved in
 - The WDSP build recipe statically embeds the vendored RNNoise and
   libspecbleach sources. The RADE build recipe identifies the pinned
   `radae_c`, Opus DNN, FreeDV reliable-text, and codec2 LDPC slices compiled
-  into its shared library.
+  into its shared library. The five Codec2 units' mixed per-file record and
+  LGPL-2.1 section 3 election for the conveyed copies are recorded in
+  `RADE-LGPL-SECTION-3-NOTICE.md`.
 - Operating-system libraries shown by native dependency inspection are system
   components and are not copied into this repository.
 

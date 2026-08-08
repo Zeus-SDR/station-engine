@@ -67,6 +67,7 @@ public static class RadioStatusEndpoints
             }
 
             prefs.Set(chosen, req.OverrideDetection);
+            radio.ApplyBoardKindToActiveClientIfSafe();
             var overrideDetection = prefs.GetOverrideDetection();
             return Results.Ok(new RadioSelectionDto(
                 Preferred: chosen?.ToString() ?? "Auto",

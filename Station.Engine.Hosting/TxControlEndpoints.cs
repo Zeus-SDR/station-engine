@@ -60,7 +60,15 @@ public static class TxControlEndpoints
             // P1 → C&C 0x0B; P2 → TxSpecific internal-keyer arm (#1032). No-op
             // when no radio is connected (cached + re-pushed on the next
             // connect). See zeus-bks.
-            radio.SetCwKeyerConfig(snapshot.Wpm, snapshot.KeyerMode, snapshot.SidetoneHz, snapshot.SidetoneGainDb);
+            radio.SetCwKeyerConfig(
+                snapshot.Wpm,
+                snapshot.KeyerMode,
+                snapshot.SidetoneHz,
+                snapshot.SidetoneGainDb,
+                snapshot.BreakIn,
+                snapshot.HangMs,
+                snapshot.Weight,
+                snapshot.PaddleReverse);
             return Results.Ok(snapshot);
         });
 

@@ -40,6 +40,8 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
 
         var carrierStarted = false;
         var tuneCompleted = false;
+        var tuneLatchClear = false;
+        var amplifierHazard = false;
         var restoreOperate = false;
         var restoreCommitted = false;
         SpeTaurusStatus? committedStatus = null;
@@ -107,9 +109,17 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
         {
             failure = "Taurus automatic tuning timed out; Zeus stopped the tuning carrier.";
         }
-        catch (Exception ex) when (ex is HttpRequestException or InvalidDataException)
+        catch (Exception ex) when (
+            ex is HttpRequestException
+                or InvalidDataException
+                or SpeTaurusAmplifierHazardException)
         {
             failure = $"Taurus automatic tuning stopped: {ex.Message}";
+            // An amplifier-side hazard can clear itself once RF drops, so the
+            // restore preflight's live status read would no longer see it.
+            // Remember it here instead: the operator inspects the amplifier
+            // before Zeus puts it back on the air.
+            amplifierHazard = ex is SpeTaurusAmplifierHazardException;
             log.LogWarning(ex, "spe-taurus automatic tune monitoring failed");
         }
         finally
@@ -190,9 +200,65 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
                         log.LogError(ex, "spe-taurus automatic tune standby cleanup threw");
                     }
 
-                    if (tuneCompleted
-                        && restoreOperate
-                        && failure is null
+                    // Disarm the Expert TUNE latch only after STANDBY/RX is
+                    // verified. If the amplifier moved to OPERATE during RF
+                    // shutdown, the standby cleanup above safely de-escalates
+                    // it before any possible TUNE cancel keypress.
+                    try
+                    {
+                        var disarmed = await amplifier
+                            .EnsureTuneDisarmedAfterAutomaticTuneAsync(
+                                expectedConfig!,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                        tuneLatchClear = disarmed.TuneLatchClear;
+                        if (!disarmed.Verified)
+                            failure = AppendFailure(
+                                failure,
+                                disarmed.Error
+                                ?? "Final Taurus TUNE state could not be verified clear.");
+                    }
+                    catch (Exception ex)
+                    {
+                        failure = AppendFailure(
+                            failure,
+                            $"Final Taurus TUNE cleanup failed: {ex.Message}");
+                        log.LogError(ex, "spe-taurus automatic tune latch cleanup threw");
+                    }
+
+                    // Restoring the amplifier to the mode the operator left it in
+                    // is part of the tuning cycle, not a reward for a flawless
+                    // run. Gate it only on conditions that make OPERATE actively
+                    // unsafe: Zeus RF still up, a TUNE latch that might still be
+                    // armed (the amplifier would start an ATU cycle on the next
+                    // key-down), or an amplifier-side hazard seen during the
+                    // cycle. Every other cleanup shortfall is a verification gap
+                    // rather than a hazard, and the restore transaction re-runs
+                    // its own full preflight — fresh config lease, FeatureActive,
+                    // and UnsafeControlReason over fresh protocol-native status
+                    // — so it still fails closed on anything genuinely wrong at
+                    // restore time.
+                    var carrierDown = !tx.IsTunOn;
+                    if (restoreOperate)
+                    {
+                        var blocked =
+                            !carrierDown
+                                ? "the Zeus tuning carrier is still on"
+                            : amplifierHazard
+                                ? "the amplifier reported a hazard during tuning"
+                            : !tuneLatchClear
+                                ? "the TUNE latch could not be confirmed clear"
+                            : null;
+                        if (blocked is not null)
+                            failure = AppendFailure(
+                                failure,
+                                $"Taurus OPERATE was not restored because {blocked}.");
+                    }
+
+                    if (restoreOperate
+                        && carrierDown
+                        && tuneLatchClear
+                        && !amplifierHazard
                         && !cancellationToken.IsCancellationRequested)
                     {
                         // The Expert Amp Server confirms only that it wrote the
@@ -202,8 +268,10 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
                         // is still returning home. Leave a full status-poll window
                         // after RF and TUNE have cleared before requesting OP.
                         log.LogInformation(
-                            "spe-taurus automatic tune waiting {SettleMilliseconds} ms before OPERATE restoration",
-                            OperateRestoreSettle.TotalMilliseconds);
+                            "spe-taurus automatic tune waiting {SettleMilliseconds} ms before OPERATE restoration (tuneCompleted={TuneCompleted}, cleanupFailure={CleanupFailure})",
+                            OperateRestoreSettle.TotalMilliseconds,
+                            tuneCompleted,
+                            failure ?? "none");
                         await Task.Delay(OperateRestoreSettle, cancellationToken)
                             .ConfigureAwait(false);
 
@@ -282,6 +350,14 @@ internal sealed class SpeTaurusAutomaticTuneCoordinator(
             cancellationToken.ThrowIfCancellationRequested();
         if (failure is null && committedStatus is not null)
             return committedStatus;
+
+        // The panel renders any error as an alarm. Lead with the outcome so a
+        // cleanup gap that Zeus recovered from does not read as "the amplifier
+        // is stuck in STANDBY", which is the state this whole path exists to
+        // avoid leaving the operator in.
+        if (restoreCommitted && failure is not null)
+            failure = "The amplifier returned to OPERATE, but Zeus could not "
+                + $"verify every tuning cleanup step: {failure}";
         return failure is null
             ? await amplifier.StatusAsync(cancellationToken).ConfigureAwait(false)
             : await WithErrorAsync(failure, cancellationToken).ConfigureAwait(false);

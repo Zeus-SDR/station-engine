@@ -14,9 +14,6 @@ namespace Zeus.Server;
 /// <summary>Maps the standalone station engine's HTTP and WebSocket surface.</summary>
 public static class StationEngineEndpoints
 {
-    internal const string NativeMicDevOriginEnvironmentVariable =
-        "ZEUS_NATIVE_MIC_DEV_ORIGIN";
-
     internal static readonly HashSet<string> AllowedBrowserOrigins = new(StringComparer.Ordinal)
     {
         "https://app.zeussdr.com",
@@ -85,57 +82,45 @@ public static class StationEngineEndpoints
 
     /// <summary>
     /// Narrow origin allowlist for the raw native-microphone websocket feed.
-    /// The ordinary engine CORS policy intentionally accepts arbitrary
-    /// loopback ports; microphone audio does not. It accepts the pinned remote
-    /// browser surfaces, the currently attached/authenticated product
-    /// process's advertised loopback HTTP port, or the exact development
-    /// origin supplied by the native launcher. A development origin is
-    /// trusted only while a product attachment exists.
+    /// Accepts the pinned remote browser surfaces, or — once a product has
+    /// genuinely completed the attach + lease handshake
+    /// (<see cref="ProductAudioRingPort.TryGetActiveProductEndpoint"/>) —
+    /// any plain-HTTP loopback origin, matching the desktop-webview CORS
+    /// policy above (<see cref="IsBrowserOriginAllowed"/>).
+    ///
+    /// This used to pin further to the product's own exact advertised port
+    /// (or a single pre-configured "dev origin" env var meant to cover a
+    /// local Vite server). That was brittle in practice: a local dev
+    /// server's port varies across worktrees and portOffsets, and any
+    /// mismatch denied the request with zero signal — indistinguishable,
+    /// from the operator's chair, from a genuinely dead microphone (the
+    /// 2026-08-05 friend/net PTT field failure). The leased product
+    /// attachment is the real trust boundary here: it can only exist
+    /// because a real local process completed the loopback-only attach/lease
+    /// handshake in <see cref="StationProtocolEndpoints"/>, so pinning the
+    /// browser tab's own port on top of that adds negligible security for
+    /// real brittleness cost.
     /// </summary>
-    internal static bool IsNativeMicOriginAllowed(
-        string origin,
-        int? productPort,
-        string? configuredDevOrigin = null)
+    internal static bool IsNativeMicOriginAllowed(string origin, int? productPort)
     {
         if (origin is "https://app.zeussdr.com"
             or "https://staging.zeus-web-app-7ag.pages.dev") return true;
         if (productPort is not > 0) return false;
-        if (origin is "http://localhost:5173"
-            or "http://127.0.0.1:5173") return true;
-        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)
-            || uri.Scheme != Uri.UriSchemeHttp
-            || !IsLoopbackHost(uri.Host))
-            return false;
-        return uri.Port == productPort
-            || IsConfiguredNativeMicDevOrigin(origin, configuredDevOrigin);
+        return Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+            && uri.Scheme == Uri.UriSchemeHttp
+            && IsLoopbackHost(uri.Host);
     }
 
-    private static bool IsConfiguredNativeMicDevOrigin(
-        string origin,
-        string? configuredDevOrigin)
-    {
-        if (!string.Equals(origin, configuredDevOrigin, StringComparison.Ordinal)
-            || !Uri.TryCreate(configuredDevOrigin, UriKind.Absolute, out var configuredUri))
-            return false;
-        return configuredUri.Scheme == Uri.UriSchemeHttp
-            && IsLoopbackHost(configuredUri.Host);
-    }
-
-    private static Func<bool> CreateNativeMicStreamAuthorization(HttpContext context)
-    {
-        var productAudio = context.RequestServices.GetService<ProductAudioRingPort>();
-        return CreateNativeMicStreamAuthorization(
+    private static Func<bool> CreateNativeMicStreamAuthorization(HttpContext context) =>
+        CreateNativeMicStreamAuthorization(
             context.Connection.RemoteIpAddress,
             context.Request.Headers.Origin,
-            productAudio,
-            Environment.GetEnvironmentVariable(NativeMicDevOriginEnvironmentVariable));
-    }
+            context.RequestServices.GetService<ProductAudioRingPort>());
 
     internal static Func<bool> CreateNativeMicStreamAuthorization(
         IPAddress? remoteAddress,
         StringValues origins,
-        ProductAudioRingPort? productAudio,
-        string? configuredDevOrigin = null)
+        ProductAudioRingPort? productAudio)
     {
         // Copy request-owned values now; the returned evaluator must never
         // retain HttpContext or its mutable header collection after handshake.
@@ -155,22 +140,21 @@ public static class StationEngineEndpoints
                     : null;
             return isLoopback
                 && origin is not null
-                && IsNativeMicOriginAllowed(origin, productPort, configuredDevOrigin);
+                && IsNativeMicOriginAllowed(origin, productPort);
         };
     }
 
     internal static bool IsTrustedNativeMicRequest(
         IPAddress? remoteAddress,
         StringValues origins,
-        int? productPort,
-        string? configuredDevOrigin = null)
+        int? productPort)
     {
         if (remoteAddress is null) return false;
         if (remoteAddress.IsIPv4MappedToIPv6) remoteAddress = remoteAddress.MapToIPv4();
         return IPAddress.IsLoopback(remoteAddress)
             && origins.Count == 1
             && origins[0] is { } origin
-            && IsNativeMicOriginAllowed(origin, productPort, configuredDevOrigin);
+            && IsNativeMicOriginAllowed(origin, productPort);
     }
 
     public static IEndpointRouteBuilder MapStationEngineEndpoints(
@@ -229,6 +213,7 @@ public static class StationEngineEndpoints
         endpoints.MapRadioCapabilitiesEndpoint();
         endpoints.MapExternalPttEndpoint();
         endpoints.MapPttStatusEndpoints();
+        endpoints.MapSerialPttEndpoints();
         endpoints.MapRadioAudioEndpoints();
         endpoints.MapPaThermalEndpoint();
         endpoints.MapRadioHardwareEndpoints();
@@ -308,7 +293,7 @@ public static class StationEngineEndpoints
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
             await context.Response.WriteAsync(
-                $"displayRxId must be an integer from 1 through {WireContract.MaxReceivers - 1}",
+                $"displayRxId must be an integer from 1 through {WireContract.MaxReceiverSlots - 1}",
                 context.RequestAborted).ConfigureAwait(false);
             return;
         }
@@ -361,7 +346,7 @@ public static class StationEngineEndpoints
     private static string NormalizeHost(string host) =>
         host.Trim().TrimStart('[').TrimEnd(']');
 
-    private static bool TryParseSessionOptions(
+    internal static bool TryParseSessionOptions(
         IQueryCollection query,
         out int? displayRxId,
         out bool suppressAudio)
@@ -381,7 +366,7 @@ public static class StationEngineEndpoints
                 CultureInfo.InvariantCulture,
                 out var parsed)
             || parsed < 1
-            || parsed >= WireContract.MaxReceivers)
+            || parsed >= WireContract.MaxReceiverSlots)
             return false;
 
         displayRxId = parsed;

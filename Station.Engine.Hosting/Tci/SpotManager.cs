@@ -52,6 +52,7 @@ public enum SpotSource
 {
     Tci,
     DxCluster,
+    Wsjtx,
 }
 
 /// <summary>
@@ -77,6 +78,7 @@ public sealed class SpotManager
 
     public const string DefaultTciOwnerId = "tci";
     public const string DefaultDxClusterOwnerId = "legacy";
+    public const string DefaultWsjtxOwnerId = "wsjtx";
 
     /// <summary>Maximum number of distinct callsigns retained before the
     /// least-recently-spotted is evicted.</summary>
@@ -114,7 +116,8 @@ public sealed class SpotManager
         string? ownerId = null,
         string? ownerName = null,
         string? spotter = null,
-        DateTime? receivedUtc = null)
+        DateTime? receivedUtc = null,
+        int? snrDb = null)
     {
         lock (_sync)
         {
@@ -130,7 +133,8 @@ public sealed class SpotManager
                 normalizedOwner,
                 string.IsNullOrWhiteSpace(ownerName) ? normalizedOwner : ownerName.Trim(),
                 string.IsNullOrWhiteSpace(spotter) ? null : spotter.Trim().ToUpperInvariant(),
-                receivedUtc ?? _timeProvider.GetUtcNow().UtcDateTime);
+                receivedUtc ?? _timeProvider.GetUtcNow().UtcDateTime,
+                snrDb);
             _observations[new ObservationKey(normalizedCall, source, normalizedOwner)] =
                 new StoredSpot(spot, _timeProvider.GetTimestamp(), ++_sequence);
 
@@ -254,7 +258,12 @@ public sealed class SpotManager
     {
         var value = ownerId?.Trim();
         if (!string.IsNullOrEmpty(value)) return value;
-        return source == SpotSource.Tci ? DefaultTciOwnerId : DefaultDxClusterOwnerId;
+        return source switch
+        {
+            SpotSource.Tci => DefaultTciOwnerId,
+            SpotSource.Wsjtx => DefaultWsjtxOwnerId,
+            _ => DefaultDxClusterOwnerId,
+        };
     }
 
     private readonly record struct ObservationKey(string Callsign, SpotSource Source, string OwnerId);
@@ -270,5 +279,6 @@ public sealed class SpotManager
         string OwnerId = "",
         string OwnerName = "",
         string? Spotter = null,
-        DateTime ReceivedUtc = default);
+        DateTime ReceivedUtc = default,
+        int? SnrDb = null);
 }

@@ -95,6 +95,13 @@ public interface IProtocol1Client : IDisposable
     }
     void SetAntennaRx(HpsdrAntenna ant);
     /// <summary>
+    /// Select the Protocol-1 RX auxiliary input without leaking the Hosting
+    /// enum into this assembly. Values are 0=base, 1=EXT1, 2=EXT2, 3=XVTR,
+    /// 4=BYPASS; invalid values coerce to base. The Config-frame encoder maps
+    /// these to the Thetis C3[7:5] relay layout independently of ANT1/2/3.
+    /// </summary>
+    void SetRxAuxInput(int input);
+    /// <summary>
     /// Select the TX antenna relay (ANT1/2/3) — Config-frame C4[1:0], external-
     /// port parity audit (GAP-P1-1). Deferred while keyed and applied on the
     /// unkey edge (no hot-switching the Alex matrix under power). Honoured on the
@@ -124,6 +131,19 @@ public interface IProtocol1Client : IDisposable
     /// → drive byte via the per-band gain lookup.
     /// </summary>
     void SetDriveByte(byte value);
+
+    /// <summary>
+    /// Set the effective PA enable after global and per-band/transverter policy
+    /// has been resolved. Encoded in DriveFilter C2[3] on HL2 and C3[7] on
+    /// legacy Hermes-class Protocol-1 radios.
+    /// </summary>
+    void SetPaEnabled(bool enabled);
+
+    /// <summary>
+    /// Enable the dedicated transverter T/R output. Independent of the RX aux
+    /// selector; encoded by the scheduled C0=0x24 frame at C2[0].
+    /// </summary>
+    void SetXvtrEnabled(bool enabled);
 
     /// <summary>
     /// User-configured Open-Collector pin masks (7 bits each). OR'd with the
@@ -252,11 +272,12 @@ public interface IProtocol1Client : IDisposable
     /// the P1 receiver count must NEVER change on a live stream: the classic-
     /// Hermes gateware applies it mid-frame and permanently sync-shifts the
     /// EP6 byte stream). Idempotent: no transition and no wire traffic when
-    /// the client is already in the requested mode, so the reconnect resync
-    /// path is a no-op after connect-while-armed. On HL2 / other boards, or
+    /// the client is already in the requested mode. On HL2 / other boards, or
     /// before <see cref="StartAsync"/>, degrades to the plain flag store of
-    /// <see cref="SetPsEnabled"/>. This is the ONLY correct way to change the
-    /// PS arm state on a live HermesC10 connection.
+    /// <see cref="SetPsEnabled"/>. RadioService starts fresh clients disarmed
+    /// and applies persisted intent through this safe transition only after
+    /// connect. This is the ONLY correct way to change the PS arm state on a
+    /// live HermesC10 connection.
     /// </summary>
     Task SetPsEnabledAsync(bool on, CancellationToken ct = default);
 
@@ -349,12 +370,12 @@ public interface IProtocol1Client : IDisposable
 
     /// <summary>
     /// Push the on-board CW keyer config to C&amp;C register 0x0B: speed in
-    /// WPM (clamped to the 6-bit 0..60 gateware field) and the keyer mode
-    /// (straight / iambic A / iambic B). Sent via the register round-robin
+    /// WPM (clamped to the 6-bit 0..60 gateware field), keyer mode, weight
+    /// (33..66), and paddle direction. Sent via the register round-robin
     /// so it self-heals on packet loss. The gateware ignores speed in
     /// straight mode. See zeus-bks.
     /// </summary>
-    void SetCwKeyerConfig(int wpm, CwKeyerMode mode);
+    void SetCwKeyerConfig(int wpm, CwKeyerMode mode, int weight, bool paddleReverse);
 
     /// <summary>
     /// Set the TX audio front-end (external-audio-jacks re-port). Global

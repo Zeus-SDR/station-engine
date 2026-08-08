@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using Zeus.Contracts;
+using Zeus.Server.Cat;
 
 namespace Zeus.Server;
 
@@ -30,6 +31,45 @@ public static class RadioIoEndpoints
         {
             store.Set(req.Enabled);
             return Results.Ok(externalPtt.Snapshot());
+        });
+
+        return endpoints;
+    }
+
+    public static IEndpointRouteBuilder MapSerialPttEndpoints(
+        this IEndpointRouteBuilder endpoints)
+    {
+        // Serial PTT switch (Thetis bit-bang PTT parity). GET returns the
+        // persisted config + live port state + enumerable serial devices; PUT
+        // validates (no CAT-port sharing, at least one sense pin when enabled),
+        // persists, and hot-reopens via the store's Changed event.
+        endpoints.MapGet("/api/radio/serial-ptt", (SerialPttService svc) =>
+        {
+            return Results.Ok(svc.Snapshot());
+        });
+
+        endpoints.MapPut("/api/radio/serial-ptt",
+            (SerialPttConfig req, SerialPttSettingsStore store, SerialPttService svc, CatSerialConfigStore catStore) =>
+        {
+            if (req is null)
+                return Results.BadRequest(new { error = "body required" });
+
+            var port = (req.PortName ?? string.Empty).Trim();
+            if (req.Enabled && !req.SenseCts && !req.SenseDsr)
+                return Results.BadRequest(new { error = "select at least one sense pin (CTS and/or DSR) when serial PTT is enabled" });
+
+            // CAT and serial PTT are exclusive-opens: the same device cannot
+            // serve both (Thetis hard-errors on this too).
+            if (req.Enabled && port.Length > 0)
+            {
+                bool conflict = catStore.Get().Any(p =>
+                    p.Enabled && SerialPortEnumeration.PortNameEquals(p.PortName.Trim(), port));
+                if (conflict)
+                    return Results.Conflict(new { error = $"{port} is already assigned to a serial CAT port" });
+            }
+
+            store.Set(req with { PortName = port });
+            return Results.Ok(svc.Snapshot());
         });
 
         return endpoints;

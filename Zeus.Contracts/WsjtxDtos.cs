@@ -37,19 +37,23 @@ public sealed record WsjtxRuntimeConfig(
     // Heartbeat (0) ~15 s, Status (1) on change + periodic, Decode (2) per FT8/FT4
     // decode, WSPRDecode (10) per spot. OFF by default — pure additional egress.
     bool SendLiveDecodes = false,
-    // Accept inbound WSJT-X Reply (type 4) datagrams — GridTracker / JTAlert send
-    // one when the operator clicks a Call Roster entry, and Zeus routes the target
-    // callsign into the same click-to-call code path the FT8 decode table uses.
-    // NEW inbound network surface — DEFAULT OFF. Replies are received on the
-    // same ephemeral socket Zeus uses for outbound traffic, only from the
-    // configured unicast peer (multicast deliberately accepts any source), and
-    // only Reply (4) is honoured; HaltTx (8), FreeText (9), etc. are dropped.
+    // Accept inbound WSJT-X Decode (type 2) reports and Reply (type 4) commands.
+    // Decodes become panadapter spots; GridTracker / JTAlert send a Reply when
+    // the operator clicks a Call Roster entry, and Zeus routes that target into
+    // the same click-to-call path as the FT8 decode table.
+    // NEW inbound network surface — DEFAULT OFF. Unicast replies arrive on the
+    // same ephemeral socket Zeus uses for outbound traffic and only from the
+    // configured peer. Multicast binds the configured port and joins the group
+    // so WSJT-X Decode reports can reach Zeus; any group member is accepted.
+    // Only Decode (2) and Reply (4) are honoured; HaltTx (8), FreeText (9), etc.
+    // are dropped.
     bool AcceptInboundReplies = false);
 
 /// <summary>Status/config view for the WSJT-X broadcaster + optional inbound
-/// reply path. Config applies live with no configured inbound port: Reply
-/// reception follows the outbound socket's lifecycle and is visible through
-/// <see cref="InboundListening"/>.</summary>
+/// path. Inbound reception follows the outbound socket's lifecycle and is
+/// visible through <see cref="InboundListening"/>. Multicast reception uses the
+/// configured group and port; unicast replies use the outbound socket's local
+/// endpoint.</summary>
 public sealed record WsjtxStatus(
     bool Enabled,
     string Host,

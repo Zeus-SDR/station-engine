@@ -10,9 +10,7 @@ internal static class TciExtendedFrequency
     public static string Command(
         StateDto state,
         TransverterSettingsDto? transverterSettings = null) => Command(
-        TransverterFrequencyConverter.ToRfHz(
-            RadioFrequencyResolver.TxFrequencyHz(state),
-            transverterSettings ?? new TransverterSettingsDto()),
+        RadioFrequencyResolver.TxFrequencyHz(state),
         state.Rx2Enabled,
         TxUsesVfoB(state));
 

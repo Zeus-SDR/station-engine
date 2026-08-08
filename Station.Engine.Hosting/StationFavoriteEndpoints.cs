@@ -16,13 +16,17 @@ public static class StationFavoriteEndpoints
         endpoints.MapPut("/api/station/favorites/{slot:int}", (
             int slot,
             StationFavoriteSetRequest request,
-            StationFavoriteStore store) =>
+            StationFavoriteStore store,
+            IServiceProvider services) =>
         {
             if (!StationFavoriteStore.IsValidSlot(slot))
                 return Results.BadRequest(new { error = "slot must be from 1 through 5" });
-            if (request.FrequencyHz <= 0
-                || request.FrequencyHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz)
-                return Results.BadRequest(new { error = "frequencyHz must be from 1 through 60000000" });
+            var radio = services.GetService<RadioService>();
+            bool frequencyAvailable = radio?.IsExternalFrequencyAvailable(request.FrequencyHz)
+                ?? request.FrequencyHz is >= TransverterFrequencyConverter.MinimumRadioFrequencyHz
+                    and <= TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+            if (!frequencyAvailable)
+                return Results.BadRequest(new { error = "frequencyHz is outside the native radio range and enabled transverter profiles" });
             if (!Enum.IsDefined(request.Mode))
                 return Results.BadRequest(new { error = "mode is invalid" });
             if (request.FilterLowHz >= request.FilterHighHz)

@@ -44,11 +44,18 @@ public static class OperatorUiSettingsEndpoints
                 req.WidebandDisplayEnabled,
                 req.DisplayMaxFrameRateHz,
                 req.DisplayDecimation,
-                req.WaterfallUpdatePeriod);
+                req.WaterfallUpdatePeriod,
+                req.WidebandSignalMarkersEnabled);
             var saved = store.Get();
             dsp.ApplyDisplaySettings(saved);
             return Results.Ok(saved);
         });
+
+        // Wideband signal markers snapshot (display-only, additive wire
+        // surface — it never rides inside the binary DisplayFrame stream).
+        // Polled by display clients while the markers overlay is enabled.
+        endpoints.MapGet("/api/radio/wideband/signals", (DspPipelineService dsp) =>
+            Results.Ok(dsp.GetWidebandSignalsSnapshot()));
 
         endpoints.MapGet("/api/display-settings/image", (DisplaySettingsStore store) =>
         {

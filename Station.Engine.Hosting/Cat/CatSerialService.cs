@@ -198,7 +198,7 @@ public sealed class CatSerialService : BackgroundService
             catch (Exception) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
-                slot.Error = Describe(ex);
+                slot.Error = SerialPortEnumeration.Describe(ex);
                 _log.LogWarning(ex, "cat.serial.error index={Idx} port={Port}; retrying", index + 1, cfg.PortName);
             }
             finally
@@ -299,7 +299,7 @@ public sealed class CatSerialService : BackgroundService
                 ClientActivity: s.Live?.Activity ?? 0,
                 Error: s.Error));
         }
-        return new CatSerialStatus(ports, AvailablePorts());
+        return new CatSerialStatus(ports, SerialPortEnumeration.AvailablePorts());
     }
 
     /// <summary>Probe-open a port with the given params to verify it can be used,
@@ -323,80 +323,8 @@ public sealed class CatSerialService : BackgroundService
         }
         catch (Exception ex)
         {
-            return new CatSerialTestResult(false, Describe(ex));
+            return new CatSerialTestResult(false, SerialPortEnumeration.Describe(ex));
         }
-    }
-
-    private static IReadOnlyList<string> AvailablePorts()
-    {
-        var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            foreach (var p in SerialPort.GetPortNames()) results.Add(p);
-        }
-        catch
-        {
-            // GetPortNames can throw on some platforms; suggestions are optional.
-        }
-
-        // Linux: the standard TTY enumeration above only sees kernel-assigned
-        // /dev/ttyUSB* /dev/ttyACM* nodes. Many stations use persistent udev
-        // symlinks — either the by-id/by-path directories udev populates
-        // automatically, or user-created aliases like /dev/KPA500. Include both
-        // so the dropdown surfaces the same names an operator picked when
-        // writing their udev rules.
-        if (OperatingSystem.IsLinux())
-        {
-            AddUdevSerialDir(results, "/dev/serial/by-id");
-            AddUdevSerialDir(results, "/dev/serial/by-path");
-            AddDevSymlinksToTty(results, "/dev");
-        }
-
-        return results
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    // /dev/serial/by-id and /dev/serial/by-path are udev-managed and their
-    // entire purpose is TTY aliases — add every entry.
-    private static void AddUdevSerialDir(HashSet<string> results, string dir)
-    {
-        try
-        {
-            if (!Directory.Exists(dir)) return;
-            foreach (var f in Directory.EnumerateFileSystemEntries(dir))
-                results.Add(f);
-        }
-        catch { /* permission or races — suggestions are optional */ }
-    }
-
-    // Top-level symlinks in /dev/ can point at anything (null, zero, disk
-    // partitions). Only keep the ones whose resolved target basename starts
-    // with tty or cu — the only names SerialPort will actually open.
-    private static void AddDevSymlinksToTty(HashSet<string> results, string dir)
-    {
-        try
-        {
-            if (!Directory.Exists(dir)) return;
-            foreach (var f in Directory.EnumerateFileSystemEntries(dir))
-            {
-                try
-                {
-                    var attrs = File.GetAttributes(f);
-                    if ((attrs & FileAttributes.ReparsePoint) == 0) continue;
-                    var target = File.ResolveLinkTarget(f, returnFinalTarget: true);
-                    if (target is null) continue;
-                    var name = Path.GetFileName(target.FullName);
-                    if (name.StartsWith("tty", StringComparison.Ordinal)
-                        || name.StartsWith("cu", StringComparison.Ordinal))
-                    {
-                        results.Add(f);
-                    }
-                }
-                catch { /* skip this entry */ }
-            }
-        }
-        catch { /* permission or races — suggestions are optional */ }
     }
 
     internal static Parity ParseParity(string? s) =>
@@ -410,16 +338,6 @@ public sealed class CatSerialService : BackgroundService
         "Two" => "2",
         "OnePointFive" => "1.5",
         _ => "1",
-    };
-
-    // Friendly, actionable message for the common serial-open failures.
-    private static string Describe(Exception ex) => ex switch
-    {
-        UnauthorizedAccessException => "Port is in use or access denied (another app may hold it; on Linux the user must be in the dialout group)",
-        FileNotFoundException => "Port not found",
-        ArgumentException => "Invalid port name",
-        IOException io => io.Message,
-        _ => ex.Message,
     };
 
     private static async Task DelaySafe(TimeSpan delay, CancellationToken ct)

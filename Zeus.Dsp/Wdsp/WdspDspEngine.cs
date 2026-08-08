@@ -109,6 +109,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private const int OutputRate = 48_000;
     private const int MaxFftSize = 262_144;
     private const int AnalyzerFftSize = 16_384;
+    private const int SnrAnalyzerPixelWidth = RxSnrSpectrumInfo.MaxPixelCount;
     private const int AnalyzerFps = 30;
     private const int AnalyzerWindow = 2;
     private const double AnalyzerKaiserPi = 14.0;
@@ -143,6 +144,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         nameof(NativeMethods.RNNRloadModel),
     ];
 
+    private static readonly string[] EngineVersionRequiredExports =
+    [
+        nameof(NativeMethods.GetWDSPVersion),
+    ];
+
     private static bool AllNativeExportsAvailable(string[] symbolNames)
     {
         if (!WdspNativeLoader.TryProbe()) return false;
@@ -161,6 +167,31 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public static bool Nr4SbnrAvailable => AllNativeExportsAvailable(SbnrRequiredExports);
 
     public static bool Nr3RnnrAvailable => AllNativeExportsAvailable(Nr3RnnrRequiredExports);
+
+    /// <summary>
+    /// The loaded libwdsp exports <c>GetWDSPVersion</c>. Older builds may not,
+    /// which is a capability gap rather than a fault — see
+    /// <see cref="ResolveEngineVersion"/>.
+    /// </summary>
+    public static bool EngineVersionAvailable => AllNativeExportsAvailable(EngineVersionRequiredExports);
+
+    /// <summary>
+    /// Version of the libwdsp actually loaded into this process. Resolved once
+    /// and cached: the answer cannot change for the lifetime of the process, and
+    /// the probe behind it dlopens the library.
+    ///
+    /// Never throws. A libwdsp that will not load, or that predates the
+    /// <c>GetWDSPVersion</c> export, comes back as a capability state rather than
+    /// an exception, so a stale engine cannot turn into a crash at channel open.
+    /// </summary>
+    public static WdspEngineVersion ResolveEngineVersion() => LazyEngineVersion.Value;
+
+    private static readonly Lazy<WdspEngineVersion> LazyEngineVersion = new(
+        static () => WdspEngineVersion.Resolve(
+            static () => NativeLibraryLoadable,
+            static () => EngineVersionAvailable,
+            NativeMethods.GetWDSPVersion),
+        LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static double FiniteOrZero(double value) =>
         double.IsFinite(value) ? value : 0.0;
@@ -216,6 +247,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         public required int Id;
         public required int Generation;
+        public required bool IsDisplayOnly;
         public required int SampleRateHz;
         public required int PixelWidth;
         public required int OutDoubles;
@@ -238,6 +270,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // it IQ (RX comes from the sidecar), so its analyzer never snaps; the
         // display drain must skip it. Also guards the first tick after any open.
         public volatile bool AnalyzerHasSnapped;
+        public required int SnrAnalyzerId;
+        public required long SnrAnalyzerGeneration;
+        public volatile bool SnrAnalyzerHasSnapped;
         public readonly float[] AudioRing = new float[AudioRingCapacity];
         public int AudioHead;
         public int AudioCount;
@@ -269,6 +304,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // fscLin/fscHin; the worker's Spectrum0 and the pixel drain's GetPixels
         // take this lock so they never interleave with an in-flight reconfig.
         public int ZoomLevel = 1;
+        // Per-channel analyzer FFT size. Defaults to the engine-wide
+        // _rxAnalyzerFftSize at open; SetRxDisplayFftSize raises it for
+        // high-resolution display-only consumers (wideband detail DDC), and
+        // every zoom-driven SetAnalyzer reconfig re-reads this field so the
+        // override survives zoom changes.
+        public int AnalyzerFftSize;
         public readonly object AnalyzerLock = new();
 
         // --- RX ingest health telemetry (issue zeus-gdc7; now permanent) ---
@@ -342,6 +383,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private readonly ILogger _log;
     private int _disposed;
     private int _channelGeneration;
+    private static long s_snrAnalyzerGeneration;
 
     // TXA lifecycle is disjoint from RXA's (no analyzer, no audio ring, no NB)
     // so we don't register it in _channels. _txaLock serializes OpenTxChannel
@@ -683,12 +725,15 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public int OpenChannel(int sampleRateHz, int pixelWidth)
     {
-        int id = OpenChannelCore(sampleRateHz, pixelWidth);
+        int id = OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: false);
         ReevaluateTxDisplayGeometry();
         return id;
     }
 
-    private int OpenChannelCore(int sampleRateHz, int pixelWidth)
+    public int OpenRxDisplayChannel(int sampleRateHz, int pixelWidth) =>
+        OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: true);
+
+    private int OpenChannelCore(int sampleRateHz, int pixelWidth, bool displayOnly = false)
     {
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
         if (pixelWidth <= 0) throw new ArgumentOutOfRangeException(nameof(pixelWidth));
@@ -700,6 +745,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         bool anbExtOpened = false;
         bool nobExtOpened = false;
         bool analyzerOpened = false;
+        bool snrAnalyzerOpened = false;
         bool workerStarted = false;
         ChannelState? openedState = null;
 
@@ -782,17 +828,30 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             ConfigureAnalyzer(id, sampleRateHz, InSize, pixelWidth, zoomLevel: 1, _rxAnalyzerFftSize, AnalyzerWindow, AnalyzerKaiserPi);
             ConfigureDisplayAveraging(id);
 
+            // RX channel slots are process-global, so the corresponding display
+            // slots 32..63 are unique across engine instances and remain below
+            // WDSP's dMAX_DISPLAYS (72). They do not consume native channels.
+            int snrAnalyzerId = MaxWdspNativeChannels + id;
+            NativeMethods.XCreateAnalyzer(snrAnalyzerId, out rc, MaxFftSize, 1, 1, null);
+            if (rc != 0) throw new InvalidOperationException($"XCreateAnalyzer(SNR) failed rc={rc}");
+            snrAnalyzerOpened = true;
+            ConfigureSnrAnalyzer(snrAnalyzerId, sampleRateHz);
+
             int inQueueCapacity = ComputeInQueueCapacity(sampleRateHz);
             var state = new ChannelState
             {
                 Id = id,
                 Generation = Interlocked.Increment(ref _channelGeneration),
+                IsDisplayOnly = displayOnly,
                 SampleRateHz = sampleRateHz,
                 PixelWidth = pixelWidth,
+                SnrAnalyzerId = snrAnalyzerId,
+                SnrAnalyzerGeneration = Interlocked.Increment(ref s_snrAnalyzerGeneration),
                 OutDoubles = outDoubles,
                 InQueue = new BlockingCollection<double[]>(boundedCapacity: inQueueCapacity),
                 InQueueCapacity = inQueueCapacity,
                 Worker = null!,
+                AnalyzerFftSize = _rxAnalyzerFftSize,
             };
             openedState = state;
 
@@ -839,6 +898,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     openedState.InQueue.Dispose();
                     openedState.Cts.Dispose();
                 }
+                if (snrAnalyzerOpened)
+                    RunNativeLifecycleCriticalSection(() => NativeMethods.DestroyAnalyzer(MaxWdspNativeChannels + id));
                 ReleaseFailedNativeOpen(id, nativeChannelOpened, analyzerOpened, anbExtOpened, nobExtOpened);
             }
             throw;
@@ -851,6 +912,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         StopChannel(state);
     }
 
+    public void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
+
     private bool TrySnapshotRxDisplayGeometry(out int pixelWidth, out int sampleRateHz, out int zoomLevel)
     {
         pixelWidth = 0;
@@ -862,6 +925,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         {
             if (monitorId == kv.Key) continue;
             var state = kv.Value;
+            if (state.IsDisplayOnly) continue;
             if (state.Stopped) continue;
             if (state.PixelWidth <= 0 || state.SampleRateHz <= 0) continue;
 
@@ -872,6 +936,22 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         }
 
         return false;
+    }
+
+    internal bool TrySnapshotRxDisplayGeometryForTesting(
+        out int pixelWidth,
+        out int sampleRateHz,
+        out int zoomLevel) =>
+        TrySnapshotRxDisplayGeometry(out pixelWidth, out sampleRateHz, out zoomLevel);
+
+    internal int TxDisplayZoomLevelForTesting
+    {
+        get { lock (_txDispLock) return _txDispZoomLevel; }
+    }
+
+    internal int PsFeedbackDisplayZoomLevelForTesting
+    {
+        get { lock (_psFbDispLock) return _psFbDispZoomLevel; }
     }
 
     private void ReevaluateTxDisplayGeometry()
@@ -1183,10 +1263,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setRxAfGain channel={Id} db={Db:F1} linear={Linear:F4}", channelId, db, linear);
     }
 
-    public void SetZoom(int channelId, int level)
+    private bool TrySetRxDisplayZoom(int channelId, int level, out bool changed)
     {
         SyntheticDspEngine.ValidateZoomLevel(level);
-        if (!_channels.TryGetValue(channelId, out var state)) return;
+        changed = false;
+        if (!_channels.TryGetValue(channelId, out var state)) return false;
         // Analyzer reconfig can race with Spectrum0 (worker) and GetPixels
         // (pipeline tick); the lock is the simpler option of the two team-lead
         // flagged. Briefly holds both producer and consumer while WDSP rebuilds
@@ -1194,10 +1275,51 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // wire — the averaging recovers in ~tau (≈100 ms) after the switch.
         lock (state.AnalyzerLock)
         {
-            if (state.ZoomLevel == level) return;
-            state.ZoomLevel = level;
-            ConfigureAnalyzer(channelId, state.SampleRateHz, InSize, state.PixelWidth, level, _rxAnalyzerFftSize, AnalyzerWindow, AnalyzerKaiserPi);
+            if (state.ZoomLevel != level)
+            {
+                state.ZoomLevel = level;
+                ConfigureAnalyzer(channelId, state.SampleRateHz, InSize, state.PixelWidth, level, state.AnalyzerFftSize, AnalyzerWindow, AnalyzerKaiserPi);
+                changed = true;
+            }
         }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Raise (or restore) the analyzer FFT size for a single RX display
+    /// channel. The wideband detail DDC uses this to reach pixel-perfect bin
+    /// density at deep zoom (65,536 points ≈ 2.9 Hz bins at 192 kHz) without
+    /// touching the operator-facing panadapter FFT default. Zoom reconfigs
+    /// re-read <see cref="ChannelState.AnalyzerFftSize"/>, so the override is
+    /// sticky. Out-of-range values snap to the 16,384 default via
+    /// <see cref="NormalizeRxAnalyzerFftSize"/>.
+    /// </summary>
+    public void SetRxDisplayFftSize(int channelId, int fftSize)
+    {
+        if (_disposed != 0) return;
+        int normalized = NormalizeRxAnalyzerFftSize(fftSize);
+        if (!_channels.TryGetValue(channelId, out var state)) return;
+        // Same race story as TrySetRxDisplayZoom: SetAnalyzer rebuilds the
+        // bin mapping while Spectrum0/GetPixels may be mid-frame.
+        lock (state.AnalyzerLock)
+        {
+            if (state.AnalyzerFftSize == normalized) return;
+            state.AnalyzerFftSize = normalized;
+            ConfigureAnalyzer(channelId, state.SampleRateHz, InSize, state.PixelWidth, state.ZoomLevel, normalized, AnalyzerWindow, AnalyzerKaiserPi);
+        }
+        _log.LogInformation("wdsp.setRxDisplayFftSize channel={Id} fftSize={FftSize}", channelId, normalized);
+    }
+
+    public void SetRxDisplayZoom(int channelId, int level)
+    {
+        if (!TrySetRxDisplayZoom(channelId, level, out bool changed) || !changed) return;
+        _log.LogInformation("wdsp.setRxDisplayZoom channel={Id} level={Level}", channelId, level);
+    }
+
+    public void SetZoom(int channelId, int level)
+    {
+        if (!TrySetRxDisplayZoom(channelId, level, out bool changed) || !changed) return;
 
         // Mirror zoom onto the TX analyzer so the TX panadapter span stays
         // lock-step with RX — otherwise keying mid-zoom would show a different
@@ -1896,6 +2018,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public bool TryGetDisplayPixels(int channelId, DisplayPixout which, Span<float> dbOut)
     {
+        if (which == DisplayPixout.SnrPower) return false;
         if (!_channels.TryGetValue(channelId, out var state)) return false;
         if (dbOut.Length != state.PixelWidth)
             throw new ArgumentException($"expected span of {state.PixelWidth}", nameof(dbOut));
@@ -1910,6 +2033,27 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // the teardown mutually exclusive and closes the crash window.
             if (state.Stopped || !state.AnalyzerHasSnapped) return false;
             NativeMethods.GetPixels(channelId, (int)which, ref MemoryMarshal.GetReference(dbOut), out int flag);
+            return flag == 1;
+        }
+    }
+
+    public bool TryGetRxSnrPowerSpectrum(
+        int channelId, Span<float> dbOut, out RxSnrSpectrumInfo info)
+    {
+        info = default;
+        if (!_channels.TryGetValue(channelId, out var state)) return false;
+        info = new RxSnrSpectrumInfo(
+            SnrAnalyzerPixelWidth, state.SampleRateHz, state.SnrAnalyzerGeneration);
+        if (dbOut.Length < SnrAnalyzerPixelWidth)
+            throw new ArgumentException($"expected span of at least {SnrAnalyzerPixelWidth}", nameof(dbOut));
+
+        lock (state.AnalyzerLock)
+        {
+            if (state.Stopped || !state.SnrAnalyzerHasSnapped) return false;
+            var pixels = dbOut[..SnrAnalyzerPixelWidth];
+            NativeMethods.GetPixels(
+                state.SnrAnalyzerId, (int)DisplayPixout.SnrPower,
+                ref MemoryMarshal.GetReference(pixels), out int flag);
             return flag == 1;
         }
     }
@@ -2012,7 +2156,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     internal static int NormalizeRxAnalyzerFftSize(int fftSize) => fftSize switch
     {
-        2048 or 4096 or 8192 or 16384 or 32768 => fftSize,
+        // Extended to MaxFftSize so per-channel high-resolution consumers
+        // (SetRxDisplayFftSize, wideband detail) can use the full analyzer
+        // range XCreateAnalyzer already allocates for.
+        2048 or 4096 or 8192 or 16384 or 32768 or 65536 or 131072 or MaxFftSize => fftSize,
         _ => AnalyzerFftSize,
     };
 
@@ -2075,7 +2222,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 if (state.Stopped) continue;
                 NativeMethods.ResetPixelBuffers(state.Id);
+                NativeMethods.ResetPixelBuffers(state.SnrAnalyzerId);
                 state.AnalyzerHasSnapped = false;
+                state.SnrAnalyzerHasSnapped = false;
             }
         }
 
@@ -4053,6 +4202,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // fast-attack after a display center change (display.cs:6360-6383).
     private const double FastAttackTauSec = 0.020;
     private const int LogRecursiveMode = 3;
+    private const int LinearRecursiveMode = 1;
+    private const int AveragePowerDetectorMode = 2;
+    private const double SnrPowerAvgTauSec = 0.750;
 
     private static void ConfigureDisplayAveraging(int disp)
         => ConfigureDisplayAveragingTau(disp, DefaultAvgTauSec);
@@ -4066,6 +4218,39 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             NativeMethods.SetDisplayAvBackmult(disp, pixout, backmult);
             NativeMethods.SetDisplayNumAverage(disp, pixout, 2);
         }
+    }
+
+    private static void ConfigureSnrPowerOutput(int disp, int sampleRateHz)
+    {
+        int pixout = (int)DisplayPixout.SnrPower;
+        double backmult = Math.Exp(-1.0 / (PipelineFps * SnrPowerAvgTauSec));
+        NativeMethods.SetDisplayDetectorMode(disp, pixout, AveragePowerDetectorMode);
+        NativeMethods.SetDisplayAverageMode(disp, pixout, LinearRecursiveMode);
+        NativeMethods.SetDisplayAvBackmult(disp, pixout, backmult);
+        NativeMethods.SetDisplayNumAverage(disp, pixout, 2);
+        // WDSP's analyzer starts with sample_rate=0; NormOneHz divides by it.
+        // The rate must be installed before enabling one-hertz normalization.
+        NativeMethods.SetDisplaySampleRate(disp, sampleRateHz);
+        NativeMethods.SetDisplayNormOneHz(disp, pixout, 1);
+    }
+
+    private static void ConfigureSnrAnalyzer(int disp, int sampleRateHz)
+    {
+        WdspWisdomInitializer.WaitUntilReady();
+        int overlap = (int)Math.Max(0,
+            Math.Ceiling(AnalyzerFftSize - (double)sampleRateHz / AnalyzerFps));
+        int maxW = AnalyzerFftSize + (int)Math.Min(
+            AnalyzerKeepTime * sampleRateHz,
+            AnalyzerKeepTime * AnalyzerFftSize * AnalyzerFps);
+        int flp = 0;
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            NativeMethods.SetAnalyzer(
+                disp, 3, 1, 1, ref flp, AnalyzerFftSize, InSize,
+                AnalyzerWindow, AnalyzerKaiserPi, overlap, 0, 0.0, 0.0,
+                SnrAnalyzerPixelWidth, 1, 0, 0.0, 0.0, maxW);
+            ConfigureSnrPowerOutput(disp, sampleRateHz);
+        });
     }
 
     // TX analyzer wrapper: maps the RX display span onto the TX/PS-feedback
@@ -4186,7 +4371,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             AnalyzerKeepTime * fftSize * AnalyzerFps);
         int flp = 0;
 
-        RunNativeLifecycleCriticalSection(() => NativeMethods.SetAnalyzer(
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            NativeMethods.SetAnalyzer(
                 disp: disp,
                 n_pixout: 2,
                 n_fft: 1,
@@ -4205,7 +4392,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 calset: 0,
                 fmin: 0.0,
                 fmax: 0.0,
-                max_w: maxW));
+                max_w: maxW);
+        });
     }
 
     private void StopChannel(ChannelState state)
@@ -4234,6 +4422,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 RunNativeLifecycleCriticalSection(() =>
                 {
                     NativeMethods.DestroyAnalyzer(state.Id);
+                    NativeMethods.DestroyAnalyzer(state.SnrAnalyzerId);
                     // Tear down EXT blankers before CloseChannel — they reference our id
                     // slot in panb[]/pnob[] and outlive CloseChannel unless destroyed here.
                     NativeMethods.DestroyAnbEXT(state.Id);
@@ -4310,9 +4499,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 lock (state.AnalyzerLock)
                 {
                     NativeMethods.Spectrum0(state.SpectrumRun, state.Id, 0, 0, ref spectrumIq[0]);
+                    NativeMethods.Spectrum0(state.SpectrumRun, state.SnrAnalyzerId, 0, 0, ref spectrumIq[0]);
                 }
                 // The analyzer now has a snapped pixel buffer; GetPixels is safe.
                 state.AnalyzerHasSnapped = true;
+                state.SnrAnalyzerHasSnapped = true;
                 state.FreeFrames.Enqueue(frame);
 
                 long frameTicks = System.Diagnostics.Stopwatch.GetTimestamp() - frameStart;

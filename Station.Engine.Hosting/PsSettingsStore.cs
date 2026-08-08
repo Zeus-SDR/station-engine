@@ -27,13 +27,14 @@ namespace Zeus.Server;
 // PureSignal settings persistence. Both production hosts supply
 // PrefsDbPath.EngineGet(), so this store's ps_settings collection lives in
 // station-engine.db alongside DspSettingsStore rather than in zeus-prefs.db.
-// Stores the operator's calibration tuning (timing delays, auto-attenuate,
-// per-board HW peak) so it survives server restarts.
+// Stores the operator's arm intent and calibration tuning (timing delays,
+// auto-attenuate, per-board HW peak) so they survive server restarts.
 //
-// PsEnabled (the master arm) is process-lifetime only and never persisted.
-// Every new server process starts disarmed until an explicit operator POST to
-// /api/tx/ps. PsSingle is likewise session-only; this is the same explicit-
-// action discipline as MOX/TUN, never an automatic resume.
+// Runtime PsEnabled still starts false in every new process. Only the distinct
+// ArmIntent field records an explicit operator arm/disarm decision, and a
+// persisted arm is applied through the connect-time disarm/rearm sanitize
+// cycle. Legacy raw PsEnabled BSON is deliberately ignored forever. PsSingle
+// is session-only, as are the MOX/TUN keying controls.
 //
 // `HwPeakByBoard` IS persisted as of 2026-05-16. The earlier "re-derive per
 // radio at connect time" assumption clobbered operator-calibrated values
@@ -165,6 +166,11 @@ public sealed class PsSettingsEntry
 {
     public int Id { get; set; }
     public string ProfileId { get; set; } = string.Empty;
+    // Operator arm intent, written only by an explicit RadioService.SetPs.
+    // Missing means false for first-run and legacy stores. This name is
+    // deliberately distinct from poisoned legacy raw PsEnabled BSON, which
+    // must remain ignored forever (PureSignalNoAutoArmStartupMatrixTests).
+    public bool ArmIntent { get; set; } = false;
     // Cal-mode default — Auto = continuous adapt. Persisted because operators
     // who prefer single-shot calibration (and run TwoTone manually) want that
     // selection to stick across sessions.
@@ -179,9 +185,10 @@ public sealed class PsSettingsEntry
     public PsFeedbackSource Source { get; set; } = PsFeedbackSource.Internal;
     // Two-tone test generator settings. Persisted so an operator who has
     // dialled in custom IMD test tones (e.g. for a specific filter response
-    // or PA test) doesn't have to re-enter them every session. PsEnabled and
-    // TwoToneEnabled are intentionally NOT persisted -- same operator-action
-    // discipline as MOX/TUN -- but the dialled-in freqs/mag are.
+    // or PA test) doesn't have to re-enter them every session. Runtime
+    // PsEnabled and TwoToneEnabled are intentionally NOT stored here; the
+    // distinct ArmIntent above carries only the operator's PS arm decision,
+    // while the dialled-in frequencies/magnitude persist below.
     // Defaults match tx-store.ts (700/1900/0.49) and pihpsdr.
     public double TwoToneFreq1 { get; set; } = 700.0;
     public double TwoToneFreq2 { get; set; } = 1900.0;

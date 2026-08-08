@@ -154,6 +154,9 @@ public sealed class TxAudioIngest : IDisposable
     private const float MonitorPreviewOpenPeak = 0.012f; // ~-38 dBFS
     private const float MonitorPreviewOpenRms = 0.003f;  // ~-50 dBFS
     private const int MonitorPreviewHangBlocks = 15;     // ~320 ms at 1024/48k
+    // All-zero mic block substituted for gated idle blocks so the monitor
+    // stream stays gapless while the preview gate is closed. Never written.
+    private static readonly float[] SilentMicBlock = new float[MicBlockSamples];
 
     private long _totalMicSamples;
     private long _totalTxBlocks;
@@ -921,20 +924,20 @@ public sealed class TxAudioIngest : IDisposable
             return;
         }
 
-        // Cheap early-out for the host/radio gate (external-audio-jacks
-        // re-port). This is NOT the hard gate — _activeSource can still flip
-        // between here and the accumulation lock below, so the AUTHORITATIVE
-        // single-select decision is re-checked atomically with the append (see
-        // "ATOMIC single-select gate" inside the accumulation lock). Doing the
-        // obvious reject here too avoids running the MOX-edge / tap / WDSP-sizing
-        // work for a block the authoritative check would drop anyway. TCI/WAV
-        // bypass this compare — they are operator-explicit overrides gated by the
-        // recency hysteresis above.
+        // Early host/radio gate (external-audio-jacks re-port). The compare and
+        // friend-PTT publication share the _sync lock with SetActiveSource, so
+        // a completed source switch can never be followed by one stale chat block. The later
+        // accumulator gate remains authoritative for the separate WDSP append,
+        // since _activeSource can flip again after this lock is released. TCI/WAV
+        // bypass both the live-mic bridge and this compare.
         if (source is MicBlockSource.Host or MicBlockSource.RadioMic)
         {
             lock (_sync)
             {
                 if (source != _activeSource) { _droppedFrames++; return; }
+                // Friend PTT hears the same selected live source that MOX would
+                // transmit, but this pre-MOX feed never keys the radio.
+                _hub.BroadcastNativeMicPcm(f32lePayload.Span);
             }
         }
 
@@ -1053,17 +1056,25 @@ public sealed class TxAudioIngest : IDisposable
         }
 
         // TX Preview is a local monitor path, not the on-air path. While MOX is
-        // off, do not keep clocking idle mic/noise through TXA: the leveler/CFC/
+        // off, do not clock idle mic/noise through TXA: the leveler/CFC/
         // ALC stack can turn a tiny idle floor or plugin self-noise into an
         // audible, self-rising monitor tone. Speech opens the preview gate
         // immediately and a short hang avoids chopping word tails. Keyed TX,
         // TCI, and WAV playback bypass this gate entirely.
+        //
+        // Substitute digital silence rather than dropping the block: while the
+        // monitor is on it REPLACES the RX audio at every sink, so a dropped
+        // block starves the playback ring — the native output falls into its
+        // ~90 ms rebuffer cycle on every speech pause and each word onset comes
+        // back clipped (the "choppy preview" report). Zeros through the chain
+        // keep the monitor stream gapless and the TXA/VST state warm, and the
+        // leveler cannot raise a tone out of exact zeros, so the gate's original
+        // purpose is preserved.
         if (monitorOn && !moxNow
             && source is MicBlockSource.Host or MicBlockSource.RadioMic
             && ShouldSuppressIdleMonitorPreviewBlock(samples))
         {
-            lock (_sync) _accumulatorFill = 0;
-            return;
+            samples = SilentMicBlock;
         }
 
         lock (_sync)

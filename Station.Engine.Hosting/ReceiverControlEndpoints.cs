@@ -4,6 +4,12 @@ using Zeus.Contracts;
 
 namespace Zeus.Server;
 
+/// <summary>
+/// Hosting-only zoom request. <see cref="CenterHz"/> is optional so existing
+/// callers that send only <c>{ "level": n }</c> retain identical behavior.
+/// </summary>
+public sealed record SpectralZoomSetRequest(int Level, long? CenterHz = null);
+
 /// <summary>Maps engine-owned receiver configuration and tuning routes.</summary>
 public static class ReceiverControlEndpoints
 {
@@ -108,13 +114,16 @@ public static class ReceiverControlEndpoints
                 {
                     error = $"receiver index out of range (0..{WireContract.KiwiReceiverIndex})",
                 });
-            if (req.Hz < 0 || req.Hz > 60_000_000)
+            bool validFrequency = index == WireContract.KiwiReceiverIndex
+                ? req.Hz is >= 0 and <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                : radio.IsExternalFrequencyAvailable(req.Hz, allowZero: true);
+            if (!validFrequency)
             {
                 log.LogInformation(
                     "api.receivers.lo rejected index={Index} hz={Hz}",
                     index,
                     req.Hz);
-                return Results.BadRequest(new { error = "hz out of range [0, 60000000]" });
+                return Results.BadRequest(new { error = "hz is outside the receiver's available range" });
             }
 
             log.LogInformation("api.receivers.lo index={Index} hz={Hz}", index, req.Hz);
@@ -168,23 +177,35 @@ public static class ReceiverControlEndpoints
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
         endpoints.MapPost("/api/rx/zoom", (
-            ZoomSetRequest req,
+            SpectralZoomSetRequest req,
             RadioService radio,
+            DspPipelineService pipeline,
             IExternalReceiverControlPort external) =>
         {
-            log.LogInformation("api.rx.zoom level={Level}", req.Level);
+            log.LogInformation(
+                "api.rx.zoom level={Level} centerHz={CenterHz}",
+                req.Level,
+                req.CenterHz);
+            int maxZoom = radio.CurrentMaxDisplayZoomLevel;
             if (req.Level < RadioService.MinDisplayZoomLevel
-                || req.Level > RadioService.MaxDisplayZoomLevel)
+                || req.Level > maxZoom)
             {
                 return Results.BadRequest(new
                 {
                     error =
-                        $"zoom level must be in [{RadioService.MinDisplayZoomLevel},{RadioService.MaxDisplayZoomLevel}]; got {req.Level}",
+                        $"zoom level must be in [{RadioService.MinDisplayZoomLevel},{maxZoom}]; got {req.Level}",
                 });
             }
 
-            external.SetZoom(req.Level);
-            return Results.Ok(radio.SetZoom(req.Level));
+            if (req.CenterHz is < 0 or > 60_000_000)
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"zoom center must be in [0,60000000] Hz; got {req.CenterHz}",
+                });
+            }
+
+            return Results.Ok(pipeline.ApplyWidebandZoomRequest(req.Level, req.CenterHz));
         });
 
         return endpoints;

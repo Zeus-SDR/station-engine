@@ -58,7 +58,23 @@ public sealed class RadioService : IDisposable
 {
     private const int DefaultHpsdrPort = 1024;
     internal const int MinDisplayZoomLevel = SyntheticDspEngine.MinZoomLevel;
+    // Existing consumers (P3 sidecar, MIDI, P1) use this as the raw-wideband
+    // ceiling. Keep it stable; P2's rate-aware hybrid ceiling is exposed only
+    // through CurrentMaxDisplayZoomLevel.
     internal const int MaxDisplayZoomLevel = WidebandSpectrumAnalyzer.MaxZoomLevel;
+    internal const int LegacyMaxDisplayZoomLevel = MaxDisplayZoomLevel;
+    internal int CurrentMaxDisplayZoomLevel
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _p2Active
+                    ? P2WidebandZoomPolicy.MaxGlobalZoomForRate(_state.SampleRate)
+                    : LegacyMaxDisplayZoomLevel;
+            }
+        }
+    }
     internal const double DefaultAgcTopDb = 90.0;   // Thetis radio.cs:1021 rx_agc_max_gain default
     // Operator AGC-T baseline range. Below ~30 dB the RX audio is effectively
     // muted; the top is Thetis's +120 slider rail. The 30..90 window used
@@ -114,6 +130,8 @@ public sealed class RadioService : IDisposable
     // Global (per-radio, NOT per-band) TX-audio source selection. Pushed via
     // PushAudioFrontEnd on store edit + connect (external-audio-jacks re-port).
     private readonly AudioSettingsStore? _audioStore;
+    private readonly TransverterSettingsStore? _transverterSettingsStore;
+    private readonly LayoutStore? _layoutStore;
     // Global (per-radio, NOT per-band) HL2 user GPIO mask (external-ports plan,
     // Phase 5; re-ported in the external-port parity audit). Pushed via
     // PushHl2Gpio on store edit + connect. HL2-only on the wire.
@@ -125,6 +143,10 @@ public sealed class RadioService : IDisposable
     // Empty when nothing is connected — PersistPsState skips HW Peak persistence
     // in that case (no board → no slot to write).
     private string _currentPsBoardKey = string.Empty;
+    // Persisted operator decision, intentionally separate from live
+    // StateDto.PsEnabled. Only SetPs changes this field; watchdog, disconnect,
+    // and connect-time sanitize disarms are runtime safety transitions.
+    private bool _psArmIntent;
     // Mirror of the persisted PS TX feedback attenuation (dB) for the
     // currently-connected board. Loaded from TxAttnByBoard on connect
     // (GetPersistedPsTxAttnDb), updated by SetPsTxAttenuationDb when the
@@ -169,8 +191,8 @@ public sealed class RadioService : IDisposable
     // re-pushed on reconnect. Seeded from CwSettingsStore in the ctor; updated
     // at runtime via SetCwKeyerConfig from the CW settings endpoint. Default
     // mode 0 (straight) is safe — see zeus-bks.
-    //   P1: speed + mode go to C&C register 0x0B (already wired).
-    //   P2: speed + mode + sidetone arm the radio's internal keyer via the
+    //   P1: speed + mode + weight + paddle direction go to C&C register 0x0B.
+    //   P2: all persisted keyer values arm the radio's internal keyer via the
     //       TxSpecific packet — issue #1032. Sidetone freq/gain are cached
     //       here too so the P2 keyer's radio-generated sidetone tracks the
     //       operator's CW pitch/level.
@@ -178,6 +200,10 @@ public sealed class RadioService : IDisposable
     private int _cwKeyerMode;
     private int _cwSidetoneHz = CwSettingsStore.DefaultSidetoneHz;
     private double _cwSidetoneGainDb = CwSettingsStore.DefaultSidetoneGainDb;
+    private int _cwBreakIn = CwSettingsStore.DefaultBreakIn ? 1 : 0;
+    private int _cwHangMs = CwSettingsStore.DefaultHangMs;
+    private int _cwWeight = CwSettingsStore.DefaultWeight;
+    private int _cwPaddleReverse = CwSettingsStore.DefaultPaddleReverse ? 1 : 0;
     // Independent TUN drive %. When TUN is keyed, the recompute uses this in
     // place of _drivePct so the operator can pre-set a lower tune level (and
     // the same per-band PA gain gives equal watts at equal percentages). piHPSDR
@@ -214,6 +240,7 @@ public sealed class RadioService : IDisposable
     internal Action? RecallRaceTestHook { get; set; }
 
     private StateDto _state;
+    private volatile int _currentMode;
 
     // Session-only per-receiver config for the extra DDC receivers (RX3+, index
     // 2..MaxReceivers-1). RX1/RX2 keep their tuning/control on the flat
@@ -261,8 +288,14 @@ public sealed class RadioService : IDisposable
     private Func<int, TransmitSafetyDecision>? _txDriveSafetyEvaluator;
 
     private Protocol1Client? _activeClient;
+    // Interface-only override used by socketless pipeline tests that need to
+    // capture P1 writes. Production and real-client tests always leave it null.
+    private IProtocol1Client? _activeClientForTest;
     private P1ConnectionAttempt? _activeP1ConnectionAttempt;
     private Action? _activeClientDisconnectedHandler;
+    // Socketless connection seam for tests that must exercise the complete
+    // RadioService connect orchestration. Production always leaves this false.
+    private bool _bypassP1SocketIoForTests = false;
     private readonly P1StartFailureRecovery? _p1StartFailureRecovery;
     private CancellationTokenSource _operatorConnectionActionCts = new();
     private long _operatorConnectionGeneration;
@@ -471,7 +504,7 @@ public sealed class RadioService : IDisposable
     private readonly IExternalReceiverSource _externalReceiverSource;
     private readonly int? _defaultConnectSampleRateHz;
 
-    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null)
+    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null, TransverterSettingsStore? transverterSettingsStore = null, LayoutStore? layoutStore = null)
     {
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<RadioService>();
@@ -486,6 +519,8 @@ public sealed class RadioService : IDisposable
         _radioStateStore = radioStateStore;
         _bandMemoryStore = bandMemoryStore;
         _audioStore = audioStore;
+        _transverterSettingsStore = transverterSettingsStore;
+        _layoutStore = layoutStore;
         if (p1Discovery is not null)
         {
             _p1StartFailureRecovery = new P1StartFailureRecovery(
@@ -515,6 +550,10 @@ public sealed class RadioService : IDisposable
             _hl2GpioStore.Changed += PushHl2Gpio;
         if (_preferredRadioStore is not null)
             _preferredRadioStore.Changed += RecomputePaAndPush;
+        if (_transverterSettingsStore is not null)
+            _transverterSettingsStore.Changed += OnTransverterSettingsChanged;
+        if (_layoutStore is not null)
+            _layoutStore.ActiveTransverterEnabledChanged += OnActiveTransverterSelectionChanged;
         // External slice mutations re-project and re-broadcast state exactly
         // like a hardware DDC mutation.
         _externalReceiverSource = externalReceiverSource ?? new NullExternalReceiverSource();
@@ -533,6 +572,10 @@ public sealed class RadioService : IDisposable
             Volatile.Write(ref _cwKeyerMode, (int)cw.KeyerMode);
             _cwSidetoneHz = cw.SidetoneHz;
             _cwSidetoneGainDb = cw.SidetoneGainDb;
+            Volatile.Write(ref _cwBreakIn, cw.BreakIn ? 1 : 0);
+            Volatile.Write(ref _cwHangMs, cw.HangMs);
+            Volatile.Write(ref _cwWeight, cw.Weight);
+            Volatile.Write(ref _cwPaddleReverse, cw.PaddleReverse ? 1 : 0);
         }
 
         // Load persisted DSP settings from the store, or use defaults if not found
@@ -611,15 +654,16 @@ public sealed class RadioService : IDisposable
             }
         }
 
-        // Load persisted PS calibration and tuning only. PsEnabled is
-        // process-lifetime only and never persisted: every new server process
-        // starts disarmed until an explicit operator POST to /api/tx/ps.
-        // MOX/TUN/TwoToneEnabled remain session-only. PsHwPeak is resolved
-        // per-radio in ApplyPsHwPeakForConnection (called from
-        // ConnectAsync / ConnectP2Async), which prefers the persisted
-        // per-board value when present and falls back to the factory
-        // default otherwise.
+        // Load persisted PS operator intent, calibration, and tuning. Runtime
+        // PsEnabled still starts false in every process; ArmIntent is applied
+        // only by the connect-time sanitize cycle after the fresh engine has
+        // received its calibration state. MOX/TUN/TwoToneEnabled remain
+        // session-only. PsHwPeak is resolved per-radio in
+        // ApplyPsHwPeakForConnection (called from ConnectAsync /
+        // ConnectP2Async), which prefers the persisted per-board value when
+        // present and falls back to the factory default otherwise.
         var ps = _psStore?.Get();
+        _psArmIntent = ps?.ArmIntent ?? false;
 
         // RadioStateStore snapshot — hydrates active mode/VFO/filter/volume/zoom
         // and the per-mode-family filter memory. Null on first run; falls through
@@ -754,7 +798,7 @@ public sealed class RadioService : IDisposable
             // register — driving both clobbered each other). Always null.
             AgcThresholdDbm: null,
             // PS persisted fields (or DTO defaults when not persisted yet).
-            PsEnabled: false, // process-lifetime only; never persisted; new process starts disarmed until explicit POST
+            PsEnabled: false, // runtime arm starts off; persisted intent is sanitized and applied after connect
             PsAuto: ps?.Auto ?? true,
             PsAutoAttenuate: ps?.AutoAttenuate ?? true,
             PsMoxDelaySec: PsTimingLimits.ClampMoxDelaySec(ps?.MoxDelaySec ?? PsTimingLimits.DefaultMoxDelaySec),
@@ -797,6 +841,7 @@ public sealed class RadioService : IDisposable
             RogerBeepEnabled: rsSnap?.RogerBeepEnabled ?? false,
             SplitEnabled: false,
             SplitTxHz: 0);
+        _currentMode = (int)_state.Mode;
 
         _state = _state with { TxPhaseRotator = persistedTxPhaseRotator };
 
@@ -884,8 +929,9 @@ public sealed class RadioService : IDisposable
     /// callers don't drop fields by writing only what they touched. Called
     /// from SetPs, SetPsAdvanced, SetPsFeedbackSource, and SetTwoTone.
     ///
-    /// PsEnabled is process-lifetime only and never persisted. Every new server
-    /// process starts disarmed until an explicit operator POST to /api/tx/ps.
+    /// Runtime PsEnabled is never written to the store. ArmIntent is the
+    /// separate persisted operator decision; only SetPs changes its in-memory
+    /// mirror, so every other caller preserves it through a full-row rewrite.
     /// TwoToneEnabled remains session-only because it can key the transmitter.
     /// PsHwPeak IS persisted per-connected-board via the HwPeakByBoard dictionary;
     /// when no board is currently connected the HwPeak portion of the write
@@ -895,6 +941,8 @@ public sealed class RadioService : IDisposable
     {
         if (_psStore is null) return;
         var snap = Snapshot();
+        bool armIntent;
+        lock (_sync) armIntent = _psArmIntent;
         // Preserve any existing per-board HW Peak map and only mutate the
         // slot owned by the currently-connected radio. Reset / disconnect
         // paths set _currentPsBoardKey back to empty, which skips the HW
@@ -920,6 +968,7 @@ public sealed class RadioService : IDisposable
         }
         _psStore.Upsert(new PsSettingsEntry
         {
+            ArmIntent = armIntent,
             Auto = snap.PsAuto,
             AutoAttenuate = snap.PsAutoAttenuate,
             MoxDelaySec = snap.PsMoxDelaySec,
@@ -1017,7 +1066,7 @@ public sealed class RadioService : IDisposable
 
     public IProtocol1Client? ActiveClient
     {
-        get { lock (_sync) return _activeClient; }
+        get { lock (_sync) return _activeClientForTest ?? _activeClient; }
     }
 
     /// <summary>
@@ -1039,7 +1088,7 @@ public sealed class RadioService : IDisposable
     /// </summary>
     public bool IsConnected
     {
-        get { lock (_sync) return _activeClient is not null || _p2Active || _p3Active; }
+        get { lock (_sync) return _activeClientForTest is not null || _activeClient is not null || _p2Active || _p3Active; }
     }
 
     /// <summary>True while a Protocol-1 client owns the connection — i.e. the
@@ -1048,7 +1097,7 @@ public sealed class RadioService : IDisposable
     /// actually drain it.</summary>
     internal bool IsProtocol1Active
     {
-        get { lock (_sync) return _activeClient is not null; }
+        get { lock (_sync) return _activeClientForTest is not null || _activeClient is not null; }
     }
 
     /// <summary>True while a Protocol-2 connection owns the radio — the symmetric
@@ -1100,6 +1149,10 @@ public sealed class RadioService : IDisposable
     {
         lock (_sync) return ProjectedStateUnderLock();
     }
+
+    /// <summary>Current RX1 mode without taking the radio-state lock or
+    /// projecting a StateDto. Intended for protocol RX edge handlers.</summary>
+    internal RxMode CurrentMode => (RxMode)_currentMode;
 
     /// <summary>Current operator preamp toggle. PreampOn isn't on the
     /// StateDto wire format, so DspPipelineService reads it directly when
@@ -1241,6 +1294,70 @@ public sealed class RadioService : IDisposable
             : fallbackKind;
     }
 
+    /// <summary>
+    /// Applies the current operator board selection to a live Protocol-1
+    /// client only while its EP6 framing and transmit path are idle. A deferred
+    /// selection is deliberately left for the next connection rather than
+    /// changing receiver-count framing on an armed or keyed stream.
+    /// </summary>
+    internal void ApplyBoardKindToActiveClientIfSafe()
+    {
+        Protocol1Client client;
+        HpsdrBoardKind previous;
+        string? deferredReason = null;
+
+        HpsdrBoardKind discovered;
+        lock (_sync)
+        {
+            client = _activeClient!;
+            if (client is null) return;
+            discovered = _activeP1ConnectionAttempt?.DiscoveredKind
+                ?? HpsdrBoardKind.Unknown;
+        }
+
+        // PreferredRadioStore can raise Changed while holding its own lock.
+        // Resolve outside _sync so this path does not add the inverse lock edge.
+        var resolved = ResolveBoardKindForPreferences(
+            discovered,
+            HpsdrBoardKind.Unknown);
+        if (resolved == HpsdrBoardKind.Unknown) return;
+
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_activeClient, client)) return;
+            previous = client.BoardKind;
+            if (resolved == previous) return;
+
+            if (_state.PsEnabled || client.PsEnabled)
+                deferredReason = "PureSignal is armed";
+            else if (_tunActive)
+                deferredReason = "TUNE is active";
+            else if (_mox)
+                deferredReason = "MOX is active";
+
+            if (deferredReason is null)
+                client.SetBoardKind(resolved);
+        }
+
+        if (deferredReason is not null)
+        {
+            _log.LogWarning(
+                "radio.board override change deferred because {Reason}; board={Board} will be retried when safe and otherwise takes effect on the next connect",
+                deferredReason,
+                resolved);
+            return;
+        }
+
+        _log.LogInformation(
+            "radio.board override applied to live Protocol-1 client previous={Previous} board={Board}",
+            previous,
+            resolved);
+        // PreferredRadioStore.Changed fired before the client board latch was
+        // safe to update, so replay PA/filter-derived state once the new board
+        // is authoritative for the live P1 client.
+        RecomputePaAndPush();
+    }
+
     public async Task<StateDto> ConnectAsync(string endpoint, int sampleRate, CancellationToken ct = default,
         HpsdrBoardKind discoveredKind = HpsdrBoardKind.Unknown, string? firmware = null,
         PhysicalAddress? mac = null)
@@ -1324,6 +1441,10 @@ public sealed class RadioService : IDisposable
                 Status = ConnectionStatus.Connecting,
                 Endpoint = endpoint,
                 SampleRate = hpsdrRate.SampleRateHz(),
+                // A connection always begins from runtime disarm. Persisted
+                // intent is applied only at the completed-connect sanitize
+                // hook, after calibration and attenuation restoration.
+                PsEnabled = false,
             };
             // Fresh connection — reset per-session auto-ATT state so a sticky
             // offset from a previous session doesn't leak onto new hardware.
@@ -1341,25 +1462,24 @@ public sealed class RadioService : IDisposable
 
         try
         {
-            await client.ConnectAsync(ipEndpoint, ct).ConfigureAwait(false);
-            // Plumb the discovered board byte so ConnectedBoardKind returns
-            // the real board rather than the Protocol1Client default
-            // (HermesLite2). Without this, an ANAN-10E (Hermes, 0x01) is
-            // treated as HL2 for PA calibration / drive profile — issue #294.
-            if (discoveredKind != HpsdrBoardKind.Unknown)
-                client.SetBoardKind(discoveredKind);
-            // #1302 F2: hand the current PS arm state to the client BEFORE
-            // StartAsync. PsEnabled survives a disconnect (by design — a
-            // separate decision), so a reconnect-while-armed must start
-            // DIRECTLY in 4-DDC mode on HermesC10: the initial handshake
-            // announces numRx=3 and the parser opens in 4-DDC format, and the
-            // radio's persisted IF_last_chan is corrected by the pre-announce
-            // frames in StartAsync while run=0. The later DspPipelineService
-            // resync then finds the client already in the requested mode and
-            // performs NO live transition (SetPsEnabledAsync is idempotent).
+            if (!_bypassP1SocketIoForTests)
+                await client.ConnectAsync(ipEndpoint, ct).ConfigureAwait(false);
+            // Latch the effective board before any board-gated configuration
+            // reads the client. With Override Detection off (or Auto selected),
+            // discovery still wins exactly as before. Unknown keeps the fresh
+            // client's backwards-compatible default.
+            var resolvedKind = ResolveBoardKindForPreferences(
+                discoveredKind,
+                HpsdrBoardKind.Unknown);
+            if (resolvedKind != HpsdrBoardKind.Unknown)
+                client.SetBoardKind(resolvedKind);
+            // #1302 F2: every fresh client starts explicitly disarmed before
+            // StartAsync, so no PS-enable bit can precede completed-connect
+            // calibration restore. The connect-tail sanitize later performs
+            // the required live disarm/rearm transition when ArmIntent is set.
             // Board-gated effects only: on non-PS P1 boards this stores a
             // state-tracking flag with zero wire impact.
-            client.SetPsEnabled(Snapshot().PsEnabled);
+            client.SetPsEnabled(false);
             int restoredHz = ResolveConnectSampleRateHz(client.BoardKind, hpsdrRate.SampleRateHz(), protocol2: false);
             if (restoredHz != hpsdrRate.SampleRateHz())
             {
@@ -1367,7 +1487,8 @@ public sealed class RadioService : IDisposable
                 lock (_sync)
                     _state = _state with { SampleRate = hpsdrRate.SampleRateHz() };
             }
-            await client.StartAsync(new StreamConfig(hpsdrRate, _preampOn, _atten), ct).ConfigureAwait(false);
+            if (!_bypassP1SocketIoForTests)
+                await client.StartAsync(new StreamConfig(hpsdrRate, _preampOn, _atten), ct).ConfigureAwait(false);
             ThrowIfSuperseded(attempt);
             // StreamConfig carries the legacy ADC0 attenuator value. Re-apply
             // the primary receiver route now that the client is running so a
@@ -1379,7 +1500,7 @@ public sealed class RadioService : IDisposable
             // snapping to VfoHz on legacy rows, so a plain SetVfoAHz here is
             // always valid. See docs/prd/panfall_behavior.md.
             var connectSnap = Snapshot();
-            client.SetVfoAHz(connectSnap.RadioLoHz);
+            client.SetVfoAHz(ToHardwareFrequencyHz(connectSnap.RadioLoHz));
 
             // Default-on the N2ADR 7-relay filter board for HL2 — mirrors
             // Thetis's HERCULES preset (setup.cs:14642). Most HL2 deployments
@@ -1421,7 +1542,7 @@ public sealed class RadioService : IDisposable
             }
 
             ThrowIfSuperseded(attempt);
-            Mutate(s => s with { Status = ConnectionStatus.Connected });
+            Mutate(s => s with { Status = ConnectionStatus.Connected, PsEnabled = false });
             _log.LogInformation("radio.connected endpoint={Ep} rate={Rate}", ipEndpoint, hpsdrRate);
             Connected?.Invoke(client);
             // N2ADR 7-relay low-pass filter board is standard equipment on HL2.
@@ -1434,7 +1555,11 @@ public sealed class RadioService : IDisposable
             // on-board iambic keyer matches the operator's panel before the
             // first key-down. Default mode straight makes this a no-op until
             // iambic is opted into. See zeus-bks.
-            client.SetCwKeyerConfig(Volatile.Read(ref _cwKeyerWpm), (CwKeyerMode)Volatile.Read(ref _cwKeyerMode));
+            client.SetCwKeyerConfig(
+                Volatile.Read(ref _cwKeyerWpm),
+                (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
+                Volatile.Read(ref _cwWeight),
+                Volatile.Read(ref _cwPaddleReverse) != 0);
             // Replay PA settings into the fresh client — drive byte, OC masks,
             // and (for P2 downstream) PA-enable. Without this the client sits
             // at the protocol defaults (drive=0, OC=0) until something else
@@ -1531,6 +1656,7 @@ public sealed class RadioService : IDisposable
         {
             Status = ConnectionStatus.Disconnected,
             Endpoint = null,
+            PsEnabled = false,
             AttOffsetDb = 0,
             AdcOverloadWarning = false,
         });
@@ -1545,16 +1671,123 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
+    private TransverterSettingsDto ActiveTransverterSettings()
+    {
+        if (_transverterSettingsStore is null || _layoutStore is null)
+            return new TransverterSettingsDto();
+        return _transverterSettingsStore.GetForConnectedRadio(_layoutStore, this);
+    }
+
+    internal bool IsTransverterActive => ActiveTransverterSettings().Enabled;
+
+    internal bool TryResolveTransverterBand(long rfHz, out TransverterBandDto band)
+    {
+        var settings = ActiveTransverterSettings();
+        band = null!;
+        return settings.Enabled
+            && TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out band);
+    }
+
+    /// <summary>
+    /// Translate an operator-facing RF value at the final hardware seam. The
+    /// active profile remains authoritative just outside its dial range too,
+    /// because CW pitch and CTUN move the physical NCO while the displayed RF
+    /// stays at the profile boundary.
+    /// </summary>
+    internal long ToHardwareFrequencyHz(long rfHz)
+    {
+        var settings = ActiveTransverterSettings();
+        if (!settings.Enabled)
+            return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
+        TransverterBandDto? band = null;
+        if (TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out var byRange))
+            band = byRange;
+        else if (rfHz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz)
+            return Math.Max(0, rfHz);
+        else if (TransverterFrequencyConverter.TryResolveActiveBand(settings, out var active))
+            band = active;
+        if (band is null) return 0;
+        try
+        {
+            long ifHz = checked(rfHz - band.LoOffsetHz + band.LoErrorHz);
+            return ifHz is >= 0 and <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                ? ifHz
+                : 0;
+        }
+        catch (OverflowException)
+        {
+            return 0;
+        }
+    }
+
+    internal double TransverterMeterCorrectionDb(long rfHz) =>
+        TryResolveTransverterBand(rfHz, out var band) ? -band.RxGainDb : 0.0;
+
+    internal string? RuntimeBandKey(long rfHz) =>
+        TryResolveTransverterBand(rfHz, out var band)
+            ? $"xvtr:{band.Id}"
+            : BandUtils.FreqToBand(rfHz);
+
+    internal bool IsExternalFrequencyAvailable(long hz, bool allowZero = false)
+    {
+        if (hz < (allowZero ? 0 : 1)) return false;
+        var settings = ActiveTransverterSettings();
+        if (settings.Enabled
+            && TransverterFrequencyConverter.TryResolveBandByRfHz(hz, settings, out _))
+            return true;
+        return hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+    }
+
+    internal long ClampTuningFrequency(long hz)
+    {
+        var settings = ActiveTransverterSettings();
+        if (!settings.Enabled || hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz)
+            return Math.Clamp(hz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
+        if (TransverterFrequencyConverter.TryResolveBandByRfHz(hz, settings, out _))
+            return hz;
+        if (TransverterFrequencyConverter.TryResolveActiveBand(settings, out var active))
+            return Math.Clamp(hz, active.BeginFrequencyHz, active.EndFrequencyHz);
+        return TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+    }
+
+    private void OnTransverterSettingsChanged()
+    {
+        var current = Snapshot();
+        if (!IsExternalFrequencyAvailable(current.VfoHz, allowZero: true))
+        {
+            SetVfo(current.VfoHz, fromExternal: true);
+            return;
+        }
+        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(current.RadioLoHz));
+        RecomputePaAndPush();
+        StateChanged?.Invoke(current);
+    }
+
+    private void OnActiveTransverterSelectionChanged(string radioKey, bool enabled)
+    {
+        if (!string.Equals(radioKey, ConnectedBoardKind.ToString(), StringComparison.Ordinal))
+            return;
+        var current = Snapshot();
+        if (!IsExternalFrequencyAvailable(current.VfoHz, allowZero: true))
+        {
+            SetVfo(current.VfoHz, fromExternal: true);
+            return;
+        }
+        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(current.RadioLoHz));
+        RecomputePaAndPush();
+        StateChanged?.Invoke(current);
+    }
+
     public StateDto SetVfo(long hz) => SetVfo(hz, fromExternal: false);
 
     public StateDto SetVfoB(long hz)
     {
-        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long clamped = ClampTuningFrequency(hz);
         lock (_sync) { if (_state.VfoLocked) return Snapshot(); }
         long previousTx;
         lock (_sync) previousTx = TxFrequencyHzLocked(_state);
         Mutate(s => WithRx2(s, r => r with { VfoHz = clamped }));
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
         {
             RecomputePaAndPush();
         }
@@ -1646,7 +1879,7 @@ public sealed class RadioService : IDisposable
                 return Snapshot();
 
             var e = _extraReceivers[index];
-            if (vfoHz is long v) e.VfoHz = Math.Clamp(v, 0L, 60_000_000L);
+            if (vfoHz is long v) e.VfoHz = ClampTuningFrequency(v);
             if (adcSource is byte a) e.AdcSource = a;
             if (mode is RxMode m) e.Mode = m;
             if (filterLowHz is int fl) e.FilterLowHz = fl;
@@ -1691,7 +1924,7 @@ public sealed class RadioService : IDisposable
         {
             var rx2 = s.Rx2();
             long nextVfoB = req.VfoBHz.HasValue
-                ? Math.Clamp(req.VfoBHz.Value, 0L, 60_000_000L)
+                ? ClampTuningFrequency(req.VfoBHz.Value)
                 : rx2.VfoHz > 0
                     ? rx2.VfoHz
                     : s.VfoHz;
@@ -1710,7 +1943,7 @@ public sealed class RadioService : IDisposable
                 ? next with { TxReceiverIndex = 0, TxVfo = TxVfo.A }
                 : next;
         });
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
         {
             RecomputePaAndPush();
         }
@@ -1753,7 +1986,7 @@ public sealed class RadioService : IDisposable
                 };
         });
         var snap = Snapshot();
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(snap)))
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
         {
             RecomputePaAndPush();
         }
@@ -1793,7 +2026,7 @@ public sealed class RadioService : IDisposable
         }, out bool applied);
         if (!applied) return Snapshot();
         var snap = Snapshot();
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(snap)))
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
             RecomputePaAndPush();
         return snap;
     }
@@ -1802,7 +2035,7 @@ public sealed class RadioService : IDisposable
     /// or hardware receive LO.</summary>
     public StateDto SetSplitFrequency(int receiverIndex, long hz)
     {
-        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long clamped = ClampTuningFrequency(hz);
         long previousTx = 0;
         Mutate(s =>
         {
@@ -1821,7 +2054,7 @@ public sealed class RadioService : IDisposable
         }, out bool applied);
         if (!applied) return Snapshot();
         var snap = Snapshot();
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(snap)))
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
             RecomputePaAndPush();
         return snap;
     }
@@ -1890,9 +2123,9 @@ public sealed class RadioService : IDisposable
         Mutate(s =>
         {
             previousTx = TxFrequencyHzLocked(s);
-            newA = Math.Clamp(s.Rx2().VfoHz, 0L, 60_000_000L);
+            newA = ClampTuningFrequency(s.Rx2().VfoHz);
             mode = s.Mode;
-            long oldA = Math.Clamp(s.VfoHz, 0L, 60_000_000L);
+            long oldA = ClampTuningFrequency(s.VfoHz);
             return WithRx2(
                 s with
                 {
@@ -1901,8 +2134,8 @@ public sealed class RadioService : IDisposable
                 },
                 r => r with { VfoHz = oldA });
         });
-        ActiveClient?.SetVfoAHz(CwOffset.EffectiveLoHz(mode, newA));
-        if (BandUtils.FreqToBand(previousTx) != BandUtils.FreqToBand(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(CwOffset.EffectiveLoHz(mode, newA)));
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
         {
             RecomputePaAndPush();
         }
@@ -1936,7 +2169,7 @@ public sealed class RadioService : IDisposable
     /// </summary>
     public StateDto SetVfo(long hz, bool fromExternal)
     {
-        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long clamped = ClampTuningFrequency(hz);
         // VFO lock guards operator dial tuning only. External sources
         // (CAT/TCI/calibration) tune intentionally and bypass the lock, matching
         // Thetis (chkVFOLock blocks the UI/knob, not CAT). No-op return preserves
@@ -1971,12 +2204,12 @@ public sealed class RadioService : IDisposable
             if (Math.Abs(shiftHz) <= ifCapHz)
             {
                 Mutate(s => s with { VfoHz = clamped });
-                if (BandUtils.FreqToBand(previous) != BandUtils.FreqToBand(clamped))
+                if (RuntimeBandKey(previous) != RuntimeBandKey(clamped))
                 {
                     RecomputePaAndPush();
                     if (!fromExternal)
                     {
-                        var newBand = BandUtils.FreqToBand(clamped);
+                        var newBand = RuntimeBandKey(clamped);
                         var afterMode = RestoreBandMode(newBand);
                         var afterFilter = RestoreBandFilter(newBand);
                         var afterZoom = RestoreBandZoom(newBand);
@@ -1999,18 +2232,18 @@ public sealed class RadioService : IDisposable
         // pitch), which leaves the WDSP CTUN-shift stage at zero.
         long radioLoNew = CwOffset.EffectiveLoHz(currentMode, clamped);
         Mutate(s => s with { VfoHz = clamped, RadioLoHz = radioLoNew });
-        ActiveClient?.SetVfoAHz(radioLoNew);
+        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(radioLoNew));
         // Band edge crossed? Per-band PA gain / OC bits may have swapped — push
         // the new snapshot before the next TX frame ships. Cheap when no
         // crossing occurred (same bytes re-pushed). Also recall the new band's
         // last-used demod mode (operator tunes only — fromExternal CAT/TCI keep
         // their own mode).
-        if (BandUtils.FreqToBand(previous) != BandUtils.FreqToBand(clamped))
+        if (RuntimeBandKey(previous) != RuntimeBandKey(clamped))
         {
             RecomputePaAndPush();
             if (!fromExternal)
             {
-                var newBand = BandUtils.FreqToBand(clamped);
+                var newBand = RuntimeBandKey(clamped);
                 var afterMode = RestoreBandMode(newBand);
                 var afterFilter = RestoreBandFilter(newBand);
                 var afterZoom = RestoreBandZoom(newBand);
@@ -2161,7 +2394,8 @@ public sealed class RadioService : IDisposable
         var stored = _bandMemoryStore.GetZoom(newBand);
         if (stored is null) return null;
         int level = stored.Value;
-        if (level < MinDisplayZoomLevel || level > MaxDisplayZoomLevel) return null;
+        int maxZoom = CurrentMaxDisplayZoomLevel;
+        if (level < MinDisplayZoomLevel || level > maxZoom) return null;
         int current;
         lock (_sync) { current = _state.ZoomLevel; }
         if (level == current) return null;
@@ -2173,8 +2407,9 @@ public sealed class RadioService : IDisposable
     /// <summary>
     /// Set the radio's hardware NCO (LO) centre frequency in Hz, leaving
     /// VfoHz untouched. Returns the updated <see cref="StateDto"/>.
-    /// Out-of-range values are clamped to [0, 60_000_000]; callers wanting
-    /// strict rejection should validate before calling. Triggers a P1 client
+    /// Values remain in external RF and are clamped to the native range or an
+    /// enabled transverter profile. Callers wanting strict rejection should
+    /// validate before calling. Triggers a P1 client
     /// SetVfoAHz (and the P2 path via DspPipelineService.OnRadioStateChanged
     /// reading the new RadioLoHz), and a PA recompute if the LO crossed a
     /// band edge. WDSP's shift stage is updated by DspPipelineService so the
@@ -2195,12 +2430,12 @@ public sealed class RadioService : IDisposable
 
     private StateDto SetRadioLoUnchecked(long hz)
     {
-        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long clamped = ClampTuningFrequency(hz);
         long previous;
         lock (_sync) { previous = _state.RadioLoHz; }
         Mutate(s => s with { RadioLoHz = clamped });
-        ActiveClient?.SetVfoAHz(clamped);
-        if (BandUtils.FreqToBand(previous) != BandUtils.FreqToBand(clamped))
+        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(clamped));
+        if (RuntimeBandKey(previous) != RuntimeBandKey(clamped))
         {
             RecomputePaAndPush();
         }
@@ -2616,8 +2851,8 @@ public sealed class RadioService : IDisposable
             //    Non-CW↔non-CW transitions return 0, so SSB/AM/FM/DIG
             //    behaviour is unchanged.
             long bump = CwOffset.DialBumpForModeTransition(currentMode, mode);
-            long nextVfoA = targetB ? s.VfoHz : Math.Clamp(s.VfoHz + bump, 0L, 60_000_000L);
-            long nextVfoB = targetB ? Math.Clamp(rx2.VfoHz + bump, 0L, 60_000_000L) : rx2.VfoHz;
+            long nextVfoA = targetB ? s.VfoHz : ClampTuningFrequency(s.VfoHz + bump);
+            long nextVfoB = targetB ? ClampTuningFrequency(rx2.VfoHz + bump) : rx2.VfoHz;
             newVfoAHz = nextVfoA;
 
             if (targetB)
@@ -2659,7 +2894,7 @@ public sealed class RadioService : IDisposable
         // pushed via DspPipelineService.OnRadioStateChanged.
         if (!targetBAtSet)
         {
-            ActiveClient?.SetVfoAHz(CwOffset.EffectiveLoHz(mode, newVfoAHz));
+            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(CwOffset.EffectiveLoHz(mode, newVfoAHz)));
             // Entering/leaving CW toggles the P2 internal keyer (TxSpecific
             // byte-5 CW-select). Re-push so a paddle keys the radio the moment
             // the operator is in CW, and the bit clears on the way back to
@@ -3130,7 +3365,13 @@ public sealed class RadioService : IDisposable
             rate = MapSampleRate(maxHz);
         }
         int hz = rate.SampleRateHz();
-        Mutate(s => s with { SampleRate = hz });
+        Mutate(s => s with
+        {
+            SampleRate = hz,
+            ZoomLevel = protocol2
+                ? Math.Min(s.ZoomLevel, P2WidebandZoomPolicy.MaxGlobalZoomForRate(hz))
+                : Math.Min(s.ZoomLevel, LegacyMaxDisplayZoomLevel),
+        });
         // P1 client owns the rate bits directly. On P2 ActiveClient is null, so
         // the SampleRateChanged event is the only way the new rate reaches the
         // live Protocol2Client and re-rates the WDSP RX channel (issue: live
@@ -3602,10 +3843,12 @@ public sealed class RadioService : IDisposable
         // below.)
         // Latch _mox before AlignLoForTx so a concurrent guarded SetRadioLo
         // (the frontend LO heartbeat) cannot slip between the snap and guard.
+        bool moxFell = false;
         lock (_sync)
         {
             if (_mox != on)
             {
+                moxFell = _mox && !on;
                 _mox = on;
                 // Telemetry arriving around a TX/RX transition can describe
                 // the old signal path. Start a fresh sample window on both
@@ -3624,6 +3867,7 @@ public sealed class RadioService : IDisposable
         ActiveClient?.SetMox(on);
         MoxChanged?.Invoke(on);
         if (!on) RestoreLoAfterTx();
+        if (moxFell) ApplyBoardKindToActiveClientIfSafe();
     }
 
     // Drive is transient like MOX — latched on the Protocol1Client so the
@@ -3667,7 +3911,7 @@ public sealed class RadioService : IDisposable
         {
             long vfoHz;
             lock (_sync) { vfoHz = _state.VfoHz; }
-            var band = BandUtils.FreqToBand(vfoHz);
+            var band = RuntimeBandKey(vfoHz);
             if (band is not null)
                 _paStore.SetBandDrive(band, clamped);
         }
@@ -3830,21 +4074,33 @@ public sealed class RadioService : IDisposable
     /// <summary>
     /// Forward the on-board CW keyer config to the connected radio and
     /// remember it so a reconnect re-applies it. Called by the CW settings
-    /// endpoint whenever the operator changes WPM, keyer mode, or sidetone.
+    /// endpoint whenever the operator changes a persisted CW setting.
     /// No-op (cached only) when no radio is connected. See zeus-bks.
     /// <list type="bullet">
-    /// <item>P1: speed + mode go to C&amp;C register 0x0B (already wired).</item>
-    /// <item>P2: speed + mode + sidetone arm the radio's internal keyer via
+    /// <item>P1: speed, mode, weight, and paddle direction go to C&amp;C register 0x0B.</item>
+    /// <item>P2: all values arm the radio's internal keyer via
     /// the TxSpecific packet so a paddle on the rear KEY jack keys the
     /// transmitter — issue #1032.</item>
     /// </list>
     /// </summary>
-    public void SetCwKeyerConfig(int wpm, CwKeyerMode mode, int sidetoneHz, double sidetoneGainDb)
+    public void SetCwKeyerConfig(
+        int wpm,
+        CwKeyerMode mode,
+        int sidetoneHz,
+        double sidetoneGainDb,
+        bool breakIn,
+        int hangMs,
+        int weight,
+        bool paddleReverse)
     {
         Volatile.Write(ref _cwKeyerWpm, wpm);
         Volatile.Write(ref _cwKeyerMode, (int)mode);
         lock (_sync) { _cwSidetoneHz = sidetoneHz; _cwSidetoneGainDb = sidetoneGainDb; }
-        ActiveClient?.SetCwKeyerConfig(wpm, mode);
+        Volatile.Write(ref _cwBreakIn, breakIn ? 1 : 0);
+        Volatile.Write(ref _cwHangMs, hangMs);
+        Volatile.Write(ref _cwWeight, weight);
+        Volatile.Write(ref _cwPaddleReverse, paddleReverse ? 1 : 0);
+        ActiveClient?.SetCwKeyerConfig(wpm, mode, weight, paddleReverse);
         PushCwToP2();
     }
 
@@ -3862,6 +4118,8 @@ public sealed class RadioService : IDisposable
     private readonly object _cwPushSync = new();
     private Func<StateDto, bool>? _hardwareCwArmEvaluator;
     private int _hardwareCwSafetyBlocked;
+    // Socketless observer of the exact config handed to the P2 client.
+    internal Action<Zeus.Protocol2.CwKeyerWireConfig>? HardwareCwConfigSinkForTests { get; set; }
 
     internal void ConfigureHardwareCwArmSafety(Func<StateDto, bool> evaluator)
     {
@@ -3941,14 +4199,20 @@ public sealed class RadioService : IDisposable
             // additionally routes the standing permission through the engine
             // safety module; isolated RadioService tests retain the legacy
             // allow when no evaluator has been installed.
-            p2.SetCwKeyerConfig(new Zeus.Protocol2.CwKeyerWireConfig
+            var config = new Zeus.Protocol2.CwKeyerWireConfig
             {
                 Active = active,
                 Mode = (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
                 SpeedWpm = Volatile.Read(ref _cwKeyerWpm),
                 SidetoneHz = sidetoneHz,
                 SidetoneLevel = CwSidetoneLevelFromGainDb(sidetoneGainDb),
-            });
+                BreakIn = Volatile.Read(ref _cwBreakIn) != 0,
+                HangMs = Volatile.Read(ref _cwHangMs),
+                Weight = Volatile.Read(ref _cwWeight),
+                PaddleReverse = Volatile.Read(ref _cwPaddleReverse) != 0,
+            };
+            p2.SetCwKeyerConfig(config);
+            HardwareCwConfigSinkForTests?.Invoke(config);
         }
     }
 
@@ -3986,7 +4250,7 @@ public sealed class RadioService : IDisposable
         {
             long vfoHz;
             lock (_sync) { vfoHz = _state.VfoHz; }
-            var band = BandUtils.FreqToBand(vfoHz);
+            var band = RuntimeBandKey(vfoHz);
             if (band is not null)
                 _paStore.SetBandTune(band, clamped);
         }
@@ -3998,8 +4262,10 @@ public sealed class RadioService : IDisposable
     // just-applied keying state (Thetis PreviousPWR swap, `console.cs:30094`).
     internal void NotifyTunActive(bool on)
     {
+        bool tuneFell;
         lock (_sync)
         {
+            tuneFell = _tunActive && !on;
             _tunActive = on;
             _txFrequencyTransition = false;
         }
@@ -4011,17 +4277,21 @@ public sealed class RadioService : IDisposable
         (ActiveClient as Zeus.Protocol1.Protocol1Client)?.SetTune(on);
         RecomputePaAndPush();
         TunActiveChanged?.Invoke(on);
+        if (tuneFell) ApplyBoardKindToActiveClientIfSafe();
     }
 
     internal void ClearTunActiveForSafety()
     {
+        bool tuneFell;
         lock (_sync)
         {
+            tuneFell = _tunActive;
             _tunActive = false;
             _txFrequencyTransition = false;
         }
         (ActiveClient as Zeus.Protocol1.Protocol1Client)?.SetTune(false);
         TunActiveChanged?.Invoke(false);
+        if (tuneFell) ApplyBoardKindToActiveClientIfSafe();
     }
 
     internal void BeginTxFrequencyTransition()
@@ -4429,12 +4699,18 @@ public sealed class RadioService : IDisposable
         _activeClient?.SetFrequencyCorrectionFactor(clamped);
         FrequencyCorrectionFactorChanged?.Invoke(clamped);
 
-        // Re-push the current dial Hz so the new factor lands on the wire.
-        // SetVfo's CwOffset application + ActiveClient push handle P1; the
-        // FrequencyCorrectionFactorChanged event handler in DspPipelineService
-        // covers the P2 client.
-        long currentDial = Snapshot().VfoHz;
-        SetVfo(currentDial);
+        // Re-push the current hardware LO so the new factor lands on the wire.
+        // Re-pushing the LO rather than re-tuning the dial matters in two
+        // states where a SetVfo(dial) round-trip never reaches the radio: under
+        // CTUN it only mutates VfoHz and leaves the frozen NCO alone, and under
+        // VFO lock it returns early — either way the fresh factor would sit
+        // unused until the operator's next tune. SetRadioLoUnchecked re-writes
+        // the same LO through ToHardwareFrequencyHz, so the corrected value
+        // ships immediately without disturbing dial, CTUN centre, or lock. The
+        // FrequencyCorrectionFactorChanged event above covers the P2 client.
+        var pushSnap = Snapshot();
+        if (pushSnap.RadioLoHz > 0) SetRadioLoUnchecked(pushSnap.RadioLoHz);
+        else SetVfo(pushSnap.VfoHz, fromExternal: true);
 
         return clamped;
     }
@@ -4475,7 +4751,11 @@ public sealed class RadioService : IDisposable
         // wire, EffectiveBoardKind == ConnectedBoardKind (discovery wins).
         var cfg = _paStore.GetAll(EffectiveBoardKind, EffectiveOrionMkIIVariant);
         var txHz = RadioFrequencyResolver.TxFrequencyHz(stateSnap);
-        var bandName = BandUtils.FreqToBand(txHz);
+        bool txThroughTransverter = TryResolveTransverterBand(txHz, out var txXvtrBand);
+        bool rxThroughTransverter = TryResolveTransverterBand(stateSnap.VfoHz, out var rxXvtrBand);
+        bool xvtrOutputEnabled = txThroughTransverter && txXvtrBand.DisablePa;
+        long hardwareTxHz = ToHardwareFrequencyHz(txHz);
+        var bandName = BandUtils.FreqToBand(hardwareTxHz);
         var bandCfg = bandName is not null
             ? cfg.Bands.FirstOrDefault(b => b.Band == bandName) ?? new PaBandSettingsDto(bandName)
             : new PaBandSettingsDto("unknown");
@@ -4490,6 +4770,8 @@ public sealed class RadioService : IDisposable
         // prevents any racing legacy/internal source from producing a drive
         // byte above the persisted amplifier ceiling.
         int activePct = Math.Min(requestedPct, Math.Clamp(stateSnap.DriveMaxPct, 1, 100));
+        if (txThroughTransverter)
+            activePct = Math.Min(activePct, txXvtrBand.Power);
         // Route through the per-board drive-profile so HL2's 4-bit drive
         // register is respected (bottom nibble ignored by gateware). See
         // Zeus.Server.RadioDriveProfile + docs/lessons/hl2-drive-byte-
@@ -4510,7 +4792,8 @@ public sealed class RadioService : IDisposable
                 cfg.Global.PaMaxPowerWatts)
             : (byte)0;
         bool paEnabled = decision.Allowed && safetyAuthorized && !safetyInhibit
-            && cfg.Global.PaEnabled && !bandCfg.DisablePa;
+            && cfg.Global.PaEnabled && !bandCfg.DisablePa
+            && (!txThroughTransverter || !txXvtrBand.DisablePa);
 
         _log.LogInformation(
             "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
@@ -4519,6 +4802,8 @@ public sealed class RadioService : IDisposable
 
         ActiveClient?.SetDriveByte(driveByte);
         ActiveClient?.SetOcMasks(bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune);
+        ActiveClient?.SetPaEnabled(paEnabled);
+        ActiveClient?.SetXvtrEnabled(xvtrOutputEnabled);
 
         // ---- External-antenna resolution (antenna slice — #804) ----
         // Server-authoritative: resolve the active band's persisted TX/RX
@@ -4530,13 +4815,36 @@ public sealed class RadioService : IDisposable
         // and defers any mid-key relay change to the unkey edge; PS owns the
         // K36/BYPASS relay while armed regardless of an aux=BYPASS pick.
         var caps = BoardCapabilitiesTable.For(ConnectedBoardKind, EffectiveOrionMkIIVariant);
-        var antSel = (_antennaStore is not null && bandName is not null)
+        var txAntSel = (_antennaStore is not null && bandName is not null)
             ? _antennaStore.GetBand(bandName)
             : new AntennaBandSelection(bandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+        long hardwareRxHz = ToHardwareFrequencyHz(stateSnap.VfoHz);
+        string? rxBandName = BandUtils.FreqToBand(hardwareRxHz);
+        var rxAntSel = (_antennaStore is not null && rxBandName is not null)
+            ? _antennaStore.GetBand(rxBandName)
+            : new AntennaBandSelection(rxBandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+        var antSel = txAntSel with
+        {
+            RxAnt = rxAntSel.RxAnt,
+            RxAux = rxAntSel.RxAux,
+        };
+        if (rxThroughTransverter && rxXvtrBand.RxAntenna != TransverterRxAntenna.Default)
+        {
+            antSel = antSel with
+            {
+                RxAnt = rxXvtrBand.RxAntenna switch
+                {
+                    TransverterRxAntenna.Ant2 => HpsdrAntenna.Ant2,
+                    TransverterRxAntenna.Ant3 => HpsdrAntenna.Ant3,
+                    _ => HpsdrAntenna.Ant1,
+                },
+            };
+        }
         int rxAuxWire = GateRxAux(antSel.RxAux, caps.RxAuxInputs);
         // P1: RX-antenna relay (C3[7:5], HL2-clamped at the wire). ActiveClient
         // is null on P2 — the P2 RX-antenna rides the SetAntennas path below.
         ActiveClient?.SetAntennaRx(antSel.RxAnt);
+        ActiveClient?.SetRxAuxInput(rxAuxWire);
         // P1: TX-antenna relay (Config-frame C4[1:0]) — external-port parity audit
         // (GAP-P1-1). Clamped to ANT1 at the wire for boards without full Alex TX
         // relays (ControlFrame.EncodeTxAntennaC4Bits → only ANAN-100D/200D emit
@@ -4565,7 +4873,8 @@ public sealed class RadioService : IDisposable
             HasTxAntennaRelays: caps.HasTxAntennaRelays,
             RxAuxInput: rxAuxWire,
             MkiiBpfRxSelect: caps.MkiiBpf,
-            RfFilters: _rfFilterStore?.GetRuntime(ConnectedBoardKind)));
+            RfFilters: _rfFilterStore?.GetRuntime(ConnectedBoardKind),
+            XvtrEnabled: xvtrOutputEnabled));
     }
 
     // Gate a persisted per-band RX-aux pick against the connected board's
@@ -5000,17 +5309,26 @@ public sealed class RadioService : IDisposable
     public StateDto SetPs(PsControlSetRequest req)
     {
         ArgumentNullException.ThrowIfNull(req);
-        Mutate(s => s with
+        bool psDisarmed = false;
+        Mutate(s =>
         {
-            PsEnabled = req.Enabled,
-            PsAuto = req.Auto,
-            PsSingle = req.Single,
+            // This is the sole writer of persisted arm intent. Runtime safety
+            // disarms (watchdog, disconnect, sanitize) use Mutate directly and
+            // therefore cannot erase the operator's decision.
+            _psArmIntent = req.Enabled;
+            psDisarmed = s.PsEnabled && !req.Enabled;
+            return s with
+            {
+                PsEnabled = req.Enabled,
+                PsAuto = req.Auto,
+                PsSingle = req.Single,
+            };
         });
-        // Persist cal-mode/tuning only. PsEnabled is process-lifetime only and
-        // never persisted; an arm can survive a radio reconnect in this server
-        // process, but every new process starts disarmed until an explicit
-        // operator POST to /api/tx/ps.
+        // Persist the explicit operator arm decision plus calibration/tuning.
+        // Runtime PsEnabled remains separate and always starts false in a new
+        // process until the connect-time sanitize applies ArmIntent.
         PersistPsState();
+        if (psDisarmed) ApplyBoardKindToActiveClientIfSafe();
         return Snapshot();
     }
 
@@ -5236,6 +5554,84 @@ public sealed class RadioService : IDisposable
             usingPersisted ? "persisted" : "factory");
     }
 
+    /// <summary>
+    /// Apply a persisted operator arm decision after a radio connection has
+    /// restored PS HW peak, feedback attenuation, and replayed the disarmed
+    /// state into the fresh engine. The explicit disarm mutation preserves a
+    /// genuine falling edge on an in-process reconnect; the conditional arm
+    /// then enters DspPipelineService's existing PS FIFO worker.
+    /// </summary>
+    internal void ApplyPsArmIntentForConnection(bool isProtocol2, HpsdrBoardKind board)
+    {
+        bool armIntent;
+        bool txActive;
+        lock (_sync)
+        {
+            armIntent = _psArmIntent;
+            txActive = _mox || _tunActive || _state.TwoToneEnabled;
+        }
+
+        if (!armIntent) return;
+
+        bool armSupported = DspPipelineService.P1PsEngineArmSupported(
+            p1Connected: !isProtocol2,
+            board);
+        if (!armSupported)
+        {
+            _log.LogInformation(
+                "ps.rearm intent=armed board={Board} skipped=unsupported",
+                board);
+            return;
+        }
+
+        if (txActive)
+        {
+            _log.LogInformation(
+                "ps.rearm intent=armed board={Board} skipped=tx-active",
+                board);
+            return;
+        }
+
+        Mutate(s => s with { PsEnabled = false });
+
+        string? skipped = null;
+        Mutate(s =>
+        {
+            // Re-check under _sync: an operator SetPs or a TX edge during the
+            // sanitize window must win over the stale connect-time read.
+            if (!_psArmIntent)
+            {
+                skipped = "intent-cleared";
+                return null;
+            }
+            if (_mox || _tunActive || s.TwoToneEnabled)
+            {
+                skipped = "tx-active";
+                return null;
+            }
+            return s with { PsEnabled = true };
+        }, out bool applied);
+
+        if (applied)
+        {
+            _log.LogInformation(
+                "ps.rearm intent=armed board={Board} sanitize=disarm→arm",
+                board);
+        }
+        else
+        {
+            _log.LogInformation(
+                "ps.rearm intent=armed board={Board} skipped={Reason}",
+                board,
+                skipped);
+        }
+    }
+
+    internal bool PsArmIntent
+    {
+        get { lock (_sync) return _psArmIntent; }
+    }
+
     public StateDto SetZoom(int level)
         => SetZoomCore(level, persist: true)!;
 
@@ -5249,9 +5645,10 @@ public sealed class RadioService : IDisposable
         // deeper values directly. A prior powers-of-two guard here silently
         // rejected 3/5/6/7 with a 500, causing the frontend slider to appear
         // stuck after valid steps.
-        if (level < MinDisplayZoomLevel || level > MaxDisplayZoomLevel)
+        int maxZoom = CurrentMaxDisplayZoomLevel;
+        if (level < MinDisplayZoomLevel || level > maxZoom)
             throw new ArgumentException(
-                $"zoom level must be in [{MinDisplayZoomLevel},{MaxDisplayZoomLevel}]; got {level}",
+                $"zoom level must be in [{MinDisplayZoomLevel},{maxZoom}]; got {level}",
                 nameof(level));
         Mutate(s =>
         {
@@ -5268,7 +5665,7 @@ public sealed class RadioService : IDisposable
         {
             long vfoHz;
             lock (_sync) { vfoHz = _state.VfoHz; }
-            var band = BandUtils.FreqToBand(vfoHz);
+            var band = RuntimeBandKey(vfoHz);
             if (band is not null)
                 _bandMemoryStore.SetZoom(band, level);
         }
@@ -5304,6 +5701,10 @@ public sealed class RadioService : IDisposable
             _audioStore.Changed -= PushAudioFrontEnd;
         if (_hl2GpioStore is not null)
             _hl2GpioStore.Changed -= PushHl2Gpio;
+        if (_transverterSettingsStore is not null)
+            _transverterSettingsStore.Changed -= OnTransverterSettingsChanged;
+        if (_layoutStore is not null)
+            _layoutStore.ActiveTransverterEnabledChanged -= OnActiveTransverterSelectionChanged;
         try { DisconnectAsync(CancellationToken.None).GetAwaiter().GetResult(); }
         catch { /* best-effort */ }
         try { _operatorConnectionActionCts.Cancel(); }
@@ -5359,6 +5760,7 @@ public sealed class RadioService : IDisposable
             };
             TransmitSafetyStateChanging?.Invoke(_state, next);
             _state = next;
+            _currentMode = (int)next.Mode;
         }
         applied = true;
         _stateDirty = true;
@@ -5644,6 +6046,12 @@ public sealed class RadioService : IDisposable
             Status = ConnectionStatus.Connected,
             Endpoint = endpoint,
             SampleRate = sampleRateHz,
+            // The fresh P2 client and engine must receive a disarmed replay
+            // before persisted intent is sanitized at the connect tail.
+            PsEnabled = false,
+            ZoomLevel = Math.Min(
+                s.ZoomLevel,
+                P2WidebandZoomPolicy.MaxGlobalZoomForRate(sampleRateHz)),
             AttOffsetDb = 0,
             AdcOverloadWarning = false,
         });
@@ -5669,18 +6077,21 @@ public sealed class RadioService : IDisposable
     internal void MarkConnectedNonP2ForTest(string endpoint) =>
         Mutate(s => s with { Status = ConnectionStatus.Connected, Endpoint = endpoint });
 
-    /// <summary>Test seam: inject a constructed-but-unconnected
-    /// <see cref="Protocol1Client"/> as the active P1 client, so
+    /// <summary>Test seam: inject a socketless
+    /// <see cref="IProtocol1Client"/> as the active P1 client, so
     /// <see cref="ActiveClient"/> / <see cref="ConnectedBoardKind"/> /
     /// <see cref="IsConnected"/> behave as a live P1 session without any
     /// socket I/O (real network in unit tests crashes the Windows CI test
-    /// host). The caller owns the client's lifetime; nothing here starts
-    /// the RX/TX loops. Used by the PsAutoAttenuate HermesC10 suite to
-    /// exercise the board dispatch against the real client's atten_on_Tx
-    /// plumbing.</summary>
-    internal void SetActiveClientForTest(Protocol1Client? client)
+    /// host). The caller owns the client; nothing here starts RX/TX loops.
+    /// Real-client tests exercise board plumbing, while an interface proxy can
+    /// capture pipeline writes without opening sockets.</summary>
+    internal void SetActiveClientForTest(IProtocol1Client? client)
     {
-        lock (_sync) _activeClient = client;
+        lock (_sync)
+        {
+            _activeClient = client as Protocol1Client;
+            _activeClientForTest = client is Protocol1Client ? null : client;
+        }
     }
 
     public void MarkProtocol2Disconnected()
@@ -5708,6 +6119,8 @@ public sealed class RadioService : IDisposable
         {
             Status = ConnectionStatus.Disconnected,
             Endpoint = null,
+            PsEnabled = false,
+            ZoomLevel = Math.Min(s.ZoomLevel, LegacyMaxDisplayZoomLevel),
             AttOffsetDb = 0,
             AdcOverloadWarning = false,
         });
@@ -5760,6 +6173,12 @@ public sealed class RadioService : IDisposable
             Status = ConnectionStatus.Connected,
             Endpoint = endpoint,
             SampleRate = sampleRateHz,
+            // P3 has no PS wire/engine path, so persisted arm intent is
+            // deliberately NOT applied here (no sanitize hook) — the forced
+            // disarm keeps the snapshot honest; intent survives untouched and
+            // is applied on the next P1/P2 connect.
+            PsEnabled = false,
+            ZoomLevel = Math.Min(s.ZoomLevel, LegacyMaxDisplayZoomLevel),
             AttOffsetDb = 0,
             AdcOverloadWarning = false,
         });
@@ -5787,6 +6206,7 @@ public sealed class RadioService : IDisposable
         {
             Status = ConnectionStatus.Disconnected,
             Endpoint = null,
+            PsEnabled = false,
             AttOffsetDb = 0,
             AdcOverloadWarning = false,
         });
@@ -5807,6 +6227,13 @@ public sealed class RadioService : IDisposable
         {
             lock (_sync)
             {
+                // Protocol1Client.BoardKind is the board actually driving the
+                // live P1 wire. It already includes any safely-applied override;
+                // when a change is deferred, keep reporting the still-active
+                // board rather than claiming the pending preference is live.
+                var protocol1 = _activeClientForTest ?? _activeClient;
+                if (protocol1 is not null) return protocol1.BoardKind;
+
                 // Check if operator has explicitly enabled board override.
                 // This allows forcing specific board behavior when auto-detection
                 // is wrong or incomplete (different hardware with same board ID).
@@ -5820,7 +6247,6 @@ public sealed class RadioService : IDisposable
                 }
 
                 // Normal path: use discovery result.
-                if (_activeClient is not null) return _activeClient.BoardKind;
                 if (_p2Active)
                 {
                     // Brick2 announces as Hermes (0x01) on P2; older Zeus
@@ -5833,6 +6259,27 @@ public sealed class RadioService : IDisposable
                 {
                     return HpsdrBoardKind.OrionMkII;
                 }
+                return HpsdrBoardKind.Unknown;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Raw board identity supplied by discovery for the active connection,
+    /// before any operator override is applied. Diagnostics use this to keep
+    /// the radio-reported identity distinct from live effective behavior.
+    /// </summary>
+    public HpsdrBoardKind DiscoveredBoardKind
+    {
+        get
+        {
+            lock (_sync)
+            {
+                if (_activeClient is not null)
+                    return _activeP1ConnectionAttempt?.DiscoveredKind
+                        ?? HpsdrBoardKind.Unknown;
+                if (_p2Active)
+                    return _p2BoardKind;
                 return HpsdrBoardKind.Unknown;
             }
         }
@@ -6018,7 +6465,9 @@ public sealed class RadioService : IDisposable
     // change through the client's safe stop/drain/restart transition, which
     // also realigns the radio's EP6 framing. Runs off-thread — the event
     // fires on the RX thread, which must never block on the state pipeline.
-    // PsEnabled is not persisted, so no store write is needed.
+    // This watchdog disarm is a runtime safety action, not an operator
+    // decision. ArmIntent deliberately survives so the next connect retries
+    // through a fresh disarm/rearm sanitize cycle; no store write is needed.
     private void OnPsFeedbackStalled()
     {
         _log.LogWarning(

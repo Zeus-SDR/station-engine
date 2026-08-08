@@ -179,6 +179,11 @@ internal static class ControlFrame
         //   keyer_reverse = cmd_data[22]    → C2[6]
         // Wire encoding lives in WriteCwKeyerConfigPayload. See zeus-bks.
         CwKeyerConfig = 0x16,
+        // Orion MkII / ANAN-8000DLE transverter T/R relay enable. Thetis
+        // networkproto1.c case 16 emits C0=0x24 and places xvtr_enable in
+        // C2[0]. This register stays in the normal rotation even when false,
+        // so leaving an XVTR band always sends the clearing write.
+        XvtrControl = 0x24,
     }
 
     /// <summary>
@@ -265,9 +270,9 @@ internal static class ControlFrame
         int PsTxAttnOnTxDb = int.MinValue,
         // On-board CW keyer config (C&C 0x0B / wire 0x16). Speed is the
         // operator's WPM (clamped 0-60 to fit the 6-bit gateware field);
-        // mode selects straight vs iambic A/B. Weight/spacing/reverse are
-        // held at sensible fixed defaults for now (no UI yet) — see
-        // WriteCwKeyerConfigPayload. Default mode Straight makes the write a
+        // mode selects straight vs iambic A/B. Weight and paddle direction
+        // are trailing operator fields below; strict spacing remains fixed
+        // off in WriteCwKeyerConfigPayload. Default mode Straight makes the write a
         // no-op until the operator opts into iambic. See zeus-bks.
         int CwKeyerSpeedWpm = 0,
         CwKeyerMode CwKeyerMode = CwKeyerMode.Straight,
@@ -330,7 +335,26 @@ internal static class ControlFrame
         bool AdcRandomEnabled = false,
         // Physical ADC1 step attenuator. Thetis shares C0=0x16 with the keyer:
         // ADC1 occupies C1[4:0] plus enable C1[5], while keyer fields use C2..C4.
-        HpsdrAtten Adc1Atten = default);
+        HpsdrAtten Adc1Atten = default,
+        // Effective PA state after the host has combined the global PA toggle
+        // with the active band's "Disable PA" / transverter policy. Thetis
+        // writes this continuously: HL2 uses DriveFilter C2[3], while legacy
+        // Hermes-class firmware uses DriveFilter C3[7].
+        bool PaEnabled = false,
+        // Wire-neutral server RX-aux selector: 0=base, 1=EXT1, 2=EXT2,
+        // 3=XVTR, 4=BYPASS. Kept as an int so the Hosting enum does not leak
+        // into the protocol assembly. -1 is a compatibility sentinel for
+        // direct CcState constructions predating the dedicated aux field.
+        int RxAuxInput = -1,
+        // Independent XVTR transmit-path enable. This is deliberately not
+        // inferred from RxAuxInput: split RX/TX transverter arrangements can
+        // select any receive input while still requiring the XVTR T/R output.
+        bool XvtrEnabled = false,
+        // Operator-exposed fields already carried by C&C register 0x0B.
+        // Trailing defaults preserve every older positional construction and
+        // today's byte-identical wire form.
+        int CwKeyerWeight = 50,
+        bool CwKeyerPaddleReverse = false);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -369,15 +393,17 @@ internal static class ControlFrame
                 // carry mic/filter/PA bits. On HermesLite2 that same block zeroes
                 // C2/C3/C4 and lights C2[3] for PA enable when pa_enabled &&
                 // !txband->disablePA. Without this bit the HL2 gateware never
-                // energizes the PA regardless of drive level. We gate on MOX so
-                // PA-enable is only asserted while transmitting.
+                // energizes the PA regardless of drive level. Legacy Hermes-
+                // class firmware consumes the same effective state at C3[7]
+                // (Thetis networkproto1.c case 10). The enable is configuration,
+                // not PTT: firmware gates actual RF with MOX independently.
                 cc[1] = state.DriveLevel;
                 cc[2] = 0;
                 cc[3] = 0;
                 cc[4] = 0;
-                if (state.Board == HpsdrBoardKind.HermesLite2 && state.Mox)
+                if (state.Board == HpsdrBoardKind.HermesLite2)
                 {
-                    cc[2] |= 0x08;
+                    if (state.PaEnabled) cc[2] |= 0x08;
                 }
                 // Hermes-class codec boards carry mic_boost (C2[0]) and
                 // mic_linein (C2[1]) on this 0x12 frame — Thetis
@@ -390,6 +416,7 @@ internal static class ControlFrame
                 {
                     if (state.MicBoost) cc[2] |= 0x01;   // C2[0] mic_boost
                     if (state.MicLineIn) cc[2] |= 0x02;  // C2[1] mic_linein
+                    if (state.PaEnabled) cc[3] |= 0x80;  // C3[7] legacy PA enable
                 }
                 // ATU auto-tune-start request — C2[4], register 0x09 bit [20]
                 // ("Tune request") per the HL2 protocol doc; the Apollo/Alex
@@ -413,6 +440,18 @@ internal static class ControlFrame
 
             case CcRegister.CwKeyerConfig:
                 WriteCwKeyerConfigPayload(cc[1..], in state);
+                break;
+
+            case CcRegister.XvtrControl:
+                // Thetis networkproto1.c case 16: C0=0x24, C2[0] =
+                // xvtr_enable and C2[6] = puresignal_run. Preserve the latter
+                // on every scheduled frame so XVTR control can never clear the
+                // firmware's existing PureSignal enable latch.
+                cc[1] = 0;
+                cc[2] = (byte)((state.XvtrEnabled ? 0x01 : 0x00)
+                    | (state.PsEnabled ? 0x40 : 0x00));
+                cc[3] = 0;
+                cc[4] = 0;
                 break;
 
             default:
@@ -621,12 +660,9 @@ internal static class ControlFrame
         c14[3] = 0;                                     // C4
     }
 
-    // CW keyer weight / spacing / reverse have no UI yet (see zeus-bks), so
-    // we hold them at the gateware-friendly neutral defaults: 50% weight
-    // (1:1 dit:dah ratio), letter-spacing off, paddles un-swapped.
-    private const byte CwKeyerDefaultWeight = 50;  // C4[6:0], range 33-66
+    // Strict letter spacing remains fixed off. Weight and paddle direction
+    // are operator values in CcState and are defensively clamped here.
     private const bool CwKeyerDefaultSpacing = false;
-    private const bool CwKeyerDefaultReverse = false;
     // Gateware speed field is 6 bits; iambic.v documents 1-60 WPM.
     private const int CwKeyerMaxWpm = 60;
 
@@ -641,14 +677,15 @@ internal static class ControlFrame
         //   keyer_spacing = cmd_data[7]     → C4[7]
         //   keyer_weight  = cmd_data[6:0]   → C4[6:0]
         int speed = Math.Clamp(s.CwKeyerSpeedWpm, 0, CwKeyerMaxWpm);
+        int weight = Math.Clamp(s.CwKeyerWeight, 33, 66);
         byte mode = (byte)((byte)s.CwKeyerMode & 0x03);
 
         int adc1Db = s.Adc1Atten.ClampedDb;
         c14[0] = adc1Db == 0 ? (byte)0 : (byte)(0x20 | adc1Db);  // C1 ADC1 ATT
-        c14[1] = (byte)(CwKeyerDefaultReverse ? 1 << 6 : 0);     // C2[6] reverse
+        c14[1] = (byte)(s.CwKeyerPaddleReverse ? 1 << 6 : 0);    // C2[6] reverse
         c14[2] = (byte)((mode << 6) | (speed & 0x3F));           // C3[7:6] mode | [5:0] speed
         c14[3] = (byte)((CwKeyerDefaultSpacing ? 1 << 7 : 0)
-                        | (CwKeyerDefaultWeight & 0x7F));        // C4[7] spacing | [6:0] weight
+                        | (weight & 0x7F));                      // C4[7] spacing | [6:0] weight
     }
 
     private static void WriteConfigPayload(Span<byte> c14, in CcState s)
@@ -724,15 +761,14 @@ internal static class ControlFrame
             if (s.AdcDitherEnabled) c3 |= 1 << 3;
             if (s.AdcRandomEnabled) c3 |= 1 << 4;
         }
-        // RX-antenna relay select C3[7:5]. Routed through the shared pure helper
-        // so the wire-layer HL2 clamp (single jack → ANT1) and the external-port
-        // encoder seam emit identical bytes. Co-tenant bits C3[2] (preamp), C3[3]
-        // (HL2 band-volts / LT2208 dither) and C3[4] (LT2208 random) are already
-        // OR'd above; the helper only touches [7:5]. During HermesC10 PS+MOX the
-        // helper overrides the operator selection with the RX BYPASS relay code
-        // (see EncodePsBypassOrRxAntennaC3Bits) — it is the SOLE writer of
-        // C3[7:5] on this frame either way, so the two encodings can't collide.
-        c3 |= EncodePsBypassOrRxAntennaC3Bits(s.RxAntenna, s.Board, s.PsEnabled, s.Mox);
+        // C3[6:5] is the RX-only AUX selector, independent of the ANT1/2/3
+        // relay in C4: 00=base, 01=EXT2, 10=EXT1, 11=XVTR. C3[7] is RX OUT;
+        // Thetis asserts it with an aux route, and an explicit BYPASS request
+        // uses RX OUT alone. The HermesC10 PS override remains the sole special
+        // case and retains its historical byte 0x20 exactly.
+        c3 |= s.Board == HpsdrBoardKind.HermesC10 && s.PsEnabled && s.Mox
+            ? EncodePsBypassOrRxAntennaC3Bits(s.RxAntenna, s.Board, s.PsEnabled, s.Mox)
+            : EncodeRxAuxC3Bits(s.RxAuxInput, s.RxAntenna, s.Board);
         c14[2] = c3;
 
         // C4: Alex TX antenna [1:0], duplex [2] = 1 (always, per
@@ -749,7 +785,12 @@ internal static class ControlFrame
         // per-band ANT2/3 (band rows are board-agnostic) can never reroute the
         // transmitter on a board that is ANT1-hardwired on transmit. Default Ant1
         // → 0 → byte-identical to before this audit.
-        c4 |= EncodeTxAntennaC4Bits(s.TxAntenna, s.Board);
+        c4 |= EncodeTrxAntennaC4Bits(
+            s.RxAntenna,
+            s.TxAntenna,
+            s.Board,
+            s.Mox,
+            explicitRxAux: s.RxAuxInput >= 0);
         c14[3] = c4;
     }
 
@@ -782,6 +823,36 @@ internal static class ControlFrame
             return 0b001 << 5;   // C3[6:5] = 01 → RX BYPASS relay; C3[7] stays 0
         }
         return EncodeRxAntennaC3Bits(rxAntenna, board);
+    }
+
+    /// <summary>
+    /// Encode the Protocol-1 Config C3 RX-aux/RX-out fields from the server's
+    /// wire-neutral selector. Thetis <c>SetAntBits</c> maps EXT2/EXT1/XVTR to
+    /// C3[6:5] = 01/10/11 and uses C3[7] as RX OUT. Firmware decodes those as
+    /// independent relay controls. The caller keeps the existing HermesC10
+    /// PureSignal helper authoritative before reaching this normal RX path.
+    /// </summary>
+    internal static byte EncodeRxAuxC3Bits(
+        int rxAuxInput,
+        HpsdrAntenna legacyRxAntenna,
+        HpsdrBoardKind board)
+    {
+        // Compatibility for tests and callers that directly construct the
+        // old CcState shape. Live Protocol1Client snapshots always provide an
+        // explicit 0..4 value.
+        if (rxAuxInput < 0)
+        {
+            return EncodeRxAntennaC3Bits(legacyRxAntenna, board);
+        }
+
+        return rxAuxInput switch
+        {
+            1 => 0xC0, // EXT1: RX OUT + C3[6:5]=10
+            2 => 0xA0, // EXT2: RX OUT + C3[6:5]=01
+            3 => 0xE0, // XVTR: RX OUT + C3[6:5]=11
+            4 => 0x80, // BYPASS: RX OUT, no EXT/XVTR input relay
+            _ => 0x00, // base antenna path
+        };
     }
 
     /// <summary>
@@ -842,6 +913,25 @@ internal static class ControlFrame
     {
         if (!P1BoardHasTxAntennaRelays(board)) return 0;
         return (byte)((byte)txAntenna & 0x03);
+    }
+
+    /// <summary>
+    /// Thetis uses Config C4[1:0] as the main ANT1/2/3 relay selector for the
+    /// current RX/TX state. Explicit RX-aux state proves the caller uses this
+    /// model; legacy direct CcState construction retains the older TX-only C4
+    /// behavior while its RX antenna remains encoded in C3.
+    /// </summary>
+    internal static byte EncodeTrxAntennaC4Bits(
+        HpsdrAntenna rxAntenna,
+        HpsdrAntenna txAntenna,
+        HpsdrBoardKind board,
+        bool mox,
+        bool explicitRxAux)
+    {
+        if (mox || !explicitRxAux)
+            return EncodeTxAntennaC4Bits(txAntenna, board);
+        if (!P1BoardHasRxAntennaRelays(board)) return 0;
+        return (byte)((byte)rxAntenna & 0x03);
     }
 
     /// <summary>
@@ -929,8 +1019,9 @@ internal static class ControlFrame
         // Pre-conditions for writing a non-zero payload: MOX engaged and an IQ
         // source is plumbed through. The wire format (L/R audio + I/Q s16 BE)
         // is identical across all Protocol-1 boards (HL2, Hermes, ANAN-class,
-        // Orion-MkII). PA enable is driven by the C0 MOX bit + board-specific
-        // DriveFilter C2 bits in WriteCcBytes — see issue #294.
+        // Orion-MkII). Actual transmit is gated by C0 MOX; the independent PA
+        // configuration rides the board-specific DriveFilter bit in
+        // WriteCcBytes — see issue #294.
         if (!state.Mox)
         {
             // RX: the radio is not transmitting, so the EP2 I/Q slots stay zero

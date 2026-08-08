@@ -49,10 +49,14 @@ public static class StationEngineHostingExtensions
         // would otherwise form a construction cycle; it is resolved only on
         // the lease-teardown path when a modem-owned key must drop.
         services.AddSingleton<ModeModemLeasePort>(sp =>
-            ActivatorUtilities.CreateInstance<ModeModemLeasePort>(
-                sp,
-                (Func<TxService?>)(() => sp.GetService<TxService>())));
-        services.AddSingleton<IAudioModemPort>(sp => sp.GetRequiredService<ModeModemLeasePort>());
+            new ModeModemLeasePort(
+                sp.GetRequiredService<RadioService>(),
+                sp.GetRequiredService<ILogger<ModeModemLeasePort>>(),
+                () => sp.GetService<TxService>()));
+        services.AddSingleton<RadeModemService>();
+        services.AddSingleton<CompositeAudioModemPort>();
+        services.AddSingleton<IAudioModemPort>(sp =>
+            sp.GetRequiredService<CompositeAudioModemPort>());
         services.AddSingleton<ProductAudioRingPort>();
         services.AddSingleton<IProductTxAudioPort>(sp => sp.GetRequiredService<ProductAudioRingPort>());
         services.AddSingleton<ProductPluginAudioPort>();
@@ -101,6 +105,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<StationFavoriteStore>();
         services.AddSingleton<RfFilterSettingsStore>();
         services.AddSingleton<PttSettingsStore>();
+        services.AddSingleton<SerialPttSettingsStore>();
         services.AddSingleton<AudioDeviceSettingsStore>();
         services.AddSingleton<RadioSpeakerSettingsStore>();
         services.AddSingleton<TxFidelityPolicyStore>();
@@ -193,7 +198,9 @@ public static class StationEngineHostingExtensions
             return source;
         });
         services.AddSingleton<CwEngine>();
+        services.AddSingleton<CwDecoderService>();
         services.AddSingleton<ExternalPttService>();
+        services.AddSingleton<SerialPttService>();
         services.AddSingleton<NativeMicCapture>();
         services.AddSingleton<EngineCacheJanitor>();
 
@@ -226,8 +233,10 @@ public static class StationEngineHostingExtensions
         services.AddHostedService(sp => sp.GetRequiredService<TxMetersService>());
         services.AddHostedService(sp => sp.GetRequiredService<TxTuneDriver>());
         services.AddHostedService(sp => sp.GetRequiredService<CwEngine>());
+        services.AddHostedService(sp => sp.GetRequiredService<CwDecoderService>());
         services.AddHostedService<PsAutoAttenuateService>();
         services.AddHostedService(sp => sp.GetRequiredService<ExternalPttService>());
+        services.AddHostedService(sp => sp.GetRequiredService<SerialPttService>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeAudioSink>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeMicCapture>());
 

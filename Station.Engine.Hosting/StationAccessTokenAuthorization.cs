@@ -56,6 +56,9 @@ public static class StationAccessTokenAuthorization
                 "/api/station/mode-modem",
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(
+                "/api/station/rade",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
                 "/api/station/key",
                 StringComparison.OrdinalIgnoreCase);
     }

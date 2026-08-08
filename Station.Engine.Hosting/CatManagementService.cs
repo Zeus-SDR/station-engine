@@ -114,39 +114,25 @@ public sealed class CatManagementService
     }
 
     public CatTestResult TestPort(string bindAddress, int port)
+        => TestPortCore(bindAddress, port, PortBindDiagnostics.ProbeTcp);
+
+    internal static CatTestResult TestPortCore(
+        string bindAddress,
+        int port,
+        Func<IPAddress, int, SocketError?> probe)
     {
         if (port is <= 0 or >= 65536)
             return new CatTestResult(Ok: false, Error: "Port must be between 1 and 65535");
 
         var addr = string.IsNullOrWhiteSpace(bindAddress) ? "127.0.0.1" : bindAddress.Trim();
 
-        if (!IsPortAvailable(addr, port))
-            return new CatTestResult(Ok: false, Error: $"Port {port} is already in use on {addr}");
+        if (!PortBindDiagnostics.TryResolveBindAddress(addr, out var ip))
+            return new CatTestResult(Ok: false, Error: $"Bind address '{addr}' is not a valid IP address, localhost, or *.");
 
-        return new CatTestResult(Ok: true, Error: null);
-    }
+        var error = probe(ip!, port);
+        if (error is null or SocketError.Success)
+            return new CatTestResult(Ok: true, Error: null);
 
-    private static bool IsPortAvailable(string bindAddress, int port)
-    {
-        try
-        {
-            IPAddress ip;
-            if (bindAddress is "0.0.0.0" or "*" or "")
-                ip = IPAddress.Any;
-            else if (string.Equals(bindAddress, "localhost", StringComparison.OrdinalIgnoreCase))
-                ip = IPAddress.Loopback;
-            else if (!IPAddress.TryParse(bindAddress, out var parsed))
-                return false;
-            else
-                ip = parsed;
-
-            using var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            socket.Bind(new IPEndPoint(ip, port));
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
+        return new CatTestResult(Ok: false, Error: PortBindDiagnostics.Describe(error.Value, addr, port, "TCP"));
     }
 }

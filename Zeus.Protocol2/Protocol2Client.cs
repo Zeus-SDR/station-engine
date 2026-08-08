@@ -149,18 +149,27 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         SaturnWidebandSamplesPerPacket * SaturnWidebandPacketsPerFrame;
     public const int WidebandMaxFrameSamples = SaturnWidebandFrameSamples;
     public const int WidebandAdcSampleRateHz = 122_880_000;
-    private const byte WidebandUpdateRateMs = 100;
+    // Snapshot pacing is per-geometry. Saturn's period register accepts any
+    // integer millisecond (saturnregisters.c SetWidebandUpdateRate converts
+    // ms to 122.88 MHz ticks), and 50 ms stays far inside the FIFO/network
+    // budget while doubling the display estimator's averaging rate. Classic
+    // gateware pacing is less documented, so it keeps Thetis' 100 ms.
+    internal const int ClassicWidebandUpdateRateMs = 100;
+    internal const int SaturnWidebandUpdateRateMs = 50;
 
-    internal readonly record struct WidebandCaptureGeometry(int SamplesPerPacket, int PacketsPerFrame)
+    internal readonly record struct WidebandCaptureGeometry(
+        int SamplesPerPacket,
+        int PacketsPerFrame,
+        int UpdateRateMs)
     {
         public int FrameSamples => SamplesPerPacket * PacketsPerFrame;
         public int PayloadBytes => SamplesPerPacket * sizeof(short);
     }
 
     private static readonly WidebandCaptureGeometry ClassicWidebandGeometry =
-        new(ClassicWidebandSamplesPerPacket, ClassicWidebandPacketsPerFrame);
+        new(ClassicWidebandSamplesPerPacket, ClassicWidebandPacketsPerFrame, ClassicWidebandUpdateRateMs);
     private static readonly WidebandCaptureGeometry SaturnWidebandGeometry =
-        new(SaturnWidebandSamplesPerPacket, SaturnWidebandPacketsPerFrame);
+        new(SaturnWidebandSamplesPerPacket, SaturnWidebandPacketsPerFrame, SaturnWidebandUpdateRateMs);
 
     // Hermes-class radios (Brick2 is the live consumer) use a single ADC
     // and have no PureSignal feedback DDCs reserved at the front of the pool.
@@ -230,6 +239,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _extraReceiverCount;
     private readonly uint[] _extraRxFreqHz = new uint[MaxRxDdc];
     private readonly byte[] _extraRxAdc = new byte[MaxRxDdc];
+    // Analyzer-only DDC owned by the hosting wideband pipeline. It is always a
+    // physical P2 DDC index (never a logical receiver index), and DDC0/1 are
+    // categorically rejected so the PureSignal reservation cannot be touched.
+    // -1 disables the stream. Its IQ is surfaced with ReceiverIndex=-1 and is
+    // never routed into an operator audio receiver.
+    public const int DisplayReceiverIndex = -1;
+    private int _displayDdcIndex = -1;
+    private uint _displayDdcFreqHz = 30_000_000;
+    private int _displayDdcAdcSource;
     // Per-source-port IQ packet rate (packets in the last completed ~1 s
     // window) for UDP ports RxDataPortBase..RxDataPortBase+MaxRxDdc-1 (1035..1042)
     // → index 0..7 → DDC 0..7. Written by the single RX thread on each window
@@ -270,13 +288,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     //   bit 0 = XVTR_enable        (0=disabled, 1=enabled)
     //   bit 1 = IO1                (0=enabled,  1=muted)  — inverted polarity
     //   bit 2 = AUTO_TUNE          (0=disabled, 1=enabled)
-    // Defaults 0. Bit 0 is derived from the applied RX-aux selector by
-    // SetAntennas, behind the OrionMkII-DLE variant gate, so it inherits the
-    // relay matrix's keyed-state deferral. Saturn/G2 p2_app also decodes bit 0
-    // (XVTR GPIO / PA inhibit), so the gate must keep it clear there. Angelia
-    // latches the byte into an unconnected port; Hermes, ANAN-10/100,
-    // ANAN-10E/100B, ANAN-200D, Metis, and G2E do not decode it. Bits 1/2 are
-    // composed independently by SetIo1Muted / SetAutoTuneEnabled. Issue #414.
+    // Defaults 0. Bit 0 is set only by explicit SetXvtrEnabled state and is
+    // deliberately independent of the RX-aux selector: a transverter can use
+    // EXT1/EXT2/base receive routing while still requiring the TX T/R output.
+    // The setter inherits the relay matrix's keyed-state deferral. Saturn/G2
+    // p2_app also decodes bit 0 as its XVTR GPIO / PA inhibit; the caller owns
+    // the active-transverter policy rather than the RX aux selection. Angelia latches
+    // the byte into an unconnected port; Hermes, ANAN-10/100, ANAN-10E/100B,
+    // ANAN-200D, Metis, and G2E do not decode it. Bits 1/2 are composed
+    // independently by SetIo1Muted / SetAutoTuneEnabled. Issue #414.
     private byte _dleOutputs;
     // Guards every read-modify-write of _dleOutputs: bits 1/2 are set from
     // the API/UI path while bit 0 is recomposed on the antenna/PA snapshot
@@ -370,8 +390,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // the antennas. -1 = nothing pending.
     private int _rxAuxInput;
     private int _pendingRxAuxInput = -1;
-    private bool _hasXvtrTxRelay;
-    private bool? _pendingHasXvtrTxRelay;
+    private bool _xvtrEnabled;
+    // -1=no pending change, 0=disable, 1=enable. Kept integral so the pending
+    // state can be read and cleared atomically on the unkey edge.
+    private int _pendingXvtrEnabled = -1;
     // Whether the connected board's Alex/BPF board uses the ANAN-7000/Saturn
     // master RX-select gating (bit 14 must accompany any aux selection). Set
     // alongside the relay-population gate. MkII-BPF boards (0x0A / G2E) use it;
@@ -397,10 +419,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     // Internal (FPGA) CW keyer config — issue #1032. Wire-encoded into the
     // TxSpecific (CmdTx, port 1026) packet bytes 5-13/17. These are the
-    // operator-driven values (CW-mode active, keyer mode, speed, sidetone);
-    // the remaining gateware parameters are pinned to the Cw* constants
-    // below, mirroring how the Protocol-1 path pins weight/spacing/reverse in
-    // ControlFrame. Latched by SetCwKeyerConfig and re-pushed on the next
+    // operator-driven values (CW-mode active, keyer mode, speed, sidetone,
+    // break-in, hang, weight, and paddle direction). Strict spacing, RF delay,
+    // and ramp remain pinned below. Latched by SetCwKeyerConfig and re-pushed on the next
     // CmdTx, exactly like the audio front-end bytes. All-default (Inactive)
     // leaves byte 5 = 0, so a non-CW transmit is byte-identical to today.
     private bool _cwActive;
@@ -408,6 +429,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _cwSpeedWpm;
     private int _cwSidetoneHz;
     private byte _cwSidetoneLevel;
+    private bool _cwBreakIn = true; // Pre-change pin; TxSpecific byte 5 bit 7.
+    private int _cwHangMs = 300; // Pre-change pin; TxSpecific bytes 11-12.
+    private int _cwWeight = 50; // Pre-change pin; TxSpecific byte 10.
+    private bool _cwPaddleReverse; // Pre-change pin false; TxSpecific byte 5 bit 2.
 
     // TxSpecific byte-5 CW mode_control bit layout — pihpsdr new_protocol.c
     // new_protocol_tx_specific (transmit_specific_buffer[5]) and OpenHPSDR
@@ -421,26 +446,13 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public const byte CwModeStrictSpacing = 0x40; // bit6 — strict char spacing
     public const byte CwModeBreakIn      = 0x80; // bit7 — break-in (radio handles TX/RX)
 
-    // Gateware keyer parameters that have no operator UI yet (mirrors the
-    // Protocol-1 neutral defaults in ControlFrame). Held as constants and
-    // sent on every CW transmit.
-    //   Weight  : TxSpecific byte 10, 50% => 1:1 dit:dah (pihpsdr default).
+    // Gateware keyer parameters that remain fixed and are sent on every CW
+    // transmit.
     //   Spacing : strict letter spacing off (bug/keyer pass-through).
-    //   Reverse : paddles un-swapped.
-    //   BreakIn : ON. *Load-bearing for issue #1032* — without break-in the
-    //             radio will not switch to TX on key-down, so the jack stays
-    //             silent (the original bug). Semi/full/off is a CW-operator
-    //             preference and a candidate follow-up control; ON is the only
-    //             value that makes "plug a key in and it works" true.
-    //   HangMs  : semi-break-in tail before the radio drops back to RX.
     //   RfDelayMs: PTT-to-RF (key-down) delay; gateware-clamped to 900/WPM
     //             (pihpsdr "FPGA iambic keyer bug" workaround, byte 13).
     //   RampMs  : CW envelope rise/fall; Thetis forces 9 (setup.cs:29327).
-    private const byte CwKeyerWeight    = 50;
     private const bool CwKeyerSpacing   = false;
-    private const bool CwKeyerReverse   = false;
-    private const bool CwKeyerBreakIn   = true;
-    private const int  CwKeyerHangMs    = 300;
     private const int  CwKeyerRfDelayMs = 8;
     private const byte CwKeyerRampMs    = 9;
 
@@ -525,6 +537,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqScratchRevision;
     private Func<long, bool>? _txIqSafetyGate;
     private readonly object _txIqGate = new();
+    private readonly object _txIqSendGate = new();
     // Must remain a multi-reader channel: the sender consumes normally, while
     // producer-side stale-drop and reset/shutdown drains also legitimately
     // dequeue packets. SingleReader would make those concurrent TryRead calls
@@ -1056,6 +1069,29 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         return 0;
     }
 
+    internal static int ReceiverIndexForRxStream(
+        int streamIndex,
+        HpsdrBoardKind board,
+        bool rx2Enabled,
+        int extraReceiverCount,
+        bool diversitySourceEnabled,
+        int displayDdcIndex)
+    {
+        // Deliberately recognize only the exact PHYSICAL DDC port here. A
+        // logical-stream fallback can be numerically identical to RX1's DDC2
+        // once RX1+RX2 are active, and treating that ambiguity as display IQ
+        // would steal the operator's audio stream. G2/Orion exposes physical
+        // DDC source ports, which is the hardware this feature targets.
+        if (displayDdcIndex >= 2 && streamIndex == displayDdcIndex)
+            return DisplayReceiverIndex;
+        return ReceiverIndexForRxStream(
+            streamIndex,
+            board,
+            rx2Enabled,
+            extraReceiverCount,
+            diversitySourceEnabled);
+    }
+
     /// <summary>
     /// IQ packet rate (packets in the last completed ~1 s window) per UDP
     /// source port 1035..1042 → index 0..7 → DDC 0..7. The RX2 DDC is
@@ -1194,6 +1230,53 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Configure an analyzer-only physical DDC. Passing an index outside
+    /// DDC2..DDC7 disables it. This path is additive to the existing user DDC
+    /// composer and never writes DDC0/1, whose PureSignal ownership is
+    /// unchanged. Incoming IQ is tagged with <see cref="DisplayReceiverIndex"/>
+    /// so hosting can feed a display-only WDSP channel without audio routing.
+    /// </summary>
+    public void SetDisplayDdc(int ddcIndex, long centerHz, byte adcSource)
+    {
+        int firstFree = FirstFreeContiguousUserDdc();
+        int nextIndex = ddcIndex == firstFree && ddcIndex is >= 2 and < MaxRxDdc
+            ? ddcIndex
+            : -1;
+        double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
+        long corrected = (long)Math.Round(centerHz * factor, MidpointRounding.AwayFromZero);
+        uint nextFreq = (uint)Math.Clamp(corrected, 0L, uint.MaxValue);
+
+        bool changed = _displayDdcFreqHz != nextFreq;
+        _displayDdcFreqHz = nextFreq;
+        changed |= Interlocked.Exchange(ref _displayDdcAdcSource, adcSource) != adcSource;
+        changed |= Interlocked.Exchange(ref _displayDdcIndex, nextIndex) != nextIndex;
+        if (!changed || !CanSendCmdHighPriority) return;
+
+        SendCmdRx();
+        SendCmdHighPriority(run: true);
+    }
+
+    private int FirstFreeContiguousUserDdc()
+    {
+        int occupied = 1; // RX1
+        bool rx2OrDiversity = Volatile.Read(ref _rx2Enabled) != 0
+            || Volatile.Read(ref _diversitySourceEnabled) != 0;
+        if (rx2OrDiversity) occupied++;
+        if (Volatile.Read(ref _rx2Enabled) != 0)
+            occupied += Math.Max(0, Volatile.Read(ref _extraReceiverCount));
+        return RxBaseDdc(_boardKind) + occupied;
+    }
+
+    private int EffectiveDisplayDdcIndex()
+    {
+        int configured = Volatile.Read(ref _displayDdcIndex);
+        int expected = FirstFreeContiguousUserDdc();
+        return configured == expected && configured is >= 2 and < MaxRxDdc
+            ? configured
+            : -1;
+    }
+
+    /// <summary>
     /// Sets the per-radio frequency-correction factor (issue #325). The
     /// caller is responsible for re-pushing the current dial Hz via
     /// <see cref="SetVfoAHz"/> after this so the new factor reaches the
@@ -1290,6 +1373,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             ? SaturnWidebandGeometry
             : ClassicWidebandGeometry;
 
+    /// <summary>Capture geometry currently negotiated with the connected
+    /// board; the display pipeline uses its update rate to convert smoothing
+    /// time constants into per-frame EMA alphas.</summary>
+    internal WidebandCaptureGeometry CurrentWidebandGeometry =>
+        WidebandGeometryFor(_boardKind, _variant);
+
     /// <summary>
     /// Per-board, per-sample-rate gain correction applied on top of the
     /// int24→[-1,+1] normalisation in <c>HandleDdcPacket</c>.
@@ -1370,6 +1459,27 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 : (byte)(_dleOutputs & ~0x04);
         }
         if (_rxTask is not null) SendCmdHighPriority(run: true);
+    }
+
+    /// <summary>
+    /// Enable / disable the dedicated XVTR transmit output at DLE_outputs[0].
+    /// This is independent of RX auxiliary input selection. Switching a T/R
+    /// output while keyed is unsafe, so changes are deferred until both MOX and
+    /// TUNE are off, matching the antenna-relay discipline.
+    /// </summary>
+    public void SetXvtrEnabled(bool enabled)
+    {
+        if (_moxOn || _tuneActive)
+        {
+            Interlocked.Exchange(ref _pendingXvtrEnabled, enabled ? 1 : 0);
+            return;
+        }
+
+        bool changed = _xvtrEnabled != enabled;
+        _xvtrEnabled = enabled;
+        Interlocked.Exchange(ref _pendingXvtrEnabled, -1);
+        UpdateXvtrOutput();
+        if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -1456,9 +1566,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         => SetAntennas(txAntWire, rxAntWire, hasTxAntennaRelays, rxAuxInput, mkiiBpfRxSelect, hasXvtrTxRelay: false);
 
     /// <summary>
-    /// Variant-gated overload. When <paramref name="hasXvtrTxRelay"/> is true,
-    /// RX aux XVTR also arms DLE_outputs bit 0. The bit is applied atomically
-    /// with the auxiliary relay selection and uses the same keyed-state defer.
+    /// Compatibility overload retaining the historical capability parameter.
+    /// XVTR output state is no longer inferred from RX aux; callers must use
+    /// <see cref="SetXvtrEnabled"/> with their resolved board/variant gate.
     /// </summary>
     public void SetAntennas(
         int txAntWire,
@@ -1468,6 +1578,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         bool mkiiBpfRxSelect,
         bool hasXvtrTxRelay)
     {
+        _ = hasXvtrTxRelay;
         int tx = (txAntWire is 1 or 2 or 3) ? txAntWire : 1;
         int rx = (rxAntWire is 1 or 2 or 3) ? rxAntWire : 1;
         int aux = (rxAuxInput is >= 0 and <= 4) ? rxAuxInput : 0;
@@ -1480,21 +1591,16 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             _pendingTxAntenna = tx;
             _pendingRxAntenna = rx;
             _pendingRxAuxInput = aux;
-            _pendingHasXvtrTxRelay = hasXvtrTxRelay;
             return;
         }
 
-        bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux
-            || _hasXvtrTxRelay != hasXvtrTxRelay;
+        bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux;
         _txAntenna = tx;
         _rxAntenna = rx;
         _rxAuxInput = aux;
-        _hasXvtrTxRelay = hasXvtrTxRelay;
-        UpdateXvtrOutputFromRxAux();
         _pendingTxAntenna = -1;
         _pendingRxAntenna = -1;
         _pendingRxAuxInput = -1;
-        _pendingHasXvtrTxRelay = null;
         if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
     }
 
@@ -1529,24 +1635,24 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         if (_pendingTxAntenna < 0
             && _pendingRxAntenna < 0
             && _pendingRxAuxInput < 0
-            && !_pendingHasXvtrTxRelay.HasValue
+            && Volatile.Read(ref _pendingXvtrEnabled) < 0
             && !_hasPendingRfFilters)
             return false;
         int tx = _pendingTxAntenna >= 0 ? _pendingTxAntenna : _txAntenna;
         int rx = _pendingRxAntenna >= 0 ? _pendingRxAntenna : _rxAntenna;
         int aux = _pendingRxAuxInput >= 0 ? _pendingRxAuxInput : _rxAuxInput;
-        bool hasXvtrTxRelay = _pendingHasXvtrTxRelay ?? _hasXvtrTxRelay;
+        int pendingXvtr = Interlocked.Exchange(ref _pendingXvtrEnabled, -1);
+        bool xvtrEnabled = pendingXvtr >= 0 ? pendingXvtr != 0 : _xvtrEnabled;
         bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux
-            || _hasXvtrTxRelay != hasXvtrTxRelay;
+            || _xvtrEnabled != xvtrEnabled;
         _txAntenna = tx;
         _rxAntenna = rx;
         _rxAuxInput = aux;
-        _hasXvtrTxRelay = hasXvtrTxRelay;
-        UpdateXvtrOutputFromRxAux();
+        _xvtrEnabled = xvtrEnabled;
+        UpdateXvtrOutput();
         _pendingTxAntenna = -1;
         _pendingRxAntenna = -1;
         _pendingRxAuxInput = -1;
-        _pendingHasXvtrTxRelay = null;
         if (_hasPendingRfFilters)
         {
             changed |= !Equals(_rfFilters, _pendingRfFilters);
@@ -1557,12 +1663,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         return changed;
     }
 
-    private void UpdateXvtrOutputFromRxAux()
+    private void UpdateXvtrOutput()
     {
-        const int XvtrRxAuxInput = 3;
         lock (_dleOutputsLock)
         {
-            _dleOutputs = _hasXvtrTxRelay && _rxAuxInput == XvtrRxAuxInput
+            _dleOutputs = _xvtrEnabled
                 ? (byte)(_dleOutputs | 0x01)
                 : (byte)(_dleOutputs & ~0x01);
         }
@@ -1842,6 +1947,46 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     public void ResetTxIqForSafety() => ResetTxIq();
 
+    /// <summary>
+    /// Sends one all-zero TX-IQ packet while unkeyed and waits for its synchronous
+    /// transport handoff. Legacy Protocol-2 gateware retains the TX FIFO output
+    /// word when the FIFO empties and PTT only masks that word, so ending the
+    /// unkeyed stream with zero prevents the previous TUNE word from reappearing
+    /// on the next MOX edge. The packet is constructed here and accepts no caller
+    /// IQ, so normal revision-gated TX-IQ remains closed during pre-key setup.
+    /// </summary>
+    internal bool PreloadZeroTxIqBeforeKeyDown()
+    {
+        // Socketless clients cannot put RF on the air. They are used by service
+        // tests that exercise state transitions without a transport.
+        if (_sock is null && _commandSinkForTesting is null) return true;
+
+        var packet = new byte[BufLen];
+        lock (_txIqGate)
+        {
+            WriteBeU32(packet, 0, _seqCmdTxIq++);
+        }
+
+        try
+        {
+            // Serialize behind any packet that passed the revision check just
+            // before egress was revoked. The zero packet must be the final
+            // port-1029 payload handed to the transport before wire MOX rises.
+            lock (_txIqSendGate)
+            {
+                SendCommandPacket(packet, 1029);
+                Interlocked.Increment(ref _txIqPacketsSent);
+            }
+            return true;
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+        {
+            Interlocked.Increment(ref _txIqSendFailures);
+            _log.LogWarning(ex, "p2.txiq pre-key zero preload failed");
+            return false;
+        }
+    }
+
     private void ResetTxIq()
     {
         lock (_txIqGate)
@@ -2017,17 +2162,20 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                             // Decision 12: a packet dequeued before an unkey/trip
                             // must not escape after pacing. Re-check its exact
                             // transition revision immediately before the socket.
-                            if (!(_txIqSafetyGate?.Invoke(queued.SafetyRevision) ?? true))
+                            lock (_txIqSendGate)
                             {
-                                Interlocked.Increment(ref _txIqSendFailures);
-                                continue;
+                                if (!(_txIqSafetyGate?.Invoke(queued.SafetyRevision) ?? true))
+                                {
+                                    Interlocked.Increment(ref _txIqSendFailures);
+                                    continue;
+                                }
+                                fifoSamples += TxIqSamplesPerPacket;
+                                // ArrayPool may return a larger array; send exactly the
+                                // 1444-byte Protocol-2 payload, synchronously, before reuse.
+                                _sock!.SendTo(packet.AsSpan(0, BufLen), SocketFlags.None, ep);
+                                rateCount++;
+                                Interlocked.Increment(ref _txIqPacketsSent);
                             }
-                            fifoSamples += TxIqSamplesPerPacket;
-                            // ArrayPool may return a larger array; send exactly the
-                            // 1444-byte Protocol-2 payload, synchronously, before reuse.
-                            _sock!.SendTo(packet.AsSpan(0, BufLen), SocketFlags.None, ep);
-                            rateCount++;
-                            Interlocked.Increment(ref _txIqPacketsSent);
                         }
                         catch (ObjectDisposedException) { break; }
                         catch (SocketException ex)
@@ -2146,7 +2294,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         packet[23] = enabled ? (byte)0x01 : (byte)0x00;
         BinaryPrimitives.WriteUInt16BigEndian(packet[24..], checked((ushort)geometry.SamplesPerPacket));
         packet[26] = 16;
-        packet[27] = enabled ? WidebandUpdateRateMs : (byte)0;
+        packet[27] = enabled ? checked((byte)geometry.UpdateRateMs) : (byte)0;
         packet[28] = checked((byte)geometry.PacketsPerFrame);
     }
 
@@ -2903,6 +3051,16 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 (byte)Volatile.Read(ref _rx2AdcSource),
                 (byte)Volatile.Read(ref _diversitySourceAdcSource));
         }
+        int displayDdc = EffectiveDisplayDdcIndex();
+        if (displayDdc is >= 2 and < MaxRxDdc)
+        {
+            p[7] |= (byte)(1 << displayDdc);
+            WriteDdcConfigBlock(
+                p,
+                displayDdc,
+                (byte)Volatile.Read(ref _displayDdcAdcSource),
+                (ushort)_sampleRateKhz);
+        }
         SendCommandPacket(p, 1025);
     }
 
@@ -2915,6 +3073,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             SpeedWpm = _cwSpeedWpm,
             SidetoneHz = _cwSidetoneHz,
             SidetoneLevel = _cwSidetoneLevel,
+            BreakIn = Volatile.Read(ref _cwBreakIn),
+            HangMs = Volatile.Read(ref _cwHangMs),
+            Weight = Volatile.Read(ref _cwWeight),
+            PaddleReverse = Volatile.Read(ref _cwPaddleReverse),
         };
         // Board-gate the PS-armed TxSpecific shape (p[57..59] PA-protection /
         // step-att for the TX-DAC reference) the same way every other PS wire
@@ -2945,6 +3107,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         _cwSpeedWpm = cw.SpeedWpm;
         _cwSidetoneHz = cw.SidetoneHz;
         _cwSidetoneLevel = cw.SidetoneLevel;
+        Volatile.Write(ref _cwBreakIn, cw.BreakIn);
+        Volatile.Write(ref _cwHangMs, cw.HangMs);
+        Volatile.Write(ref _cwWeight, cw.Weight);
+        Volatile.Write(ref _cwPaddleReverse, cw.PaddleReverse);
         if (_rxTask is not null) SendCmdTx();
     }
 
@@ -3008,25 +3174,23 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // self-keys off the rear KEY jack once byte-5 bit-1 is set.
         if (cw.Active)
         {
-            // Gateware-pinned bits use ternary-OR (not `if`) so the const
-            // false/true folds to an expression rather than unreachable code.
             byte mode = CwModeCwSelected;
-            mode |= CwKeyerReverse ? CwModeReverse : (byte)0;
+            mode |= cw.PaddleReverse ? CwModeReverse : (byte)0;
             // Straight = no element timing (external keyer/bug pass-through);
             // Iambic-A sets the iambic bit; Iambic-B sets iambic + Mode B.
             if (cw.Mode == CwKeyerMode.IambicA) mode |= CwModeIambic;
             else if (cw.Mode == CwKeyerMode.IambicB) mode |= (byte)(CwModeIambic | CwModeModeB);
             mode |= cw.SidetoneLevel != 0 ? CwModeSidetone : (byte)0;
             mode |= CwKeyerSpacing ? CwModeStrictSpacing : (byte)0;
-            mode |= CwKeyerBreakIn ? CwModeBreakIn : (byte)0;
+            mode |= cw.BreakIn ? CwModeBreakIn : (byte)0;
             p[5] = mode;
 
             p[6] = (byte)(cw.SidetoneLevel & 0x7F);
             WriteBeU16(p, 7, (ushort)Math.Clamp(cw.SidetoneHz, 0, 0xFFFF));
             int wpm = Math.Clamp(cw.SpeedWpm, 1, 60);
             p[9] = (byte)wpm;
-            p[10] = CwKeyerWeight;
-            WriteBeU16(p, 11, (ushort)Math.Clamp(CwKeyerHangMs, 0, 0xFFFF));
+            p[10] = (byte)Math.Clamp(cw.Weight, 33, 66);
+            WriteBeU16(p, 11, (ushort)Math.Clamp(cw.HangMs, 0, 1023));
             // RF (key-down) delay, clamped to 900/WPM — pihpsdr's documented
             // FPGA iambic-keyer-bug workaround (new_protocol.c:1500-1503).
             int rfDelay = Math.Min(CwKeyerRfDelayMs, 900 / wpm);
@@ -3187,6 +3351,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             }
         }
 
+        int displayDdc = EffectiveDisplayDdcIndex();
+        if (displayDdc is >= 2 and < MaxRxDdc)
+            WriteBeU32(p, 9 + displayDdc * 4, (uint)(_displayDdcFreqHz * HzToPhase));
+
         // PureSignal — when armed, DDC0 + DDC1 phase words also need to
         // track the TX frequency during xmit so the feedback DDC samples
         // the actual TX coupler signal. pihpsdr new_protocol.c:827-839.
@@ -3238,10 +3406,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
 
         // OrionMkII DLE gateware and Saturn/G2 p2_app both honor byte 1400;
-        // bit 0 is variant-gated above because the former drives the XVTR TX
-        // relay while the latter uses it as XVTR GPIO / PA inhibit. Angelia
-        // latches an unconnected port; Hermes/ANAN-10/100/10E/100B/200D,
-        // Metis, and G2E do not decode it. Issue #414.
+        // the explicit bit-0 state is resolved by the caller because the former
+        // drives the XVTR TX relay while the latter uses it as XVTR GPIO / PA
+        // inhibit. Angelia latches an unconnected port; Hermes/
+        // ANAN-10/100/10E/100B/200D, Metis, and G2E do not decode it. Issue #414.
         WriteDleOutputs(p);
 
         // RX front-end: Mercury preamp bit (1403) + ADC0/ADC1 step
@@ -4496,7 +4664,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             _boardKind,
             Volatile.Read(ref _rx2Enabled) != 0,
             Volatile.Read(ref _extraReceiverCount),
-            Volatile.Read(ref _diversitySourceEnabled) != 0);
+            Volatile.Read(ref _diversitySourceEnabled) != 0,
+            EffectiveDisplayDdcIndex());
 
         var frame = new IqFrame(
             InterleavedSamples: new ReadOnlyMemory<double>(samples, 0, samplesPerPacket * 2),

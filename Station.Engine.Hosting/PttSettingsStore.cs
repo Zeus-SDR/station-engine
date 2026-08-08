@@ -34,6 +34,7 @@ public sealed class PttSettingsStore : IDisposable
     private readonly ILiteCollection<PttSettingsEntry> _rows;
     private readonly ILogger<PttSettingsStore> _log;
     private readonly object _sync = new();
+    private volatile bool _enabled;
 
     // Fired on any write so the UI / status endpoint re-reads the gate.
     public event Action? Changed;
@@ -49,6 +50,7 @@ public sealed class PttSettingsStore : IDisposable
         _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
         _db = _dbLease.Database;
         _rows = _db.GetCollection<PttSettingsEntry>("ptt_settings");
+        _enabled = _rows.FindAll().FirstOrDefault()?.Enabled ?? true;
 
         _log.LogInformation("PttSettingsStore initialized at {Path}", dbPath);
     }
@@ -57,14 +59,7 @@ public sealed class PttSettingsStore : IDisposable
     /// install / pre-feature DB) defaults to ON — the footswitch keys MOX out of
     /// the box, like Thetis. The operator can turn the gate OFF in Radio
     /// Settings for UI-only keying; that choice is persisted.</summary>
-    public bool Get()
-    {
-        lock (_sync)
-        {
-            var entry = _rows.FindAll().FirstOrDefault();
-            return entry?.Enabled ?? true;
-        }
-    }
+    public bool Get() => _enabled;
 
     /// <summary>Replace the global enable gate. Insert-then-Update (matching
     /// ChatEnabledStore) avoids the LiteDB Id=0 upsert bug (PR #387).</summary>
@@ -84,6 +79,7 @@ public sealed class PttSettingsStore : IDisposable
                 existing.UpdatedUtc = nowUtc;
                 _rows.Update(existing);
             }
+            _enabled = enabled;
         }
         Changed?.Invoke();
     }

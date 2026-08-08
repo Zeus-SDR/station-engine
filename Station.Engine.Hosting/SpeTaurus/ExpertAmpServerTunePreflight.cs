@@ -12,6 +12,7 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 
@@ -26,6 +27,13 @@ internal sealed class ExpertAmpServerTunePreflight(
     internal const string PluginId = "org.openhpsdr.speexperttaurus";
     internal const string HttpClientName = "SpeTaurusExpertAmpServer";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(75);
+
+    /// <summary>
+    /// Ceiling on the time spent waiting for a display frame that carries the
+    /// Taurus model banner. Never more than half the operator's arm timeout —
+    /// the remainder belongs to the TUNE-indicator confirmation.
+    /// </summary>
+    private static readonly TimeSpan MaximumIdentityProbe = TimeSpan.FromMilliseconds(900);
 
     public async Task<AmplifierTunePreflightResult> PrepareAsync(
         CancellationToken cancellationToken)
@@ -57,17 +65,26 @@ internal sealed class ExpertAmpServerTunePreflight(
                 $"{config.ExpertServerUrl}/api/v1/status",
                 token).ConfigureAwait(false);
 
-            // Identity is confirmed separately from the checksum-valid LCD
-            // immediately below so older servers that omit modelName remain usable.
+            // Identity is deferred to ResolveIdentityAsync below — a real Taurus
+            // reports the 1.5K-FA model code here, so gating on modelName at this
+            // point would reject every genuine amplifier. Nothing is written
+            // before identity is settled.
             var unsafeReason = UnsafeStatusReason(status, displayIdentityConfirmed: true);
             if (unsafeReason is not null) return Fail(unsafeReason);
 
-            var before = await GetDisplayFrameAsync(client, config.ExpertServerUrl, token)
-                .ConfigureAwait(false);
-            var identityConfirmed = IsExpectedTaurus(status) || before.TaurusIdentity;
+            var (before, identityConfirmed) = await ResolveIdentityAsync(
+                client,
+                config,
+                status,
+                token).ConfigureAwait(false);
             if (!identityConfirmed)
-                return Fail(
-                    "Expert Amp Server did not provide checksum-valid SPE Expert 1.5K Taurus identity evidence.");
+            {
+                var reason = IdentityFailureReason(status);
+                log.LogWarning(
+                    "spe-taurus.expert-server tune preflight identity unresolved model={Model} banner=absent",
+                    string.IsNullOrWhiteSpace(status.ModelName) ? "(none)" : status.ModelName);
+                return Fail(reason);
+            }
             if (before.Tune)
                 return await ConfirmReadyAsync(client, config, identityConfirmed, token)
                     .ConfigureAwait(false);
@@ -138,6 +155,74 @@ internal sealed class ExpertAmpServerTunePreflight(
     private static AmplifierTunePreflightResult Fail(string error) =>
         AmplifierTunePreflightResult.Fail($"Taurus TUN preflight failed: {error}");
 
+    /// <summary>
+    /// Establishes that the amplifier being armed really is a Taurus, and
+    /// returns the display frame the decision was made against.
+    /// </summary>
+    /// <remarks>
+    /// A Taurus answers <c>/api/v1/status</c> with the 1.5K-FA model code, so
+    /// <c>modelName</c> alone never names one; the proof is the LCD model
+    /// banner, which sits on row 0 of the standby screen and is therefore
+    /// missing from every partial frame the Expert Amp Server serves. A single
+    /// frame read is a coin flip, which is why this probes a bounded run of
+    /// frames and also honours a confirmation already earned elsewhere in this
+    /// config epoch (panel poll, discovery, a previous arm) via
+    /// <see cref="SpeTaurusService.HasConfirmedTaurusIdentity"/>. A model that
+    /// is neither Taurus nor 1.5K-FA is a different amplifier and fails closed
+    /// immediately — no amount of display evidence rescues it.
+    /// </remarks>
+    private async Task<(ExpertDisplayEvidence Display, bool Confirmed)> ResolveIdentityAsync(
+        HttpClient client,
+        SpeTaurusConfig config,
+        ExpertStatus status,
+        CancellationToken cancellationToken)
+    {
+        var namedTaurus = IsExpectedTaurus(status);
+        var canFallBackToDisplay =
+            ExpertAmpServerEvidence.CanUseDisplayIdentityFallback(status.ModelName);
+        if (namedTaurus) taurus.RememberTaurusIdentity(config);
+        else if (!canFallBackToDisplay) taurus.ForgetTaurusIdentity(config);
+
+        var probe = Stopwatch.StartNew();
+        var budget = IdentityProbeBudget(config);
+        while (true)
+        {
+            var display = await GetDisplayFrameAsync(
+                client,
+                config.ExpertServerUrl,
+                cancellationToken).ConfigureAwait(false);
+            if (namedTaurus) return (display, true);
+            if (!canFallBackToDisplay) return (display, false);
+            if (display.TaurusIdentity)
+            {
+                taurus.RememberTaurusIdentity(config);
+                return (display, true);
+            }
+            if (taurus.HasConfirmedTaurusIdentity(config)) return (display, true);
+            if (probe.Elapsed >= budget) return (display, false);
+            await Task.Delay(PollInterval, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static TimeSpan IdentityProbeBudget(SpeTaurusConfig config)
+    {
+        var half = TimeSpan.FromMilliseconds(config.TuneArmTimeoutMs / 2.0);
+        return half < MaximumIdentityProbe ? half : MaximumIdentityProbe;
+    }
+
+    private static string IdentityFailureReason(ExpertStatus status)
+    {
+        var model = string.IsNullOrWhiteSpace(status.ModelName)
+            ? "no model name"
+            : $"model \"{status.ModelName.Trim()}\"";
+        return ExpertAmpServerEvidence.CanUseDisplayIdentityFallback(status.ModelName)
+            ? "Expert Amp Server did not provide checksum-valid SPE Expert 1.5K Taurus "
+                + $"identity evidence: it reported {model}, and no display frame carried the "
+                + $"\"{ExpertAmpServerEvidence.TaurusDisplayBanner}\" banner. Bring the amplifier "
+                + "to its standby screen so its model banner is visible, then retry."
+            : $"Expert Amp Server reported {model}, which is not an SPE Expert 1.5K Taurus.";
+    }
+
     private async Task<AmplifierTunePreflightResult> ConfirmReadyAsync(
         HttpClient client,
         SpeTaurusConfig expectedConfig,
@@ -202,7 +287,7 @@ internal sealed class ExpertAmpServerTunePreflight(
                 "Expert Amp Server did not provide checksum-valid Taurus display evidence; RF was not keyed.");
         return new(
             flags.Leds.Tune,
-            frame.ScreenText?.Contains("EXPERT 1.5K TAURUS", StringComparison.OrdinalIgnoreCase) == true);
+            ExpertAmpServerEvidence.HasTaurusDisplayBanner(frame.ScreenText));
     }
 
     private static bool HasAuthoritativeStatus(ExpertStatus status) =>
@@ -213,7 +298,7 @@ internal sealed class ExpertAmpServerTunePreflight(
             status.LastContactAt);
 
     private static bool IsExpectedTaurus(ExpertStatus status) =>
-        status.ModelName?.Contains("TAURUS", StringComparison.OrdinalIgnoreCase) == true;
+        ExpertAmpServerEvidence.MentionsTaurus(status.ModelName);
 
     private static async Task<T> GetDataAsync<T>(
         HttpClient client,

@@ -20,6 +20,22 @@ public sealed record EngineScannedPlugin(
     int NumInputs,
     int NumOutputs);
 
+/// <summary>
+/// Outcome of an engine-driven scan. Beyond the enumerated <see cref="Plugins"/>,
+/// it carries the files the engine has BLACKLISTED (crashed or hung while the
+/// engine probed them — JUCE KnownPluginList + dead-man's-pedal) so the caller
+/// can surface them instead of letting them vanish silently, and whether the
+/// engine process DIED mid-scan (a probing plugin took it down — the supervisor
+/// relaunches it and the dead-man's pedal blacklists the offender, so a rescan
+/// makes progress). The pinned 2026.06.14 engine predates upstream's
+/// sacrificial-child <c>--probe</c> scanner (verified absent from the binary),
+/// so mid-scan death is a real, expected failure mode the caller must handle.
+/// </summary>
+public sealed record EngineScanResult(
+    IReadOnlyList<EngineScannedPlugin> Plugins,
+    IReadOnlyList<string> BlacklistedFiles,
+    bool EngineDied);
+
 /// <summary>Outcome of a <see cref="VstEngineController.ActivateAsync"/> call.</summary>
 public enum VstEngineStartResult
 {
@@ -145,8 +161,13 @@ public sealed class VstEngineController : IAsyncDisposable
     /// </summary>
     public event Action<string>? Faulted;
 
-    public VstEngineController(int maxFrames = 4096, int rate = 48000, int channels = 1)
-        : this(maxFrames, rate, channels, launch: null, resolveExe: null, createBridge: null)
+    /// <param name="concealOnMiss">
+    /// RX-only: replay the last good output block on a late/timed-out block
+    /// instead of dry passthrough. Leave false for TX — see
+    /// <see cref="VstEngineBridge.Create"/>.
+    /// </param>
+    public VstEngineController(int maxFrames = 4096, int rate = 48000, int channels = 1, bool concealOnMiss = false)
+        : this(maxFrames, rate, channels, launch: null, resolveExe: null, createBridge: null, concealOnMiss: concealOnMiss)
     {
     }
 
@@ -158,7 +179,8 @@ public sealed class VstEngineController : IAsyncDisposable
         int maxFrames, int rate, int channels,
         Func<string, IVstEngineProcess>? launch,
         Func<string?>? resolveExe,
-        Func<IVstEngineBridge>? createBridge)
+        Func<IVstEngineBridge>? createBridge,
+        bool concealOnMiss = false)
     {
         if (maxFrames <= 0) throw new ArgumentOutOfRangeException(nameof(maxFrames));
         if (rate <= 0) throw new ArgumentOutOfRangeException(nameof(rate));
@@ -172,7 +194,7 @@ public sealed class VstEngineController : IAsyncDisposable
         _supportsEngine = seamed || OperatingSystem.IsWindows();
         _resolveExe = resolveExe ?? VstEngineProcess.FindEngineExe;
         _launch = launch ?? (path => VstEngineProcess.Launch(path, _shmName, _maxFrames, _rate, _channels));
-        _createBridge = createBridge ?? (() => VstEngineBridge.Create(_shmName, _maxFrames, _rate, _channels));
+        _createBridge = createBridge ?? (() => VstEngineBridge.Create(_shmName, _maxFrames, _rate, _channels, concealOnMiss));
     }
 
     /// <summary>
@@ -223,6 +245,46 @@ public sealed class VstEngineController : IAsyncDisposable
     /// or 0 when no bridge exists yet. Diagnostics only.
     /// </summary>
     public uint EngineFlags => _bridge?.EngineFlags ?? 0;
+
+    /// <summary>
+    /// One engine telemetry snapshot, streamed by the engine's ~30 Hz
+    /// <c>levels</c> event: <see cref="CpuLoad"/> is the JUCE audio-callback
+    /// load (0–1; sustained ≈1 means the chain can't keep up in realtime),
+    /// <see cref="InputLevel"/>/<see cref="OutputLevel"/> the chain's
+    /// input/output peaks, and <see cref="SlotLevels"/> one output level per
+    /// chain slot. Immutable; swapped atomically per event.
+    /// </summary>
+    public sealed record VstEngineLevels(
+        double CpuLoad,
+        double InputLevel,
+        double OutputLevel,
+        IReadOnlyList<float> SlotLevels,
+        long Sequence);
+
+    // Written on the engine reader thread only; read lock-free from anywhere.
+    private VstEngineLevels? _levels;
+    private long _levelsSeq;
+
+    /// <summary>
+    /// Latest engine telemetry snapshot, or null until the engine streams its
+    /// first <c>levels</c> event (engine down, or an old engine build).
+    /// </summary>
+    public VstEngineLevels? LatestLevels => Volatile.Read(ref _levels);
+
+    /// <summary>Engine audio-callback CPU load (0–1), or null before the first telemetry event.</summary>
+    public double? EngineCpuLoad => LatestLevels?.CpuLoad;
+
+    /// <summary>Blocks the engine serviced within budget since the last (re)launch (bridge telemetry).</summary>
+    public long EngineServicedBlocks => _bridge?.ServicedBlocks ?? 0;
+
+    /// <summary>Mean engine round-trip time (µs) this session (bridge telemetry).</summary>
+    public double EngineAverageRoundTripMicros => _bridge?.AverageRoundTripMicros ?? 0;
+
+    /// <summary>Worst engine round-trip time (µs) this session (bridge telemetry).</summary>
+    public double EngineMaxRoundTripMicros => _bridge?.MaxRoundTripMicros ?? 0;
+
+    /// <summary>Most recent engine round-trip time (µs) (bridge telemetry).</summary>
+    public double EngineLastRoundTripMicros => _bridge?.LastRoundTripMicros ?? 0;
 
     /// <summary>The engine exe resolved on the last activation attempt, if any.</summary>
     public string? ResolvedEnginePath { get; private set; }
@@ -764,15 +826,35 @@ public sealed class VstEngineController : IAsyncDisposable
     /// "shell" VST3 (e.g. Waves WaveShell) this yields one entry PER hosted
     /// sub-plugin, each with its own <see cref="EngineScannedPlugin.Uid"/> — the
     /// identifier Zeus must pass back in <c>load_chain</c> to load that exact one.
-    /// Returns empty when the engine isn't active. Control thread only.
+    /// Returns an empty result when the engine isn't active. Control thread only.
+    ///
+    /// <para>The reply's <c>blacklist</c> (files that crashed/hung while the
+    /// engine probed them) is captured into <see cref="EngineScanResult.BlacklistedFiles"/>
+    /// so callers can surface them — a blacklisted plugin silently absent from
+    /// the list is exactly the "permanent failure that never says anything"
+    /// failure mode the engine-health RCA forbids. The scan also RACES the
+    /// engine process: if a probing plugin kills the engine mid-scan (possible
+    /// on the pinned 2026.06.14 build, which predates upstream's sacrificial-child
+    /// <c>--probe</c> scanner), the call returns promptly with
+    /// <see cref="EngineScanResult.EngineDied"/> instead of hanging out the full
+    /// timeout against a dead process.</para>
     /// </summary>
-    public async Task<IReadOnlyList<EngineScannedPlugin>> ScanPluginsAsync(
+    public async Task<EngineScanResult> ScanPluginsAsync(
         IReadOnlyList<string> paths, TimeSpan timeout, CancellationToken ct = default)
     {
-        if (!_active) return Array.Empty<EngineScannedPlugin>();
+        IVstEngineProcess? proc;
+        lock (_lifecycleLock) proc = _active ? _proc : null;
+        if (proc is null)
+            return new EngineScanResult([], [], EngineDied: false);
 
-        var tcs = new TaskCompletionSource<IReadOnlyList<EngineScannedPlugin>>(
+        var tcs = new TaskCompletionSource<(IReadOnlyList<EngineScannedPlugin>, IReadOnlyList<string>)>(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        var died = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnProcExited(IVstEngineProcess p)
+        {
+            if (ReferenceEquals(p, proc)) died.TrySetResult();
+        }
 
         void Handler(JsonElement e)
         {
@@ -817,24 +899,44 @@ public sealed class VstEngineController : IAsyncDisposable
                             NumOutputs: Int(p, "numOutputs")));
                     }
                 }
-                tcs.TrySetResult(list);
+
+                var blacklist = new List<string>();
+                if (e.TryGetProperty("blacklist", out var bl) && bl.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var f in bl.EnumerateArray())
+                    {
+                        if (f.ValueKind == JsonValueKind.String && f.GetString() is { Length: > 0 } file)
+                            blacklist.Add(file);
+                    }
+                }
+                tcs.TrySetResult((list, blacklist));
             }
-            catch { tcs.TrySetResult(Array.Empty<EngineScannedPlugin>()); }
+            catch { tcs.TrySetResult((Array.Empty<EngineScannedPlugin>(), (IReadOnlyList<string>)[])); }
         }
 
         EngineEvent += Handler;
+        proc.Exited += OnProcExited;
+        if (proc.HasExited) died.TrySetResult(); // close the exit-before-subscribe race
         try
         {
             SendCommand(new { cmd = "scan_plugins", paths });
-            return await tcs.Task.WaitAsync(timeout, ct).ConfigureAwait(false);
+            var completed = await Task.WhenAny(tcs.Task, died.Task)
+                .WaitAsync(timeout, ct).ConfigureAwait(false);
+            if (ReferenceEquals(completed, died.Task))
+                return new EngineScanResult([], [], EngineDied: true);
+            var (plugins, blacklist) = await tcs.Task.ConfigureAwait(false);
+            return new EngineScanResult(plugins, blacklist, EngineDied: false);
         }
         catch (TimeoutException)
         {
-            return Array.Empty<EngineScannedPlugin>();
+            // A timeout against an exited process means the scan died with the
+            // engine — report that precisely instead of a bare empty result.
+            return new EngineScanResult([], [], EngineDied: proc.HasExited);
         }
         finally
         {
             EngineEvent -= Handler;
+            proc.Exited -= OnProcExited;
         }
     }
 
@@ -867,7 +969,63 @@ public sealed class VstEngineController : IAsyncDisposable
         => _ = TryProcess(input, output, ctx);
 
     private void OnStdErr(string line) => StdErr?.Invoke(line);
-    private void OnEngineEvent(JsonElement e) => EngineEvent?.Invoke(e);
+
+    private void OnEngineEvent(JsonElement e)
+    {
+        // Intercept the engine's ~30 Hz telemetry before forwarding: swap one
+        // small immutable snapshot per event (reader/control thread only — the
+        // realtime path never touches this).
+        if (e.TryGetProperty("event", out var evt)
+            && evt.ValueKind == JsonValueKind.String
+            && evt.GetString() == "levels")
+        {
+            UpdateLevels(e);
+        }
+        EngineEvent?.Invoke(e);
+    }
+
+    /// <summary>
+    /// Parse a <c>levels</c> event into <see cref="LatestLevels"/>. Defensive:
+    /// every field defaults to 0/empty, and a malformed event is dropped rather
+    /// than breaking event forwarding — telemetry must never take down the
+    /// control plane. JUCE serialises levels as numbers (0–1 floats).
+    /// </summary>
+    private void UpdateLevels(JsonElement e)
+    {
+        try
+        {
+            // A levels event without a numeric cpu reading is not telemetry —
+            // drop it WHOLE rather than overwrite a good snapshot with zeros.
+            if (!e.TryGetProperty("cpu", out var cpu)
+                || cpu.ValueKind != JsonValueKind.Number
+                || !cpu.TryGetDouble(out var cpuLoad))
+                return;
+
+            static double Num(JsonElement o, string k) =>
+                o.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.Number
+                    && v.TryGetDouble(out var d) ? d : 0;
+
+            float[] slots = [];
+            if (e.TryGetProperty("slots", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<float>(arr.GetArrayLength());
+                foreach (var s in arr.EnumerateArray())
+                {
+                    if (s.ValueKind == JsonValueKind.Number && s.TryGetDouble(out var d))
+                        list.Add((float)d);
+                }
+                slots = list.ToArray();
+            }
+
+            Volatile.Write(ref _levels, new VstEngineLevels(
+                CpuLoad: cpuLoad,
+                InputLevel: Num(e, "input"),
+                OutputLevel: Num(e, "output"),
+                SlotLevels: slots,
+                Sequence: Interlocked.Increment(ref _levelsSeq)));
+        }
+        catch { /* malformed telemetry — keep the previous snapshot */ }
+    }
 
     public ValueTask DisposeAsync()
     {

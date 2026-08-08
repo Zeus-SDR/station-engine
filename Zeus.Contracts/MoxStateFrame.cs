@@ -46,16 +46,26 @@ using System.Buffers;
 
 namespace Zeus.Contracts;
 
-// MOX/TUN state edge frame. 3 bytes:
-//   [0x1C][moxOn:u8][tunOn:u8]
+// MOX/TUN state edge frame. 4 bytes:
+//   [0x1C][moxOn:u8][tunOn:u8][source:u8]
 //
 // Broadcast on every MOX or TUN edge from any source (UI, TCI, SWR trip,
 // TX timeout). The frontend updates useTxStore.moxOn / tunOn on receipt so
 // TCI-driven TX keying is reflected in the meter panel without a round-trip
 // through the HTTP REST endpoint.
-public readonly record struct MoxStateFrame(bool MoxOn, bool TunOn)
+//
+// Source carries the MoxSource that raised this edge (meaningful on a
+// MoxOn:true rising edge; a stale/default value on falling edges is
+// harmless since nothing keys off it there). The frontend uses it to arm
+// local mic streaming only for MoxSource.Hardware — a physical footswitch
+// or radio mic PTT expects whatever TX audio source (Host/RadioMic/etc.) is
+// currently selected, same as the on-screen MOX button or spacebar PTT.
+// MoxSource.Tci/Cat/Plugin/etc. must NOT arm it: those sources carry their
+// own audio and dual-feeding the browser mic in parallel corrupts
+// TxAudioIngest's accumulator (issue #346).
+public readonly record struct MoxStateFrame(bool MoxOn, bool TunOn, MoxSource Source = MoxSource.UI)
 {
-    public const int ByteLength = 3;
+    public const int ByteLength = 4;
 
     public void Serialize(IBufferWriter<byte> writer)
     {
@@ -63,6 +73,7 @@ public readonly record struct MoxStateFrame(bool MoxOn, bool TunOn)
         span[0] = (byte)MsgType.MoxState;
         span[1] = MoxOn ? (byte)1 : (byte)0;
         span[2] = TunOn ? (byte)1 : (byte)0;
+        span[3] = (byte)Source;
         writer.Advance(ByteLength);
     }
 
@@ -72,6 +83,6 @@ public readonly record struct MoxStateFrame(bool MoxOn, bool TunOn)
             throw new InvalidDataException($"MoxStateFrame requires {ByteLength} bytes, got {bytes.Length}");
         if (bytes[0] != (byte)MsgType.MoxState)
             throw new InvalidDataException($"expected MoxState (0x{(byte)MsgType.MoxState:X2}), got 0x{bytes[0]:X2}");
-        return new MoxStateFrame(MoxOn: bytes[1] != 0, TunOn: bytes[2] != 0);
+        return new MoxStateFrame(MoxOn: bytes[1] != 0, TunOn: bytes[2] != 0, Source: (MoxSource)bytes[3]);
     }
 }

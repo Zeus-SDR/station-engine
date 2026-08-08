@@ -14,8 +14,19 @@ public static class RadioTuningEndpoints
 
         endpoints.MapPost("/api/vfo", (VfoSetRequest req, RadioService r) =>
         {
+            if (!r.IsExternalFrequencyAvailable(req.Hz))
+            {
+                log.LogInformation(
+                    "api.vfo rejected receiver={Receiver} hz={Hz}",
+                    req.Receiver,
+                    req.Hz);
+                return Results.BadRequest(new
+                {
+                    error = "hz is outside the native radio range and enabled transverter profiles",
+                });
+            }
             log.LogInformation("api.vfo receiver={Receiver} hz={Hz}", req.Receiver, req.Hz);
-            return r.SetReceiverVfo(req.Receiver, req.Hz);
+            return Results.Ok(r.SetReceiverVfo(req.Receiver, req.Hz));
         });
 
         endpoints.MapPost("/api/vfo/swap", (RadioService r) =>
@@ -53,29 +64,43 @@ public static class RadioTuningEndpoints
         endpoints.MapPut("/api/radio/transverter", (
             TransverterSettingsSetRequest req,
             TransverterSettingsStore store,
-            LayoutStore layouts) =>
+            LayoutStore layouts,
+            TxService tx) =>
         {
+            if (tx.IsMoxOn || tx.IsTunOn || tx.IsTwoToneOn)
+                return Results.Conflict(new
+                {
+                    error = "transverter settings cannot change while the transmitter is active",
+                });
             var settings = new TransverterSettingsDto(
                 req.Enabled,
                 req.IfFrequencyHz,
-                req.RfFrequencyHz);
+                req.RfFrequencyHz,
+                req.Bands,
+                req.Bands is null && req.Enabled ? 0 : req.ActiveBandId);
             if (!TransverterFrequencyConverter.TryValidate(settings, out var error))
                 return Results.BadRequest(new { error });
 
             // Suppress intermediate notifications so TCI never observes the new
             // workspace flag with the old IF/RF anchors (or vice versa).
-            if (!layouts.SetTransverterEnabled(
-                    req.RadioKey, req.LayoutId, req.Enabled, notifyChanged: false))
+            if (!layouts.SetTransverterSelection(
+                    req.RadioKey,
+                    req.LayoutId,
+                    req.Enabled,
+                    settings.ActiveBandId,
+                    notifyChanged: false))
                 return Results.BadRequest(new { error = "radio/layout workspace not found" });
 
             store.Set(settings, notifyChanged: false);
             store.NotifyChanged();
             var effective = store.GetForLayout(layouts, req.RadioKey, req.LayoutId);
             log.LogInformation(
-                "api.radio.transverter radio={Radio} layout={Layout} enabled={Enabled} ifHz={IfHz} rfHz={RfHz}",
+                "api.radio.transverter radio={Radio} layout={Layout} enabled={Enabled} activeBand={ActiveBand} bands={BandCount} ifHz={IfHz} rfHz={RfHz}",
                 req.RadioKey,
                 req.LayoutId,
                 settings.Enabled,
+                settings.ActiveBandId,
+                effective.Bands?.Count ?? 0,
                 settings.IfFrequencyHz,
                 settings.RfFrequencyHz);
             return Results.Ok(effective);
@@ -157,8 +182,8 @@ public static class RadioTuningEndpoints
             var state = r.Snapshot();
             if (!SplitReceiverAvailable(state, req.Receiver))
                 return Results.BadRequest(new { error = "split receiver is not exposed" });
-            if (req.Hz <= 0 || req.Hz > 60_000_000)
-                return Results.BadRequest(new { error = "hz out of range [1, 60000000]" });
+            if (!r.IsExternalFrequencyAvailable(req.Hz))
+                return Results.BadRequest(new { error = "hz is outside the native radio range and enabled transverter profiles" });
             log.LogInformation("api.tx.split.frequency receiver={Receiver} hz={Hz}", req.Receiver, req.Hz);
             return Results.Ok(r.SetSplitFrequency(req.Receiver, req.Hz));
         });
@@ -169,10 +194,10 @@ public static class RadioTuningEndpoints
         // See docs/prd/panfall_behavior.md.
         endpoints.MapPost("/api/radio/lo", (RadioLoSetRequest req, RadioService r) =>
         {
-            if (req.Hz < 0 || req.Hz > 60_000_000)
+            if (!r.IsExternalFrequencyAvailable(req.Hz, allowZero: true))
             {
                 log.LogInformation("api.radio.lo rejected hz={Hz}", req.Hz);
-                return Results.BadRequest(new { error = "hz out of range [0, 60000000]" });
+                return Results.BadRequest(new { error = "hz is outside the native radio range and enabled transverter profiles" });
             }
             log.LogInformation("api.radio.lo hz={Hz}", req.Hz);
             return Results.Ok(r.SetRadioLo(req.Hz));

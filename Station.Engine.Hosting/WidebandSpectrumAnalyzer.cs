@@ -24,42 +24,53 @@ internal sealed class WidebandSpectrumAnalyzer
     public const int AnalysisFftSize = 32_768;
 
     private const int FftSize = AnalysisFftSize;
+    private const int MinSegmentLength = 8_192;
+    // Segmentation is allowed while the coarser FFT bin stays at or below
+    // this fraction of a display pixel, so reprojection always keeps at
+    // least ~1.7 real bins per pixel. Overview zooms (where one 3.75 kHz
+    // bin is already far finer than one 14.6 kHz pixel) qualify; deep
+    // zooms keep the full-length transform and its native resolution.
+    private const double MaxSegmentBinToPixelRatio = 0.6;
+    private const int MaxSegments = 8;
     private const double MinAmplitude = 1e-12;
-    private const double SpectrumEmaAlpha = 0.38;
-    private const double MaxZoomSpectrumEmaAlpha = 0.62;
+    private const double MinPower = MinAmplitude * MinAmplitude;
+    // Temporal smoothing is expressed as time constants and converted to a
+    // per-frame EMA alpha from the actual snapshot cadence, so the display
+    // feels identical at the Saturn 50 ms rate and the classic 100 ms rate.
+    private const double PanTauOverviewMs = 210.0;
+    private const double PanTauMaxZoomMs = 100.0;
+    // Attack is deliberately ~2.5x faster than the slowest decay and only
+    // engages on rises well above the averaged level, so signal onsets
+    // render promptly while ordinary noise wiggle never trips the fast
+    // path and the floor keeps the full averaging depth.
+    private const double PanAttackTauMs = 80.0;
+    private const double PanAttackTriggerRatio = 1.6;
+    private const double WfTauMs = 70.0;
+    private const double MinFrameIntervalMs = 10.0;
+    private const double MaxFrameIntervalMs = 1_000.0;
     private const double MinSpatialSideWeight = 0.06;
     private const double MaxSpatialSideWeight = 0.18;
 
     private readonly double[] _real = new double[FftSize];
-    private readonly double[] _imag = new double[FftSize];
-    private readonly double[] _window = new double[Protocol2Client.WidebandMaxFrameSamples];
-    private readonly int[] _bitReverse = new int[FftSize];
-    private readonly double[] _stageCos;
-    private readonly double[] _stageSin;
     private readonly double[] _binPower = new double[(FftSize / 2) + 1];
-    private readonly float[] _smoothedDb = new float[DisplayWidth];
-    private double _windowSum;
-    private int _windowSampleCount;
+    private readonly double[] _avgPanPower = new double[DisplayWidth];
+    private readonly double[] _avgWfPower = new double[DisplayWidth];
+    private readonly Dictionary<int, FftPlan> _fftPlans = new();
+    private readonly Dictionary<int, WindowPlan> _windowPlans = new();
+    private int _activeBinCount;
+    private int _segmentLength = FftSize;
+    private int[] _segmentOffsets = [0];
     private int _sampleRateHz;
     private long _viewportCenterHz;
     private float _viewportHzPerPixel;
+    private int _windowSampleCount;
     private bool _smoothedValid;
 
     public WidebandSpectrumAnalyzer()
     {
-        int bits = 0;
-        for (int n = FftSize; n > 1; n >>= 1) bits++;
-        for (int i = 0; i < FftSize; i++)
-            _bitReverse[i] = ReverseBits(i, bits);
-
-        _stageCos = new double[bits];
-        _stageSin = new double[bits];
-        for (int stage = 0, len = 2; len <= FftSize; stage++, len <<= 1)
-        {
-            double angle = -2.0 * Math.PI / len;
-            _stageCos[stage] = Math.Cos(angle);
-            _stageSin[stage] = Math.Sin(angle);
-        }
+        // The full-length plan is always needed (deep zooms and classic
+        // captures run unsegmented), so build it up front.
+        _ = PlanFor(FftSize);
     }
 
     public WidebandSpectrumViewport Analyze(
@@ -68,7 +79,31 @@ internal sealed class WidebandSpectrumAnalyzer
         Span<float> panDb,
         Span<float> wfDb,
         int zoomLevel,
-        long targetCenterHz)
+        long targetCenterHz,
+        double frameIntervalMs = 100.0) =>
+        Analyze(samples, sampleRateHz, panDb, wfDb, zoomLevel, targetCenterHz,
+            frameIntervalMs, signalDetector: null, markers: default, out _);
+
+    /// <summary>
+    /// Full analysis pass plus optional signal detection. When
+    /// <paramref name="signalDetector"/> is provided, markers for the
+    /// detected signals are written to <paramref name="markers"/> (strongest
+    /// SNR first) and <paramref name="markerCount"/> reports how many were
+    /// written. Detection runs on the same DC-suppressed, Welch-averaged
+    /// spectrum the display is drawn from, so markers always agree with the
+    /// rendered trace.
+    /// </summary>
+    public WidebandSpectrumViewport Analyze(
+        ReadOnlySpan<short> samples,
+        int sampleRateHz,
+        Span<float> panDb,
+        Span<float> wfDb,
+        int zoomLevel,
+        long targetCenterHz,
+        double frameIntervalMs,
+        WidebandSignalDetector? signalDetector,
+        Span<WidebandSignalMarker> markers,
+        out int markerCount)
     {
         if (panDb.Length < DisplayWidth || wfDb.Length < DisplayWidth)
             throw new ArgumentException("Output spans must be at least DisplayWidth samples long.");
@@ -78,6 +113,7 @@ internal sealed class WidebandSpectrumAnalyzer
                 nameof(samples));
 
         if (sampleRateHz <= 0) sampleRateHz = Protocol2Client.WidebandAdcSampleRateHz;
+        frameIntervalMs = Math.Clamp(frameIntervalMs, MinFrameIntervalMs, MaxFrameIntervalMs);
         var viewport = ResolveViewport(zoomLevel, targetCenterHz);
         if (sampleRateHz != _sampleRateHz ||
             samples.Length != _windowSampleCount ||
@@ -85,34 +121,72 @@ internal sealed class WidebandSpectrumAnalyzer
             Math.Abs(viewport.HzPerPixel - _viewportHzPerPixel) > Math.Max(1e-6f, viewport.HzPerPixel * 1e-6f))
         {
             _sampleRateHz = sampleRateHz;
+            _windowSampleCount = samples.Length;
             _viewportCenterHz = viewport.CenterHz;
             _viewportHzPerPixel = viewport.HzPerPixel;
             _smoothedValid = false;
+            PlanSegments(samples.Length, sampleRateHz, viewport.HzPerPixel);
         }
 
-        int copy = samples.Length;
-        PrepareWindow(copy);
-        for (int i = 0; i < copy; i++)
-            _real[i] = samples[i] * _window[i];
-        if (copy < FftSize) Array.Clear(_real, copy, FftSize - copy);
-        Array.Clear(_imag, 0, _imag.Length);
-
-        FftInPlace();
-
-        double baseScale = 1.0 / (_windowSum * 32768.0);
-        int maxPositiveBin = FftSize / 2;
-        for (int bin = 0; bin <= maxPositiveBin; bin++)
+        // Welch step: average the per-segment periodograms in linear power.
+        // Overlapped Blackman-Harris segments are correlated, but even the
+        // conservative ~1.8x variance reduction at the 3-segment overview is
+        // noise the single-periodogram estimator used to show as grass.
+        int bins = (_segmentLength / 2) + 1;
+        Array.Clear(_binPower, 0, bins);
+        foreach (int offset in _segmentOffsets)
         {
-            double scale = bin == 0 ? baseScale : 2.0 * baseScale;
-            double re = _real[bin] * scale;
-            double im = _imag[bin] * scale;
-            _binPower[bin] = re * re + im * im;
+            // The slice is only ever short for the unsegmented full-frame
+            // case (e.g. 32,736 Saturn samples padded to the 32,768 FFT);
+            // AccumulateSegmentPower zero-pads up to the transform size.
+            AccumulateSegmentPower(
+                samples.Slice(offset, Math.Min(_segmentLength, samples.Length - offset)),
+                bins);
+        }
+        if (_segmentOffsets.Length > 1)
+        {
+            double inv = 1.0 / _segmentOffsets.Length;
+            for (int bin = 0; bin < bins; bin++)
+                _binPower[bin] *= inv;
+        }
+        _activeBinCount = bins;
+
+        // DC / LO-feedthrough suppression: bin 0 collects ADC offset and
+        // residual DC, and the window mainlobe spreads it across the next
+        // few bins, which otherwise paints a false hot line into the
+        // leftmost display pixels. Replace the DC skirt with the mean of
+        // bins past the mainlobe, matching how high-end analyzers blank the
+        // DC region. Real RF under ~40 kHz on HF is the ADC's own offset,
+        // never signal.
+        if (bins > 19)
+        {
+            double dcFloor = 0.0;
+            for (int bin = 6; bin <= 18; bin++)
+                dcFloor += _binPower[bin];
+            dcFloor /= 13.0;
+            for (int bin = 0; bin <= 4; bin++)
+                _binPower[bin] = dcFloor;
         }
 
-        double binHz = sampleRateHz / (double)FftSize;
+        double binHz = sampleRateHz / (double)_segmentLength;
+
+        // Signal detection rides the same spectrum the display renders:
+        // DC-suppressed, Welch-averaged, pre-smoothing bin power.
+        if (signalDetector != null)
+        {
+            markerCount = signalDetector.Detect(
+                _binPower.AsSpan(0, bins), binHz, frameIntervalMs, markers);
+        }
+        else
+        {
+            markerCount = 0;
+        }
+
         double nyquistHz = sampleRateHz / 2.0;
         double startHz = viewport.CenterHz - (viewport.SpanHz / 2.0);
-        double emaAlpha = EmaAlphaForZoom(viewport.ZoomLevel);
+        double panDecayAlpha = EmaAlpha(frameIntervalMs, PanTauMsForZoom(viewport.ZoomLevel));
+        double panAttackAlpha = EmaAlpha(frameIntervalMs, PanAttackTauMs);
+        double wfAlpha = EmaAlpha(frameIntervalMs, WfTauMs);
         for (int pixel = 0; pixel < DisplayWidth; pixel++)
         {
             double loHz = startHz + pixel * viewport.HzPerPixel;
@@ -121,19 +195,33 @@ internal sealed class WidebandSpectrumAnalyzer
             if (hiHz > 0.0 && loHz < nyquistHz)
             {
                 double startBin = Math.Max(0.0, loHz / binHz);
-                double endBin = Math.Min(maxPositiveBin, hiHz / binHz);
+                double endBin = Math.Min((_segmentLength / 2), hiHz / binHz);
                 power = IntegratePower(startBin, endBin);
             }
 
-            double amplitude = Math.Sqrt(Math.Max(power, 0.0));
-            float db = (float)(20.0 * Math.Log10(Math.Max(amplitude, MinAmplitude)));
+            // Average in linear power, convert to dB once at display time.
+            // Averaging in dB (the old path) biases the noise floor ~2.5 dB
+            // low for Rayleigh-distributed noise and does not reduce its
+            // variance; power averaging does, which is what gives the trace
+            // the same tight floor as the WDSP single-receiver display.
             if (!_smoothedValid)
             {
-                _smoothedDb[pixel] = db;
+                _avgPanPower[pixel] = power;
+                _avgWfPower[pixel] = power;
             }
             else
             {
-                _smoothedDb[pixel] = (float)(_smoothedDb[pixel] * (1.0 - emaAlpha) + db * emaAlpha);
+                // Fast attack / slow decay on the trace, like a lab
+                // analyzer: a genuine signal onset (>2 dB above the
+                // averaged level) pops on within a frame or two while the
+                // noise floor keeps the full averaging depth. The waterfall
+                // stays symmetric and fast to preserve time texture.
+                double panAlpha =
+                    power > _avgPanPower[pixel] * PanAttackTriggerRatio
+                        ? panAttackAlpha
+                        : panDecayAlpha;
+                _avgPanPower[pixel] = _avgPanPower[pixel] * (1.0 - panAlpha) + power * panAlpha;
+                _avgWfPower[pixel] = _avgWfPower[pixel] * (1.0 - wfAlpha) + power * wfAlpha;
             }
         }
 
@@ -142,37 +230,112 @@ internal sealed class WidebandSpectrumAnalyzer
         double centerWeight = 1.0 - (2.0 * sideWeight);
         for (int pixel = 0; pixel < DisplayWidth; pixel++)
         {
-            float db = _smoothedDb[pixel];
-            float smoothedDb =
-                pixel == 0 || pixel == DisplayWidth - 1
-                    ? db
-                    : (float)(_smoothedDb[pixel - 1] * sideWeight + db * centerWeight + _smoothedDb[pixel + 1] * sideWeight);
-            panDb[pixel] = smoothedDb;
-            wfDb[pixel] = smoothedDb;
+            panDb[pixel] = SpatiallySmoothedDb(_avgPanPower, pixel, sideWeight, centerWeight);
+            wfDb[pixel] = SpatiallySmoothedDb(_avgWfPower, pixel, sideWeight, centerWeight);
         }
 
         return viewport;
     }
 
-    private void PrepareWindow(int sampleCount)
+    private static float SpatiallySmoothedDb(double[] power, int pixel, double sideWeight, double centerWeight)
     {
-        if (_windowSampleCount == sampleCount) return;
+        double p = power[pixel];
+        double smoothed =
+            pixel == 0 || pixel == DisplayWidth - 1
+                ? p
+                : power[pixel - 1] * sideWeight + p * centerWeight + power[pixel + 1] * sideWeight;
+        return (float)(10.0 * Math.Log10(Math.Max(smoothed, MinPower)));
+    }
 
-        double windowSum = 0.0;
-        for (int i = 0; i < sampleCount; i++)
+    private void PlanSegments(int sampleCount, int sampleRateHz, double hzPerPixel)
+    {
+        int segLen = FftSize;
+        while (segLen > MinSegmentLength &&
+               (segLen >> 1) <= sampleCount &&
+               sampleRateHz / (double)(segLen >> 1) <= hzPerPixel * MaxSegmentBinToPixelRatio)
         {
-            double phase = 2.0 * Math.PI * i / (sampleCount - 1);
+            segLen >>= 1;
+        }
+
+        _segmentLength = segLen;
+        if (segLen >= sampleCount)
+        {
+            // Full-frame transform; zero-padding up to the FFT size (the 32
+            // missing Saturn samples) happens in AccumulateSegmentPower.
+            _segmentOffsets = [0];
+            return;
+        }
+
+        int nseg = Math.Clamp(
+            (int)Math.Round((sampleCount - segLen) / (double)(segLen / 2)) + 1,
+            1,
+            MaxSegments);
+        if (nseg <= 1)
+        {
+            _segmentOffsets = [0];
+            return;
+        }
+
+        var offsets = new int[nseg];
+        double hop = (sampleCount - segLen) / (double)(nseg - 1);
+        for (int i = 0; i < nseg; i++)
+            offsets[i] = (int)Math.Round(i * hop);
+        _segmentOffsets = offsets;
+    }
+
+    private void AccumulateSegmentPower(ReadOnlySpan<short> samples, int bins)
+    {
+        var window = WindowFor(samples.Length);
+        var plan = PlanFor(_segmentLength);
+        int n = plan.Size;
+        for (int i = 0; i < samples.Length; i++)
+            _real[i] = samples[i] * window.Coefficients[i];
+        if (samples.Length < n) Array.Clear(_real, samples.Length, n - samples.Length);
+
+        // Real-input transform: the input is real-only, so the packed N/2
+        // complex FFT plus split computes the identical single-sided
+        // spectrum at roughly half the cost of the old full-complex pass.
+        plan.Fft.ForwardPower(_real.AsSpan(0, n), plan.Power);
+
+        double baseScale = 1.0 / (window.Sum * 32768.0);
+        int maxPositiveBin = n / 2;
+        for (int bin = 0; bin <= maxPositiveBin; bin++)
+        {
+            double scale = bin == 0 ? baseScale : 2.0 * baseScale;
+            _binPower[bin] += scale * scale * plan.Power[bin];
+        }
+    }
+
+    private WindowPlan WindowFor(int length)
+    {
+        if (_windowPlans.TryGetValue(length, out var plan)) return plan;
+
+        var coefficients = new double[length];
+        double sum = 0.0;
+        for (int i = 0; i < length; i++)
+        {
+            double phase = 2.0 * Math.PI * i / (length - 1);
             double w =
                 0.35875 -
                 0.48829 * Math.Cos(phase) +
                 0.14128 * Math.Cos(2.0 * phase) -
                 0.01168 * Math.Cos(3.0 * phase);
-            _window[i] = w;
-            windowSum += w;
+            coefficients[i] = w;
+            sum += w;
         }
 
-        _windowSum = windowSum;
-        _windowSampleCount = sampleCount;
+        plan = new WindowPlan(coefficients, sum);
+        _windowPlans[length] = plan;
+        return plan;
+    }
+
+    private FftPlan PlanFor(int size)
+    {
+        if (_fftPlans.TryGetValue(size, out var plan)) return plan;
+
+        plan = new FftPlan(size, new WidebandRealFft(size), new double[(size / 2) + 1]);
+        _fftPlans[size] = plan;
+        return plan;
     }
 
     public static WidebandSpectrumViewport ResolveViewport(int zoomLevel, long targetCenterHz)
@@ -199,15 +362,18 @@ internal sealed class WidebandSpectrumAnalyzer
             level);
     }
 
-    private static double EmaAlphaForZoom(int zoomLevel)
+    private static double EmaAlpha(double frameIntervalMs, double tauMs) =>
+        1.0 - Math.Exp(-frameIntervalMs / tauMs);
+
+    private static double PanTauMsForZoom(int zoomLevel)
     {
-        if (zoomLevel <= SyntheticDspEngine.MaxZoomLevel) return SpectrumEmaAlpha;
+        if (zoomLevel <= SyntheticDspEngine.MaxZoomLevel) return PanTauOverviewMs;
         double t = Math.Clamp(
             (zoomLevel - SyntheticDspEngine.MaxZoomLevel) /
             (double)(MaxZoomLevel - SyntheticDspEngine.MaxZoomLevel),
             0.0,
             1.0);
-        return SpectrumEmaAlpha + (MaxZoomSpectrumEmaAlpha - SpectrumEmaAlpha) * t;
+        return PanTauOverviewMs + (PanTauMaxZoomMs - PanTauOverviewMs) * t;
     }
 
     private static double SpatialSideWeightForZoom(int zoomLevel)
@@ -236,7 +402,7 @@ internal sealed class WidebandSpectrumAnalyzer
         double weightSum = 0.0;
         for (int bin = first; bin <= last; bin++)
         {
-            if ((uint)bin >= (uint)_binPower.Length) continue;
+            if ((uint)bin >= (uint)_activeBinCount) continue;
             double weight = Math.Min(endBin, bin + 1.0) - Math.Max(startBin, bin);
             if (weight <= 0.0) continue;
             weightedPower += _binPower[bin] * weight;
@@ -251,61 +417,14 @@ internal sealed class WidebandSpectrumAnalyzer
         if (!double.IsFinite(binPosition)) return 0.0;
         if (binPosition <= 0.0) return _binPower[0];
         int lo = (int)Math.Floor(binPosition);
-        if (lo >= _binPower.Length - 1) return _binPower[^1];
+        if (lo >= _activeBinCount - 1) return _binPower[_activeBinCount - 1];
         double frac = binPosition - lo;
         return _binPower[lo] * (1.0 - frac) + _binPower[lo + 1] * frac;
     }
 
-    private void FftInPlace()
-    {
-        for (int i = 0; i < FftSize; i++)
-        {
-            int j = _bitReverse[i];
-            if (i >= j) continue;
-            (_real[i], _real[j]) = (_real[j], _real[i]);
-            (_imag[i], _imag[j]) = (_imag[j], _imag[i]);
-        }
+    private sealed record WindowPlan(double[] Coefficients, double Sum);
 
-        for (int stage = 0, len = 2; len <= FftSize; stage++, len <<= 1)
-        {
-            int half = len >> 1;
-            double wLenRe = _stageCos[stage];
-            double wLenIm = _stageSin[stage];
-            for (int i = 0; i < FftSize; i += len)
-            {
-                double wRe = 1.0;
-                double wIm = 0.0;
-                for (int j = 0; j < half; j++)
-                {
-                    int even = i + j;
-                    int odd = even + half;
-                    double oddRe = _real[odd] * wRe - _imag[odd] * wIm;
-                    double oddIm = _real[odd] * wIm + _imag[odd] * wRe;
-                    double evenRe = _real[even];
-                    double evenIm = _imag[even];
-                    _real[even] = evenRe + oddRe;
-                    _imag[even] = evenIm + oddIm;
-                    _real[odd] = evenRe - oddRe;
-                    _imag[odd] = evenIm - oddIm;
-
-                    double nextRe = wRe * wLenRe - wIm * wLenIm;
-                    wIm = wRe * wLenIm + wIm * wLenRe;
-                    wRe = nextRe;
-                }
-            }
-        }
-    }
-
-    private static int ReverseBits(int value, int bits)
-    {
-        int result = 0;
-        for (int i = 0; i < bits; i++)
-        {
-            result = (result << 1) | (value & 1);
-            value >>= 1;
-        }
-        return result;
-    }
+    private sealed record FftPlan(int Size, WidebandRealFft Fft, double[] Power);
 }
 
 internal readonly record struct WidebandSpectrumViewport(

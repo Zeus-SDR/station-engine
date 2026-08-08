@@ -42,6 +42,7 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using Microsoft.Extensions.Logging.Abstractions;
 using Zeus.Dsp.Wdsp;
 
 namespace Zeus.Server;
@@ -51,21 +52,104 @@ namespace Zeus.Server;
 /// isn't blocked for ~2 minutes while FFTW runs FFTW_PATIENT across sizes
 /// 64..262144. Returns from StartAsync immediately — Kestrel must not wait
 /// on wisdom generation.
+///
+/// Also the one place that states, on the record, which DSP engine this process
+/// actually loaded. Both hosts (Zeus.Server and the standalone station engine)
+/// register this as a hosted service exactly once, so the version line is
+/// emitted once per process at DSP start.
 /// </summary>
 public sealed class WisdomBootstrapService : IHostedService
 {
     private readonly WdspWisdomInitializer _initializer;
+    private readonly ILogger _log;
+    private readonly Func<WdspEngineVersion> _resolveEngineVersion;
 
-    public WisdomBootstrapService(WdspWisdomInitializer initializer)
+    public WisdomBootstrapService(
+        WdspWisdomInitializer initializer,
+        ILogger<WisdomBootstrapService>? logger = null)
+        : this(initializer, logger, WdspDspEngine.ResolveEngineVersion)
     {
-        _initializer = initializer;
+    }
+
+    internal WisdomBootstrapService(
+        WdspWisdomInitializer initializer,
+        ILogger? logger,
+        Func<WdspEngineVersion> resolveEngineVersion)
+    {
+        _initializer = initializer ?? throw new ArgumentNullException(nameof(initializer));
+        _log = logger ?? NullLogger.Instance;
+        _resolveEngineVersion = resolveEngineVersion ?? throw new ArgumentNullException(nameof(resolveEngineVersion));
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        LogEngineVersion(_log, _resolveEngineVersion);
         _ = _initializer.EnsureInitializedAsync();
         return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>
+    /// Puts the loaded engine's identity on the wire. One greppable prefix
+    /// (<c>wdsp.engine.version</c>) with the same key set in every case, so a
+    /// field report can be filtered on the prefix alone and still carry both the
+    /// raw integer WDSP returned and its human form.
+    ///
+    /// A version below the required one is a genuine engine mismatch and is
+    /// logged at Error, but deliberately does NOT stop the process or block the
+    /// operator: Zeus drives real transmitters, and refusing to start is a worse
+    /// outcome than running loudly degraded. The condition is additionally
+    /// published in diagnostics (<c>wdspVersionMismatch</c>) so the UI can
+    /// surface it.
+    /// </summary>
+    internal static void LogEngineVersion(ILogger log, Func<WdspEngineVersion> resolve)
+    {
+        WdspEngineVersion version;
+        try
+        {
+            version = resolve();
+        }
+        catch (Exception ex)
+        {
+            // Engine identity is diagnostic, never load-bearing. Failing to read
+            // it must not take the host down at start.
+            log.LogWarning(ex, "wdsp.engine.version probe failed; engine identity unknown");
+            return;
+        }
+
+        switch (version.State)
+        {
+            case WdspEngineVersionState.Ok:
+                log.LogInformation(
+                    "wdsp.engine.version raw={Raw} version={Version} required={Required} status={Status}",
+                    version.Raw, version.Display, WdspEngineVersion.RequiredDisplay, version.StatusToken);
+                break;
+
+            case WdspEngineVersionState.Mismatch:
+                log.LogError(
+                    "wdsp.engine.version raw={Raw} version={Version} required={Required} status={Status} "
+                    + "— the loaded libwdsp is OLDER than the engine Zeus targets. Every WDSP-2.0-dependent "
+                    + "behaviour is unreliable until the matching library is installed.",
+                    version.Raw, version.Display, WdspEngineVersion.RequiredDisplay, version.StatusToken);
+                break;
+
+            case WdspEngineVersionState.SymbolMissing:
+                log.LogWarning(
+                    "wdsp.engine.version raw={Raw} version={Version} required={Required} status={Status} "
+                    + "— the loaded libwdsp does not export GetWDSPVersion, so its version cannot be confirmed.",
+                    version.Raw, version.Display, WdspEngineVersion.RequiredDisplay, version.StatusToken);
+                break;
+
+            default:
+                // No library at all is already reported by the native-loadable
+                // diagnostics; state it here too so the version line is never
+                // simply absent, but at Information — this is not a version fault.
+                log.LogInformation(
+                    "wdsp.engine.version raw={Raw} version={Version} required={Required} status={Status} "
+                    + "— libwdsp is not loadable in this process.",
+                    version.Raw, version.Display, WdspEngineVersion.RequiredDisplay, version.StatusToken);
+                break;
+        }
+    }
 }

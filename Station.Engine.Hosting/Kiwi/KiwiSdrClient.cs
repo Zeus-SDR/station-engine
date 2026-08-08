@@ -45,6 +45,10 @@ public sealed class KiwiSdrClient : IAsyncDisposable
     private readonly string? _password;
     private readonly string _identUser;
     private readonly ILogger _log;
+    // ClientWebSocket supports one send and one receive concurrently, but not
+    // overlapping sends. Commands originate from handshake, tune coalescing,
+    // zoom and keepalive paths, so serialize them across both Kiwi sockets.
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
 
     private ClientWebSocket? _snd;
     private ClientWebSocket? _wf;
@@ -62,11 +66,16 @@ public sealed class KiwiSdrClient : IAsyncDisposable
     private string _mode = "usb";
     private int _lowCutHz = 100;
     private int _highCutHz = 2_850;
-    private double _displaySpanHz = 24_000;
+    // Kiwi-native waterfall zoom (z0..server zoom_cap). Each integer step
+    // halves the span; this is deliberately not Zeus's linear 1..32 DDC zoom.
+    private int _waterfallZoom = 7;
 
     // Captured from the server handshake.
     private volatile int _audioRateHz; // native SND rate, ~12000
-    private double _wfFullSpanHz = 30_000_000; // full waterfall span at zoom 0
+    private double _wfFullSpanHz = 30_000_000; // negotiated bandwidth, span at z0
+    private int _wfFftSize = 1024;
+    private int _wfZoomMax = 14;
+    private int _wfZoomCap = 14;
     private bool _wfStarted;
     private bool _handshakeReady;
     private int _lastWfZoom = -1;       // last SET zoom step pushed to the W/F socket
@@ -78,6 +87,21 @@ public sealed class KiwiSdrClient : IAsyncDisposable
     private bool _loggedFirstSnd;
     private bool _loggedFirstWf;
     private int _msgLogCount;
+    // Waterfall drop diagnostics. A "connected, audio fine, panadapter blank"
+    // session means every W/F row is being rejected in DecodeWaterfallRow, and
+    // rows arrive up to ~23/s — so count every drop but emit at most one
+    // warning per reason per WfDropLogIntervalMs (first drop logs at once).
+    private const long WfDropLogIntervalMs = 10_000;
+    private long _wfDropGeometryCount;
+    private long _wfDropGeometryLastLogMs = -1;
+    private long _wfDropAdpcmCount;
+    private long _wfDropAdpcmLastLogMs = -1;
+    // Per-socket operation timeouts so an unresponsive Kiwi (firewall drop,
+    // proxy hang, server restart) fails fast instead of freezing the UI on
+    // "connecting" indefinitely. Linked to the caller's token so shutdown still
+    // aborts promptly.
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>Decoded audio: mono float samples in -1..1 (first arg) at the
     /// native Kiwi rate in Hz (second arg). Fires once per SND frame.</summary>
@@ -85,7 +109,19 @@ public sealed class KiwiSdrClient : IAsyncDisposable
 
     /// <summary>One waterfall row: per-bin power in dBm, plus the row's center
     /// frequency and Hz-per-bin so the consumer can build a DisplayFrame.</summary>
-    public Action<float[], long, double>? WaterfallReceived;
+    public Action<float[], long, double, int>? WaterfallReceived;
+
+    /// <summary>Fires when the remote reports its native zoom cap.</summary>
+    public Action<int>? ZoomCapChanged;
+
+    /// <summary>The server-negotiated maximum native waterfall zoom.</summary>
+    public int ZoomCap => Volatile.Read(ref _wfZoomCap);
+
+    /// <summary>The server-negotiated full waterfall bandwidth in Hz.</summary>
+    public double WaterfallBandwidthHz
+    {
+        get { lock (_sync) return _wfFullSpanHz; }
+    }
 
     /// <summary>RX signal level in dBm, from the SND frame S-meter.</summary>
     public Action<double>? SignalLevel;
@@ -113,9 +149,10 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         var token = _cts.Token;
         StatusChanged?.Invoke("connecting", $"{_host}:{_port}");
 
-        // KiwiSDR uses an integer cache-buster / channel token in the path; the
-        // exact value is irrelevant as long as the two sockets differ.
-        long stamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        // The supported browser route uses a millisecond connection token and
+        // shares it between the paired SND/W/F sockets. Legacy external-API
+        // firmware treats the token as an arbitrary cache-buster too.
+        long stamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         _snd = await OpenSocketAsync(stamp, "SND", token).ConfigureAwait(false);
         _wf = await OpenSocketAsync(stamp, "W/F", token).ConfigureAwait(false);
@@ -127,24 +164,80 @@ public sealed class KiwiSdrClient : IAsyncDisposable
 
     private async Task<ClientWebSocket> OpenSocketAsync(long stamp, string which, CancellationToken ct)
     {
-        var ws = new ClientWebSocket();
-        ws.Options.SetRequestHeader("User-Agent", "ZeusSDR");
-        var scheme = _secure ? "wss" : "ws";
-        var uri = new Uri($"{scheme}://{_host}:{_port}/{stamp}/{which}");
-        await ws.ConnectAsync(uri, ct).ConfigureAwait(false);
+        var uri = BuildSocketUri(_host, _port, _secure, stamp, which);
+        ClientWebSocket ws;
+        try
+        {
+            ws = await ConnectSocketAsync(uri, ct).ConfigureAwait(false);
+        }
+        catch (WebSocketException ex) when (!ct.IsCancellationRequested)
+        {
+            // Pre-/ws/kiwi firmware only knows the external-API route. A
+            // current Kiwi returns the browser route immediately; an older
+            // one rejects it during the WebSocket handshake, so fall back
+            // without changing the route used by other platforms.
+            var legacyUri = BuildLegacySocketUri(_host, _port, _secure, stamp, which);
+            _log.LogDebug(
+                "kiwi.ws modern route rejected stream={Stream} err={Err}; retrying legacy route={Route}",
+                which, ex.Message, legacyUri.AbsolutePath);
+            ws = await ConnectSocketAsync(legacyUri, ct).ConfigureAwait(false);
+        }
 
-        // Auth first ("#" password = public receiver), then etiquette identity.
-        await SendAsync(ws, $"SET auth t=kiwi p={_password ?? "#"}", ct).ConfigureAwait(false);
-        await SendAsync(ws, $"SET ident_user={_identUser}", ct).ConfigureAwait(false);
-        await SendAsync(ws, "SET geo=", ct).ConfigureAwait(false);
-        return ws;
+        try
+        {
+            // Auth first ("#" password = public receiver), then etiquette identity.
+            await SendAsync(ws, $"SET auth t=kiwi p={_password ?? "#"}", ct).ConfigureAwait(false);
+            await SendAsync(ws, $"SET ident_user={_identUser}", ct).ConfigureAwait(false);
+            await SendAsync(ws, "SET geo=", ct).ConfigureAwait(false);
+            return ws;
+        }
+        catch
+        {
+            ws.Dispose();
+            throw;
+        }
     }
 
-    private static async Task SendAsync(ClientWebSocket ws, string command, CancellationToken ct)
+    internal static Uri BuildSocketUri(string host, int port, bool secure, long stamp, string which)
     {
-        if (ws.State != WebSocketState.Open) return;
-        var bytes = Encoding.ASCII.GetBytes(command);
-        await ws.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct).ConfigureAwait(false);
+        var scheme = secure ? "wss" : "ws";
+        return new Uri($"{scheme}://{host}:{port}/ws/kiwi/{stamp}/{which}");
+    }
+
+    internal static Uri BuildLegacySocketUri(string host, int port, bool secure, long stamp, string which)
+    {
+        var scheme = secure ? "wss" : "ws";
+        return new Uri($"{scheme}://{host}:{port}/{stamp / 1000}/{which}");
+    }
+
+    private async Task<ClientWebSocket> ConnectSocketAsync(Uri uri, CancellationToken ct)
+    {
+        var ws = new ClientWebSocket();
+        try
+        {
+            ws.Options.SetRequestHeader("User-Agent", "ZeusSDR");
+            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            connectCts.CancelAfter(ConnectTimeout);
+            await ws.ConnectAsync(uri, connectCts.Token).ConfigureAwait(false);
+            return ws;
+        }
+        catch
+        {
+            ws.Dispose();
+            throw;
+        }
+    }
+
+    private async Task SendAsync(ClientWebSocket ws, string command, CancellationToken ct)
+    {
+        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (ws.State != WebSocketState.Open) return;
+            var bytes = Encoding.ASCII.GetBytes(command);
+            await ws.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct).ConfigureAwait(false);
+        }
+        finally { _sendGate.Release(); }
     }
 
     // -------------------------------------------------------------------------
@@ -158,8 +251,8 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested && _snd is { State: WebSocketState.Open })
             {
-                var (count, isText) = await ReceiveMessageAsync(_snd, buf, ct).ConfigureAwait(false);
-                if (count < 0) break;
+                var (count, isText, endReason) = await ReceiveMessageAsync(_snd, buf, ct).ConfigureAwait(false);
+                if (count < 0) { error = endReason; break; }
                 // KiwiSDR delivers MSG/SND/W/F as BINARY frames led by a 3-byte
                 // ASCII tag (never WebSocket text frames). The "MSG" frames carry
                 // the audio_rate/sample_rate handshake that flips us to connected.
@@ -173,13 +266,17 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         catch (Exception ex)
         {
             error = ex.Message;
-            _log.LogWarning("kiwi.snd.loop ended host={Host} err={Err}", _host, error);
         }
-        // Issue #1114 (SND twin): a server-side close (graceful WebSocket close,
-        // proxy idle timeout, server restart) returns count<0 with no exception —
-        // surface every unsolicited exit so KiwiSdrService can reconnect.
+        // Issue #1114 (SND twin): surface every unsolicited exit so KiwiSdrService
+        // can reconnect — and name the real cause. A 15 s receive starvation used
+        // to log nothing and surface as "audio socket closed", pointing debugging
+        // at a socket problem that didn't exist.
         if (!ct.IsCancellationRequested)
-            StatusChanged?.Invoke("dropped", error ?? "audio socket closed");
+        {
+            var reason = error ?? "audio socket closed";
+            _log.LogWarning("kiwi.snd.loop ended host={Host} reason={Reason}", _host, reason);
+            StatusChanged?.Invoke("dropped", reason);
+        }
     }
 
     // SND binary frame layout (compression=0):
@@ -211,6 +308,7 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         }
         int rate = _audioRateHz > 0 ? _audioRateHz : 12_000;
         if (!_loggedFirstSnd) { _loggedFirstSnd = true; _log.LogDebug("kiwi.snd.first samples={N} rate={Rate}", n, rate); }
+        MarkStreamStarted();
         AudioReceived?.Invoke(samples, rate);
     }
 
@@ -225,8 +323,8 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested && _wf is { State: WebSocketState.Open })
             {
-                var (count, isText) = await ReceiveMessageAsync(_wf, buf, ct).ConfigureAwait(false);
-                if (count < 0) break;
+                var (count, isText, endReason) = await ReceiveMessageAsync(_wf, buf, ct).ConfigureAwait(false);
+                if (count < 0) { error = endReason; break; }
                 if (isText) { await HandleTextAsync(buf.AsMemory(0, count), ct).ConfigureAwait(false); continue; }
                 if (count < 3) continue;
                 if (IsTag(buf, 'M', 'S', 'G')) await HandleTextAsync(buf.AsMemory(3, count - 3), ct).ConfigureAwait(false);
@@ -237,40 +335,136 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         catch (Exception ex)
         {
             error = ex.Message;
-            _log.LogWarning("kiwi.wf.loop ended host={Host} err={Err}", _host, error);
         }
         // Issue #1114: the KiwiSDR's wide-FFT (/W/F) socket closes mid-session
         // (server bug / proxy timeout / channel limit) while the audio (/SND)
         // socket stays up. Without this signal the pan/waterfall went blank and
         // Zeus never reconnected — the operator had to toggle the slice manually.
+        // Name the real cause: a 15 s receive starvation used to log nothing and
+        // surface as "waterfall socket closed", which reads as a socket problem
+        // when the socket is fine and the remote simply stopped sending.
         if (!ct.IsCancellationRequested)
-            StatusChanged?.Invoke("dropped", error ?? "waterfall socket closed");
+        {
+            var reason = error ?? "waterfall socket closed";
+            _log.LogWarning("kiwi.wf.loop ended host={Host} reason={Reason}", _host, reason);
+            StatusChanged?.Invoke("dropped", reason);
+        }
     }
 
     // W/F binary frame layout (wf_comp=0):
-    //   [0..3)   ASCII tag "W/F"
-    //   [3..15)  three uint32 LE: x-bin start, packed flags/zoom, seq
-    //   [15..]   one unsigned byte per FFT bin; dBm = byte - 255
+    //   [0..4)   ASCII tag "W/F "
+    //   [4..16)  three uint32 LE: x-bin start, packed flags/zoom, seq
+    //   [16..]   one unsigned byte per FFT bin; dBm = byte - 255
     private void DecodeWfFrame(ReadOnlySpan<byte> msg)
     {
-        const int header = 15;
-        if (msg.Length <= header) return;
-        var bins = msg.Slice(header);
-        int n = bins.Length;
-        var db = new float[n];
-        for (int i = 0; i < n; i++)
-            db[i] = bins[i] - 255f;
-
-        long centerHz;
-        double hzPerBin;
+        double bandwidth;
+        int fftSize, zoomMax;
         lock (_sync)
         {
-            centerHz = _centerHz;
-            double span = CurrentWfSpanHz();
-            hzPerBin = n > 0 ? span / n : 1.0;
+            bandwidth = _wfFullSpanHz;
+            fftSize = _wfFftSize;
+            zoomMax = _wfZoomMax;
         }
-        if (!_loggedFirstWf) { _loggedFirstWf = true; _log.LogDebug("kiwi.wf.first bins={N} hzPerBin={Hpb:F1} centerHz={C}", n, hzPerBin, centerHz); }
-        WaterfallReceived?.Invoke(db, centerHz, hzPerBin);
+        var row = DecodeWaterfallRow(msg, bandwidth, fftSize, zoomMax, out var drop);
+        if (row is null)
+        {
+            LogWaterfallDrop(drop, msg.Length, fftSize, bandwidth);
+            return;
+        }
+        // Information, not Debug: shipped log sinks are capped at Information,
+        // and this single line is the positive proof the W/F decode path is
+        // alive (its absence, paired with kiwi.wf.drop warnings, is what
+        // diagnoses a blank-panadapter-but-audio session).
+        if (!_loggedFirstWf) { _loggedFirstWf = true; _log.LogInformation("kiwi.wf.first bins={N} zoom={Zoom} hzPerBin={Hpb:F1} centerHz={C}", row.Value.BinsDb.Length, row.Value.Zoom, row.Value.HzPerBin, row.Value.CenterHz); }
+        MarkStreamStarted();
+        WaterfallReceived?.Invoke(row.Value.BinsDb, row.Value.CenterHz, row.Value.HzPerBin, row.Value.Zoom);
+    }
+
+    // DecodeWaterfallRow rejected a row. Without this line a silent drop is
+    // indistinguishable from "server sent nothing" — the failure mode behind a
+    // blank panadapter with healthy audio. Throttled per reason; the count
+    // keeps the drop cadence visible without flooding the log at ~23 rows/s.
+    private void LogWaterfallDrop(WaterfallRowDrop drop, int msgLength, int fftSize, double bandwidthHz)
+    {
+        long now = Environment.TickCount64;
+        if (drop == WaterfallRowDrop.Compressed)
+        {
+            long count = Interlocked.Increment(ref _wfDropAdpcmCount);
+            long last = Interlocked.Read(ref _wfDropAdpcmLastLogMs);
+            if (last >= 0 && now - last < WfDropLogIntervalMs) return;
+            Interlocked.Exchange(ref _wfDropAdpcmLastLogMs, now);
+            // The server/proxy ignored SET wf_comp=0 and is streaming
+            // ADPCM-compressed rows this client does not decode.
+            _log.LogWarning(
+                "kiwi.wf.drop reason=adpcm host={Host} rows={Rows} (compressed waterfall rows despite SET wf_comp=0)",
+                _host, count);
+            return;
+        }
+        long sizeCount = Interlocked.Increment(ref _wfDropGeometryCount);
+        long sizeLast = Interlocked.Read(ref _wfDropGeometryLastLogMs);
+        if (sizeLast >= 0 && now - sizeLast < WfDropLogIntervalMs) return;
+        Interlocked.Exchange(ref _wfDropGeometryLastLogMs, now);
+        // Row length != 16-byte header + negotiated fftSize (or the wf_fft_size
+        // handshake never landed). The logged values identify which.
+        _log.LogWarning(
+            "kiwi.wf.drop reason=geometry host={Host} rows={Rows} msgLen={MsgLen} fftSize={FftSize} bandwidthHz={Bandwidth}",
+            _host, sizeCount, msgLength, fftSize, bandwidthHz);
+    }
+
+    internal readonly record struct WaterfallRow(float[] BinsDb, long CenterHz, double HzPerBin, int Zoom);
+
+    /// <summary>Why <see cref="DecodeWaterfallRow"/> rejected a W/F row.</summary>
+    internal enum WaterfallRowDrop
+    {
+        /// <summary>Row decoded cleanly.</summary>
+        None,
+        /// <summary>The row is not exactly 16-byte header + fftSize payload (or
+        /// the negotiated geometry is non-positive — e.g. the wf_fft_size
+        /// handshake has not landed or the sender disagrees with it).</summary>
+        Geometry,
+        /// <summary>The flags word carries the ADPCM bit: the sender ignored
+        /// <c>SET wf_comp=0</c> and is streaming compressed rows.</summary>
+        Compressed,
+    }
+
+    internal static WaterfallRow? DecodeWaterfallRow(
+        ReadOnlySpan<byte> msg,
+        double bandwidthHz,
+        int fftSize,
+        int zoomMax)
+        => DecodeWaterfallRow(msg, bandwidthHz, fftSize, zoomMax, out _);
+
+    internal static WaterfallRow? DecodeWaterfallRow(
+        ReadOnlySpan<byte> msg,
+        double bandwidthHz,
+        int fftSize,
+        int zoomMax,
+        out WaterfallRowDrop drop)
+    {
+        const int header = 16;
+        if (msg.Length != header + fftSize || !(bandwidthHz > 0) || fftSize <= 0)
+        {
+            drop = WaterfallRowDrop.Geometry;
+            return null;
+        }
+
+        uint xBin = BinaryPrimitives.ReadUInt32LittleEndian(msg.Slice(4, 4));
+        uint flags = BinaryPrimitives.ReadUInt32LittleEndian(msg.Slice(8, 4));
+        if ((flags & 0x0001_0000) != 0) // ADPCM-compressed row
+        {
+            drop = WaterfallRowDrop.Compressed;
+            return null;
+        }
+        int actualZoom = Math.Clamp((int)(flags & 0xffff), 0, Math.Max(0, zoomMax));
+        var bins = msg.Slice(header);
+        var db = new float[bins.Length];
+        for (int i = 0; i < bins.Length; i++) db[i] = bins[i] - 255f;
+
+        double spanHz = bandwidthHz / Math.Pow(2, actualZoom);
+        double hzPerStart = bandwidthHz / (fftSize * Math.Pow(2, Math.Max(0, zoomMax)));
+        long centerHz = (long)Math.Round(xBin * hzPerStart + spanHz / 2.0);
+        drop = WaterfallRowDrop.None;
+        return new WaterfallRow(db, centerHz, spanHz / bins.Length, actualZoom);
     }
 
     // -------------------------------------------------------------------------
@@ -316,6 +510,31 @@ public sealed class KiwiSdrClient : IAsyncDisposable
                     await OnHandshakeReadyAsync(ct).ConfigureAwait(false);
                 }
             }
+            else if (key.SequenceEqual("bandwidth"))
+            {
+                if (TryParseDouble(val, out var bandwidth) && bandwidth > 0)
+                    lock (_sync) _wfFullSpanHz = bandwidth;
+            }
+            else if (key.SequenceEqual("wf_fft_size"))
+            {
+                if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var fftSize) && fftSize > 0)
+                    lock (_sync) _wfFftSize = fftSize;
+            }
+            else if (key.SequenceEqual("zoom_max"))
+            {
+                if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var zoomMax))
+                    lock (_sync) _wfZoomMax = Math.Clamp(zoomMax, 0, 30);
+            }
+            else if (key.SequenceEqual("zoom_cap"))
+            {
+                if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var zoomCap))
+                {
+                    zoomCap = Math.Clamp(zoomCap, 0, 30);
+                    Volatile.Write(ref _wfZoomCap, zoomCap);
+                    lock (_sync) _waterfallZoom = Math.Min(_waterfallZoom, zoomCap);
+                    ZoomCapChanged?.Invoke(zoomCap);
+                }
+            }
             else if (key.SequenceEqual("sample_rate") || key.SequenceEqual("wf_setup") || key.SequenceEqual("wf_fps"))
             {
                 // sample_rate / wf_* arrive even when the RX channel is ultimately
@@ -350,6 +569,23 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         await PushTuneAsync(ct).ConfigureAwait(false);
         await EnsureWaterfallStartedAsync(ct).ConfigureAwait(false);
         _log.LogInformation("kiwi.handshake.ready host={Host} audioRate={Rate}", _host, _audioRateHz);
+        // NOT "connected": a bare handshake proves only that the server answered
+        // MSGs. Dead/zombie endpoints (e.g. a wedged receiver behind a
+        // kiwisdr.com proxy) complete the handshake and then stream nothing —
+        // reporting "connected" here showed CONNECTED on a permanently blank
+        // pan/waterfall. The status flips in MarkStreamStarted() when the first
+        // real SND/W/F frame decodes.
+        StatusChanged?.Invoke("handshake", null);
+    }
+
+    // First decoded stream frame (audio OR waterfall) — the only honest proof
+    // the remote is actually streaming. Idempotent.
+    private bool _streamStarted;
+    private void MarkStreamStarted()
+    {
+        if (_streamStarted) return;
+        _streamStarted = true;
+        _log.LogInformation("kiwi.stream.started host={Host}", _host);
         StatusChanged?.Invoke("connected", null);
     }
 
@@ -374,9 +610,9 @@ public sealed class KiwiSdrClient : IAsyncDisposable
     /// frequency; <paramref name="centerHz"/> is the waterfall centre — they
     /// differ under CTUN (centre frozen, dial roams). <paramref name="mode"/> is a
     /// Kiwi mode word (usb/lsb/am/cw/cwn/nbfm/iq/sam). Cuts are passband edges in
-    /// Hz relative to the carrier. <paramref name="displaySpanHz"/> drives the
-    /// waterfall zoom.</summary>
-    public void Tune(long freqHz, long centerHz, string mode, int lowCutHz, int highCutHz, double displaySpanHz)
+    /// Hz relative to the carrier. <paramref name="waterfallZoom"/> is Kiwi's
+    /// native integer z-level (z0..the negotiated zoom cap).</summary>
+    public void Tune(long freqHz, long centerHz, string mode, int lowCutHz, int highCutHz, int waterfallZoom)
     {
         lock (_sync)
         {
@@ -385,7 +621,7 @@ public sealed class KiwiSdrClient : IAsyncDisposable
             _mode = string.IsNullOrWhiteSpace(mode) ? _mode : mode;
             _lowCutHz = lowCutHz;
             _highCutHz = highCutHz;
-            if (displaySpanHz > 0) _displaySpanHz = displaySpanHz;
+            _waterfallZoom = Math.Clamp(waterfallZoom, 0, _wfZoomCap);
         }
         SchedulePush();
     }
@@ -473,19 +709,8 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         await SendAsync(_wf, cmd, ct).ConfigureAwait(false);
     }
 
-    // Pick the zoom level whose span is the closest >= the desired display span,
-    // clamped to the Kiwi's 0..14 range. Caller holds _sync.
-    private int CurrentZoom()
-    {
-        if (_displaySpanHz <= 0) return 10;
-        double ratio = _wfFullSpanHz / _displaySpanHz;
-        if (ratio <= 1) return 0;
-        int z = (int)Math.Floor(Math.Log2(ratio));
-        return Math.Clamp(z, 0, 14);
-    }
-
-    // Actual waterfall span at the current zoom. Caller holds _sync.
-    private double CurrentWfSpanHz() => _wfFullSpanHz / Math.Pow(2, CurrentZoom());
+    // Caller holds _sync.
+    private int CurrentZoom() => Math.Clamp(_waterfallZoom, 0, _wfZoomCap);
 
     // -------------------------------------------------------------------------
     // Keepalive + receive plumbing + teardown.
@@ -505,22 +730,46 @@ public sealed class KiwiSdrClient : IAsyncDisposable
         catch (Exception ex) { _log.LogDebug("kiwi.keepalive ended err={Err}", ex.Message); }
     }
 
-    // Reads one full WebSocket message into buf. Returns (byteCount, isText);
-    // byteCount < 0 signals the socket closed.
-    private static async Task<(int, bool)> ReceiveMessageAsync(ClientWebSocket ws, byte[] buf, CancellationToken ct)
+    // Reads one full WebSocket message into buf. Returns (byteCount, isText,
+    // endReason); byteCount < 0 signals the stream ended, with endReason naming
+    // why — receive-timeout starvation, a remote close, or a transport error —
+    // so the loops surface the real cause instead of a generic "socket closed".
+    private static async Task<(int Count, bool IsText, string? EndReason)> ReceiveMessageAsync(
+        ClientWebSocket ws, byte[] buf, CancellationToken ct)
     {
         int offset = 0;
         while (true)
         {
             var seg = new ArraySegment<byte>(buf, offset, buf.Length - offset);
             WebSocketReceiveResult res;
-            try { res = await ws.ReceiveAsync(seg, ct).ConfigureAwait(false); }
-            catch (WebSocketException) { return (-1, false); }
-            if (res.MessageType == WebSocketMessageType.Close) return (-1, false);
+            try
+            {
+                using var receiveCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                receiveCts.CancelAfter(ReceiveTimeout);
+                res = await ws.ReceiveAsync(seg, receiveCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // The socket never closed — nothing arrived for the whole
+                // ReceiveTimeout window (wedged server, dead proxy, black-holed
+                // route). Distinct from a close: the remote is starving us.
+                return (-1, false,
+                    $"stream starved — no data for {(int)ReceiveTimeout.TotalSeconds} s");
+            }
+            catch (WebSocketException ex)
+            {
+                return (-1, false, $"transport error: {ex.Message}");
+            }
+            if (res.MessageType == WebSocketMessageType.Close)
+            {
+                return (-1, false, string.IsNullOrEmpty(res.CloseStatusDescription)
+                    ? "closed by remote"
+                    : $"closed by remote — {res.CloseStatusDescription}");
+            }
             offset += res.Count;
             if (res.EndOfMessage)
-                return (offset, res.MessageType == WebSocketMessageType.Text);
-            if (offset >= buf.Length) return (offset, res.MessageType == WebSocketMessageType.Text); // drop overflow
+                return (offset, res.MessageType == WebSocketMessageType.Text, null);
+            if (offset >= buf.Length) return (offset, res.MessageType == WebSocketMessageType.Text, null); // drop overflow
         }
     }
 

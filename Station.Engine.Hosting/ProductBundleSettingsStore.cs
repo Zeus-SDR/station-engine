@@ -33,6 +33,8 @@ public sealed class ProductBundleSettingsStore : IDisposable
     private readonly ILogger<ProductBundleSettingsStore> _log;
     private readonly object _sync = new();
 
+    public event Action? Changed;
+
     public ProductBundleSettingsStore(
         ILogger<ProductBundleSettingsStore> log, string? dbPathOverride = null)
     {
@@ -66,15 +68,17 @@ public sealed class ProductBundleSettingsStore : IDisposable
             throw new ArgumentException(
                 $"Bundle settings document exceeds {MaxDocumentBytes} bytes.", nameof(json));
 
+        ProductBundleSettingsEntry entry;
         lock (_sync)
         {
-            var entry = _docs.FindAll().FirstOrDefault() ?? new ProductBundleSettingsEntry();
+            entry = _docs.FindAll().FirstOrDefault() ?? new ProductBundleSettingsEntry();
             entry.Json = json;
             entry.UpdatedUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             if (entry.Id == 0) _docs.Insert(entry);
             else _docs.Update(entry);
-            return entry;
         }
+        Changed?.Invoke();
+        return entry;
     }
 
     public void Dispose() => _dbLease.Dispose();

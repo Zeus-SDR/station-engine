@@ -363,6 +363,9 @@ public sealed record PaRuntimeSnapshot(
     int RxAuxInput = 0,
     bool MkiiBpfRxSelect = false,
     RfFilterRuntimeSettings? RfFilters = null,
+    // Dedicated XVTR T/R output. Independent of the RX auxiliary input so a
+    // receive-path selection cannot accidentally assert a transmit relay.
+    bool XvtrEnabled = false,
     // Per-band OC-TUNE additive mask (issue #1325). OR'd on top of OcTxMask
     // while TUN is active; ignored during regular MOX / RX. Default 0 keeps
     // pre-#1325 behaviour byte-for-byte.

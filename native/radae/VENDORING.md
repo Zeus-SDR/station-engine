@@ -1,74 +1,98 @@
-# native/radae — RADE V1 (Radio Autoencoder) vendoring
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 
-> **STATUS: SCAFFOLD ONLY. THE NATIVE BUILD IS NOT IMPLEMENTED YET.**
-> RADEV1 is surfaced + gated in the UI (Phase 1, landed). This directory is the
-> starting point for Phase 2 (the native build).
->
-> **⚠ VERIFIED 2026-06-23 — do NOT FetchContent `drowe67/radae`.** A real build
-> investigation found upstream `librade` embeds CPython + PyTorch at runtime
-> (`rade_api.c` unconditionally includes `Python.h`; the OFDM modem/sync run in
-> Python; even freedv-gui ships embedded Python + downloads PyTorch). It cannot be
-> vendored dependency-free. The viable Python-free base is **`peterbmarks/radae_nopy`**
-> (pure C, weights compiled in, BSD-2 — but Linux/macOS only, no Windows/arm, and
-> upstream-deprecated in favour of a future `freedv-backend`). Pick the base
-> (radae_nopy now vs. waiting for the upstream C port) before writing CMake.
-> Full analysis: `docs/designs/rade-v1-integration.md` → "Phase 2 build investigation".
+# RADE V1 native source and rebuild procedure
 
-## What this will produce (target)
+`zeus_rade` is one shared library containing the Python-free RADE C modem,
+Opus DNN/FARGAN, FreeDV reliable text and its five Codec2 LDPC units, and the
+Zeus BSD-2-Clause shim. `CMakeLists.txt` is the authoritative composition.
 
-```
-macOS   : librade.dylib   (arm64, x86_64)
-Linux   : librade.so      (x86_64, arm64, Raspberry Pi)
-Windows : rade.dll        (x64, arm64) — no "lib" prefix
+## Obtain and verify the exact upstream source
+
+The private development repository intentionally does not commit the roughly
+95 MB upstream slices. Native CI and the corresponding-source exporter use the
+same fail-closed command:
+
+```sh
+bash native/radae/vendor/fetch-sources.sh native/radae/vendor
 ```
 
-…plus the FARGAN vocoder (from Opus's `spl_fargan` branch) and the RADE model
-weights, so Zeus can P/Invoke `rade_api.h` + the `fargan_*` synth.
+That command fetches Thetis-RADE commit
+`f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8`, verifies the fetched commit and
+the three recorded Git tree IDs, materializes `radae_c`, `opus_dnn`, and
+`freedv_text`, then verifies deterministic SHA-256 content hashes and Opus pin
+`940d4e5af64351ca8ba8390df3f555484c567fbb`. All machine-readable pins are in
+`vendor/SOURCE-SLICES.json`; provenance and authorship are in
+`vendor/PROVENANCE.md`.
 
-## Upstream
+The public Station Engine source export already carries the verified slices
+under `native/radae/vendor/`, so fetching again is optional when rebuilding a
+release-matched source tag.
 
-| | |
-|---|---|
-| Repo | `drowe67/radae` |
-| License | BSD-2-clause |
-| Pin | **TBD** — pick a release tag, never moving HEAD (cf. codec2's `1.2.0` pin) |
-| FARGAN/Opus | Opus `spl_fargan` branch, pulled by radae's `cmake/BuildOpus.cmake` |
-| Model | `.pth` checkpoint → C (`rade_enc_data.c`/`rade_dec_data.c`) via repo export, or runtime blob |
+## Create the scalar Opus placeholders
 
-## Known build blockers (why this isn't a copy of native/codec2)
+The pinned Opus slice omits SIMD subtrees while its `*.mk` lists still name
+files there. With intrinsics disabled, CMake validates but does not compile
+those paths. Create empty placeholders for missing `*.c` and `*.h` references:
 
-1. **Python at configure time.** radae's root `CMakeLists.txt` requires
-   `Python3` (Interpreter + Development + NumPy); even the cross-compile path
-   wants `-DPython3_ROOT_DIR`. We must drive only the C decoder + FARGAN targets
-   and supply pre-exported C weights so Python isn't needed to *build the lib we
-   ship*. Reference freedv-gui's build, which does exactly this for distribution.
-2. **Custom Opus/FARGAN build.** Not `find_package(Opus)` — radae includes
-   `cmake/BuildOpus.cmake` to fetch+configure the `spl_fargan` Opus branch with
-   FARGAN. That sub-build must succeed under each toolchain.
-3. **MSVC can't compile the C99 `_Complex` DSP** (same as codec2). Windows builds
-   via **clang-cl**; expect an `if(NOT MSVC)` patch like
-   `native/codec2/patch-codec2-msvc.cmake`, applied to both radae and the Opus
-   sub-build.
-4. **arm/Pi.** RADE runs on arm (TI AM625, Librem 5) but the AVX option must be
-   off there; ensure the Opus/FARGAN SIMD selection is correct per arch.
-5. **Reverses `LPCNET=OFF`.** This is the deliberate dependency-free decision in
-   `native/codec2/VENDORING.md`. Accepted for RADE (maintainer, 2026-06-23):
-   bigger binaries + more CPU. Keep the FARGAN dependency contained to `librade`;
-   do NOT let it leak back into the codec2 build.
+```sh
+python3 - <<'PY'
+import glob, os, re
+root = "native/radae/vendor/opus_dnn"
+for mk in glob.glob(os.path.join(root, "**", "*.mk"), recursive=True):
+    with open(mk, "r", errors="ignore") as source:
+        text = source.read()
+    for token in re.findall(r'[\w./\\-]+\.[ch]', text):
+        relative = token.strip().replace("\\", "/")
+        target = os.path.normpath(os.path.join(root, relative))
+        if not os.path.exists(target):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            open(target, "a").close()
+PY
+```
 
-## Plan (Phase 2)
+These zero-byte configure-time placeholders are not upstream source and are
+not part of the recorded source-slice hashes.
 
-1. Pin a radae release tag; FetchContent radae + (via its cmake) Opus `spl_fargan`.
-2. Force the C decoder path; provide exported model weights as C so no Python is
-   needed to build the shipped library.
-3. Apply clang-cl / arm patches until `rade` + FARGAN link on win/linux/mac × x64/arm.
-4. Name outputs `rade.dll` / `librade.{so,dylib}` (PREFIX "" on WIN32, like codec2).
-5. Wire into `build-native-libs.yml`; emit binaries next to `codec2.*`.
-6. Then Phase 4: `RadeNativeMethods`/`RadeNativeLoader`/`RadeModem` P/Invoke +
-   the 48k↔16k resampler + real→complex front end; flip `RadeAvailable` true.
+## Configure and build
 
-## Update procedure (once it builds)
+Install CMake and Ninja, then run:
 
-Bump the radae pin → rebuild on all platforms via CI → re-export weights if the
-model changed → verify `rade_version()` + an on-air decode. Mirror the codec2
-VENDORING update discipline.
+```sh
+cmake -S native/radae -B native/build-rade -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DOPUS_DISABLE_INTRINSICS=ON \
+  -DZEUS_RADE_VENDOR="$PWD/native/radae/vendor" \
+  -DZEUS_RADE_BUILD_TEST=OFF
+cmake --build native/build-rade --config Release --parallel
+```
+
+For linux-arm64 add:
+
+```sh
+-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+-DCMAKE_SYSTEM_NAME=Linux \
+-DCMAKE_SYSTEM_PROCESSOR=aarch64
+```
+
+Run the Windows x64 command in an MSYS2 UCRT64 MinGW shell. The CMake project
+sets the Windows output name and static GCC runtime link. macOS uses the same
+scalar recipe; its conveyed arm64 dylib was built locally with AppleClang
+21.0.0, CMake 4.3.2, and Ninja 1.13.0 and passed the managed RADE test families.
+
+The result is `libzeus_rade.so` on Linux, `zeus_rade.dll` on Windows, or
+`libzeus_rade.dylib` on macOS. Stage only a library built and validated for its
+matching RID.
+
+## Binary/source binding and license disposition
+
+Every source export contains
+`vendor/BINARY-SOURCE-BINDING.json`, generated from the exported tree. It
+binds each conveyed RID and SHA-256 to the Thetis-RADE and Opus pins, source
+slice hashes, CMake file, shim inputs, build configuration, and recorded
+toolchain evidence.
+
+The five Codec2 LDPC units retain their original authorship and mixed LGPL
+provenance. Their composite disposition is LGPL-2.1-only. The Station Engine
+notice set prominently records the LGPL-2.1 section 3 election applying
+GPL-2.0-or-later to the exact conveyed copies, and the combined Station Engine
+binary is conveyed as GPL-3.0-or-later.

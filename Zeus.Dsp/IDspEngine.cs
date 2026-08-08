@@ -50,6 +50,12 @@ public enum DisplayPixout : byte
 {
     Panadapter = 0,
     Waterfall = 1,
+    /// <summary>
+    /// RX-only, one-hertz-normalized average-power PSD used for calibrated
+    /// in-passband signal-quality measurements. TX and PureSignal analyzers do
+    /// not expose this output.
+    /// </summary>
+    SnrPower = 2,
 }
 
 /// <summary>Outcome of <see cref="IDspEngine.LoadNr3Model"/>.</summary>
@@ -71,10 +77,27 @@ public enum Nr3ModelLoadResult
 
 public readonly record struct IqFrame(ReadOnlyMemory<double> InterleavedIq, int SampleRateHz);
 
+/// <summary>Geometry and lifetime identity for the fixed full-span RX SNR analyzer.</summary>
+public readonly record struct RxSnrSpectrumInfo(int PixelCount, int SampleRateHz, long Generation)
+{
+    public const int MaxPixelCount = 16_384;
+    public bool IsValid => PixelCount is > 0 and <= MaxPixelCount && SampleRateHz > 0 && Generation > 0;
+}
+
 public interface IDspEngine : IDisposable
 {
     int OpenChannel(int sampleRateHz, int pixelWidth);
     void CloseChannel(int channelId);
+
+    /// <summary>
+    /// Open an analyzer-only RX channel whose geometry must never become the
+    /// source of TX or PureSignal-feedback display geometry.
+    /// </summary>
+    int OpenRxDisplayChannel(int sampleRateHz, int pixelWidth) =>
+        OpenChannel(sampleRateHz, pixelWidth);
+
+    /// <summary>Close a channel opened by <see cref="OpenRxDisplayChannel"/>.</summary>
+    void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
     void FeedIq(int channelId, ReadOnlySpan<double> interleavedIqSamples);
     void SetMode(int channelId, RxMode mode);
     void SetFilter(int channelId, int lowHz, int highHz);
@@ -208,9 +231,30 @@ public interface IDspEngine : IDisposable
     void SetNotchTuneFrequencyHz(double loHz);
 
     void SetZoom(int channelId, int level);
+
+    /// <summary>
+    /// Reconfigure only the named RX analyzer. Unlike <see cref="SetZoom"/>,
+    /// this must not mirror the level onto TX or PureSignal-feedback analyzers.
+    /// </summary>
+    void SetRxDisplayZoom(int channelId, int level) => SetZoom(channelId, level);
+
+    /// <summary>
+    /// Override the analyzer FFT size for a single RX display channel
+    /// (high-resolution consumers such as the wideband detail DDC). Engines
+    /// without per-channel analyzer control may ignore it; the default no-op
+    /// keeps synthetic engines and test fakes source-compatible.
+    /// </summary>
+    void SetRxDisplayFftSize(int channelId, int fftSize) { }
     int ReadAudio(int channelId, Span<float> output);
 
     bool TryGetDisplayPixels(int channelId, DisplayPixout which, Span<float> dbOut);
+
+    /// <summary>Drain the fixed, full-span, one-hertz-normalized average-power RX PSD.</summary>
+    bool TryGetRxSnrPowerSpectrum(int channelId, Span<float> dbOut, out RxSnrSpectrumInfo info)
+    {
+        info = default;
+        return false;
+    }
 
     /// <summary>TX panadapter / waterfall pixels in dBm, sourced from a
     /// dedicated WDSP analyzer fed with the post-CFIR TX IQ. Returns false

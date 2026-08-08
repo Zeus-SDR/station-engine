@@ -25,6 +25,7 @@ namespace Zeus.Contracts;
 /// {"kind":"cleared","room":"lobby"}
 /// {"kind":"notice","from":"N9WAR","text":"...","ts":123}
 /// {"kind":"bans","bans":["N0CALL", ...]}
+/// {"kind":"floor","room":"g0123456789","holder":"N9WAR"|null,"ts":123}
 /// </code>
 ///
 /// JSON (rather than fixed binary) because the payload is small, low-rate, and
@@ -83,6 +84,11 @@ public static class ChatEventFrame
     /// <summary>Encodes the current ban list (admins only) into a 0x35 frame.</summary>
     public static byte[] Bans(IReadOnlyList<string> bans) =>
         Encode(new BansEnvelope(bans));
+
+    /// <summary>Encodes a net-floor change (holder callsign, or null when the
+    /// floor is free) for a net-enabled group room into a 0x35 frame.</summary>
+    public static byte[] Floor(string room, string? holder, long ts) =>
+        Encode(new FloorEnvelope(room, holder, ts));
 
     /// <summary>Serialises <paramref name="envelope"/> to UTF-8 JSON and
     /// prefixes the ChatEvent type byte.</summary>
@@ -163,5 +169,10 @@ public static class ChatEventFrame
     public sealed record BansEnvelope(IReadOnlyList<string> Bans)
     {
         public string Kind => "bans";
+    }
+
+    public sealed record FloorEnvelope(string Room, string? Holder, long Ts)
+    {
+        public string Kind => "floor";
     }
 }

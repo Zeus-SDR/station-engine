@@ -49,6 +49,10 @@ using Zeus.Contracts;
 
 namespace Zeus.Server;
 
+public readonly record struct TransverterWorkspaceSelection(
+    bool Enabled,
+    int? ActiveBandId);
+
 // UI layout persistence — stores the operator's panel arrangement so it
 // survives page reloads and reinstalls. Shares zeus-prefs.db with
 // BandMemoryStore (layout isn't sensitive).
@@ -70,7 +74,7 @@ public sealed class LayoutStore : IDisposable
     private readonly ILiteCollection<RadioSavedLayoutsEntry> _saved;
     private readonly ILogger<LayoutStore> _log;
     private readonly object _lock = new();
-    private readonly Dictionary<string, bool> _activeTransverterEnabled =
+    private readonly Dictionary<string, TransverterWorkspaceSelection> _activeTransverterSelections =
         new(StringComparer.Ordinal);
 
     /// <summary>Raised when a radio's effective active-workspace flag changes.</summary>
@@ -193,6 +197,15 @@ public sealed class LayoutStore : IDisposable
 
     /// <summary>Read one workspace's top-level transverter flag.</summary>
     public bool GetTransverterEnabled(string radioKey, string layoutId)
+        => GetTransverterSelection(radioKey, layoutId).Enabled;
+
+    public int? GetTransverterActiveBandId(string radioKey, string layoutId)
+        => GetTransverterSelection(radioKey, layoutId).ActiveBandId;
+
+    /// <summary>Read one workspace's top-level transverter selection.</summary>
+    public TransverterWorkspaceSelection GetTransverterSelection(
+        string radioKey,
+        string layoutId)
     {
         radioKey = NormalizeRadioKey(radioKey);
         layoutId = NormalizeLayoutId(layoutId);
@@ -200,23 +213,30 @@ public sealed class LayoutStore : IDisposable
         {
             var entry = _v2.FindOne(x => x.RadioKey == radioKey);
             var layout = entry?.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
-            return ReadTransverterEnabled(layout?.LayoutJson);
+            return ReadTransverterSelection(layout?.LayoutJson);
         }
     }
 
     /// <summary>Read the flag effective for a radio's active workspace.</summary>
     public bool GetActiveTransverterEnabled(string radioKey)
+        => GetActiveTransverterSelection(radioKey).Enabled;
+
+    public int? GetActiveTransverterBandId(string radioKey)
+        => GetActiveTransverterSelection(radioKey).ActiveBandId;
+
+    /// <summary>Read the selection effective for a radio's active workspace.</summary>
+    public TransverterWorkspaceSelection GetActiveTransverterSelection(string radioKey)
     {
         radioKey = NormalizeRadioKey(radioKey);
         lock (_lock)
         {
-            if (_activeTransverterEnabled.TryGetValue(radioKey, out bool enabled))
-                return enabled;
+            if (_activeTransverterSelections.TryGetValue(radioKey, out var selection))
+                return selection;
 
-            enabled = GetActiveTransverterEnabled(
+            selection = GetActiveTransverterSelection(
                 _v2.FindOne(x => x.RadioKey == radioKey));
-            _activeTransverterEnabled[radioKey] = enabled;
-            return enabled;
+            _activeTransverterSelections[radioKey] = selection;
+            return selection;
         }
     }
 
@@ -251,7 +271,7 @@ public sealed class LayoutStore : IDisposable
                 ActiveLayoutId = layoutId,
                 Layouts = new List<NamedLayoutEntry>(),
             };
-            bool previousEffective = GetActiveTransverterEnabled(entry);
+            var previousEffective = GetActiveTransverterSelection(entry);
 
             var existing = entry.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
             if (existing is null)
@@ -281,9 +301,10 @@ public sealed class LayoutStore : IDisposable
             if (entry.Id == 0) _v2.Insert(entry);
             else _v2.Update(entry);
 
-            effectiveEnabled = GetActiveTransverterEnabled(entry);
-            _activeTransverterEnabled[radioKey] = effectiveEnabled;
-            effectiveChanged = previousEffective != effectiveEnabled;
+            var effective = GetActiveTransverterSelection(entry);
+            effectiveEnabled = effective.Enabled;
+            _activeTransverterSelections[radioKey] = effective;
+            effectiveChanged = previousEffective != effective;
             result = ToDto(entry);
         }
 
@@ -303,8 +324,34 @@ public sealed class LayoutStore : IDisposable
         string radioKey,
         string layoutId,
         bool enabled,
+        bool notifyChanged) =>
+        SetTransverterSelection(
+            radioKey,
+            layoutId,
+            enabled,
+            GetTransverterSelection(radioKey, layoutId).ActiveBandId,
+            notifyChanged);
+
+    /// <summary>
+    /// Atomically patch workspace enablement and active band in one JSON write.
+    /// </summary>
+    public bool SetTransverterSelection(
+        string radioKey,
+        string layoutId,
+        bool enabled,
+        int? activeBandId) =>
+        SetTransverterSelection(radioKey, layoutId, enabled, activeBandId, notifyChanged: true);
+
+    internal bool SetTransverterSelection(
+        string radioKey,
+        string layoutId,
+        bool enabled,
+        int? activeBandId,
         bool notifyChanged)
     {
+        if (activeBandId is < TransverterFrequencyConverter.MinimumBandId
+            or > TransverterFrequencyConverter.MaximumBandId)
+            return false;
         radioKey = NormalizeRadioKey(radioKey);
         layoutId = NormalizeLayoutId(layoutId);
         bool effectiveChanged;
@@ -313,16 +360,17 @@ public sealed class LayoutStore : IDisposable
             var entry = _v2.FindOne(x => x.RadioKey == radioKey);
             var layout = entry?.Layouts.FirstOrDefault(l => l.LayoutId == layoutId);
             if (entry is null || layout is null
-                || !TrySetTransverterEnabled(layout.LayoutJson, enabled, out var patchedJson))
+                || !TrySetTransverterSelection(
+                    layout.LayoutJson, enabled, activeBandId, out var patchedJson))
                 return false;
 
-            bool previousEffective = GetActiveTransverterEnabled(entry);
+            var previousEffective = GetActiveTransverterSelection(entry);
             layout.LayoutJson = patchedJson;
             layout.UpdatedUtc = DateTime.UtcNow;
             _v2.Update(entry);
-            bool effectiveEnabled = GetActiveTransverterEnabled(entry);
-            _activeTransverterEnabled[radioKey] = effectiveEnabled;
-            effectiveChanged = previousEffective != effectiveEnabled;
+            var effective = GetActiveTransverterSelection(entry);
+            _activeTransverterSelections[radioKey] = effective;
+            effectiveChanged = previousEffective != effective;
         }
 
         if (notifyChanged && effectiveChanged)
@@ -348,12 +396,13 @@ public sealed class LayoutStore : IDisposable
                 return new RadioLayoutsDto(radioKey, Array.Empty<NamedLayoutDto>(), string.Empty);
             if (!entry.Layouts.Any(l => l.LayoutId == layoutId))
                 return ToDto(entry);
-            bool previousEffective = GetActiveTransverterEnabled(entry);
+            var previousEffective = GetActiveTransverterSelection(entry);
             entry.ActiveLayoutId = layoutId;
             _v2.Update(entry);
-            effectiveEnabled = GetActiveTransverterEnabled(entry);
-            _activeTransverterEnabled[radioKey] = effectiveEnabled;
-            effectiveChanged = previousEffective != effectiveEnabled;
+            var effective = GetActiveTransverterSelection(entry);
+            effectiveEnabled = effective.Enabled;
+            _activeTransverterSelections[radioKey] = effective;
+            effectiveChanged = previousEffective != effective;
             result = ToDto(entry);
         }
 
@@ -379,14 +428,15 @@ public sealed class LayoutStore : IDisposable
             var entry = _v2.FindOne(x => x.RadioKey == radioKey);
             if (entry is null)
                 return new RadioLayoutsDto(radioKey, Array.Empty<NamedLayoutDto>(), string.Empty);
-            bool previousEffective = GetActiveTransverterEnabled(entry);
+            var previousEffective = GetActiveTransverterSelection(entry);
             entry.Layouts.RemoveAll(l => l.LayoutId == layoutId);
             if (entry.ActiveLayoutId == layoutId)
                 entry.ActiveLayoutId = entry.Layouts.FirstOrDefault()?.LayoutId ?? string.Empty;
             _v2.Update(entry);
-            effectiveEnabled = GetActiveTransverterEnabled(entry);
-            _activeTransverterEnabled[radioKey] = effectiveEnabled;
-            effectiveChanged = previousEffective != effectiveEnabled;
+            var effective = GetActiveTransverterSelection(entry);
+            effectiveEnabled = effective.Enabled;
+            _activeTransverterSelections[radioKey] = effective;
+            effectiveChanged = previousEffective != effective;
             result = ToDto(entry);
         }
 
@@ -513,32 +563,44 @@ public sealed class LayoutStore : IDisposable
             .ToList(),
         e.ActiveLayoutId);
 
-    private static bool GetActiveTransverterEnabled(RadioLayoutsEntry? entry)
+    private static TransverterWorkspaceSelection GetActiveTransverterSelection(
+        RadioLayoutsEntry? entry)
     {
-        if (entry is null || string.IsNullOrEmpty(entry.ActiveLayoutId)) return false;
+        if (entry is null || string.IsNullOrEmpty(entry.ActiveLayoutId)) return new(false, 0);
         var active = entry.Layouts.FirstOrDefault(l => l.LayoutId == entry.ActiveLayoutId);
-        return ReadTransverterEnabled(active?.LayoutJson);
+        return ReadTransverterSelection(active?.LayoutJson);
     }
 
-    private static bool ReadTransverterEnabled(string? layoutJson)
+    private static TransverterWorkspaceSelection ReadTransverterSelection(string? layoutJson)
     {
-        if (string.IsNullOrWhiteSpace(layoutJson)) return false;
+        if (string.IsNullOrWhiteSpace(layoutJson)) return new(false, 0);
         try
         {
             using var document = JsonDocument.Parse(layoutJson);
-            return document.RootElement.ValueKind == JsonValueKind.Object
-                && document.RootElement.TryGetProperty("transverterEnabled", out var value)
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return new(false, 0);
+            bool enabled = document.RootElement.TryGetProperty("transverterEnabled", out var value)
                 && value.ValueKind == JsonValueKind.True;
+            int? activeBandId = document.RootElement.TryGetProperty(
+                    "activeTransverterBandId", out var active)
+                && active.ValueKind == JsonValueKind.Number
+                && active.TryGetInt32(out int id)
+                && id is >= TransverterFrequencyConverter.MinimumBandId
+                    and <= TransverterFrequencyConverter.MaximumBandId
+                    ? id
+                    : 0;
+            return new(enabled, activeBandId);
         }
         catch (JsonException)
         {
-            return false;
+            return new(false, 0);
         }
     }
 
-    private static bool TrySetTransverterEnabled(
+    private static bool TrySetTransverterSelection(
         string layoutJson,
         bool enabled,
+        int? activeBandId,
         out string patchedJson)
     {
         patchedJson = layoutJson;
@@ -546,6 +608,7 @@ public sealed class LayoutStore : IDisposable
         {
             if (JsonNode.Parse(layoutJson) is not JsonObject root) return false;
             root["transverterEnabled"] = enabled;
+            root["activeTransverterBandId"] = activeBandId;
             patchedJson = root.ToJsonString();
             return true;
         }

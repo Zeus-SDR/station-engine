@@ -913,14 +913,12 @@ public sealed class TciSession : IDisposable
         int channel,
         TransverterSettingsDto? transverterSettings = null)
     {
-        long ifHz = channel switch
+        return channel switch
         {
             0 => state.VfoHz,
             1 => RadioFrequencyResolver.TxDialFrequencyHz(state),
             _ => throw new ArgumentOutOfRangeException(nameof(channel)),
         };
-        return TransverterFrequencyConverter.ToRfHz(
-            ifHz, transverterSettings ?? new TransverterSettingsDto());
     }
 
     internal static void SetVfoChannel(
@@ -929,19 +927,26 @@ public sealed class TciSession : IDisposable
         long rfHz,
         TransverterSettingsDto? transverterSettings = null)
     {
-        if (!TransverterFrequencyConverter.TryToIfHz(
-                rfHz, transverterSettings ?? new TransverterSettingsDto(), out long ifHz))
+        var settings = transverterSettings ?? new TransverterSettingsDto();
+        bool covered = settings.Enabled
+            ? rfHz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                || (settings.Bands is null
+                    ? TransverterFrequencyConverter.TryToIfHz(rfHz, settings, out _)
+                    : TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out _))
+            : radio.IsExternalFrequencyAvailable(rfHz);
+        if (!covered)
+        {
             return;
-
+        }
         if (channel == 0)
         {
-            radio.SetVfo(ifHz, fromExternal: true);
+            radio.SetVfo(rfHz, fromExternal: true);
             return;
         }
         if (channel == 1)
         {
             var state = radio.Snapshot();
-            radio.SetSplitFrequency(state.TxReceiverIndex, ifHz);
+            radio.SetSplitFrequency(state.TxReceiverIndex, rfHz);
             return;
         }
         throw new ArgumentOutOfRangeException(nameof(channel));
@@ -960,15 +965,13 @@ public sealed class TciSession : IDisposable
             Send(TciProtocol.Command(
                 "dds",
                 rx,
-                TransverterFrequencyConverter.ToRfHz(
-                    CwOffset.EffectiveLoHz(state), CurrentTransverterSettings)));
+                CwOffset.EffectiveLoHz(state)));
         }
         else if (args.Length >= 2 && TciProtocol.TryParseLong(args[1], out long hz))
         {
             // Set DDS (same as VFO for single-RX). External source — see HandleVfo.
-            if (TransverterFrequencyConverter.TryToIfHz(
-                    hz, CurrentTransverterSettings, out long ifHz))
-                _radio.SetVfo(ifHz, fromExternal: true);
+            if (hz <= 0) return;
+            SetVfoChannel(_radio, 0, hz, CurrentTransverterSettings);
         }
     }
 

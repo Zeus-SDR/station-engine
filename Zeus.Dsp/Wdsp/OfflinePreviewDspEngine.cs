@@ -22,13 +22,23 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
         _tx = new WdspDspEngine(logger, rxAnalyzerFftSize);
     }
 
-    public int OpenChannel(int sampleRateHz, int pixelWidth)
+    public int OpenChannel(int sampleRateHz, int pixelWidth) =>
+        OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: false);
+
+    public int OpenRxDisplayChannel(int sampleRateHz, int pixelWidth) =>
+        OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: true);
+
+    private int OpenChannelCore(int sampleRateHz, int pixelWidth, bool displayOnly)
     {
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
-        int controlId = _control.OpenChannel(sampleRateHz, pixelWidth);
+        int controlId = displayOnly
+            ? _control.OpenRxDisplayChannel(sampleRateHz, pixelWidth)
+            : _control.OpenChannel(sampleRateHz, pixelWidth);
         try
         {
-            int txRxId = _tx.OpenChannel(sampleRateHz, pixelWidth);
+            int txRxId = displayOnly
+                ? _tx.OpenRxDisplayChannel(sampleRateHz, pixelWidth)
+                : _tx.OpenChannel(sampleRateHz, pixelWidth);
             lock (_channelLock) _channelMap[controlId] = txRxId;
             return controlId;
         }
@@ -52,6 +62,8 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
         if (txChannelId >= 0)
             _tx.CloseChannel(txChannelId);
     }
+
+    public void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
 
     private int TxChannelFor(int channelId)
     {
@@ -173,6 +185,12 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
     {
         _control.SetZoom(channelId, level);
         _tx.SetZoom(TxChannelFor(channelId), level);
+    }
+
+    public void SetRxDisplayZoom(int channelId, int level)
+    {
+        _control.SetRxDisplayZoom(channelId, level);
+        _tx.SetRxDisplayZoom(TxChannelFor(channelId), level);
     }
 
     public int ReadAudio(int channelId, Span<float> output)

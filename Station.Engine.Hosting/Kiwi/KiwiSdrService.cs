@@ -40,10 +40,8 @@ public sealed class KiwiSdrService : BackgroundService,
     // DSP mix tick (consumer). Power of two (~1.36 s @ 48 kHz). The Kiwi rides
     // the same RX-audio mix bus as the hardware RXs.
     private const int AudioBusCapacity = 65_536;
-    // Waterfall span at zoom level 1 (widest). The global slider is clamped to
-    // Kiwi's own 1..32 remote-waterfall range here, so zoom 1 ≈ 192 kHz of band
-    // down to ≈ 6 kHz (single-signal) at zoom 32.
-    private const double FullSpanHz = 192_000;
+    private const double DefaultWaterfallBandwidthHz = 30_000_000;
+    private const int DefaultZoomCap = 14;
     // Fixed panadapter/waterfall width, matching the hardware DDC DisplayFrame
     // width so the frontend renderer treats the Kiwi identically (and never
     // resets on a per-row bin-count wobble).
@@ -87,7 +85,9 @@ public sealed class KiwiSdrService : BackgroundService,
     private int _filterLowHz = 100;
     private int _filterHighHz = 2_850;
     private bool _muted;
-    private int _zoomLevel = 1; // Kiwi-local 1..32 clamp fed by /api/rx/zoom.
+    // Kiwi-native waterfall zoom. z7 preserves the integration's previous
+    // initial ~234 kHz view; every subsequent integer step halves the span.
+    private int _zoomLevel = 7;
 
     // True while the radio is transmitting (MOX or TUN). The Kiwi is a remote RX
     // monitoring the same band the operator transmits on, so during TX it would
@@ -134,12 +134,7 @@ public sealed class KiwiSdrService : BackgroundService,
     private const double SqlAttackPerSample = 1.0 / 60.0;
     private const double SqlReleasePerSample = 1.0 / 600.0;
 
-    // Waterfall span for the current zoom level. Caller need not hold _sync.
-    private double CurrentSpanHz()
-    {
-        int z = Math.Clamp(Volatile.Read(ref _zoomLevel), 1, 32);
-        return FullSpanHz / z;
-    }
+    private int CurrentZoomLevel() => Math.Clamp(Volatile.Read(ref _zoomLevel), 0, DefaultZoomCap);
 
     // Auto-reconnect (issue #1114). The KiwiSDR's W/F socket can close mid-session
     // while the SND socket stays up; without recovery the operator's panadapter
@@ -151,6 +146,7 @@ public sealed class KiwiSdrService : BackgroundService,
     private int _reconnectBusy;      // 0/1 — a reconnect loop is running
     private int _reconnectPending;   // 0/1 — a fresh drop arrived while the loop was busy
     private long _reconnectGen;      // bumped on operator/radio state changes
+    private string? _lastDropReason; // last "dropped" detail, echoed while retrying
     // Service-lifetime token (captured in ExecuteAsync). The reconnect back-off
     // honours it so a pending attempt aborts on host shutdown instead of
     // resurrecting the Kiwi client after the service has stopped.
@@ -158,6 +154,10 @@ public sealed class KiwiSdrService : BackgroundService,
 
     // Frame sequencing + audio resampling (48 kHz output from the ~12 kHz Kiwi).
     private uint _displaySeq;
+    // Paces the bursty Kiwi W/F rows (8–16 fps, 60–260 ms jitter) into the
+    // steady 30 Hz stream the spectrum surfaces are built for. One per client
+    // session; recreated on every (re)connect, disposed on stop.
+    private KiwiFramePacer? _pacer;
     // 1 Hz rate instrumentation (bring-up): WF frames/s, audio frames/s, audio
     // samples/s. All touched from both socket loop threads → Interlocked.
     private long _rateWindowStartMs;
@@ -433,7 +433,17 @@ public sealed class KiwiSdrService : BackgroundService,
     {
         var s = _store.Get();
         lock (_sync)
-            return new KiwiConfigDto(_enabled, s.Url, s.Password is not null, _status, _statusDetail);
+        {
+            int cap = _client?.ZoomCap ?? DefaultZoomCap;
+            return new KiwiConfigDto(
+                _enabled,
+                s.Url,
+                s.Password is not null,
+                _status,
+                _statusDetail,
+                Math.Clamp(_zoomLevel, 0, cap),
+                cap);
+        }
     }
 
     public async Task<KiwiConfigDto> SetConfigAsync(bool? enabled, string? url, string? password, CancellationToken ct)
@@ -508,7 +518,7 @@ public sealed class KiwiSdrService : BackgroundService,
             client = _client;
             freq = _vfoHz; center = _centerHz; m = _mode; lo = _filterLowHz; hi = _filterHighHz;
         }
-        client?.Tune(freq, center, KiwiMode(m), lo, hi, CurrentSpanHz());
+        client?.Tune(freq, center, KiwiMode(m), lo, hi, CurrentZoomLevel());
         RaiseChanged();
     }
 
@@ -525,7 +535,7 @@ public sealed class KiwiSdrService : BackgroundService,
             client = _client;
             freq = _vfoHz; center = _centerHz; m = _mode; lo = _filterLowHz; hi = _filterHighHz;
         }
-        client?.Tune(freq, center, KiwiMode(m), lo, hi, CurrentSpanHz());
+        client?.Tune(freq, center, KiwiMode(m), lo, hi, CurrentZoomLevel());
         RaiseChanged();
     }
 
@@ -555,20 +565,88 @@ public sealed class KiwiSdrService : BackgroundService,
         RaiseChanged();
     }
 
-    /// <summary>Apply the global zoom level to the Kiwi waterfall, clamped to
-    /// Kiwi's 1..32 remote-waterfall range. The span shrinks as the level grows
-    /// (<see cref="FullSpanHz"/> / level); the client re-tunes the remote KiwiSDR's
-    /// <c>SET zoom</c> and starts emitting frames at the new Hz/pixel, which the
-    /// self-scaled frontend renders.</summary>
-    public void SetZoom(int level)
+    /// <summary>External-receiver control port: set an absolute native zoom
+    /// level about the current centre. Kept as the port's contract; the slice
+    /// window and the wheel both go through the anchored overloads below.</summary>
+    public void SetZoom(int level) => SetZoomLevel(level, 0.5);
+
+    /// <summary>The Kiwi's own native waterfall zoom (z0..cap) and the cap the
+    /// remote negotiated. Reported in <see cref="KiwiConfigDto"/> so the slice
+    /// window can drive this zoom instead of the radio-wide DDC zoom.</summary>
+    public (int Level, int Cap) ZoomState()
     {
-        Volatile.Write(ref _zoomLevel, Math.Clamp(level, 1, 32));
+        lock (_sync)
+        {
+            int cap = _client?.ZoomCap ?? DefaultZoomCap;
+            return (Math.Clamp(_zoomLevel, 0, cap), cap);
+        }
+    }
+
+    /// <summary>Move exactly one native Kiwi zoom step and preserve the
+    /// frequency at <paramref name="anchor"/> (0=left, 1=right), matching the
+    /// kiwisdr.com waterfall wheel behavior.</summary>
+    public (int Level, bool Changed, long CenterHz) StepZoom(int delta, double anchor, long? observedCenterHz = null)
+        => ApplyZoom(current => current + Math.Sign(delta), anchor, observedCenterHz, "step");
+
+    /// <summary>Jump straight to an absolute native Kiwi zoom level (clamped to
+    /// z0..the negotiated cap), preserving the frequency at
+    /// <paramref name="anchor"/>. This is what the Kiwi slice window's zoom
+    /// slider drives — it moves the Kiwi's own view and never touches the
+    /// radio-wide DDC zoom.</summary>
+    public (int Level, bool Changed, long CenterHz) SetZoomLevel(int level, double anchor, long? observedCenterHz = null)
+        => ApplyZoom(_ => level, anchor, observedCenterHz, "set");
+
+    /// <summary>Shared body for both zoom entry points. <paramref name="target"/>
+    /// maps the current level to the requested one INSIDE the lock, so the cap
+    /// clamp and the centre recompute always see the same current level.</summary>
+    private (int Level, bool Changed, long CenterHz) ApplyZoom(
+        Func<int, int> target,
+        double anchor,
+        long? observedCenterHz,
+        string source)
+    {
         KiwiSdrClient? client;
-        long freq, center; RxMode m; int lo, hi;
-        lock (_sync) { client = _client; freq = _vfoHz; center = _centerHz; m = _mode; lo = _filterLowHz; hi = _filterHighHz; }
-        double span = CurrentSpanHz();
-        _log.LogInformation("kiwi.zoom level={Level} spanHz={Span:F0}", _zoomLevel, span);
-        client?.Tune(freq, center, KiwiMode(m), lo, hi, span);
+        long freq, center; RxMode m; int lo, hi, next;
+        lock (_sync)
+        {
+            client = _client;
+            int cap = client?.ZoomCap ?? DefaultZoomCap;
+            int current = Math.Clamp(_zoomLevel, 0, cap);
+            next = Math.Clamp(target(current), 0, cap);
+            if (next == current) return (current, false, _centerHz);
+
+            double bandwidth = client?.WaterfallBandwidthHz ?? DefaultWaterfallBandwidthHz;
+            long baseCenter = observedCenterHz.HasValue
+                ? Math.Clamp(observedCenterHz.Value, 0, 60_000_000)
+                : _centerHz;
+            _centerHz = ZoomCenterForStep(baseCenter, bandwidth, current, next, anchor);
+            _zoomLevel = next;
+            freq = _vfoHz; center = _centerHz; m = _mode; lo = _filterLowHz; hi = _filterHighHz;
+        }
+        _log.LogInformation("kiwi.zoom.{Source} level={Level} anchor={Anchor:F3} centerHz={Center}",
+            source, next, anchor, center);
+        client?.Tune(freq, center, KiwiMode(m), lo, hi, next);
+        return (next, true, center);
+    }
+
+    internal static long ZoomCenterForStep(
+        long centerHz,
+        double bandwidthHz,
+        int currentZoom,
+        int nextZoom,
+        double anchor)
+    {
+        double oldSpan = bandwidthHz / Math.Pow(2, currentZoom);
+        double newSpan = bandwidthHz / Math.Pow(2, nextZoom);
+        double x = Math.Clamp(double.IsFinite(anchor) ? anchor : 0.5, 0, 1);
+        double requested = centerHz + (x - 0.5) * (oldSpan - newSpan);
+        // Kiwi clamps the left-edge start bin to its RF passband. Express that
+        // in center coordinates so the value returned to a multi-step gesture
+        // is the same center the remote can actually apply. At z0 min==max and
+        // the only legal center is bandwidth/2.
+        double minCenter = newSpan / 2.0;
+        double maxCenter = bandwidthHz - newSpan / 2.0;
+        return (long)Math.Round(Math.Clamp(requested, minCenter, maxCenter));
     }
 
     // -------------------------------------------------------------------------
@@ -619,6 +697,13 @@ public sealed class KiwiSdrService : BackgroundService,
         var client = new KiwiSdrClient(host, port, secure, password, "ZeusSDR", _loggerFactory.CreateLogger<KiwiSdrClient>());
         client.AudioReceived = OnAudio;
         client.WaterfallReceived = OnWaterfall;
+        client.ZoomCapChanged = cap =>
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_client, client)) _zoomLevel = Math.Min(_zoomLevel, cap);
+            }
+        };
         client.StatusChanged = OnClientStatus;
         // The Kiwi S-meter is NOT broadcast (RxMeterFrame carries no RxId, so it
         // would overwrite RX1's meter — the panadapter/waterfall convey the Kiwi
@@ -633,6 +718,9 @@ public sealed class KiwiSdrService : BackgroundService,
             _status = "connecting";
             _statusDetail = $"{host}:{port}";
             _resamplePhase = 0; _resamplePrev = 0; _resampleInRate = 0;
+            _pacer?.Dispose();
+            _pacer = new KiwiFramePacer(DisplayWidth) { FrameReady = OnPacedFrame };
+            _pacer.Start();
         }
         try
         {
@@ -642,7 +730,7 @@ public sealed class KiwiSdrService : BackgroundService,
             // operator's frequency.
             long freq, center; RxMode m; int lo, hi;
             lock (_sync) { freq = _vfoHz; center = _centerHz; m = _mode; lo = _filterLowHz; hi = _filterHighHz; }
-            client.Tune(freq, center, KiwiMode(m), lo, hi, CurrentSpanHz());
+            client.Tune(freq, center, KiwiMode(m), lo, hi, CurrentZoomLevel());
         }
         catch
         {
@@ -651,7 +739,9 @@ public sealed class KiwiSdrService : BackgroundService,
             // _client to decide "are we connected?" — a phantom would misreport a
             // connected slice and block self-recovery. Roll it back and dispose
             // the partially-opened sockets, then rethrow so the caller marks error.
-            lock (_sync) { if (ReferenceEquals(_client, client)) _client = null; }
+            KiwiFramePacer? failedPacer;
+            lock (_sync) { if (ReferenceEquals(_client, client)) _client = null; failedPacer = _pacer; _pacer = null; }
+            failedPacer?.Dispose();
             try { await client.DisposeAsync().ConfigureAwait(false); } catch { /* best effort */ }
             throw;
         }
@@ -660,7 +750,7 @@ public sealed class KiwiSdrService : BackgroundService,
     private async Task StopClientAsync()
     {
         KiwiSdrClient? client;
-        lock (_sync) { client = _client; _client = null; }
+        lock (_sync) { client = _client; _client = null; _pacer?.Dispose(); _pacer = null; }
         if (client is not null)
         {
             try { await client.DisposeAsync().ConfigureAwait(false); }
@@ -670,6 +760,26 @@ public sealed class KiwiSdrService : BackgroundService,
 
     private void OnClientStatus(string status, string? detail)
     {
+        // The client reports "handshake" once the auth/rate handshake completes
+        // but BEFORE any stream frame has decoded. That is not a live receiver:
+        // zombie endpoints (e.g. a wedged kiwisdr.com proxy registration) answer
+        // the handshake and then stream nothing. Keep the pill on CONNECTING
+        // until the first real SND/W/F frame promotes it to "connected".
+        if (status == "handshake")
+        {
+            lock (_sync)
+            {
+                // ...but a LATE handshake must not regress a live session. The
+                // two legs race: on some receivers the W/F socket decodes its
+                // first row (promoting us to "connected") before the SND
+                // socket's audio_rate MSG arrives and fires "handshake".
+                if (_status == "connected") return;
+                _status = "connecting"; _statusDetail = "handshake ok — waiting for stream data";
+            }
+            RaiseChanged();
+            return;
+        }
+
         // KiwiSdrClient signals an unsolicited socket close as "dropped"; surface
         // it as "error" on the wire (existing pill set: connecting/connected/
         // error/closed/disabled) so the operator sees ERROR in Settings while
@@ -679,7 +789,12 @@ public sealed class KiwiSdrService : BackgroundService,
             ? "connection dropped"
             : detail;
 
-        lock (_sync) { _status = stored; _statusDetail = storedDetail; }
+        lock (_sync)
+        {
+            _status = stored;
+            _statusDetail = storedDetail;
+            if (status == "dropped") _lastDropReason = storedDetail;
+        }
         RaiseChanged();
 
         if (status == "connected")
@@ -754,6 +869,18 @@ public sealed class KiwiSdrService : BackgroundService,
                     "kiwi.reconnect scheduled attempt={Attempt} in={DelaySec}s url={Url}",
                     attempt, delay.TotalSeconds, url);
 
+                // Keep the pill honest during the back-off: without this the
+                // detail still showed the last stale state (or a bare "error")
+                // while the slice silently retried in the background.
+                lock (_sync)
+                {
+                    if (_status == "error")
+                        _statusDetail = string.IsNullOrEmpty(_lastDropReason)
+                            ? $"connection lost — reconnecting (attempt {attempt})"
+                            : $"{_lastDropReason} — reconnecting (attempt {attempt})";
+                }
+                RaiseChanged();
+
                 try { await Task.Delay(delay, token).ConfigureAwait(false); }
                 catch (OperationCanceledException) { return; }
 
@@ -824,9 +951,13 @@ public sealed class KiwiSdrService : BackgroundService,
         }
     }
 
-    private void OnWaterfall(float[] binsDb, long centerHz, double hzPerBin)
+    private void OnWaterfall(float[] binsDb, long centerHz, double hzPerBin, int _)
     {
         if (binsDb.Length == 0) return;
+        // The row's x-bin/zoom are display truth, but never replace the
+        // authoritative requested centre here: an old queued row at the same
+        // zoom could otherwise roll a newer pan command backward. Cursor zoom
+        // sends the currently observed frame centre with its request instead.
         // Resample the Kiwi's native bin count (~1024, and it can wobble by ±1
         // between rows) to the fixed 2048-wide frame a hardware DDC produces.
         // A constant width is load-bearing: the frontend renderer does a full
@@ -837,6 +968,20 @@ public sealed class KiwiSdrService : BackgroundService,
         double span = binsDb.Length * hzPerBin;
         LogWfDbRangeIfDue(binsDb);
         var db = ResampleBins(binsDb, DisplayWidth);
+        // Hand the row to the pacer instead of broadcasting immediately: the
+        // Kiwi's 8–16 fps bursty rows go in, a steady 30 Hz smoothed stream
+        // comes out (see KiwiFramePacer for why).
+        KiwiFramePacer? pacer;
+        lock (_sync) pacer = _pacer;
+        pacer?.Push(db, centerHz, span / DisplayWidth);
+    }
+
+    // 30 Hz paced output from KiwiFramePacer. The db array carries the spectrum
+    // for BOTH the panadapter trace and the waterfall history (the Kiwi row IS
+    // the spectrum), exactly like the direct path before it — only the cadence
+    // and smoothness change.
+    private void OnPacedFrame(float[] db, long centerHz, double hzPerPixel)
+    {
         var frame = new DisplayFrame(
             Seq: unchecked(++_displaySeq),
             TsUnixMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -844,9 +989,7 @@ public sealed class KiwiSdrService : BackgroundService,
             BodyFlags: DisplayBodyFlags.PanValid | DisplayBodyFlags.WfValid,
             Width: DisplayWidth,
             CenterHz: centerHz,
-            HzPerPixel: (float)(span / DisplayWidth),
-            // The Kiwi waterfall row is the spectrum; reuse it for both the
-            // panadapter trace and the waterfall history.
+            HzPerPixel: (float)hzPerPixel,
             PanDb: db,
             WfDb: db);
         if (_hub.DisplayStreamRequested)

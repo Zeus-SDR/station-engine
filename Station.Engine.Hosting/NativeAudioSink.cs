@@ -150,6 +150,24 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     private readonly CancellationToken _recoveryToken;
     private bool _disposed;
 
+    // Playback-callback liveness watchdog (issue #1140). A miniaudio device can
+    // silently wedge — the OS playback callback (OnPlaybackData) stops firing
+    // without ever emitting a "stopped" notification (a CoreAudio route /
+    // interruption failure mode) — while DSP keeps publishing healthy RX audio
+    // into the ring. Because ScheduleRecovery only runs on an explicit stopped
+    // notification, that strands receive audio with no recovery. We stamp the
+    // last callback time here and, from the Publish cadence (which only runs
+    // while audio is actually arriving), single-flight the existing recovery
+    // path once the callback has gone stale past the threshold. A monotonic
+    // clock is used so a wall-clock step can't spoof staleness; it is injectable
+    // so the watchdog is unit-testable without opening a real device.
+    private const long StallRecoveryThresholdMs = 2_000;
+    private readonly Func<long> _monotonicMs;
+    private readonly Action _onStallRecovery;
+    private long _lastCallbackMs;
+    private int _stallRecoveryInFlight;
+    private volatile bool _outputActive;
+
     private volatile bool _rebuffering = true;
 
     // Local side-channel enable flag. Audio Suite preview now uses the full
@@ -308,7 +326,9 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         AudioDeviceSettingsStore? deviceSettings = null,
         IServiceProvider? services = null,
         RxAudioMuteState? muteState = null,
-        bool outputEnabled = true)
+        bool outputEnabled = true,
+        Func<long>? monotonicClock = null,
+        Action? onStallRecovery = null)
     {
         _log = log;
         _outputEnabled = outputEnabled;
@@ -318,6 +338,12 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         _muteChangedHandler = OnMuteChanged;
         _muteState.Changed += _muteChangedHandler;
         _recoveryToken = _recoveryCancellation.Token;
+        _monotonicMs = monotonicClock ?? (static () => Environment.TickCount64);
+        // Default watchdog action: reuse the existing device-stop recovery path,
+        // passing the current device generation so ShouldSchedule accepts it (a
+        // stall has no stopped-notification generation of its own).
+        _onStallRecovery = onStallRecovery
+            ?? (() => ScheduleRecovery(Volatile.Read(ref _deviceGeneration)));
     }
 
     /// <summary>
@@ -482,6 +508,13 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     {
         _output = output;
         _activeOutputDeviceId = NormalizeDeviceId(requestedDeviceId);
+        // Arm the liveness watchdog: mark the device live and stamp the heartbeat
+        // so a freshly opened device gets a full StallRecoveryThresholdMs grace
+        // window before its first callback is judged stale. Re-arm the
+        // single-flight so a future stall on this new device can schedule again.
+        Interlocked.Exchange(ref _lastCallbackMs, _monotonicMs());
+        Interlocked.Exchange(ref _stallRecoveryInFlight, 0);
+        _outputActive = true;
         _log.LogInformation(
             "audio.native.rx open device={Device} rate={Rate}Hz channels={Channels} version={Version}",
             _activeOutputDeviceId is null ? "default" : "selected",
@@ -532,6 +565,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         }
         _output = null;
         _activeOutputDeviceId = null;
+        _outputActive = false;
     }
 
     /// <summary>
@@ -596,6 +630,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         }
         Interlocked.Add(ref _totalSamplesIn, src.Length);
 
+        MaybeRecoverStalledOutput();
         MaybeLog();
     }
 
@@ -766,6 +801,55 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         }
 
         Interlocked.Add(ref _totalSamplesOut, totalFrames);
+
+        // Liveness heartbeat: the callback fired, so the device is alive
+        // regardless of whether it rendered audio or a silence tail. Re-arm the
+        // stall watchdog's single-flight so a later stall (or a stall on a
+        // device that just recovered) can schedule recovery again.
+        Interlocked.Exchange(ref _lastCallbackMs, _monotonicMs());
+        Interlocked.Exchange(ref _stallRecoveryInFlight, 0);
+    }
+
+    /// <summary>
+    /// Watchdog driven off the <see cref="Publish"/> cadence: if the playback
+    /// callback has gone stale past <see cref="StallRecoveryThresholdMs"/> while
+    /// the device is nominally open and RX audio is arriving, single-flight the
+    /// existing device recovery path. Called only after a real RX frame has been
+    /// enqueued, so a muted or input-idle sink (Publish not reached / returns
+    /// early) never trips it.
+    /// </summary>
+    private void MaybeRecoverStalledOutput()
+    {
+        if (!_outputActive) return;
+        long now = _monotonicMs();
+        long last = Interlocked.Read(ref _lastCallbackMs);
+        if (!ShouldRecoverStalledCallback(
+                _outputActive, _muteState.IsMuted, last, now, StallRecoveryThresholdMs))
+            return;
+        // Single-flight until a callback fires again (OnPlaybackData re-arms) or a
+        // fresh device is adopted — so a persistent stall schedules exactly one
+        // recovery instead of one per publish.
+        if (Interlocked.CompareExchange(ref _stallRecoveryInFlight, 1, 0) != 0) return;
+        _log.LogWarning(
+            "audio.native.rx playback callback stalled {StallMs}ms while RX audio arriving; scheduling recovery",
+            now - last);
+        _onStallRecovery();
+    }
+
+    // Pure decision for the callback-liveness watchdog: recover only when the
+    // device is open, not muted, and the last playback callback is older than the
+    // stall threshold. Static + side-effect free so it is trivially unit-tested.
+    internal static bool ShouldRecoverStalledCallback(
+        bool outputOpen, bool muted, long lastCallbackMs, long nowMs, long stallThresholdMs) =>
+        outputOpen && !muted && (nowMs - lastCallbackMs) >= stallThresholdMs;
+
+    // Test seam: mark the device live and stamp a fresh heartbeat without opening
+    // a real miniaudio device, so the watchdog can be exercised headlessly.
+    internal void SimulateDeviceOpenForTest()
+    {
+        Interlocked.Exchange(ref _lastCallbackMs, _monotonicMs());
+        Interlocked.Exchange(ref _stallRecoveryInFlight, 0);
+        _outputActive = true;
     }
 
     private void OnDeviceNotification(int kind, int generation)

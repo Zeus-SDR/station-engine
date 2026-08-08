@@ -40,9 +40,20 @@ public static class CatEndpoints
             (CatSerialService svc) => Results.Ok(svc.Snapshot()));
 
         endpoints.MapPut("/api/cat/serial/config",
-            (CatSerialConfig req, CatSerialConfigStore store, CatSerialService svc) =>
+            (CatSerialConfig req, CatSerialConfigStore store, CatSerialService svc, SerialPttSettingsStore serialPttStore) =>
         {
             var ports = req?.Ports ?? Array.Empty<CatSerialPortConfig>();
+            // Mirror of the serial-PTT PUT check: a device already carrying the
+            // serial PTT switch cannot also be assigned to a CAT port (both are
+            // exclusive-opens; Thetis hard-errors on the same conflict).
+            var serialPtt = serialPttStore.Get();
+            if (serialPtt.Enabled && serialPtt.PortName.Length > 0)
+            {
+                var conflicting = ports.FirstOrDefault(p =>
+                    p.Enabled && SerialPortEnumeration.PortNameEquals((p.PortName ?? string.Empty).Trim(), serialPtt.PortName));
+                if (conflicting is not null)
+                    return Results.Conflict(new { error = $"{serialPtt.PortName} is already assigned to the serial PTT switch" });
+            }
             log.LogInformation("api.cat.serial.config ports=[{Ports}]",
                 string.Join(", ", ports.Select((p, i) => $"#{i + 1} {(p.Enabled ? $"{p.PortName}@{p.BaudRate}" : "off")}")));
             store.Set(ports);

@@ -34,11 +34,9 @@ namespace Zeus.Protocol2;
 ///
 /// <para>
 /// Fields here are the values an operator changes (CW mode active, keyer
-/// mode, speed, sidetone). The remaining gateware parameters
-/// (weight / spacing / reversed / break-in / hang / RF-delay / ramp) are
-/// pinned to Thetis/pihpsdr-faithful defaults inside
-/// <see cref="Protocol2Client.ComposeCmdTxBuffer"/>, exactly as the
-/// Protocol-1 path pins them in <c>ControlFrame</c>.
+/// mode, speed, sidetone, break-in, hang, weight, and paddle direction).
+/// Strict spacing, RF delay, and ramp remain pinned inside
+/// <see cref="Protocol2Client.ComposeCmdTxBuffer"/>.
 /// </para>
 /// </summary>
 public readonly record struct CwKeyerWireConfig
@@ -48,6 +46,13 @@ public readonly record struct CwKeyerWireConfig
     /// byte-5 bit-1 ("CW selected"): when false the byte stays 0 and the
     /// CmdTx tail is byte-identical to a non-CW transmit, so SSB/AM/FM/DIG
     /// wire form is unchanged.
+    ///
+    /// <para><b>Default-struct trap:</b> because <see cref="Inactive"/> is
+    /// <c>default</c>, a partially initialized active config leaves break-in
+    /// off, weight at 0 (wire-clamped to 33), and hang at 0 rather than the
+    /// historical true / 50 / 300 defaults. Every construction site must set
+    /// every keyer field. <c>RadioService.PushCwToP2</c>, the sole production
+    /// caller, does so.</para>
     /// </summary>
     public bool Active { get; init; }
 
@@ -68,7 +73,23 @@ public readonly record struct CwKeyerWireConfig
     /// bit). TxSpecific byte 6. Derived from the operator's sidetone gain.</summary>
     public byte SidetoneLevel { get; init; }
 
+    /// <summary>Radio-handled break-in. TxSpecific byte 5 bit 7.</summary>
+    public bool BreakIn { get; init; }
+
+    /// <summary>Break-in hang delay in milliseconds. TxSpecific bytes 11-12;
+    /// Orion gateware consumes the low 10 bits.</summary>
+    public int HangMs { get; init; }
+
+    /// <summary>Keyer element weight. TxSpecific byte 10; operator range
+    /// 33..66, defensively clamped again at the wire seam.</summary>
+    public int Weight { get; init; }
+
+    /// <summary>Swap dit/dah paddles. TxSpecific byte 5 bit 2.</summary>
+    public bool PaddleReverse { get; init; }
+
     /// <summary>A neutral, inactive config (no CW) — the default for every
-    /// non-CW transmit and for callers/tests that don't drive CW.</summary>
+    /// non-CW transmit and for callers/tests that don't drive CW. Its new
+    /// fields are zero/default by design; the encoder must ignore all of them
+    /// while <see cref="Active"/> is false.</summary>
     public static CwKeyerWireConfig Inactive => default;
 }

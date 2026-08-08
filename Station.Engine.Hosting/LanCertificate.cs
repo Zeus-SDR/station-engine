@@ -78,11 +78,62 @@ public static class LanCertificate
             ? port
             : 6443;
 
+    // A stray/zombie process (a leftover dev run, an unclean prior launch) can
+    // permanently squat on the LAN HTTPS port, silently denying phone/mobile
+    // access to every later launch with no diagnosable signal reaching the
+    // operator. Probing a small range above the preferred port means the next
+    // launch still gets LAN HTTPS — on a different port if it has to —
+    // instead of quietly going loopback-only or crashing outright.
+    public static int ResolveAvailableHttpsPort(int preferredPort, int maxAttempts = 10)
+    {
+        for (var offset = 0; offset < maxAttempts; offset++)
+        {
+            var candidate = preferredPort + offset;
+            if (IsPortBindable(candidate)) return candidate;
+        }
+        // Every candidate in range is taken (exceedingly unlikely) — return the
+        // preferred port so the real bind failure surfaces the actual error.
+        return preferredPort;
+    }
+
+    public static bool IsPortBindable(int port)
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+            socket.DualMode = true;
+            socket.ExclusiveAddressUse = true;
+            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+            return true;
+        }
+        catch (SocketException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            try
+            {
+                using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.ExclusiveAddressUse = true;
+                socket.Bind(new IPEndPoint(IPAddress.Any, port));
+                return true;
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+        }
+    }
+
     public static IReadOnlyList<IPAddress> GetLanIps()
     {
         return NetworkInterface.GetAllNetworkInterfaces()
             .Where(network => network.OperationalStatus == OperationalStatus.Up
-                && network.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                && network.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                && network.GetIPProperties().GatewayAddresses
+                    .Any(gateway => gateway.Address.AddressFamily == AddressFamily.InterNetwork
+                        && !gateway.Address.Equals(IPAddress.Any)))
             .SelectMany(network => network.GetIPProperties().UnicastAddresses)
             .Where(address => address.Address.AddressFamily == AddressFamily.InterNetwork
                 && !IPAddress.IsLoopback(address.Address))

@@ -170,6 +170,39 @@ public static class StationProtocolEndpoints
                 : Results.Conflict(new { error });
         });
 
+        endpoints.MapGet("/api/station/rade/status", (HttpContext context) =>
+        {
+            if (!IsLoopback(context))
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var port = context.RequestServices.GetService<CompositeAudioModemPort>();
+            return port is null ? Results.NotFound() : Results.Ok(port.RadeStatus());
+        });
+
+        endpoints.MapPost("/api/station/rade/select", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context))
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var port = context.RequestServices.GetService<CompositeAudioModemPort>();
+            if (port is null) return Results.NotFound();
+            var request = await ReadRequestAsync<RadeSelectRequest>(context).ConfigureAwait(false);
+            if (request is null) return Results.BadRequest(new { error = "RADE selection is required" });
+            return port.SelectRade(request.Active, request.TxText)
+                ? Results.Ok(port.RadeStatus())
+                : Results.Conflict(new { error = "RADE is unavailable for this station-engine RID/build" });
+        });
+
+        endpoints.MapPost("/api/station/rade/mic", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context))
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var port = context.RequestServices.GetService<CompositeAudioModemPort>();
+            if (port is null) return Results.NotFound();
+            var request = await ReadRequestAsync<RadeMicConfig>(context).ConfigureAwait(false);
+            if (request is null) return Results.BadRequest(new { error = "RADE mic config is required" });
+            port.SetRadeMicConfig(request);
+            return Results.Ok(port.RadeStatus());
+        });
+
         endpoints.MapPost("/api/station/key/arm", async (HttpContext context) =>
         {
             if (!IsLoopback(context))

@@ -1534,13 +1534,19 @@ public sealed record KiwiSetRequest(
 /// <c>GET /api/kiwi</c> and the value returned from <c>POST /api/kiwi</c>.
 /// <see cref="HasPassword"/> avoids ever returning the stored secret to the
 /// client; <see cref="Status"/> is a short connection-state word
-/// ("disabled", "connecting", "connected", "error").</summary>
+/// ("disabled", "connecting", "connected", "error").
+/// <para><see cref="ZoomLevel"/> / <see cref="ZoomCap"/> are the Kiwi's OWN
+/// native waterfall zoom (z0..cap, each step halving the span) — not the
+/// radio-wide DDC zoom. The frontend needs them so the Kiwi slice window can
+/// render a zoom control that moves the Kiwi and nothing else.</para></summary>
 public sealed record KiwiConfigDto(
     bool Enabled,
     string? Url,
     bool HasPassword,
     string Status,
-    string? StatusDetail = null);
+    string? StatusDetail = null,
+    int ZoomLevel = 0,
+    int ZoomCap = 0);
 
 /// <summary>Operator settings for the POTA/SOTA Spots feature. Persisted in
 /// zeus-prefs.db (<c>SpotsSettingsStore</c>) and shared with the frontend.
@@ -1709,7 +1715,8 @@ public sealed record ActivationSpotDto(
     string? Grid,
     string? Comments,
     string? Spotter,
-    string SpotTime);
+    string SpotTime,
+    int? SnrDb = null);
 
 /// <summary>Set the hardware NCO (radio LO) frequency in Hz. Does not move
 /// the operator's tuned frequency (VfoHz). Used by the panadapter pure-pan
@@ -1951,7 +1958,19 @@ public sealed record CwSettingsDto(
     string[] Macros,
     double SidetoneGainDb,
     int SidetoneHz,
-    CwKeyerMode KeyerMode);
+    CwKeyerMode KeyerMode,
+    // Protocol-2 TxSpecific byte 5 bit 7 (Tx_specific_C&C.v). Default true
+    // preserves the previously pinned radio-handled break-in behaviour.
+    bool BreakIn = true,
+    // Protocol-2 TxSpecific bytes 11-12, decoded as hang[9:0]. Default 300 ms
+    // preserves the previously pinned semi-break-in tail.
+    int HangMs = 300,
+    // Protocol-2 byte 10 (8-bit) and Protocol-1 register 0x0B C4[6:0].
+    // Default 50 preserves the pinned neutral weight on both protocols.
+    int Weight = 50,
+    // Protocol-2 byte 5 bit 2 and Protocol-1 register 0x0B C2[6]. Default
+    // false preserves the previously pinned unswapped paddle wiring.
+    bool PaddleReverse = false);
 
 // PATCH-shaped: every field nullable so the frontend can save one slider
 // (or one macro) without re-sending the whole record. Server merges on top
@@ -1962,7 +1981,11 @@ public sealed record CwSettingsSetRequest(
     string[]? Macros = null,
     double? SidetoneGainDb = null,
     int? SidetoneHz = null,
-    CwKeyerMode? KeyerMode = null);
+    CwKeyerMode? KeyerMode = null,
+    bool? BreakIn = null,
+    int? HangMs = null,
+    int? Weight = null,
+    bool? PaddleReverse = null);
 
 // Hermes-Lite 2 (and the wider openHPSDR family) on-board CW keyer mode,
 // written to C&C register 0x0B C3[7:6] (gateware rtl/cw_openhpsdr.sv:32).
@@ -2418,7 +2441,12 @@ public sealed record DisplaySettingsDto(
     bool WidebandDisplayEnabled = false,
     double DisplayMaxFrameRateHz = 30.0,
     int DisplayDecimation = 1,
-    int WaterfallUpdatePeriod = 1);
+    int WaterfallUpdatePeriod = 1,
+    // Wideband signal markers (display-only): when on, the engine runs the
+    // deterministic wideband signal detector alongside the spectrum analyzer
+    // and the overlay is available to display clients. Default off — this is
+    // an opt-in operator aid layered on the wideband display.
+    bool WidebandSignalMarkersEnabled = false);
 
 public sealed record DisplaySettingsSetRequest(
     string Mode,
@@ -2439,7 +2467,31 @@ public sealed record DisplaySettingsSetRequest(
     bool? WidebandDisplayEnabled = null,
     double? DisplayMaxFrameRateHz = null,
     int? DisplayDecimation = null,
-    int? WaterfallUpdatePeriod = null);
+    int? WaterfallUpdatePeriod = null,
+    bool? WidebandSignalMarkersEnabled = null);
+
+// One detected wideband signal, as reported by the engine's deterministic
+// wideband signal detector. Frequencies are absolute Hz in the wideband ADC
+// baseband (0 .. sampleRate/2); levels are dB against the analyzer's
+// calibrated reference. Additive wire surface: polled over REST, never
+// embedded in the binary DisplayFrame stream.
+public sealed record WidebandSignalMarkerDto(
+    double CenterHz,
+    double LowHz,
+    double HighHz,
+    double PeakDb,
+    double NoiseFloorDb,
+    double SnrDb,
+    double Confidence);
+
+// Point-in-time snapshot of detected wideband signals plus the viewport they
+// were detected under, so a display client can project markers into pixels
+// and drop snapshots that went stale (transport off, markers toggled off).
+public sealed record WidebandSignalsSnapshotDto(
+    long TsUnixMs,
+    long CenterHz,
+    float HzPerPixel,
+    IReadOnlyList<WidebandSignalMarkerDto> Signals);
 
 // Server-side mirror of the frontend Signal Intelligence weak-signal display
 // controls. The DSP math remains in zeus-web's signal-estimator; this DTO lets

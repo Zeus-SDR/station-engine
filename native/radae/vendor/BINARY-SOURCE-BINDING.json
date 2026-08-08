@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/sv1eia/Thetis-RADE.git",
+    "commit": "f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8",
+    "sparsePath": "Project Files/lib"
+  },
+  "opusCommit": "940d4e5af64351ca8ba8390df3f555484c567fbb",
+  "sourceSlices": [
+    {
+      "name": "radae_c",
+      "path": "native/radae/vendor/radae_c",
+      "upstreamPath": "Project Files/lib/radae_c",
+      "gitTree": "fcb4a88dc322c621b090bda323985155ab53a188",
+      "fileCount": 31,
+      "contentSha256": "1743f20b0a7000c11f4414489e62cec77a8bf41db62064945b37bdd8ac09eab4"
+    },
+    {
+      "name": "opus_dnn",
+      "path": "native/radae/vendor/opus_dnn",
+      "upstreamPath": "Project Files/lib/opus_dnn",
+      "gitTree": "f44426488357dd209a046021e4bb5ec1a9dd5be2",
+      "fileCount": 636,
+      "contentSha256": "ed9327e4cce6b5ed8a8fc8c12ee1139ad2ea20b38e2a02d97207e62cc87e53c3"
+    },
+    {
+      "name": "freedv_text",
+      "path": "native/radae/vendor/freedv_text",
+      "upstreamPath": "Project Files/lib/freedv_text",
+      "gitTree": "71c6810a72d5f4c459fe2612bd30898c844a6fda",
+      "fileCount": 17,
+      "contentSha256": "49723f26e81de9f00d179fc5b4cf1bc1062bf876d492b37665ffbdfa4c9f6dea"
+    }
+  ],
+  "binaries": [
+    {
+      "rid": "linux-x64",
+      "path": "Zeus.Dsp/runtimes/linux-x64/native/libzeus_rade.so",
+      "sha256": "ed569a070379c47c1e9583792b4d6f01eecdaacedceece90ad6379c5c66a8897",
+      "toolchain": "Ubuntu 22.04 runner with CMake and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+    },
+    {
+      "rid": "linux-arm64",
+      "path": "Zeus.Dsp/runtimes/linux-arm64/native/libzeus_rade.so",
+      "sha256": "0f411f4a3eb8419c6cf9a7d1f3a2ff396da03f826d4118c02b2512abef233baa",
+      "toolchain": "Ubuntu 22.04 runner with gcc-aarch64-linux-gnu and g++-aarch64-linux-gnu cross toolchains, CMake, and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+    },
+    {
+      "rid": "win-x64",
+      "path": "Zeus.Dsp/runtimes/win-x64/native/zeus_rade.dll",
+      "sha256": "79dfe2be219d9619758381307aea258007bd83775ee8f079b2613c69fee31867",
+      "toolchain": "Windows 2022 runner under MSYS2 UCRT64 with mingw-w64-ucrt-x86_64-gcc, mingw-w64-ucrt-x86_64-cmake, and mingw-w64-ucrt-x86_64-ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+    },
+    {
+      "rid": "osx-arm64",
+      "path": "Zeus.Dsp/runtimes/osx-arm64/native/libzeus_rade.dylib",
+      "sha256": "a593e230c3e6e8c3d98f71d5a447c6de244f16f6e5692bea1753ea23e2cfcda7",
+      "toolchain": "macOS 14 runner with CMake and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+    }
+  ],
+  "buildInputs": [
+    {
+      "path": "native/radae/CMakeLists.txt",
+      "sha256": "9c3b1e6b890ebc3089d97a8c92fd2033c6b3b3ab89fe9274a370f7dc2bf5bdaa"
+    },
+    {
+      "path": "native/radae/shim/compat/alloca.h",
+      "sha256": "6a3be6234d1722798019dcde23004c2d7f56f53ddcd5ede612ae6913313c64d4"
+    },
+    {
+      "path": "native/radae/shim/zeus_rade.c",
+      "sha256": "f3ce5feb1910b83a54772fd72ecce59a7c92860f0e151ddc74fc67042d5b7342"
+    },
+    {
+      "path": "native/radae/shim/zeus_rade.h",
+      "sha256": "7fe0ac28e5e196a1e2ff22019a2bfe2a2a048494fce99746c92c469ce2f67afa"
+    },
+    {
+      "path": "native/radae/shim/zeus_rade_test.c",
+      "sha256": "0e7d2eaf3647c46b192cd0f9799a421d38356b9308f800969614d768ce699e74"
+    }
+  ],
+  "buildConfiguration": {
+    "cmakeArguments": [
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DOPUS_DISABLE_INTRINSICS=ON",
+      "-DZEUS_RADE_BUILD_TEST=OFF"
+    ],
+    "localChanges": "Zeus CMake composition and shim are identified by buildInputs; fetched upstream slices are unmodified."
+  }
+}

@@ -21,6 +21,25 @@ internal interface IVstEngineBridge : IDisposable
     /// <summary>Blocks that fell through to passthrough (timeout / stale-seq).</summary>
     long DegradedBlocks { get; }
 
+    // ── Round-trip latency telemetry ─────────────────────────────────────────
+    // Default implementations keep test fakes source-compatible; the real
+    // bridge overrides them. Written on the realtime thread, read lock-free by
+    // diagnostics — a momentarily torn sample is benign (see VstEngineBridge).
+    // All values reset on <see cref="ResetForRelaunch"/>: they describe the
+    // CURRENT engine session, not a lifetime total like <see cref="DegradedBlocks"/>.
+
+    /// <summary>Blocks the engine serviced inside the budget this session.</summary>
+    long ServicedBlocks => 0;
+
+    /// <summary>Mean engine round-trip time (µs) over <see cref="ServicedBlocks"/>.</summary>
+    double AverageRoundTripMicros => 0;
+
+    /// <summary>Worst engine round-trip time (µs) this session.</summary>
+    double MaxRoundTripMicros => 0;
+
+    /// <summary>Most recent engine round-trip time (µs).</summary>
+    double LastRoundTripMicros => 0;
+
     /// <summary>
     /// Engine-written lifecycle state from the SHM header (0=init, 1=running,
     /// 2=draining). Diagnostics only — read off the realtime thread. Reads 0 when

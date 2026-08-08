@@ -828,7 +828,51 @@ public class DspPipelineService : BackgroundService,
     private int _widebandDisplayEnabled;
     private int _widebandTransportEnabled;
     private int _p2WidebandTransportEnabled;
+    // Hybrid P2 detail source. The target is display-only: it never mutates
+    // RadioLo/VFO or any operator receiver. It uses a physical hidden DDC;
+    // at full capacity the request stays on the honest raw-snapshot ceiling.
+    private long _widebandTargetCenterHz = long.MinValue;
+    private long _widebandSourceGeneration;
+    private int _widebandDetailChannelId = -1;
+    private int _widebandDetailDdcIndex = -1;
+    private int _widebandDetailSourceReceiverIndex = int.MinValue;
+    private long _widebandDetailSourceCenterHz;
+    private int _widebandDetailZoomLevel = 1;
+    private int _widebandDetailReady;
+    private long _widebandDetailLastIqMs = long.MinValue;
+    // Delay-compensated centre history for wideband-detail frames — same
+    // pixel_ref emulation as _loHistory (issue #597 Phase 2), but fed by
+    // wideband viewport pans. Lets a mid-drag frame carry the centre its
+    // pixels were actually captured at, so panning glides instead of
+    // stick-then-jump. Mirrors the detail channel's live analyzer FFT size
+    // so the lookback tracks the true aperture (65,536 pts ≈ 341 ms at
+    // 192 kHz, vs the engine default's ~85 ms).
+    private readonly LoHistoryRing _widebandCenterHistory = new();
+    private int _widebandDetailAnalyzerFftSize = P2WidebandZoomPolicy.MinDetailAnalyzerFftSize;
+    private readonly object _widebandZoomRequestLock = new();
+    internal const long WidebandDetailIqStaleMs = 750;
     private readonly WidebandSpectrumAnalyzer _widebandAnalyzer = new();
+    // Deterministic wideband signal detection (opt-in via display settings).
+    // Runs inside the analyzer loop on the same DC-suppressed, averaged
+    // spectrum the display renders; results are published as a snapshot under
+    // _widebandSignalSnapshotLock for the REST signals endpoint. Display-only:
+    // markers never touch the binary DisplayFrame stream or any RX/TX path.
+    private readonly WidebandSignalDetector _widebandSignalDetector =
+        new((WidebandSpectrumAnalyzer.AnalysisFftSize / 2) + 1);
+    private readonly WidebandSignalMarker[] _widebandMarkersBuf =
+        new WidebandSignalMarker[WidebandSignalDetector.MaxTrackedSignals];
+    private int _widebandSignalMarkersEnabled;
+    private readonly object _widebandSignalSnapshotLock = new();
+    private WidebandSignalMarker[] _widebandSignalSnapshot =
+        new WidebandSignalMarker[WidebandSignalDetector.MaxTrackedSignals];
+    private int _widebandSignalSnapshotCount;
+    private long _widebandSignalSnapshotMs;
+    private long _widebandSignalSnapshotCenterHz;
+    private float _widebandSignalSnapshotHzPerPixel;
+    // Analyzer-loop fault containment: a bad frame must never kill the
+    // display worker. Counted and log-throttled for diagnostics.
+    private long _widebandAnalyzerErrorCount;
+    private long _widebandAnalyzerErrorLogMs;
     private readonly object _widebandFrameLock = new();
     private readonly SemaphoreSlim _widebandFrameSignal = new(0, int.MaxValue);
     private readonly short[] _widebandPendingSamples =
@@ -1291,6 +1335,9 @@ public class DspPipelineService : BackgroundService,
     private readonly object _displayFrameRateLock = new();
     private long _displayFrameBudgetLastTicks;
     private double _displayFrameBudget = 1.0;
+    // P2 raw-wideband and P3 sidecar ownership are mutually exclusive in steady
+    // state; sharing this deadline preserves one cadence across their handoff.
+    private long _unpacedDisplayDeadlineStopwatchTicks;
     private int _waterfallFrameCounter;
     // Per-receiver display/audio probe: 1 Hz tally of how often each receiver's
     // pan/wf pixout reports fresh data. If a secondary's wf advances but pan stays
@@ -1326,6 +1373,11 @@ public class DspPipelineService : BackgroundService,
     // and gated in-place by the floor tracker on the single meter thread;
     // never read concurrently, so it needs no lock.
     private readonly float[] _autoAgcFloorBuf;
+    // Dedicated WDSP pixout 2. Unlike the visual pan/waterfall outputs this is
+    // average power in linear space, normalized to a one-hertz bandwidth, and
+    // is drained at the meter cadence even when no spectrum panel is mounted.
+    private readonly float[] _snrPowerBuf;
+    private readonly InPassbandSnrEstimator _snrEstimator = new();
     // Thetis-faithful band noise-floor tracker (display.cs processNoiseFloor
     // port): gated quiet-bin mean + 2-tap power smoothing + 2 s attack lerp +
     // fast-attack. Fed at the 5 Hz meter cadence; consumed by RadioService's
@@ -1484,6 +1536,7 @@ public class DspPipelineService : BackgroundService,
         _lastTxWfBuf = new float[_panadapterWidth];
         _calPanSnapshot = new float[_panadapterWidth];
         _autoAgcFloorBuf = new float[_panadapterWidth];
+        _snrPowerBuf = new float[RxSnrSpectrumInfo.MaxPixelCount];
         _diagWfSnapshot = new float[_panadapterWidth];
         var loggedDisplayPerformanceProfile = !DisplayPerformanceOptions.IsStock(displayPerformance);
         if (loggedDisplayPerformanceProfile)
@@ -1614,6 +1667,14 @@ public class DspPipelineService : BackgroundService,
     /// </summary>
     public virtual bool PrimeTxDspForKeyDown() => ResolveTxIngest()?.PrimeTxDspForKeyDown() ?? false;
 
+    /// <summary>
+    /// Leaves a zero word at the output of a legacy Protocol-2 radio's TX FIFO
+    /// before wire MOX rises. Other transports have no retained radio-side FIFO
+    /// word to sanitize and remain unchanged.
+    /// </summary>
+    public virtual bool SanitizeProtocol2TxBeforeKeyDown() =>
+        _p2Client?.PreloadZeroTxIqBeforeKeyDown() ?? true;
+
     public virtual bool DrainTxIqTransportTail(TimeSpan timeout)
     {
         var p2 = _p2Client;
@@ -1684,10 +1745,48 @@ public class DspPipelineService : BackgroundService,
     {
         ApplyTxDisplaySettings(dto);
         SetWidebandDisplayEnabled(dto.WidebandDisplayEnabled);
+        SetWidebandSignalMarkersEnabled(dto.WidebandSignalMarkersEnabled);
         SetDisplayPerformance(
             dto.DisplayMaxFrameRateHz,
             dto.DisplayDecimation,
             dto.WaterfallUpdatePeriod);
+    }
+
+    private void SetWidebandSignalMarkersEnabled(bool enabled)
+    {
+        Volatile.Write(ref _widebandSignalMarkersEnabled, enabled ? 1 : 0);
+        if (enabled) return;
+        // Toggled off: drop the published snapshot immediately so polling
+        // clients see an empty, current answer instead of stale markers.
+        lock (_widebandSignalSnapshotLock)
+        {
+            _widebandSignalSnapshotCount = 0;
+            _widebandSignalSnapshotMs = 0;
+        }
+    }
+
+    /// <summary>
+    /// Latest detected wideband signals plus the viewport they were detected
+    /// under. Empty when markers are disabled, wideband is off, or no signal
+    /// has been confirmed yet.
+    /// </summary>
+    public WidebandSignalsSnapshotDto GetWidebandSignalsSnapshot()
+    {
+        lock (_widebandSignalSnapshotLock)
+        {
+            var signals = new WidebandSignalMarkerDto[_widebandSignalSnapshotCount];
+            for (int i = 0; i < _widebandSignalSnapshotCount; i++)
+            {
+                var m = _widebandSignalSnapshot[i];
+                signals[i] = new WidebandSignalMarkerDto(
+                    m.CenterHz, m.LowHz, m.HighHz, m.PeakDb, m.NoiseFloorDb, m.SnrDb, m.Confidence);
+            }
+            return new WidebandSignalsSnapshotDto(
+                _widebandSignalSnapshotMs,
+                _widebandSignalSnapshotCenterHz,
+                _widebandSignalSnapshotHzPerPixel,
+                signals);
+        }
     }
 
     private void SetDisplayPerformance(
@@ -1713,6 +1812,7 @@ public class DspPipelineService : BackgroundService,
             _waterfallUpdatePeriod = nextWaterfallUpdatePeriod;
             _displayFrameBudgetLastTicks = 0;
             _displayFrameBudget = 1.0;
+            _unpacedDisplayDeadlineStopwatchTicks = 0;
             _waterfallFrameCounter = 0;
             Volatile.Write(ref _inlineDisplayDeadlineStopwatchTicks, 0);
             changed = true;
@@ -1731,15 +1831,32 @@ public class DspPipelineService : BackgroundService,
     private void SetWidebandDisplayEnabled(bool enabled)
     {
         Volatile.Write(ref _widebandDisplayEnabled, enabled ? 1 : 0);
+        Interlocked.Increment(ref _widebandSourceGeneration);
         RefreshWidebandDisplayState();
+        PostDspCommand(() =>
+        {
+            var engine = Volatile.Read(ref _engine);
+            if (engine is not null)
+                ReconcileWidebandDetailSource(engine, _radio.Snapshot());
+        });
     }
 
-    private bool RefreshWidebandDisplayState()
+    private bool RefreshWidebandDisplayState(StateDto? state = null)
     {
         var client = _p2Client;
         bool enabled = Volatile.Read(ref _widebandDisplayEnabled) != 0;
         bool displayRequested = _hub.DisplayStreamRequested;
-        bool p2Desired = client is not null && enabled && displayRequested;
+        var currentState = state ?? _radio.Snapshot();
+        bool p2DetailReady = client is not null && enabled && displayRequested &&
+            P2WidebandZoomPolicy.Resolve(
+                Volatile.Read(ref _sampleRateHz),
+                currentState.ZoomLevel).UseDdcDetail &&
+            Volatile.Read(ref _widebandDetailReady) != 0 &&
+            Volatile.Read(ref _widebandDetailChannelId) >= 0;
+        // Keep raw snapshots flowing until the private detail analyzer has
+        // received IQ. This avoids a blank handoff; once ready, only one source
+        // can publish RxId0 frames.
+        bool p2Desired = client is not null && enabled && displayRequested && !p2DetailReady;
         bool p3Desired = client is null && _hasExternalRadioSidecar &&
             _radio.IsProtocol3Active && enabled && displayRequested;
         bool anyDesired = p2Desired || p3Desired;
@@ -1747,6 +1864,7 @@ public class DspPipelineService : BackgroundService,
         bool p2Current = Volatile.Read(ref _p2WidebandTransportEnabled) != 0;
         if (p2Desired != p2Current)
         {
+            Interlocked.Increment(ref _widebandSourceGeneration);
             Volatile.Write(ref _p2WidebandTransportEnabled, p2Desired ? 1 : 0);
             try { client?.SetWidebandDisplayEnabled(p2Desired); }
             catch (ObjectDisposedException) { }
@@ -1781,23 +1899,24 @@ public class DspPipelineService : BackgroundService,
 
     private readonly record struct DisplayFramePlan(int Decimation, bool IncludeWaterfall);
 
-    private bool TryBeginDisplayFrame(long nowTicks, out DisplayFramePlan plan)
+    private bool TryBeginDisplayFrame(
+        long nowTicks,
+        bool producerIsRatePaced,
+        out DisplayFramePlan plan)
     {
         lock (_displayFrameRateLock)
         {
-            var frameRateHz = _displayMaxFrameRateHz;
-            if (frameRateHz < DisplayPerformanceOptions.DefaultFrameRateHz)
+            if (!ShouldEmitDisplayFrameForPublisher(
+                    nowTicks,
+                    _displayMaxFrameRateHz,
+                    Stopwatch.Frequency,
+                    producerIsRatePaced,
+                    ref _displayFrameBudgetLastTicks,
+                    ref _displayFrameBudget,
+                    ref _unpacedDisplayDeadlineStopwatchTicks))
             {
-                if (!ShouldEmitBudgetedDisplayFrame(
-                        nowTicks,
-                        frameRateHz,
-                        Stopwatch.Frequency,
-                        ref _displayFrameBudgetLastTicks,
-                        ref _displayFrameBudget))
-                {
-                    plan = default;
-                    return false;
-                }
+                plan = default;
+                return false;
             }
 
             var waterfallPeriod = Math.Max(1, _waterfallUpdatePeriod);
@@ -1806,6 +1925,51 @@ public class DspPipelineService : BackgroundService,
             plan = new DisplayFramePlan(_displayDecimation, includeWaterfall);
             return true;
         }
+    }
+
+    internal static bool ShouldEmitDisplayFrameForPublisher(
+        long nowTicks,
+        double frameRateHz,
+        long stopwatchFrequency,
+        bool producerIsRatePaced,
+        ref long budgetLastTicks,
+        ref double budget,
+        ref long unpacedDeadlineTicks)
+    {
+        if (frameRateHz < DisplayPerformanceOptions.DefaultFrameRateHz)
+        {
+            return ShouldEmitBudgetedDisplayFrame(
+                nowTicks,
+                frameRateHz,
+                stopwatchFrequency,
+                ref budgetLastTicks,
+                ref budget);
+        }
+
+        // The inline/full-tick publishers are already paced at 30 Hz or at the
+        // configured faster cadence. Keep their >= 30 Hz emission pattern unchanged.
+        if (producerIsRatePaced) return true;
+
+        var periodTicks = Math.Max(
+            1,
+            (long)Math.Ceiling(stopwatchFrequency / frameRateHz));
+        if (unpacedDeadlineTicks == 0)
+        {
+            unpacedDeadlineTicks = nowTicks + periodTicks;
+            return true;
+        }
+        if (nowTicks < unpacedDeadlineTicks) return false;
+
+        // Translate the absolute next deadline to AdvanceTickDeadline's last-
+        // cadence representation, then back. Its max-slip clamp prevents a
+        // long idle producer from burst-emitting to catch up.
+        var previousCadenceTicks = unpacedDeadlineTicks - periodTicks;
+        unpacedDeadlineTicks = AdvanceTickDeadline(
+            nowTicks,
+            previousCadenceTicks,
+            periodTicks,
+            periodTicks * 2) + periodTicks;
+        return true;
     }
 
     // Must be called from the display-update serialisation context because the budget is passed by ref.
@@ -1963,9 +2127,275 @@ public class DspPipelineService : BackgroundService,
     private static int DdcZoomLevel(int zoomLevel) =>
         Math.Clamp(zoomLevel, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
 
-    private static long WidebandViewportTargetCenterHz(StateDto state)
+    internal static float VisibleDdcHzPerPixel(int sampleRateHz, int globalZoomLevel, int pixelWidth) =>
+        (float)((double)sampleRateHz /
+            DdcZoomLevel(globalZoomLevel) /
+            Math.Max(1, pixelWidth));
+
+    public StateDto ApplyWidebandZoomRequest(int requestedLevel, long? centerHz)
     {
-        var centerHz = state.RadioLoHz > 0
+        lock (_widebandZoomRequestLock)
+        {
+            int normalizedLevel = NormalizeWidebandZoomRequest(requestedLevel);
+            var before = _radio.Snapshot();
+            long nextCenter = 0;
+            bool centerChanged = false;
+
+            // A rejected deep step (normally: no spare DDC) must not pan the raw
+            // overview using geometry the server cannot honor.
+            if (centerHz is long requestedCenter && normalizedLevel == requestedLevel)
+            {
+                nextCenter = Math.Clamp(
+                    requestedCenter,
+                    0L,
+                    (long)WidebandSpectrumAnalyzer.DisplaySpanHz);
+                centerChanged = Interlocked.Read(ref _widebandTargetCenterHz) != nextCenter;
+            }
+
+            bool levelChanged = normalizedLevel != before.ZoomLevel;
+
+            // Center-only pan: glide path. A pan retunes the hidden DDC's NCO
+            // (radio-side, sample-continuous) — the detail channel, its
+            // analyzer, the ready/publish barriers and RadioService zoom state
+            // all stay put, so display frames keep flowing mid-drag instead of
+            // re-aperturing on every pointer step. Frame centre coherence comes
+            // from _widebandCenterHistory at publish time.
+            if (centerChanged && !levelChanged)
+            {
+                Interlocked.Exchange(ref _widebandTargetCenterHz, nextCenter);
+                _widebandCenterHistory.Append(Stopwatch.GetTimestamp(), nextCenter);
+                PostDspCommand(() =>
+                {
+                    var engine = Volatile.Read(ref _engine);
+                    if (engine is not null)
+                        ReconcileWidebandDetailSource(engine, before);
+                });
+                return before;
+            }
+
+            bool sourceChanged = centerChanged || levelChanged;
+            if (sourceChanged)
+            {
+                // Pre-barrier: neither raw nor detail may publish a frame captured
+                // between the target update and the RadioService zoom mutation.
+                Volatile.Write(ref _widebandDetailReady, 0);
+                Interlocked.Increment(ref _widebandSourceGeneration);
+            }
+            if (centerChanged)
+            {
+                Interlocked.Exchange(ref _widebandTargetCenterHz, nextCenter);
+                _widebandCenterHistory.Append(Stopwatch.GetTimestamp(), nextCenter);
+            }
+
+            StateDto result = _radio.SetZoom(normalizedLevel);
+
+            // Post-barrier: an overview analyzer that raced the state mutation is
+            // invalidated before it can broadcast a mixed center/zoom frame.
+            Interlocked.Increment(ref _widebandSourceGeneration);
+            PostDspCommand(() =>
+            {
+                var engine = Volatile.Read(ref _engine);
+                if (engine is not null)
+                    ReconcileWidebandDetailSource(engine, result);
+            });
+            return result;
+        }
+    }
+
+    public int NormalizeWidebandZoomRequest(int requestedLevel)
+    {
+        var state = _radio.Snapshot();
+        int rate = state.SampleRate > 0 ? state.SampleRate : Volatile.Read(ref _sampleRateHz);
+        int level = Math.Clamp(
+            requestedLevel,
+            RadioService.MinDisplayZoomLevel,
+            P2WidebandZoomPolicy.MaxGlobalZoomForRate(rate));
+        if (_p2Client is null || Volatile.Read(ref _widebandDisplayEnabled) == 0)
+            return Math.Min(level, RadioService.LegacyMaxDisplayZoomLevel);
+        var plan = P2WidebandZoomPolicy.Resolve(rate, level);
+        if (!plan.UseDdcDetail)
+            return Math.Min(level, RadioService.LegacyMaxDisplayZoomLevel);
+        return ResolveWidebandDetailSource(state, plan).IsAvailable
+            ? level
+            : Math.Min(
+                state.ZoomLevel,
+                P2WidebandZoomPolicy.MaxOverviewZoomForRate(rate));
+    }
+
+    private P2WidebandDetailSource ResolveWidebandDetailSource(
+        StateDto state,
+        P2WidebandZoomPlan zoomPlan)
+    {
+        int rate = Volatile.Read(ref _sampleRateHz);
+        if (rate <= 0) rate = state.SampleRate;
+        int baseDdc = Zeus.Protocol2.Protocol2Client.RxBaseDdc(_radio.EffectiveBoardKind);
+        bool diversitySource = state.Diversity is { Enabled: true, SourceRx: 1 };
+        int extraCount = 0;
+        if (state.Rx2Enabled && state.Receivers is { } receivers)
+            for (int ri = 2; ri < receivers.Count && ri < MaxReceivers && receivers[ri].Enabled; ri++)
+                extraCount++;
+
+        return P2WidebandZoomPolicy.ResolveDetailSource(
+            baseDdc,
+            state.Rx2Enabled,
+            diversitySource,
+            extraCount,
+            rate,
+            WidebandViewportTargetCenterHz(state),
+            zoomPlan.RequestedSpanHz);
+    }
+
+    private bool ReconcileWidebandDetailSource(IDspEngine engine, StateDto state)
+    {
+        var p2 = _p2Client;
+        int rate = Volatile.Read(ref _sampleRateHz);
+        if (rate <= 0) rate = state.SampleRate;
+        var zoomPlan = P2WidebandZoomPolicy.Resolve(rate, state.ZoomLevel);
+        bool requested = p2 is not null &&
+            Volatile.Read(ref _widebandDisplayEnabled) != 0 &&
+            _hub.DisplayStreamRequested &&
+            zoomPlan.UseDdcDetail;
+        var source = requested
+            ? ResolveWidebandDetailSource(state, zoomPlan)
+            : P2WidebandDetailSource.None;
+
+        if (!source.IsAvailable)
+        {
+            p2?.SetDisplayDdc(-1, 0, 0);
+            CloseWidebandDetailChannel(engine);
+            return false;
+        }
+
+        int oldSource = Volatile.Read(ref _widebandDetailSourceReceiverIndex);
+        int oldDdc = Volatile.Read(ref _widebandDetailDdcIndex);
+        long oldCenter = Interlocked.Read(ref _widebandDetailSourceCenterHz);
+        // Identity (which DDC feeds us) and centre (where that DDC sits) are
+        // deliberately NOT the same change. An identity or zoom change rebuilds
+        // the channel; a centre-only pan keeps the channel and analyzer alive —
+        // the NCO retune below is sample-continuous, so the display glides.
+        bool identityChanged = oldSource != source.ReceiverIndex ||
+            oldDdc != source.DdcIndex;
+        bool centerOnlyChanged = !identityChanged && oldCenter != source.SourceCenterHz;
+        bool zoomChanged = Volatile.Read(ref _widebandDetailZoomLevel) != zoomPlan.DdcZoomLevel;
+
+        int detailChannel = Volatile.Read(ref _widebandDetailChannelId);
+        if (detailChannel >= 0 && (identityChanged || zoomChanged))
+        {
+            Volatile.Write(ref _widebandDetailChannelId, -1);
+            try { engine.CloseRxDisplayChannel(detailChannel); } catch { /* best-effort reset */ }
+            detailChannel = -1;
+        }
+        if (detailChannel < 0)
+        {
+            detailChannel = engine.OpenRxDisplayChannel(rate, _panadapterWidth);
+            Volatile.Write(ref _widebandDetailChannelId, detailChannel);
+            identityChanged = true;
+        }
+        if (identityChanged || zoomChanged)
+        {
+            Volatile.Write(ref _widebandDetailSourceReceiverIndex, source.ReceiverIndex);
+            Volatile.Write(ref _widebandDetailDdcIndex, source.DdcIndex);
+            Interlocked.Exchange(ref _widebandDetailSourceCenterHz, source.SourceCenterHz);
+            Volatile.Write(ref _widebandDetailReady, 0);
+            Interlocked.Exchange(ref _widebandDetailLastIqMs, Environment.TickCount64);
+            Interlocked.Increment(ref _widebandSourceGeneration);
+        }
+        else if (centerOnlyChanged)
+        {
+            // Glide: latch the new centre only. The channel, its analyzer (and
+            // its full FFT aperture) survive the pan; publish-side centre
+            // coherence comes from _widebandCenterHistory.
+            Interlocked.Exchange(ref _widebandDetailSourceCenterHz, source.SourceCenterHz);
+        }
+
+        long target = WidebandViewportTargetCenterHz(state);
+        if (source.Kind == P2WidebandDetailSourceKind.HiddenDdc)
+            p2!.SetDisplayDdc(source.DdcIndex, target, ReceiverAdcSource(state, 0));
+        else
+            p2!.SetDisplayDdc(-1, 0, 0);
+
+        if (zoomChanged || identityChanged)
+        {
+            // Pixel-dense detail: size the analyzer FFT so true bins never
+            // exceed one display pixel at this DDC zoom (65,536 points at
+            // zoom 32). Applied before the zoom reconfig so the sticky
+            // per-channel override is already in place when SetRxDisplayZoom
+            // rebuilds the analyzer.
+            int detailFftSize =
+                P2WidebandZoomPolicy.DetailAnalyzerFftSize(_panadapterWidth, zoomPlan.DdcZoomLevel);
+            engine.SetRxDisplayFftSize(detailChannel, detailFftSize);
+            Volatile.Write(ref _widebandDetailAnalyzerFftSize, detailFftSize);
+            engine.SetRxDisplayZoom(detailChannel, zoomPlan.DdcZoomLevel);
+            Volatile.Write(ref _widebandDetailZoomLevel, zoomPlan.DdcZoomLevel);
+        }
+        engine.SetVfoHz(detailChannel, target);
+        return Volatile.Read(ref _widebandDetailReady) != 0;
+    }
+
+    private void CloseWidebandDetailChannel(IDspEngine engine)
+    {
+        int channel = Interlocked.Exchange(ref _widebandDetailChannelId, -1);
+        Volatile.Write(ref _widebandDetailDdcIndex, -1);
+        Volatile.Write(ref _widebandDetailSourceReceiverIndex, int.MinValue);
+        Volatile.Write(ref _widebandDetailReady, 0);
+        Interlocked.Exchange(ref _widebandDetailLastIqMs, long.MinValue);
+        if (channel >= 0)
+        {
+            try { engine.CloseRxDisplayChannel(channel); }
+            catch (Exception ex) { _log.LogDebug(ex, "dsp.pipeline wideband detail close failed channel={Channel}", channel); }
+            Interlocked.Increment(ref _widebandSourceGeneration);
+        }
+    }
+
+    private void ApplyVisibleDdcZoom(IDspEngine engine, StateDto state)
+    {
+        int zoom = DdcZoomLevel(state.ZoomLevel);
+        if (zoom == _appliedZoomLevel) return;
+
+        engine.SetZoom(Volatile.Read(ref _channelId), zoom);
+        for (int receiverIndex = 1; receiverIndex < MaxReceivers; receiverIndex++)
+        {
+            var rx = _secondaryRx[receiverIndex];
+            int channelId = Volatile.Read(ref rx.ChannelId);
+            if (channelId < 0) continue;
+            engine.SetZoom(channelId, zoom);
+            rx.AppliedZoom = zoom;
+        }
+        _appliedZoomLevel = zoom;
+    }
+
+    internal static bool IsWidebandDetailIqStale(long nowMs, long lastIqMs) =>
+        lastIqMs != long.MinValue && nowMs - lastIqMs > WidebandDetailIqStaleMs;
+
+    internal static bool CanPromoteWidebandDetail(
+        bool analyzerFresh,
+        long nowMs,
+        long lastIqMs,
+        long frameGeneration,
+        long currentGeneration,
+        int frameChannel,
+        int currentChannel) =>
+        analyzerFresh &&
+        !IsWidebandDetailIqStale(nowMs, lastIqMs) &&
+        frameGeneration == currentGeneration &&
+        frameChannel == currentChannel;
+
+    internal static bool CanPublishWidebandDetail(
+        bool detailReady,
+        long frameGeneration,
+        long currentGeneration,
+        int frameChannel,
+        int currentChannel) =>
+        detailReady &&
+        frameGeneration == currentGeneration &&
+        frameChannel == currentChannel;
+
+    private long WidebandViewportTargetCenterHz(StateDto state)
+    {
+        long configured = Interlocked.Read(ref _widebandTargetCenterHz);
+        var centerHz = configured != long.MinValue
+            ? configured
+            : state.RadioLoHz > 0
             ? state.RadioLoHz
             : CwOffset.EffectiveLoHz(state);
         return Math.Clamp(centerHz, 0L, (long)WidebandSpectrumAnalyzer.DisplaySpanHz);
@@ -1988,19 +2418,55 @@ public class DspPipelineService : BackgroundService,
                 _widebandFramePending = false;
             }
 
-            if (Volatile.Read(ref _widebandDisplayEnabled) == 0 || !_hub.DisplayStreamRequested)
+            if (Volatile.Read(ref _p2WidebandTransportEnabled) == 0 || !_hub.DisplayStreamRequested)
                 continue;
-            if (!TryBeginDisplayFrame(Stopwatch.GetTimestamp(), out var displayPlan))
+            // Packet arrival is this publisher's only pacer; the packet rate is
+            // unrelated to the operator's configured display cap.
+            if (!TryBeginDisplayFrame(
+                    Stopwatch.GetTimestamp(),
+                    producerIsRatePaced: false,
+                    out var displayPlan))
                 continue;
+            long sourceGeneration = Interlocked.Read(ref _widebandSourceGeneration);
 
             var state = _radio.Snapshot();
-            var viewport = _widebandAnalyzer.Analyze(
-                _widebandAnalysisSamples.AsSpan(0, sampleCount),
-                sampleRateHz,
-                _widebandPanBuf,
-                _widebandWfBuf,
-                state.ZoomLevel,
-                WidebandViewportTargetCenterHz(state));
+            double frameIntervalMs =
+                _p2Client?.CurrentWidebandGeometry.UpdateRateMs
+                ?? Zeus.Protocol2.Protocol2Client.ClassicWidebandUpdateRateMs;
+            WidebandSpectrumViewport viewport;
+            int markerCount = 0;
+            try
+            {
+                viewport = _widebandAnalyzer.Analyze(
+                    _widebandAnalysisSamples.AsSpan(0, sampleCount),
+                    sampleRateHz,
+                    _widebandPanBuf,
+                    _widebandWfBuf,
+                    state.ZoomLevel,
+                    WidebandViewportTargetCenterHz(state),
+                    frameIntervalMs,
+                    Volatile.Read(ref _widebandSignalMarkersEnabled) != 0 ? _widebandSignalDetector : null,
+                    _widebandMarkersBuf,
+                    out markerCount);
+            }
+            catch (Exception ex)
+            {
+                // Fault containment: one malformed frame must not kill the
+                // wideband display worker. Skip the frame, count it, and log
+                // at most once per 30 s so a persistent fault stays visible
+                // without flooding the log.
+                Interlocked.Increment(ref _widebandAnalyzerErrorCount);
+                long nowLogMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                long lastLogMs = Interlocked.Read(ref _widebandAnalyzerErrorLogMs);
+                if (nowLogMs - lastLogMs > 30_000 &&
+                    Interlocked.CompareExchange(ref _widebandAnalyzerErrorLogMs, nowLogMs, lastLogMs) == lastLogMs)
+                {
+                    _log.LogWarning(ex,
+                        "wideband analyzer frame failed; frame skipped (total {ErrorCount})",
+                        Interlocked.Read(ref _widebandAnalyzerErrorCount));
+                }
+                continue;
+            }
             SanitizeDisplayBuffer(_widebandPanBuf);
             if (displayPlan.IncludeWaterfall)
                 SanitizeDisplayBuffer(_widebandWfBuf);
@@ -2037,6 +2503,12 @@ public class DspPipelineService : BackgroundService,
                 PanDb: panBins,
                 WfDb: wfBins);
 
+            if (sourceGeneration != Interlocked.Read(ref _widebandSourceGeneration) ||
+                Volatile.Read(ref _p2WidebandTransportEnabled) == 0)
+            {
+                continue;
+            }
+
             lock (_calPanLock)
             {
                 CopyDiagnosticDisplayBins(_widebandPanBuf, _calPanSnapshot);
@@ -2062,7 +2534,27 @@ public class DspPipelineService : BackgroundService,
                 _diagLastPsFeedbackCorrecting = false;
             }
 
-            _hub.Broadcast(frame);
+            // Recheck at the final ownership boundary too: a hidden analyzer can
+            // become ready while diagnostic bookkeeping above is running.
+            if (sourceGeneration == Interlocked.Read(ref _widebandSourceGeneration) &&
+                Volatile.Read(ref _p2WidebandTransportEnabled) != 0)
+            {
+                // Publish the markers snapshot only for frames that pass the
+                // ownership checks and actually reach operators, so markers
+                // always agree with the rendered trace they overlay.
+                if (Volatile.Read(ref _widebandSignalMarkersEnabled) != 0)
+                {
+                    lock (_widebandSignalSnapshotLock)
+                    {
+                        Array.Copy(_widebandMarkersBuf, _widebandSignalSnapshot, markerCount);
+                        _widebandSignalSnapshotCount = markerCount;
+                        _widebandSignalSnapshotMs = (long)nowMs;
+                        _widebandSignalSnapshotCenterHz = viewport.CenterHz;
+                        _widebandSignalSnapshotHzPerPixel = viewport.HzPerPixel;
+                    }
+                }
+                _hub.Broadcast(frame);
+            }
         }
     }
 
@@ -2074,7 +2566,14 @@ public class DspPipelineService : BackgroundService,
         while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
         {
             if (!ShouldPollP3WidebandDisplay()) continue;
-            if (!TryBeginDisplayFrame(Stopwatch.GetTimestamp(), out var displayPlan)) continue;
+            // The fixed 100 ms poller is not paced to the operator's display cap.
+            if (!TryBeginDisplayFrame(
+                    Stopwatch.GetTimestamp(),
+                    producerIsRatePaced: false,
+                    out var displayPlan))
+            {
+                continue;
+            }
 
             ExternalDisplayFrame? sidecarFrame;
             try
@@ -2438,15 +2937,27 @@ public class DspPipelineService : BackgroundService,
         }
         else
         {
-            lock (_engineLock)
-            {
-                _engine?.SetMox(false);
-                _engine?.ResetDisplayPixelBuffers();
-            }
             int postTxMuteBlocks = PostTxMuteBlocksForDelayMs(_radio.TxPostTxRxMuteDelayMs);
-            Volatile.Write(ref _rxPostTxMuteBlocksRemaining, postTxMuteBlocks);
-            Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
-            _rxAudioSuppressedForTx = false;
+            try
+            {
+                lock (_engineLock)
+                {
+                    _engine?.SetMox(false);
+                    _engine?.ResetDisplayPixelBuffers();
+                }
+            }
+            finally
+            {
+                // Clear the RX-audio suppression latch and prime the post-TX
+                // drain counters even if the engine MOX-off throws. The caller
+                // (TxService.ConvergeToSafeIdle) invokes this through a Safe(…)
+                // wrapper that swallows exceptions, so a latch left high here
+                // would keep RX audio muted until a reconnect rebuilt the
+                // engine — the "no receive audio after TX" symptom (issue #993).
+                Volatile.Write(ref _rxPostTxMuteBlocksRemaining, postTxMuteBlocks);
+                Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
+                _rxAudioSuppressedForTx = false;
+            }
         }
     }
 
@@ -2483,6 +2994,20 @@ public class DspPipelineService : BackgroundService,
     /// without acquiring the lock. Engine swap writers continue to take
     /// _engineLock to serialise themselves against each other.</summary>
     public virtual IDspEngine? CurrentEngine => Volatile.Read(ref _engine);
+
+    /// <summary>
+    /// Version of the libwdsp actually loaded, for the diagnostics snapshot.
+    /// Cached behind a Lazy in <see cref="WdspDspEngine"/> — the loaded library
+    /// cannot change for the lifetime of the process — so this costs a field
+    /// read per snapshot.
+    ///
+    /// Virtual purely so tests can drive a stale engine through the real
+    /// endpoint: the bench library reports exactly the required version, so
+    /// without a seam the "loud mismatch" path has no observable behaviour.
+    /// Mirrors <see cref="CurrentEngine"/>.
+    /// </summary>
+    internal virtual WdspEngineVersion ResolveEngineVersion() =>
+        WdspDspEngine.ResolveEngineVersion();
 
     public virtual void ResetTxPhaseRotatorAuto()
     {
@@ -2530,6 +3055,7 @@ public class DspPipelineService : BackgroundService,
         var audio = SnapshotAudioDiagnostics();
         var display = SnapshotDisplayDiagnostics(engine);
         var secondReceiverHealth = SnapshotSecondReceiverHealth(state);
+        var engineVersion = ResolveEngineVersion();
         return new
         {
             schemaVersion = 1,
@@ -2574,6 +3100,16 @@ public class DspPipelineService : BackgroundService,
             secondReceiverHealth,
             wdspWisdomPhase = wisdom.Phase.ToString(),
             wdspWisdomStatus = wisdom.Status,
+            // Identity of the libwdsp actually loaded, alongside the FFTW wisdom
+            // status it shares a home with. Additive only. wdspVersionMismatch is
+            // the machine-readable "the loaded engine is older than Zeus targets"
+            // flag the UI surfaces; a missing symbol or an unloadable library
+            // leaves it false and shows up in wdspVersionStatus instead.
+            wdspVersion = engineVersion.Display,
+            wdspVersionRaw = engineVersion.Raw,
+            wdspVersionStatus = engineVersion.StatusToken,
+            wdspVersionMismatch = engineVersion.IsMismatch,
+            wdspVersionRequired = WdspEngineVersion.RequiredDisplay,
             readiness = wdspActive
                 ? "wdsp-active"
                 : offlinePreview
@@ -4405,12 +4941,14 @@ public class DspPipelineService : BackgroundService,
         // P1's Connected event is raised after RadioService already broadcast
         // Status=Connected, so the first state callback can hit the synthetic
         // engine we are replacing here. Replay the canonical live state so the
-        // same-process PS arm reaches the freshly-opened WDSP engine even when
-        // ApplyPsHwPeakForConnection did not move any StateDto fields.
-        // PsEnabled is process-lifetime only and never persisted: every new
-        // server process starts disarmed until an explicit operator POST to
-        // /api/tx/ps.
+        // disarmed runtime state reaches the freshly-opened WDSP engine even
+        // when ApplyPsHwPeakForConnection did not move any StateDto fields.
+        // This replay is the sanitize cycle's off half; only after calibration
+        // and attenuation restores are complete may persisted intent re-arm.
         OnRadioStateChanged(_radio.Snapshot());
+        _radio.ApplyPsArmIntentForConnection(
+            isProtocol2: false,
+            _radio.ConnectedBoardKind);
     }
 
     private void OnRadioDisconnected()
@@ -4495,7 +5033,7 @@ public class DspPipelineService : BackgroundService,
         // RadioLoHz to the P2 client (the P1 client gets the same push from
         // RadioService.SetRadioLo). See docs/prd/panfall_behavior.md.
         var p2 = _p2Client;
-        p2?.SetVfoAHz(s.RadioLoHz);
+        p2?.SetVfoAHz(_radio.ToHardwareFrequencyHz(s.RadioLoHz));
         p2?.SetReceiverAdcSources(ReceiverAdcSource(s, 0), ReceiverAdcSource(s, 1));
         var diversity = s.Diversity ?? new DiversityConfig();
         bool hiddenDiversitySource = diversity is { Enabled: true, SourceRx: 1 };
@@ -4514,7 +5052,8 @@ public class DspPipelineService : BackgroundService,
         // panel holds still while VFO B roams under CTUN. The WDSP shift in
         // ApplyStateToRx2Channel moves the dial within that window.
         UpdateRxLo(1, s);
-        p2?.SetVfoBHz(hiddenDiversitySource ? s.RadioLoHz : _secondaryRx[1].LoHz);
+        p2?.SetVfoBHz(_radio.ToHardwareFrequencyHz(
+            hiddenDiversitySource ? s.RadioLoHz : _secondaryRx[1].LoHz));
 
         // Multi-RX split TX: when any secondary receiver is the TX target and RX2
         // is on, drive the TX DUC to that receiver's effective LO INDEPENDENTLY so
@@ -4534,7 +5073,7 @@ public class DspPipelineService : BackgroundService,
         bool independentSplitTx = RadioFrequencyResolver.IsSplitEnabledForTx(s);
         p2?.SetTxDucFrequency(
             independentTxToSecondary || independentSplitTx
-                ? RadioService.TxEffectiveLoHz(s)
+                ? _radio.ToHardwareFrequencyHz(RadioService.TxEffectiveLoHz(s))
                 : 0);
 
         // Issue #597 Phase 0: arm the RX display fast-attack when the LO
@@ -4584,7 +5123,9 @@ public class DspPipelineService : BackgroundService,
                 for (int ri = 2; ri <= 1 + extraCount; ri++)
                 {
                     UpdateRxLo(ri, s);
-                    p2.SetExtraReceiverFreqHz(ri, _secondaryRx[ri].LoHz);
+                    p2.SetExtraReceiverFreqHz(
+                        ri,
+                        _radio.ToHardwareFrequencyHz(_secondaryRx[ri].LoHz));
                 }
             }
             else
@@ -4594,6 +5135,21 @@ public class DspPipelineService : BackgroundService,
         }
         for (int ri = 2; ri < MaxReceivers; ri++)
             _ = EnsureSecondaryRxChannel(engine, ri, s);
+
+        if (p2 is not null)
+        {
+            int normalizedZoom = NormalizeWidebandZoomRequest(s.ZoomLevel);
+            if (normalizedZoom != s.ZoomLevel)
+            {
+                // The receiver/layout edge consumed the last spare DDC. Re-enter
+                // once with the honest raw ceiling; the nested snapshot contains
+                // every mutation from this state edge, so returning here loses no
+                // control update.
+                _radio.SetZoom(normalizedZoom);
+                return;
+            }
+        }
+        ReconcileWidebandDetailSource(engine, s);
 
         // FreeDV has no WDSP sideband of its own — resolve the effective demod/mod
         // orientation from the dial (LSB < 10 MHz, USB ≥). For every other mode
@@ -4791,13 +5347,7 @@ public class DspPipelineService : BackgroundService,
             engine.SetTxPhaseRotator(channel, txPhaseRotator);
             _appliedTxPhaseRotator = txPhaseRotator;
         }
-        int ddcZoomLevel = DdcZoomLevel(s.ZoomLevel);
-        if (ddcZoomLevel != _appliedZoomLevel)
-        {
-            engine.SetZoom(channel, ddcZoomLevel);
-            if (rx2Channel >= 0) engine.SetZoom(rx2Channel, ddcZoomLevel);
-            _appliedZoomLevel = ddcZoomLevel;
-        }
+        ApplyVisibleDdcZoom(engine, s);
 
         // ---- TwoTone (protocol-agnostic; PostGen mode=1 inside TXA) ----
         // TwoTone is safe on P1 even though PS itself is P2-only in v1
@@ -4915,8 +5465,8 @@ public class DspPipelineService : BackgroundService,
                 // settle, then engine arm) becomes a proper await instead of
                 // Task.Delay(100).Wait(). Single-flight FIFO worker: requests
                 // serialize, and SetPsEnabledAsync's idempotence collapses
-                // redundant transitions (e.g. the post-connect resync after a
-                // connect-while-armed is a wire no-op).
+                // redundant state pushes around the connect-time disarmed
+                // replay and subsequent sanitized arm.
                 SchedulePsArmTransition(s.PsEnabled, p1Active, engine, psEngineSupported);
             }
             // Mark applied only when we actually armed or disarmed. A deferred
@@ -5184,6 +5734,7 @@ public class DspPipelineService : BackgroundService,
             }
             _p2Client?.SetPsFeedbackEnabled(false);
             await SetAndReconcileP1PsEnabledAsync(p1, false).ConfigureAwait(false);
+            _radio.ApplyBoardKindToActiveClientIfSafe();
             DrainPsFeedback();
         }
     }
@@ -5456,6 +6007,12 @@ public class DspPipelineService : BackgroundService,
             // prior slewed state, so the new channel snaps to its target.
             _secondaryRx[i].ResetAppliedState();
         }
+        Volatile.Write(ref _widebandDetailChannelId, -1);
+        Volatile.Write(ref _widebandDetailDdcIndex, -1);
+        Volatile.Write(ref _widebandDetailSourceReceiverIndex, int.MinValue);
+        Volatile.Write(ref _widebandDetailReady, 0);
+        Interlocked.Exchange(ref _widebandDetailLastIqMs, long.MinValue);
+        Interlocked.Increment(ref _widebandSourceGeneration);
     }
 
     /// <summary>
@@ -5512,7 +6069,7 @@ public class DspPipelineService : BackgroundService,
     {
         if (rxIndex < 1 || rxIndex >= MaxReceivers) return;
         if (_p2Client is null) return; // P1 secondaries share RadioLoHz — not pannable
-        long clamped = Math.Clamp(hz, 0L, 60_000_000L);
+        long clamped = _radio.ClampTuningFrequency(hz);
         lock (_engineLock)
         {
             var s = _radio.Snapshot();
@@ -5946,17 +6503,27 @@ public class DspPipelineService : BackgroundService,
         // first CmdTx, not deferred until a store edit. No-op on boards without
         // an audio front-end (gated + OFF defaults).
         _radio.ReplayAudioFrontEnd();
+        // Calibration and feedback attenuation are now restored, and the
+        // disarmed resync above has initialized the fresh engine. Apply any
+        // persisted operator intent through the normal disarm/rearm pipeline.
+        _radio.ApplyPsArmIntentForConnection(
+            isProtocol2: true,
+            _radio.ConnectedBoardKind);
         return sampleRateKhz;
     }
 
     private async Task DisposeUnpublishedP2ClientAsync(Zeus.Protocol2.Protocol2Client client)
     {
+        try { client.SetDisplayDdc(-1, 0, 0); } catch { }
         try { client.SetWidebandDisplayEnabled(false); } catch { }
         try { client.DetachWidebandFrameHandler(); } catch { }
         try { await client.StopAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
         try { await client.DisposeAsync().ConfigureAwait(false); } catch { }
         Volatile.Write(ref _widebandTransportEnabled, 0);
         Volatile.Write(ref _p2WidebandTransportEnabled, 0);
+        Volatile.Write(ref _widebandDetailReady, 0);
+        Interlocked.Exchange(ref _widebandDetailLastIqMs, long.MinValue);
+        Interlocked.Increment(ref _widebandSourceGeneration);
     }
 
     private void OnP2ClientDisconnected(Zeus.Protocol2.Protocol2Client client, long generation)
@@ -6003,6 +6570,7 @@ public class DspPipelineService : BackgroundService,
         // stay at zero per EU2AV's reserved-bit rule.
         p2.SetOcDxMasks(snap.OcDxTxMask, snap.OcDxRxMask);
         p2.SetPaEnabled(snap.PaEnabled);
+        p2.SetXvtrEnabled(snap.XvtrEnabled);
         p2.SetRfFilters(snap.RfFilters);
         // External antenna (antenna slice — #804). HpsdrAntenna.Ant1=0 → wire 1
         // → ALEX_TX_ANTENNA_1, so the +1 maps the 0-based enum to the 1-based
@@ -6205,6 +6773,8 @@ public class DspPipelineService : BackgroundService,
         int oldChannel = Volatile.Read(ref _channelId);
         try
         {
+            p2.SetDisplayDdc(-1, 0, 0);
+            CloseWidebandDetailChannel(engine);
             // Re-rate keeps the SAME engine, so close every open secondary channel
             // here (they reopen at the new rate via EnsureSecondaryRxChannel below).
             for (int i = 1; i < MaxReceivers; i++)
@@ -6230,6 +6800,7 @@ public class DspPipelineService : BackgroundService,
             // its DDC (re-emits the RX-spec). Ordering this last means new-rate
             // IQ only starts arriving once the channel can decode it.
             p2.SetSampleRateKhz(rateHz / 1000);
+            ReconcileWidebandDetailSource(engine, state);
             _log.LogInformation("dsp.pipeline p2 re-rate channel={Ch} rate={Rate}", newChannel, rateHz);
         }
         catch (Exception ex)
@@ -6863,6 +7434,16 @@ public class DspPipelineService : BackgroundService,
         var engine = Volatile.Read(ref _engine);
         if (engine is not null)
         {
+            if (frame.ReceiverIndex == Zeus.Protocol2.Protocol2Client.DisplayReceiverIndex)
+            {
+                int displayChannel = Volatile.Read(ref _widebandDetailChannelId);
+                if (displayChannel >= 0)
+                {
+                    Interlocked.Exchange(ref _widebandDetailLastIqMs, Environment.TickCount64);
+                    engine.FeedIq(displayChannel, frame.InterleavedSamples.Span);
+                }
+                return;
+            }
             if (frame.ReceiverIndex >= 1)
             {
                 // A secondary receiver's own DDC stream (true independent RX). Feed
@@ -7019,7 +7600,7 @@ public class DspPipelineService : BackgroundService,
         var displayPeriod = CurrentInlineDisplayPeriodTicks();
         if (displayPeriod >= TickPeriodStopwatchTicks ||
             !_hub.DisplayStreamRequested ||
-            Volatile.Read(ref _widebandDisplayEnabled) != 0)
+            Volatile.Read(ref _widebandTransportEnabled) != 0)
         {
             return;
         }
@@ -7180,7 +7761,7 @@ public class DspPipelineService : BackgroundService,
     private void OnP2WidebandFrame(int adcIndex, ReadOnlySpan<short> samples, int sampleRateHz)
     {
         if (adcIndex != 0) return;
-        if (Volatile.Read(ref _widebandDisplayEnabled) == 0 || !_hub.DisplayStreamRequested) return;
+        if (Volatile.Read(ref _p2WidebandTransportEnabled) == 0 || !_hub.DisplayStreamRequested) return;
 
         bool release = false;
         lock (_widebandFrameLock)
@@ -7221,6 +7802,11 @@ public class DspPipelineService : BackgroundService,
         _rxSinkAttached = false;
         Volatile.Write(ref _widebandTransportEnabled, 0);
         Volatile.Write(ref _p2WidebandTransportEnabled, 0);
+        Volatile.Write(ref _widebandDetailReady, 0);
+        Interlocked.Exchange(ref _widebandDetailLastIqMs, long.MinValue);
+        Interlocked.Increment(ref _widebandSourceGeneration);
+        try { client?.SetDisplayDdc(-1, 0, 0); }
+        catch (ObjectDisposedException) { }
         try { client?.SetWidebandDisplayEnabled(false); }
         catch (ObjectDisposedException) { }
         client?.DetachWidebandFrameHandler();
@@ -7337,6 +7923,50 @@ public class DspPipelineService : BackgroundService,
         // real-radio data, so suppressing it unconditionally is correct.
         if (engine is SyntheticDspEngine) return true;
 
+        // Display subscribers can appear/disappear, and WB can be toggled,
+        // without producing a RadioService state mutation. Reconcile the WDSP
+        // zoom here on the DSP thread so the frame geometry and analyzer crop
+        // always change together at the overview/detail boundary.
+        ApplyVisibleDdcZoom(engine, state);
+        bool widebandDetailReady = ReconcileWidebandDetailSource(engine, state);
+        int widebandDetailChannel = Volatile.Read(ref _widebandDetailChannelId);
+        if (widebandDetailReady && IsWidebandDetailIqStale(
+            Environment.TickCount64,
+            Interlocked.Read(ref _widebandDetailLastIqMs)))
+        {
+            // A configured DDC can disappear without a state edge (firmware
+            // restart, dropped command, or stream fault). Relinquish detail
+            // ownership so raw wideband snapshots resume instead of leaving a
+            // permanently frozen high-resolution frame on screen.
+            Volatile.Write(ref _widebandDetailReady, 0);
+            Interlocked.Increment(ref _widebandSourceGeneration);
+            widebandDetailReady = false;
+        }
+        if (!widebandDetailReady && widebandDetailChannel >= 0)
+        {
+            long generation = Interlocked.Read(ref _widebandSourceGeneration);
+            bool fresh = engine.TryGetDisplayPixels(
+                widebandDetailChannel,
+                DisplayPixout.Panadapter,
+                panBuf);
+            if (CanPromoteWidebandDetail(
+                fresh,
+                Environment.TickCount64,
+                Interlocked.Read(ref _widebandDetailLastIqMs),
+                generation,
+                Interlocked.Read(ref _widebandSourceGeneration),
+                widebandDetailChannel,
+                Volatile.Read(ref _widebandDetailChannelId)))
+            {
+                // The first analyzer-generated frame is the ownership barrier.
+                // Keep raw packets enabled through warmup, then invalidate any
+                // raw FFT already in flight before publishing detail.
+                Interlocked.Increment(ref _widebandSourceGeneration);
+                Volatile.Write(ref _widebandDetailReady, 1);
+                widebandDetailReady = true;
+            }
+        }
+
         // Issue #597 Phase 0: restore the default display tau once the LO has
         // been quiet for FastAttackRestoreMs. Runs on the RX/pipeline thread;
         // the engine call is idempotent and channel-guarded, so a race with a
@@ -7361,13 +7991,18 @@ public class DspPipelineService : BackgroundService,
         // record construction, and the 16 KB-ish byte[] payload fanout would
         // allocate. Control-only clients still receive meters/state/audio as
         // appropriate; they just do not pin the high-rate display stream on.
-        bool widebandDisplayActive = RefreshWidebandDisplayState();
+        bool widebandDisplayActive = RefreshWidebandDisplayState(state);
         bool displayStreamRequested = _hub.DisplayStreamRequested;
         DisplayFramePlan displayPlan = default;
         bool hasDisplaySubscribers =
             displayStreamRequested &&
             !widebandDisplayActive &&
-            TryBeginDisplayFrame(Stopwatch.GetTimestamp(), out displayPlan);
+            // Full ticks use TickPeriod and faster display-only ticks use the
+            // configured inline deadline, so this publisher is already paced.
+            TryBeginDisplayFrame(
+                Stopwatch.GetTimestamp(),
+                producerIsRatePaced: true,
+                out displayPlan);
         // Audio path uses nowMs too (it runs even when no clients are connected,
         // for in-process RxAudioAvailable subscribers like TCI). Hoisted above
         // the display gate to keep one timestamp call per tick.
@@ -7381,6 +8016,13 @@ public class DspPipelineService : BackgroundService,
         double rxAudioRmsForMeter = double.NaN;
         if (hasDisplaySubscribers)
         {
+            bool useWidebandDetail = widebandDetailReady && !_keyed;
+            int rxDisplayChannel = useWidebandDetail
+                ? Volatile.Read(ref _widebandDetailChannelId)
+                : channel;
+            long widebandDetailGeneration = useWidebandDetail
+                ? Interlocked.Read(ref _widebandSourceGeneration)
+                : 0;
             bool suppressPostTxRxDisplay = ShouldSuppressRxDisplayForCurrentTick();
 
             // While keyed (MOX or TUN — see _keyed comment) pull the panadapter
@@ -7500,13 +8142,13 @@ public class DspPipelineService : BackgroundService,
             {
                 if (!pan)
                 {
-                    pan = engine.TryGetDisplayPixels(channel, DisplayPixout.Panadapter, panBuf);
-                    if (pan) panSource = "rx";
+                    pan = engine.TryGetDisplayPixels(rxDisplayChannel, DisplayPixout.Panadapter, panBuf);
+                    if (pan) panSource = useWidebandDetail ? "wideband-detail" : "rx";
                 }
                 if (displayPlan.IncludeWaterfall && !wf)
                 {
-                    wf = engine.TryGetDisplayPixels(channel, DisplayPixout.Waterfall, wfBuf);
-                    if (wf) wfSource = "rx";
+                    wf = engine.TryGetDisplayPixels(rxDisplayChannel, DisplayPixout.Waterfall, wfBuf);
+                    if (wf) wfSource = useWidebandDetail ? "wideband-detail" : "rx";
                 }
             }
             else
@@ -7603,8 +8245,12 @@ public class DspPipelineService : BackgroundService,
             // the VFO, so hzPerPixel shrinks by the same factor. Client re-uses
             // this for axis labels and planWaterfallUpdate horizontal shift — no
             // extra contract field needed, per task #7 scope note.
-            int zoomLevel = DdcZoomLevel(state.ZoomLevel);
-            float hzPerPixel = (float)((double)sampleRate / zoomLevel / _panadapterWidth);
+            int zoomLevel = useWidebandDetail
+                ? Volatile.Read(ref _widebandDetailZoomLevel)
+                : DdcZoomLevel(state.ZoomLevel);
+            float hzPerPixel = useWidebandDetail
+                ? (float)((double)sampleRate / zoomLevel / _panadapterWidth)
+                : VisibleDdcHzPerPixel(sampleRate, state.ZoomLevel, _panadapterWidth);
             // Panadapter centre: the LO the pixels were actually computed
             // at (issue #597 Phase 2). The analyzer output broadcast this
             // tick reflects IQ captured ~stampLag earlier; LookupAt rewinds
@@ -7613,16 +8259,29 @@ public class DspPipelineService : BackgroundService,
             // Stable LO (≥ stampLag with no tune) ⇒ identical to the old
             // `state.RadioLoHz` stamp, byte for byte.
             double fftFillMs = sampleRate > 0
-                ? _rxAnalyzerFftSize / (double)sampleRate * 1000.0
+                ? (useWidebandDetail
+                    // The detail channel runs its own adaptive FFT (up to
+                    // 65,536 pts), so its aperture — not the engine default —
+                    // sets the lookback for delay-compensated centre stamps.
+                    ? Volatile.Read(ref _widebandDetailAnalyzerFftSize)
+                    : _rxAnalyzerFftSize) / (double)sampleRate * 1000.0
                 : 0.0;
             double stampLagMs = 0.5 * fftFillMs
                 + (CenterStampLagOverrideMs
                    ?? (CenterStampEmaLagMs
                        + (_p2Client is not null ? CenterStampTransportP2Ms : CenterStampTransportP1Ms)));
             long stampLagTicks = (long)(stampLagMs / 1000.0 * Stopwatch.Frequency);
-            long centerHz = _loHistory.LookupAt(
-                Stopwatch.GetTimestamp() - stampLagTicks,
-                fallbackLoHz: state.RadioLoHz);
+            long centerHz = useWidebandDetail
+                // Mid-pan frames carry the centre their pixels were captured
+                // at (glide), not the live target (stick-then-jump). Stable
+                // target ≥ stampLag ⇒ identical to the live target, matching
+                // the old stamp byte for byte.
+                ? _widebandCenterHistory.LookupAt(
+                    Stopwatch.GetTimestamp() - stampLagTicks,
+                    fallbackLoHz: WidebandViewportTargetCenterHz(state))
+                : _loHistory.LookupAt(
+                    Stopwatch.GetTimestamp() - stampLagTicks,
+                    fallbackLoHz: state.RadioLoHz);
 
             // Cache for the frequency-calibration service (issue #325). The
             // cal reads from this cache to avoid racing for WDSP's "fresh
@@ -7693,7 +8352,13 @@ public class DspPipelineService : BackgroundService,
             // real frames, flipping slice.width on the client and (historically)
             // storming the waterfall history-texture realloc. Skipping empties
             // also spares P1/P2 a wasted frame on any stale tick with no fresh FFT.
-            if (flags != DisplayBodyFlags.None)
+            bool displaySourceCurrent = !useWidebandDetail || CanPublishWidebandDetail(
+                Volatile.Read(ref _widebandDetailReady) != 0,
+                widebandDetailGeneration,
+                Interlocked.Read(ref _widebandSourceGeneration),
+                rxDisplayChannel,
+                Volatile.Read(ref _widebandDetailChannelId));
+            if (flags != DisplayBodyFlags.None && displaySourceCurrent)
                 _hub.Broadcast(frame);
 
             // Secondary receivers (RX2..RXn): each open secondary broadcasts its
@@ -7735,7 +8400,10 @@ public class DspPipelineService : BackgroundService,
                         BodyFlags: secFlags,
                         Width: secFrameWidth,
                         CenterHz: rx.LoHz,
-                        HzPerPixel: hzPerPixel * displayPlan.Decimation,
+                        HzPerPixel: VisibleDdcHzPerPixel(
+                            sampleRate,
+                            state.ZoomLevel,
+                            _panadapterWidth) * displayPlan.Decimation,
                         PanDb: secPanBins,
                         WfDb: secWfBins);
                     if (secFlags != DisplayBodyFlags.None)
@@ -8136,7 +8804,8 @@ public class DspPipelineService : BackgroundService,
             _rxMeterTickMod = 0;
             double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
                 _radio.EffectiveBoardKind,
-                _radio.EffectiveOrionMkIIVariant);
+                _radio.EffectiveOrionMkIIVariant)
+                + _radio.TransverterMeterCorrectionDb(state.VfoHz);
 
             // Prefer WDSP's S-meter when it's ticking. In this
             // integration the meter tap reads -400 ("didn't run") — needs
@@ -8199,6 +8868,43 @@ public class DspPipelineService : BackgroundService,
             }
             _hub.Broadcast(v2);
             RxMetersV2Updated?.Invoke(channel, v2);
+
+            // Passband SNR uses WDSP's independent average-power PSD
+            // output. Never substitute the visual waterfall floor: its peak
+            // detector/log averaging and subscriber-driven drain are unsuitable
+            // for a signal report.
+            bool snrFresh = engine.TryGetRxSnrPowerSpectrum(
+                channel, _snrPowerBuf, out var snrInfo);
+            if (snrFresh && snrInfo.IsValid)
+                Array.Reverse(_snrPowerBuf, 0, snrInfo.PixelCount);
+            var engineMode = RadioService.EffectiveEngineMode(state.Mode, state.VfoHz);
+            var (snrFilterLow, snrFilterHigh) = SignedRxFilterFor(state, engineMode);
+            long effectiveVfoHz = CwOffset.EffectiveLoHz(state.Mode, state.VfoHz)
+                + (state.RitEnabled ? state.RitHz : 0L);
+            long analyzerCenterHz = state.RadioLoHz > 0 ? state.RadioLoHz : state.VfoHz;
+            double hzPerPixel = snrInfo.IsValid
+                ? (double)snrInfo.SampleRateHz / snrInfo.PixelCount
+                : double.NaN;
+            var snrResult = _snrEstimator.Update(
+                snrInfo.IsValid ? _snrPowerBuf.AsSpan(0, snrInfo.PixelCount) : ReadOnlySpan<float>.Empty,
+                hzPerPixel,
+                effectiveVfoHz + snrFilterLow - analyzerCenterHz,
+                effectiveVfoHz + snrFilterHigh - analyzerCenterHz,
+                new InPassbandSnrEstimator.MeasurementKey(
+                    RxId: 0,
+                    SampleRateHz: snrInfo.SampleRateHz,
+                    PixelCount: snrInfo.PixelCount,
+                    AnalyzerGeneration: snrInfo.Generation,
+                    AnalyzerCenterHz: analyzerCenterHz,
+                    EffectiveVfoHz: effectiveVfoHz,
+                    FilterLowHz: snrFilterLow,
+                    FilterHighHz: snrFilterHigh),
+                Environment.TickCount64,
+                fresh: snrFresh,
+                keyed: _keyed);
+            var quality = BuildRxSignalQualityFrame(0, snrResult, rxCalOffsetDb);
+            _hub.Broadcast(quality);
+            RxSignalQualityUpdated?.Invoke(quality);
         }
         return true;
         }
@@ -8213,6 +8919,9 @@ public class DspPipelineService : BackgroundService,
     /// observe the encoded frame without instantiating a WebSocket.
     /// </summary>
     public event Action<int, RxMetersV2Frame>? RxMetersV2Updated;
+
+    /// <summary>Test/diagnostic seam for the measured passband-quality frame.</summary>
+    public event Action<RxSignalQualityFrame>? RxSignalQualityUpdated;
 
     /// <summary>
     /// Protocol-3 RX meter ingress (S-meter fix): the sidecar frame forwarder
@@ -8234,7 +8943,8 @@ public class DspPipelineService : BackgroundService,
         if (!_radio.IsProtocol3Active) return;
         double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
             _radio.EffectiveBoardKind,
-            _radio.EffectiveOrionMkIIVariant);
+            _radio.EffectiveOrionMkIIVariant)
+            + _radio.TransverterMeterCorrectionDb(_radio.Snapshot().VfoHz);
         double dbm = ApplyRxMeterCalibration(dbfsRaw, rxCalOffsetDb);
         if (!double.IsFinite(dbm)) dbm = -160.0;
         float adcPk = (float)(double.IsFinite(adcHeadroomDb) ? -adcHeadroomDb : -200.0);
@@ -8279,6 +8989,27 @@ public class DspPipelineService : BackgroundService,
         }
         _hub.Broadcast(v2);
         RxMetersV2Updated?.Invoke(channel, v2);
+        // Protocol 3 currently has no normalized raw-spectrum passband source.
+        // Explicitly clear quality rather than falling back to a display floor.
+        var unavailableQuality = RxSignalQualityFrame.Unavailable((byte)Math.Clamp(channel, 0, byte.MaxValue));
+        _hub.Broadcast(unavailableQuality);
+        RxSignalQualityUpdated?.Invoke(unavailableQuality);
+    }
+
+    internal static RxSignalQualityFrame BuildRxSignalQualityFrame(
+        byte rxId,
+        InPassbandSnrEstimator.Result result,
+        double rxCalibrationDb)
+    {
+        if (!result.IsValid || !double.IsFinite(rxCalibrationDb))
+            return RxSignalQualityFrame.Unavailable(rxId);
+
+        return new RxSignalQualityFrame(
+            RxId: rxId,
+            SnrDb: (float)result.SnrDb,
+            SignalOnlyDbm: (float)(result.SignalOnlyDb + rxCalibrationDb),
+            IntegratedNoiseDbm: (float)(result.IntegratedNoiseDb + rxCalibrationDb),
+            Confidence: (float)Math.Clamp(result.Confidence, 0.0, 1.0));
     }
 
     /// <summary>

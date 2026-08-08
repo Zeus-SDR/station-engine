@@ -20,8 +20,8 @@ namespace Zeus.Contracts;
 /// </code>
 ///
 /// 13-byte fixed header + variable text payload. <see cref="Text"/> is the
-/// chunk of characters decoded during one audio tick (usually 0–2 chars,
-/// including ' ' on a word gap); the client appends them in order. Decoding
+/// accumulated chunk of characters emitted by the decoder's rate-limited
+/// broadcaster at no more than 10 frames per second; the client appends them in order. Decoding
 /// happens server-side so it works in the desktop/native-audio host and
 /// headless — see CwDecoderService. Text is capped at <see cref="MaxTextBytes"/>.
 ///
@@ -33,8 +33,8 @@ public readonly record struct CwDecodedTextFrame(
     float SnrDb,
     float Confidence)
 {
-    /// <summary>Hard cap on the text payload. One tick decodes a handful of
-    /// characters at most, so this is comfortably generous and keeps the
+    /// <summary>Hard cap on the text payload. One broadcast decodes a handful
+    /// of characters at most, so this is comfortably generous and keeps the
     /// frame well under one MTU.</summary>
     public const int MaxTextBytes = 256;
 

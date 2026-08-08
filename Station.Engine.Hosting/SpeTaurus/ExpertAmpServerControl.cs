@@ -12,10 +12,22 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Buffers.Binary;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 
 namespace Zeus.Server.SpeTaurus;
+
+/// <summary>
+/// Raised when the amplifier itself reports a hazard during automatic tuning —
+/// an alarm, or leaving STANDBY while Zeus owns the carrier. Distinct from the
+/// monitoring-quality faults that merely end the cycle, because a hazard must
+/// also suppress OPERATE restoration: the operator inspects the amplifier before
+/// it is put back on the air. A hazard can clear on its own once RF drops, so it
+/// is remembered for the rest of the cycle rather than re-read at restore time.
+/// </summary>
+internal sealed class SpeTaurusAmplifierHazardException(string message)
+    : Exception(message);
 
 internal readonly record struct AutomaticTuneOperateRestoreResult(
     bool Restored,
@@ -26,6 +38,18 @@ internal readonly record struct AutomaticTuneStandbyResult(
     bool Verified,
     SpeTaurusStatus? Status,
     string? Error);
+
+/// <summary>
+/// Outcome of the post-tune TUNE-latch cleanup. <paramref name="TuneLatchClear"/>
+/// is positive evidence that the Expert TUNE indication was observed continuously
+/// clear for the confirmation window; it defaults to <c>false</c> so every
+/// unverified or faulted path fails closed. OPERATE restoration is gated on it,
+/// because an armed latch would start an ATU cycle on the next key-down.
+/// </summary>
+internal readonly record struct AutomaticTuneDisarmResult(
+    bool Verified,
+    string? Error,
+    bool TuneLatchClear = false);
 
 internal sealed record SpeRemoteActionResult(
     bool Success,
@@ -49,7 +73,10 @@ internal sealed record SpeDisplayText(
     DateTimeOffset UpdatedAt,
     string Source,
     string ModelName,
-    string ScreenText);
+    string ScreenText,
+    bool TuneActive);
+
+internal sealed record SpeDisplayImage(byte[] Bytes);
 
 /// <summary>
 /// Selects the direct SPE transport or the Expert Amp Server owned by the G2.
@@ -58,9 +85,24 @@ internal sealed record SpeDisplayText(
 /// </summary>
 internal sealed class ExpertAmpServerControl : IDisposable
 {
+    private const int MaxRenderedDisplayBytes = 1024 * 1024;
+    private static readonly byte[] PngSignature =
+        [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(75);
     private static readonly TimeSpan AutomaticTuneOperateConfirmationTimeout =
         TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan TuneClearConfirmation =
+        TimeSpan.FromMilliseconds(600);
+
+    /// <summary>
+    /// How long a degraded status reading must persist during automatic tuning
+    /// before Zeus abandons the cycle. A single stale, dropped, or lagging poll
+    /// is not evidence that the amplifier moved, but the carrier must still come
+    /// down promptly once contact is genuinely lost. An amplifier alarm is never
+    /// debounced and stops RF on the first sample.
+    /// </summary>
+    private static readonly TimeSpan TransientStatusTolerance =
+        TimeSpan.FromMilliseconds(600);
     private static readonly string[] Bands =
     [
         "160m", "80m", "60m", "40m", "30m", "20m",
@@ -74,10 +116,8 @@ internal sealed class ExpertAmpServerControl : IDisposable
     private readonly ILogger _log;
     private readonly SemaphoreSlim _commands = new(1, 1);
     private readonly object _featureGate = new();
-    private readonly object _identityGate = new();
     private readonly object _remotePowerGate = new();
     private CancellationTokenSource _featureCancellation = new();
-    private SpeTaurusConfig? _confirmedIdentityConfig;
     private SpeTaurusConfig? _ambiguousRemotePowerConfig;
     private string? _ambiguousRemotePowerReason;
     private bool _featureActive;
@@ -197,12 +237,26 @@ internal sealed class ExpertAmpServerControl : IDisposable
                         "The Taurus configuration changed before final STANDBY verification.");
                 }
 
-                var before = await GetRawStatusAsync(expectedConfig, token)
-                    .ConfigureAwait(false);
-                var unsafeReason = UnsafeControlReason(
-                    before,
-                    RemoteCommand.Operate,
-                    false);
+                // Zeus has already dropped RF locally by the time this runs;
+                // Expert Amp Server's own status poll of the amplifier can lag
+                // a cycle behind. Give a momentarily stale TX/contact reading
+                // a chance to settle before treating it as unsafe.
+                var settleDeadline = DateTimeOffset.UtcNow.AddMilliseconds(
+                    confirmationTimeoutMs);
+                ExpertStatus before;
+                string? unsafeReason;
+                while (true)
+                {
+                    before = await GetRawStatusAsync(expectedConfig, token)
+                        .ConfigureAwait(false);
+                    unsafeReason = UnsafeControlReason(
+                        before,
+                        RemoteCommand.Operate,
+                        false);
+                    if (unsafeReason is null || DateTimeOffset.UtcNow >= settleDeadline)
+                        break;
+                    await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                }
                 if (unsafeReason is not null)
                 {
                     return new(
@@ -283,6 +337,192 @@ internal sealed class ExpertAmpServerControl : IDisposable
     }
 
     /// <summary>
+    /// Verifies that the Taurus TUNE latch is clear after Zeus has removed RF.
+    /// A checksum-valid active indication is canceled with one TUNE keypress;
+    /// the non-idempotent write is never retried when its outcome is ambiguous.
+    /// </summary>
+    internal async Task<AutomaticTuneDisarmResult>
+        EnsureTuneDisarmedAfterAutomaticTuneAsync(
+            SpeTaurusConfig expectedConfig,
+            CancellationToken cancellationToken)
+    {
+        var confirmationTimeout = TimeSpan.FromMilliseconds(Math.Max(
+            AutomaticTuneOperateConfirmationTimeout.TotalMilliseconds,
+            expectedConfig.ResponseTimeoutMs));
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        operation.CancelAfter(TimeSpan.FromMilliseconds(
+            expectedConfig.ConnectTimeoutMs + confirmationTimeout.TotalMilliseconds));
+        var token = operation.Token;
+
+        await _commands.WaitAsync(token).ConfigureAwait(false);
+        IDisposable? configLease = null;
+        var writeAttempted = false;
+        try
+        {
+            try
+            {
+                configLease = await _taurus.TryAcquireConfigLeaseAsync(
+                        expectedConfig,
+                        token)
+                    .ConfigureAwait(false);
+                if (configLease is null || !CanUse(expectedConfig))
+                    return new(false,
+                        "The Taurus configuration changed before final TUNE cleanup.");
+
+                // As above, give Expert Amp Server's own status poll a bounded
+                // chance to catch up with the STANDBY/RX transition that the
+                // prior verification step already confirmed.
+                var settleDeadline = DateTimeOffset.UtcNow + confirmationTimeout;
+                ExpertStatus status;
+                while (true)
+                {
+                    status = await GetRawStatusAsync(expectedConfig, token)
+                        .ConfigureAwait(false);
+                    if (IsVerifiedStandby(status) || DateTimeOffset.UtcNow >= settleDeadline)
+                        break;
+                    await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                }
+                if (!IsVerifiedStandby(status))
+                    return new(false,
+                        "Taurus TUNE cleanup is blocked because fresh STANDBY/RX could not be verified.");
+
+                // The settle loop above may legitimately consume its entire
+                // window waiting for Expert Amp Server's status poll to catch
+                // up. Grant the display-evidence phase the same fresh budget it
+                // sets for its own deadline below, exactly as the STANDBY and
+                // OPERATE transactions do after their settle phases. Without
+                // this the outer token expires mid-loop and reports a bogus
+                // cleanup timeout that used to suppress OPERATE restoration.
+                operation.CancelAfter(TimeSpan.FromMilliseconds(
+                    expectedConfig.ConnectTimeoutMs + confirmationTimeout.TotalMilliseconds));
+
+                var client = _httpClientFactory.CreateClient(
+                    ExpertAmpServerTunePreflight.HttpClientName);
+                var clearSince = (DateTimeOffset?)null;
+                var activeSince = (DateTimeOffset?)null;
+                var deadline = DateTimeOffset.UtcNow + confirmationTimeout;
+                while (DateTimeOffset.UtcNow < deadline)
+                {
+                    var display = await GetDisplayEvidenceAsync(
+                        client,
+                        expectedConfig.ExpertServerUrl,
+                        token).ConfigureAwait(false);
+                    if (display.Tune)
+                    {
+                        clearSince = null;
+                        activeSince ??= DateTimeOffset.UtcNow;
+                        if (DateTimeOffset.UtcNow - activeSince < TuneClearConfirmation)
+                        {
+                            await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        status = await GetRawStatusAsync(expectedConfig, token)
+                            .ConfigureAwait(false);
+                        if (!IsVerifiedStandby(status))
+                            return new(false,
+                                "Taurus TUNE cleanup stopped because STANDBY/RX was no longer verified.");
+
+                        writeAttempted = true;
+                        await PostButtonRawAsync(
+                                expectedConfig,
+                                RemoteCommand.Tune,
+                                token)
+                            .ConfigureAwait(false);
+                        // Fresh confirmation floor after the one non-idempotent
+                        // cancel keypress, plus connect slack so the loop's own
+                        // deadline governs instead of the token guillotining an
+                        // in-flight poll and reporting an unknown latch.
+                        operation.CancelAfter(TimeSpan.FromMilliseconds(
+                            expectedConfig.ConnectTimeoutMs
+                            + confirmationTimeout.TotalMilliseconds));
+                        clearSince = null;
+                        deadline = DateTimeOffset.UtcNow + confirmationTimeout;
+                        break;
+                    }
+
+                    activeSince = null;
+                    clearSince ??= DateTimeOffset.UtcNow;
+                    if (DateTimeOffset.UtcNow - clearSince >= TuneClearConfirmation)
+                    {
+                        status = await GetRawStatusAsync(expectedConfig, token)
+                            .ConfigureAwait(false);
+                        // The latch itself is confirmed clear either way; only
+                        // the STANDBY/RX read is inconclusive, and OPERATE
+                        // restoration re-verifies that from scratch.
+                        return IsVerifiedStandby(status)
+                            ? new(true, null, TuneLatchClear: true)
+                            : new(false,
+                                "Taurus TUNE cleared, but final STANDBY/RX could not be verified.",
+                                TuneLatchClear: true);
+                    }
+                    await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                }
+
+                if (!writeAttempted)
+                    return new(false,
+                        "Final Taurus TUNE state did not remain clear long enough to verify.");
+
+                clearSince = null;
+                while (DateTimeOffset.UtcNow < deadline)
+                {
+                    await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                    var display = await GetDisplayEvidenceAsync(
+                        client,
+                        expectedConfig.ExpertServerUrl,
+                        token).ConfigureAwait(false);
+                    if (display.Tune)
+                    {
+                        clearSince = null;
+                        continue;
+                    }
+
+                    clearSince ??= DateTimeOffset.UtcNow;
+                    if (DateTimeOffset.UtcNow - clearSince >= TuneClearConfirmation)
+                    {
+                        status = await GetRawStatusAsync(expectedConfig, token)
+                            .ConfigureAwait(false);
+                        return IsVerifiedStandby(status)
+                            ? new(true, null, TuneLatchClear: true)
+                            : new(false,
+                                "Taurus TUNE cleared after the cancel keypress, but final STANDBY/RX could not be verified.",
+                                TuneLatchClear: true);
+                    }
+                }
+
+                return new(false,
+                    "The Taurus did not confirm that TUNE cleared after one cancel keypress; it was not repeated.");
+            }
+            catch (OperationCanceledException) when (writeAttempted)
+            {
+                return new(false,
+                    "Taurus TUNE cleanup timed out after one cancel keypress; it was not repeated.");
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                return new(false,
+                    "Taurus TUNE cleanup timed out before a cancel keypress was sent.");
+            }
+            catch (Exception ex) when (
+                ex is HttpRequestException or InvalidDataException or TimeoutException)
+            {
+                var phase = writeAttempted
+                    ? "after one cancel keypress; it was not repeated"
+                    : "before a cancel keypress was sent";
+                _log.LogWarning(ex, "spe-taurus automatic tune latch cleanup failed");
+                return new(false,
+                    $"Taurus TUNE cleanup failed {phase}: {ex.Message}");
+            }
+        }
+        finally
+        {
+            configLease?.Dispose();
+            _commands.Release();
+        }
+    }
+
+    /// <summary>
     /// Restores OP after a completed automatic tune as one control transaction.
     /// The original configuration lease remains held through confirmation and
     /// any compensating STANDBY, so a settings save cannot redirect cleanup to
@@ -319,8 +559,24 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 operation.CancelAfter(TimeSpan.FromMilliseconds(
                     expectedConfig.ConnectTimeoutMs + confirmationTimeoutMs));
                 var token = operation.Token;
-                var before = await GetRawStatusAsync(expectedConfig, token).ConfigureAwait(false);
-                var unsafeReason = UnsafeControlReason(before, RemoteCommand.Operate, true);
+
+                // As with final STANDBY verification, Expert Amp Server's own
+                // status poll of the amplifier can still be catching up with
+                // the STANDBY/RX state the prior cleanup step already
+                // confirmed. Give a stale reading a bounded chance to settle
+                // before failing OPERATE restoration.
+                var settleDeadline = DateTimeOffset.UtcNow.AddMilliseconds(
+                    confirmationTimeoutMs);
+                ExpertStatus before;
+                string? unsafeReason;
+                while (true)
+                {
+                    before = await GetRawStatusAsync(expectedConfig, token).ConfigureAwait(false);
+                    unsafeReason = UnsafeControlReason(before, RemoteCommand.Operate, true);
+                    if (unsafeReason is null || DateTimeOffset.UtcNow >= settleDeadline)
+                        break;
+                    await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                }
                 if (unsafeReason is not null)
                     return new(false, ToPanelStatus(expectedConfig, before, unsafeReason), unsafeReason);
                 if (cancellationToken.IsCancellationRequested || !FeatureActive)
@@ -753,8 +1009,110 @@ internal sealed class ExpertAmpServerControl : IDisposable
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(configIo.Token);
         timeout.CancelAfter(config.ConnectTimeoutMs);
         var display = await GetDisplayTextAsync(config, timeout.Token).ConfigureAwait(false);
-        return ValidateDisplay(display);
+        var client = _httpClientFactory.CreateClient(
+            ExpertAmpServerTunePreflight.HttpClientName);
+        var evidence = await GetDisplayEvidenceAsync(
+                client,
+                config.ExpertServerUrl,
+                timeout.Token)
+            .ConfigureAwait(false);
+        return ValidateDisplay(display, evidence.Tune);
     }
+
+    internal async Task<SpeDisplayImage> DisplayImageAsync(
+        CancellationToken cancellationToken)
+    {
+        var config = _taurus.Config;
+        if (!FeatureActive)
+            throw new InvalidDataException("The Taurus feature is inactive.");
+        if (config.ExpertServerUrl.Length == 0)
+            throw new InvalidDataException(
+                "The amplifier display is available only through Expert Amp Server.");
+
+        using var featureIo = LinkFeatureIo(cancellationToken);
+        using var configIo = _taurus.LinkConfigIo(config, featureIo.Token);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(configIo.Token);
+        timeout.CancelAfter(config.ConnectTimeoutMs);
+        var client = _httpClientFactory.CreateClient(
+            ExpertAmpServerTunePreflight.HttpClientName);
+        using var response = await client.GetAsync(
+                $"{config.ExpertServerUrl}/api/v1/display/render.png?scale=2",
+                HttpCompletionOption.ResponseHeadersRead,
+                timeout.Token)
+            .ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"Expert Amp Server returned {(int)response.StatusCode} for the rendered display.");
+        if (!string.Equals(
+                response.Content.Headers.ContentType?.MediaType,
+                "image/png",
+                StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException(
+                "Expert Amp Server rendered display did not return image/png.");
+        if (response.Content.Headers.ContentLength is > MaxRenderedDisplayBytes)
+            throw new InvalidDataException(
+                "Expert Amp Server rendered display exceeded the 1 MiB safety limit.");
+
+        await using var source = await response.Content.ReadAsStreamAsync(timeout.Token)
+            .ConfigureAwait(false);
+        using var destination = new MemoryStream();
+        var buffer = new byte[8192];
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, timeout.Token).ConfigureAwait(false);
+            if (read == 0) break;
+            if (destination.Length + read > MaxRenderedDisplayBytes)
+                throw new InvalidDataException(
+                    "Expert Amp Server rendered display exceeded the 1 MiB safety limit.");
+            destination.Write(buffer, 0, read);
+        }
+
+        var bytes = destination.ToArray();
+        ValidateRenderedPng(bytes);
+        return new(bytes);
+    }
+
+    private static void ValidateRenderedPng(byte[] bytes)
+    {
+        if (bytes.Length < 33
+            || !bytes.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature))
+            throw new InvalidDataException(
+                "Expert Amp Server rendered display did not contain a valid PNG signature.");
+
+        var ihdrLength = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(8, 4));
+        if (ihdrLength != 13
+            || !bytes.AsSpan(12, 4).SequenceEqual("IHDR"u8))
+            throw new InvalidDataException(
+                "Expert Amp Server rendered display did not begin with a valid PNG IHDR chunk.");
+
+        var width = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(16, 4));
+        var height = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(20, 4));
+        if (width != 480 || height != 128)
+            throw new InvalidDataException(
+                $"Expert Amp Server rendered display has invalid PNG dimensions {width}x{height}; expected 480x128.");
+
+        var bitDepth = bytes[24];
+        var colorType = bytes[25];
+        var compression = bytes[26];
+        var filter = bytes[27];
+        var interlace = bytes[28];
+        if (!IsValidPngBitDepth(colorType, bitDepth)
+            || compression != 0
+            || filter != 0
+            || interlace > 1)
+            throw new InvalidDataException(
+                "Expert Amp Server rendered display has invalid PNG IHDR encoding fields.");
+    }
+
+    private static bool IsValidPngBitDepth(byte colorType, byte bitDepth) =>
+        colorType switch
+        {
+            0 => bitDepth is 1 or 2 or 4 or 8 or 16,
+            2 => bitDepth is 8 or 16,
+            3 => bitDepth is 1 or 2 or 4 or 8,
+            4 or 6 => bitDepth is 8 or 16,
+            _ => false,
+        };
 
     internal Task<SpeRemoteActionResult> CycleDisplayPageAsync(
         CancellationToken cancellationToken) =>
@@ -763,6 +1121,30 @@ internal sealed class ExpertAmpServerControl : IDisposable
     internal Task<SpeRemoteActionResult> CycleCatPageAsync(
         CancellationToken cancellationToken) =>
         ExecuteAdvancedAsync(RemoteCommand.Cat, cancellationToken);
+
+    internal Task<SpeRemoteActionResult> PressPanelButtonAsync(
+        string? name,
+        CancellationToken cancellationToken)
+    {
+        var command = name?.Trim().ToLowerInvariant() switch
+        {
+            "band-" => RemoteCommand.BandDown,
+            "band+" => RemoteCommand.BandUp,
+            "l-" => RemoteCommand.InductanceDown,
+            "l+" => RemoteCommand.InductanceUp,
+            "c-" => RemoteCommand.CapacitanceDown,
+            "c+" => RemoteCommand.CapacitanceUp,
+            "left" or "up" => RemoteCommand.LeftUp,
+            "right" or "down" => RemoteCommand.RightDown,
+            "set" => RemoteCommand.Set,
+            _ => (RemoteCommand?)null,
+        };
+        return command is { } selected
+            ? ExecuteAdvancedAsync(selected, cancellationToken)
+            : Task.FromResult(Blocked(
+                "panel-button-invalid",
+                "That Expert Amp Server panel button is not available through Zeus."));
+    }
 
     private async Task<SpeRemoteActionResult> ExecuteAdvancedAsync(
         RemoteCommand command,
@@ -779,6 +1161,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
         using var featureIo = LinkFeatureIo(cancellationToken);
         CancellationTokenSource? operation = null;
         var writeAttempted = false;
+        var writeAccepted = false;
         ExpertStatus? before = null;
         try
         {
@@ -803,6 +1186,11 @@ internal sealed class ExpertAmpServerControl : IDisposable
                     "CAT page control is blocked because the current CAT interface is unknown.",
                     ToPanelStatus(config, before));
             }
+            if (RequiresStandbyPanelControl(command) && !IsVerifiedStandby(before))
+                return Blocked(
+                    ButtonName(command),
+                    "This front-panel control is available only in verified STANDBY/RX.",
+                    ToPanelStatus(config, before));
 
             using var configLease = await _taurus.TryAcquireConfigLeaseAsync(config, token)
                 .ConfigureAwait(false);
@@ -822,23 +1210,30 @@ internal sealed class ExpertAmpServerControl : IDisposable
                     "cat",
                     "CAT page control is blocked because the current CAT interface is unknown.",
                     ToPanelStatus(config, before));
+            if (RequiresStandbyPanelControl(command) && !IsVerifiedStandby(before))
+                return Blocked(
+                    ButtonName(command),
+                    "This front-panel control is available only in verified STANDBY/RX.",
+                    ToPanelStatus(config, before));
 
             // Capture the display baseline under the same configuration lease
             // and immediately before the one DISPLAY write. A merely newer
             // periodic frame is insufficient; confirmation also needs changed
             // LCD content.
-            var displayBefore = command == RemoteCommand.Display
+            var confirmsThroughDisplay = command != RemoteCommand.Cat;
+            var displayBefore = confirmsThroughDisplay
                 ? ValidateDisplay(await GetDisplayTextAsync(config, token).ConfigureAwait(false))
                 : null;
 
             writeAttempted = true;
             await PostButtonRawAsync(config, command, token).ConfigureAwait(false);
+            writeAccepted = true;
             var deadline = DateTimeOffset.UtcNow.AddMilliseconds(
                 Math.Max(750, config.ResponseTimeoutMs));
             while (DateTimeOffset.UtcNow < deadline)
             {
                 await Task.Delay(PollInterval, token).ConfigureAwait(false);
-                if (command == RemoteCommand.Display)
+                if (confirmsThroughDisplay)
                 {
                     var displayAfter = ValidateDisplay(
                         await GetDisplayTextAsync(config, token).ConfigureAwait(false));
@@ -846,12 +1241,18 @@ internal sealed class ExpertAmpServerControl : IDisposable
                         && displayAfter.Sequence > displayBefore.Sequence
                         && DisplayContentChanged(displayBefore, displayAfter))
                     {
+                        var state = command == RemoteCommand.Display
+                            ? "display-page-changed"
+                            : $"{ButtonName(command)}-confirmed";
+                        var message = command == RemoteCommand.Display
+                            ? "The Taurus confirmed a new display page."
+                            : $"The Taurus display confirmed {ButtonName(command).ToUpperInvariant()}.";
                         return new(
                             true,
                             true,
                             true,
-                            "display-page-changed",
-                            "The Taurus confirmed a new display page.",
+                            state,
+                            message,
                             ToPanelStatus(config, before));
                     }
                     continue;
@@ -871,33 +1272,49 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 }
             }
 
-            return Ambiguous(
+            return AcceptedUnconfirmed(
                 $"{ButtonName(command)}-unconfirmed",
-                $"{ButtonName(command).ToUpperInvariant()} was sent exactly once, but the new state was not confirmed; it was not repeated.");
+                $"Expert Amp Server accepted {ButtonName(command).ToUpperInvariant()} exactly once, but the new state is still unconfirmed; it was not repeated.",
+                ToPanelStatus(config, before));
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return writeAttempted
+            return writeAccepted
+                ? AcceptedUnconfirmed(
+                    $"{ButtonName(command)}-unconfirmed",
+                    $"Expert Amp Server accepted {ButtonName(command).ToUpperInvariant()} exactly once, but confirmation timed out; it was not repeated.",
+                    before is null ? null : ToPanelStatus(initialConfig, before))
+                : writeAttempted
                 ? Ambiguous(
                     $"{ButtonName(command)}-unconfirmed",
-                    $"{ButtonName(command).ToUpperInvariant()} was sent exactly once, but confirmation timed out; it was not repeated.")
+                    $"{ButtonName(command).ToUpperInvariant()} write outcome is ambiguous because no server acceptance response arrived; it was not repeated.")
                 : Blocked(ButtonName(command), "The command timed out before it was sent.");
         }
         catch (OperationCanceledException)
         {
             if (!writeAttempted) throw;
-            return Ambiguous(
-                $"{ButtonName(command)}-unconfirmed",
-                $"{ButtonName(command).ToUpperInvariant()} was sent exactly once, but cancellation left its outcome unknown; it was not repeated.");
+            return writeAccepted
+                ? AcceptedUnconfirmed(
+                    $"{ButtonName(command)}-unconfirmed",
+                    $"Expert Amp Server accepted {ButtonName(command).ToUpperInvariant()} exactly once, but cancellation prevented confirmation; it was not repeated.",
+                    before is null ? null : ToPanelStatus(initialConfig, before))
+                : Ambiguous(
+                    $"{ButtonName(command)}-unconfirmed",
+                    $"{ButtonName(command).ToUpperInvariant()} write outcome is ambiguous because cancellation occurred before server acceptance was known; it was not repeated.");
         }
         catch (Exception ex) when (
             ex is HttpRequestException or InvalidDataException or TimeoutException)
         {
             _log.LogWarning(ex, "spe-taurus.expert-server {Command} failed", ButtonName(command));
-            return writeAttempted
+            return writeAccepted
+                ? AcceptedUnconfirmed(
+                    $"{ButtonName(command)}-unconfirmed",
+                    $"Expert Amp Server accepted {ButtonName(command).ToUpperInvariant()} exactly once, but later confirmation failed; it was not repeated. {ex.Message}",
+                    before is null ? null : ToPanelStatus(initialConfig, before))
+                : writeAttempted
                 ? Ambiguous(
                     $"{ButtonName(command)}-unconfirmed",
-                    $"{ButtonName(command).ToUpperInvariant()} outcome is ambiguous; it was not repeated. {ex.Message}")
+                    $"{ButtonName(command).ToUpperInvariant()} write outcome is ambiguous because server acceptance was not established; it was not repeated. {ex.Message}")
                 : Blocked(ButtonName(command), ex.Message);
         }
         finally
@@ -921,6 +1338,8 @@ internal sealed class ExpertAmpServerControl : IDisposable
         var monitorToken = configIo.Token;
         var client = _httpClientFactory.CreateClient(
             ExpertAmpServerTunePreflight.HttpClientName);
+        DateTimeOffset? clearSince = null;
+        DateTimeOffset? degradedSince = null;
         while (true)
         {
             if (!carrierStillOn())
@@ -930,37 +1349,92 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 throw new InvalidDataException(
                     "The Taurus feature or Expert Amp Server configuration changed while tuning.");
 
-            using var sampleTimeout = CancellationTokenSource.CreateLinkedTokenSource(
-                monitorToken);
-            sampleTimeout.CancelAfter(expectedConfig.ConnectTimeoutMs);
-            var sampleToken = sampleTimeout.Token;
-            var status = await GetStatusAsync(expectedConfig, sampleToken)
-                .ConfigureAwait(false);
-            if (!status.RecentContact || !HasAuthoritativeStatus(status))
-                throw new InvalidDataException(
-                    "Expert Amp Server lost fresh protocol-native Taurus status while tuning.");
-            if (!IsExpectedTaurus(status))
-                throw new InvalidDataException(
-                    "Expert Amp Server lost confirmed SPE Expert 1.5K Taurus identity while tuning.");
-            if (!string.Equals(
-                    OperatingState(status),
-                    "standby",
-                    StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException(
-                    "The amplifier left STANDBY while tuning; Zeus stopped the carrier.");
-            if (status.Tx is null)
-                throw new InvalidDataException(
-                    "The Taurus transmit state became unknown while tuning; Zeus stopped the carrier.");
-            var alarm = AlarmText(status);
-            if (alarm.Length > 0)
-                throw new InvalidDataException(
-                    $"The Taurus reported an alarm while tuning ({alarm}); Zeus stopped the carrier.");
+            // A degraded sample is debounced; only a sustained one ends the
+            // cycle. Ending it early used to abort the whole tune and leave the
+            // amplifier stranded in STANDBY over a single lagging poll.
+            string? degraded = null;
+            var degradedIsHazard = false;
+            var displayTune = false;
+            try
+            {
+                using var sampleTimeout = CancellationTokenSource.CreateLinkedTokenSource(
+                    monitorToken);
+                sampleTimeout.CancelAfter(expectedConfig.ConnectTimeoutMs);
+                var sampleToken = sampleTimeout.Token;
+                var status = await GetStatusAsync(expectedConfig, sampleToken)
+                    .ConfigureAwait(false);
 
-            var display = await GetDisplayEvidenceAsync(
-                client,
-                expectedConfig.ExpertServerUrl,
-                sampleToken).ConfigureAwait(false);
-            if (!display.Tune) return;
+                // An alarm is a real hazard, never a stale reading. Stop RF on
+                // the first sample that reports one.
+                var alarm = AlarmText(status);
+                if (alarm.Length > 0)
+                    throw new SpeTaurusAmplifierHazardException(
+                        $"The Taurus reported an alarm while tuning ({alarm}); Zeus stopped the carrier.");
+
+                if (!status.RecentContact || !HasAuthoritativeStatus(status))
+                    degraded =
+                        "Expert Amp Server lost fresh protocol-native Taurus status while tuning.";
+                else if (!IsExpectedTaurus(status))
+                    degraded =
+                        "Expert Amp Server lost confirmed SPE Expert 1.5K Taurus identity while tuning.";
+                else if (!string.Equals(
+                        OperatingState(status),
+                        "standby",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // The amplifier moved out of the STANDBY safety boundary on
+                    // its own while Zeus owned RF. That is an amplifier-side
+                    // hazard, not a status-quality problem.
+                    degraded =
+                        "The amplifier left STANDBY while tuning; Zeus stopped the carrier.";
+                    degradedIsHazard = true;
+                }
+                else if (status.Tx is null)
+                    degraded =
+                        "The Taurus transmit state became unknown while tuning; Zeus stopped the carrier.";
+
+                if (degraded is null)
+                {
+                    var display = await GetDisplayEvidenceAsync(
+                        client,
+                        expectedConfig.ExpertServerUrl,
+                        sampleToken).ConfigureAwait(false);
+                    displayTune = display.Tune;
+                }
+            }
+            catch (Exception ex) when (
+                ex is HttpRequestException or TimeoutException
+                || (ex is OperationCanceledException && !monitorToken.IsCancellationRequested))
+            {
+                degraded = $"Zeus lost fresh Taurus status while tuning: {ex.Message}";
+            }
+
+            if (degraded is not null)
+            {
+                degradedSince ??= DateTimeOffset.UtcNow;
+                if (DateTimeOffset.UtcNow - degradedSince >= TransientStatusTolerance)
+                    throw degradedIsHazard
+                        ? new SpeTaurusAmplifierHazardException(degraded)
+                        : (Exception)new InvalidDataException(degraded);
+                // Tune completion is only ever concluded from a continuously
+                // observed clear run. A blind gap invalidates the run in
+                // progress rather than counting toward it.
+                clearSince = null;
+                await Task.Delay(PollInterval, monitorToken).ConfigureAwait(false);
+                continue;
+            }
+
+            degradedSince = null;
+            if (displayTune)
+            {
+                clearSince = null;
+            }
+            else
+            {
+                clearSince ??= DateTimeOffset.UtcNow;
+                if (DateTimeOffset.UtcNow - clearSince >= TuneClearConfirmation)
+                    return;
+            }
             await Task.Delay(PollInterval, monitorToken).ConfigureAwait(false);
         }
     }
@@ -1198,7 +1672,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
             return status;
         }
         if (HasConfirmedTaurusIdentity(expectedConfig))
-            return status with { ModelName = "EXPERT 1.5K TAURUS" };
+            return status with { ModelName = ExpertAmpServerEvidence.TaurusDisplayBanner };
         try
         {
             var display = await GetDisplayEvidenceAsync(
@@ -1207,7 +1681,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 cancellationToken).ConfigureAwait(false);
             if (!display.TaurusIdentity) return status;
             RememberTaurusIdentity(expectedConfig);
-            return status with { ModelName = "EXPERT 1.5K TAURUS" };
+            return status with { ModelName = ExpertAmpServerEvidence.TaurusDisplayBanner };
         }
         catch (Exception ex) when (ex is InvalidDataException or HttpRequestException)
         {
@@ -1230,7 +1704,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
             && HasAuthoritativeStatus(status)
             && CanUseDisplayIdentityFallback(status.ModelName)
             && HasConfirmedTaurusIdentity(expectedConfig)
-                ? status with { ModelName = "EXPERT 1.5K TAURUS" }
+                ? status with { ModelName = ExpertAmpServerEvidence.TaurusDisplayBanner }
                 : status;
     }
 
@@ -1318,7 +1792,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 "Expert Amp Server did not provide checksum-valid Taurus display evidence.");
         return new(
             flags.Leds.Tune,
-            frame.ScreenText?.Contains("EXPERT 1.5K TAURUS", StringComparison.OrdinalIgnoreCase) == true);
+            ExpertAmpServerEvidence.HasTaurusDisplayBanner(frame.ScreenText));
     }
 
     private async Task<ExpertDisplayText> GetDisplayTextAsync(
@@ -1337,7 +1811,9 @@ internal sealed class ExpertAmpServerControl : IDisposable
             .ConfigureAwait(false);
     }
 
-    private static SpeDisplayText ValidateDisplay(ExpertDisplayText display)
+    private static SpeDisplayText ValidateDisplay(
+        ExpertDisplayText display,
+        bool tuneActive = false)
     {
         if (display.Rows is null || display.Rows.Length != 8
             || display.Rows.Any(row => row is null || row.Length != 40))
@@ -1378,13 +1854,16 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 "Expert Amp Server returned a future-dated Taurus display frame.");
         var source = (display.Source ?? "").Trim();
         var model = (display.ModelName ?? "").Trim();
-        if (source.Length == 0
-            || !source.StartsWith("serial", StringComparison.OrdinalIgnoreCase)
-            || !model.Contains("TAURUS", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException(
-                "Expert Amp Server display is not serial evidence from an SPE Expert Taurus.");
         var selected = display.SelectedText ?? "";
-        var screen = display.ScreenText ?? "";
+        var screen = string.IsNullOrWhiteSpace(display.ScreenText)
+            ? string.Join('\n', display.Rows)
+            : display.ScreenText;
+        if (source.Length == 0
+            || !source.StartsWith("serial", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException(
+                "Expert Amp Server display is not serial amplifier evidence.");
+        if (model.Length == 0 && ExpertAmpServerEvidence.HasTaurusDisplayBanner(screen))
+            model = ExpertAmpServerEvidence.TaurusDisplayBanner;
         if (selected.Length > 320 || screen.Length > 1024 || source.Length > 128 || model.Length > 128)
             throw new InvalidDataException("Expert Amp Server returned oversized display text.");
 
@@ -1396,7 +1875,8 @@ internal sealed class ExpertAmpServerControl : IDisposable
             updatedAt,
             source,
             model,
-            screen);
+            screen,
+            tuneActive);
     }
 
     private SpeRemoteActionResult? RemotePowerUnavailable(
@@ -1429,6 +1909,12 @@ internal sealed class ExpertAmpServerControl : IDisposable
 
     private static SpeRemoteActionResult Ambiguous(string state, string message) =>
         new(false, true, false, state, message, null);
+
+    private static SpeRemoteActionResult AcceptedUnconfirmed(
+        string state,
+        string message,
+        SpeTaurusStatus? status) =>
+        new(true, true, false, state, message, status);
 
     private SpeRemoteActionResult AmbiguousRemotePower(
         SpeTaurusConfig config,
@@ -1519,6 +2005,17 @@ internal sealed class ExpertAmpServerControl : IDisposable
         && HasAuthoritativeStatus(status)
         && IsExpectedTaurus(status)
         && status.Tx is false;
+
+    private static bool RequiresStandbyPanelControl(RemoteCommand command) =>
+        command is RemoteCommand.BandDown
+            or RemoteCommand.BandUp
+            or RemoteCommand.InductanceDown
+            or RemoteCommand.InductanceUp
+            or RemoteCommand.CapacitanceDown
+            or RemoteCommand.CapacitanceUp
+            or RemoteCommand.LeftUp
+            or RemoteCommand.RightDown
+            or RemoteCommand.Set;
 
     private static string? UnsafeControlReason(
         ExpertStatus status,
@@ -1714,42 +2211,24 @@ internal sealed class ExpertAmpServerControl : IDisposable
             status.LastContactAt);
 
     private static bool IsExpectedTaurus(ExpertStatus status) =>
-        status.ModelName?.Contains("TAURUS", StringComparison.OrdinalIgnoreCase) == true;
+        ExpertAmpServerEvidence.MentionsTaurus(status.ModelName);
 
     private static bool CanUseDisplayIdentityFallback(string? modelName) =>
-        string.IsNullOrWhiteSpace(modelName)
-        || modelName.Contains("1.5K-FA", StringComparison.OrdinalIgnoreCase);
+        ExpertAmpServerEvidence.CanUseDisplayIdentityFallback(modelName);
 
-    private bool HasConfirmedTaurusIdentity(SpeTaurusConfig config)
-    {
-        lock (_identityGate)
-            return ReferenceEquals(_confirmedIdentityConfig, config);
-    }
+    // Identity lives on SpeTaurusService, the owner of the config epoch, so the
+    // TUNE preflight shares this confirmation instead of re-earning it from a
+    // display banner that is absent from most frames.
+    private bool HasConfirmedTaurusIdentity(SpeTaurusConfig config) =>
+        _taurus.HasConfirmedTaurusIdentity(config);
 
-    private void RememberTaurusIdentity(SpeTaurusConfig config)
-    {
-        lock (_identityGate)
-        {
-            if (ReferenceEquals(config, _taurus.Config))
-                _confirmedIdentityConfig = config;
-        }
-    }
+    private void RememberTaurusIdentity(SpeTaurusConfig config) =>
+        _taurus.RememberTaurusIdentity(config);
 
-    private void ForgetTaurusIdentity(SpeTaurusConfig config)
-    {
-        lock (_identityGate)
-        {
-            if (ReferenceEquals(_confirmedIdentityConfig, config)
-                || ReferenceEquals(config, _taurus.Config))
-                _confirmedIdentityConfig = null;
-        }
-    }
+    private void ForgetTaurusIdentity(SpeTaurusConfig config) =>
+        _taurus.ForgetTaurusIdentity(config);
 
-    private void ForgetTaurusIdentity()
-    {
-        lock (_identityGate)
-            _confirmedIdentityConfig = null;
-    }
+    private void ForgetTaurusIdentity() => _taurus.ForgetTaurusIdentity();
 
     private static string AlarmText(ExpertStatus status) => FirstNonBlank(
         status.AlarmsText?.FirstOrDefault(),
@@ -1773,6 +2252,15 @@ internal sealed class ExpertAmpServerControl : IDisposable
         RemoteCommand.Off => "off",
         RemoteCommand.Display => "display",
         RemoteCommand.Cat => "cat",
+        RemoteCommand.BandDown => "band-",
+        RemoteCommand.BandUp => "band+",
+        RemoteCommand.InductanceDown => "l-",
+        RemoteCommand.InductanceUp => "l+",
+        RemoteCommand.CapacitanceDown => "c-",
+        RemoteCommand.CapacitanceUp => "c+",
+        RemoteCommand.LeftUp => "left",
+        RemoteCommand.RightDown => "right",
+        RemoteCommand.Set => "set",
         _ => "tune",
     };
 
@@ -1870,6 +2358,15 @@ internal sealed class ExpertAmpServerControl : IDisposable
         Off,
         Display,
         Cat,
+        BandDown,
+        BandUp,
+        InductanceDown,
+        InductanceUp,
+        CapacitanceDown,
+        CapacitanceUp,
+        LeftUp,
+        RightDown,
+        Set,
     }
 
     private sealed record ExpertEnvelope<T>(

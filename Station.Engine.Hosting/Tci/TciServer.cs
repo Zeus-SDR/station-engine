@@ -330,28 +330,26 @@ public sealed class TciServer : IHostedService, IDisposable
         var transverter = _transverterSettings.GetForConnectedRadio(_layouts, _radio);
 
         // VFO/DDS events can fire rapidly during tuning, so retain the existing
-        // per-session coalescing while translating only at the TCI boundary.
+        // per-session coalescing. State is already operator-facing external RF;
+        // IF translation belongs exclusively to the hardware egress seam.
         BroadcastRateLimited(
             "vfo:0,0",
             TciProtocol.Command(
-                "vfo", 0, 0, TransverterFrequencyConverter.ToRfHz(state.VfoHz, transverter)));
+                "vfo", 0, 0, state.VfoHz));
         BroadcastRateLimited(
             "vfo:0,1",
             TciProtocol.Command(
                 "vfo",
                 0,
                 1,
-                TransverterFrequencyConverter.ToRfHz(
-                    RadioFrequencyResolver.TxDialFrequencyHz(state), transverter)));
+                RadioFrequencyResolver.TxDialFrequencyHz(state)));
         BroadcastRateLimited(
             "dds:0",
             TciProtocol.Command(
                 "dds",
                 0,
-                TransverterFrequencyConverter.ToRfHz(
-                    CwOffset.EffectiveLoHz(state), transverter)));
-        var txFrequencyHz = TransverterFrequencyConverter.ToRfHz(
-            RadioFrequencyResolver.TxFrequencyHz(state), transverter);
+                CwOffset.EffectiveLoHz(state)));
+        var txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(state);
         Broadcast(TciProtocol.Command("tx_frequency", txFrequencyHz));
         Broadcast(TciExtendedFrequency.Command(
             txFrequencyHz,
@@ -360,12 +358,18 @@ public sealed class TciServer : IHostedService, IDisposable
 
         if (includeVfoLimits)
         {
+            long minimumVfoHz = TransverterFrequencyConverter.MinimumRadioFrequencyHz;
+            long maximumVfoHz = TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+            if (transverter.Enabled
+                && TransverterFrequencyConverter.TryResolveActiveBand(transverter, out var activeBand))
+            {
+                minimumVfoHz = activeBand.BeginFrequencyHz;
+                maximumVfoHz = activeBand.EndFrequencyHz;
+            }
             Broadcast(TciProtocol.Command(
                 "vfo_limits",
-                TransverterFrequencyConverter.ToRfHz(
-                    TransverterFrequencyConverter.MinimumRadioFrequencyHz, transverter),
-                TransverterFrequencyConverter.ToRfHz(
-                    TransverterFrequencyConverter.MaximumRadioFrequencyHz, transverter)));
+                minimumVfoHz,
+                maximumVfoHz));
         }
     }
 

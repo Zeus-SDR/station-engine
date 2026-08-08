@@ -41,6 +41,82 @@
  * upstream change without truncating real output. */
 #define ZR_MAX_FRAMES_PER_RX 64
 
+/* Local pi constant instead of M_PI: MSVC only defines M_PI under
+ * _USE_MATH_DEFINES, which the shared CMakeLists doesn't set. */
+#define ZR_PI 3.14159265358979323846f
+
+/* Mic AGC: block RMS -> desired linear gain, smoothed onto the block. Fast
+ * attack turns a hot mic down before it clips the encoder; slow release
+ * avoids audible gain-pumping between syllables. */
+#define ZR_AGC_MIN_GAIN  0.125f  /* -18 dB floor */
+#define ZR_AGC_MAX_GAIN  8.0f    /* +18 dB ceiling */
+#define ZR_AGC_ATTACK_S  0.010f
+#define ZR_AGC_RELEASE_S 0.300f
+#define ZR_MIC_AGC_DEFAULT_TARGET_DB -18.0f
+
+/* Direct-Form-I-transposed biquad, used for the fixed 3-band mic EQ. */
+typedef struct { float b0, b1, b2, a1, a2, z1, z2; } zr_biquad;
+
+static float zr_biquad_process(zr_biquad *bq, float x)
+{
+    float y = bq->b0 * x + bq->z1;
+    bq->z1 = bq->b1 * x - bq->a1 * y + bq->z2;
+    bq->z2 = bq->b2 * x - bq->a2 * y;
+    return y;
+}
+
+/* RBJ Audio EQ Cookbook shelf/peaking filters. sr/fc in Hz, gain_db the
+ * band gain, s the shelf slope (1.0 = gentle), q the peaking Q. */
+static void zr_biquad_low_shelf(zr_biquad *bq, float fc, float sr, float gain_db, float s)
+{
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * ZR_PI * fc / sr;
+    float cosw0 = cosf(w0), sinw0 = sinf(w0);
+    float alpha = sinw0 / 2.0f * sqrtf((A + 1.0f / A) * (1.0f / s - 1.0f) + 2.0f);
+    float sqrtA2alpha = 2.0f * sqrtf(A) * alpha;
+    float b0 =      A * ((A + 1) - (A - 1) * cosw0 + sqrtA2alpha);
+    float b1 =  2 * A * ((A - 1) - (A + 1) * cosw0);
+    float b2 =      A * ((A + 1) - (A - 1) * cosw0 - sqrtA2alpha);
+    float a0 =          (A + 1) + (A - 1) * cosw0 + sqrtA2alpha;
+    float a1 =     -2 * ((A - 1) + (A + 1) * cosw0);
+    float a2 =          (A + 1) + (A - 1) * cosw0 - sqrtA2alpha;
+    bq->b0 = b0 / a0; bq->b1 = b1 / a0; bq->b2 = b2 / a0;
+    bq->a1 = a1 / a0; bq->a2 = a2 / a0;
+}
+
+static void zr_biquad_high_shelf(zr_biquad *bq, float fc, float sr, float gain_db, float s)
+{
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * ZR_PI * fc / sr;
+    float cosw0 = cosf(w0), sinw0 = sinf(w0);
+    float alpha = sinw0 / 2.0f * sqrtf((A + 1.0f / A) * (1.0f / s - 1.0f) + 2.0f);
+    float sqrtA2alpha = 2.0f * sqrtf(A) * alpha;
+    float b0 =      A * ((A + 1) + (A - 1) * cosw0 + sqrtA2alpha);
+    float b1 = -2 * A * ((A - 1) + (A + 1) * cosw0);
+    float b2 =      A * ((A + 1) + (A - 1) * cosw0 - sqrtA2alpha);
+    float a0 =          (A + 1) - (A - 1) * cosw0 + sqrtA2alpha;
+    float a1 =      2 * ((A - 1) - (A + 1) * cosw0);
+    float a2 =          (A + 1) - (A - 1) * cosw0 - sqrtA2alpha;
+    bq->b0 = b0 / a0; bq->b1 = b1 / a0; bq->b2 = b2 / a0;
+    bq->a1 = a1 / a0; bq->a2 = a2 / a0;
+}
+
+static void zr_biquad_peaking(zr_biquad *bq, float fc, float sr, float gain_db, float q)
+{
+    float A = powf(10.0f, gain_db / 40.0f);
+    float w0 = 2.0f * ZR_PI * fc / sr;
+    float cosw0 = cosf(w0), sinw0 = sinf(w0);
+    float alpha = sinw0 / (2.0f * q);
+    float b0 = 1 + alpha * A;
+    float b1 = -2 * cosw0;
+    float b2 = 1 - alpha * A;
+    float a0 = 1 + alpha / A;
+    float a1 = -2 * cosw0;
+    float a2 = 1 - alpha / A;
+    bq->b0 = b0 / a0; bq->b1 = b1 / a0; bq->b2 = b2 / a0;
+    bq->a1 = a1 / a0; bq->a2 = a2 / a0;
+}
+
 /* OPUS_DISABLE_INTRINSICS build: the runtime CPU-dispatch arch is the scalar
  * path (0). The whole library is built scalar/portable, so 0 is correct on every
  * target; a future SIMD build would pass opus_select_arch() here instead. */
@@ -70,7 +146,25 @@ struct zeus_rade {
     float tx_feat[ZR_MAX_FRAMES_PER_RX * NB_TOTAL_FEATURES]; /* features for one tx call */
     rade_text_t  txt_tx;  /* reliable-text encoder for the EOO callsign */
     float eoo_tx_bits[1024]; /* EOO symbol payload handed to rade_tx_set_eoo_bits */
+
+    /* TX-side mic tap meters, refreshed each zeus_rade_tx() call. */
+    float tx_mic_peak;      /* most recent block's peak |sample| / 32768 */
+    int   tx_mic_clip_hold; /* samples remaining in the ~500ms clip-hold window */
+
+    /* Pre-encoder mic conditioning (TX-side), off by default. */
+    int   mic_agc_enabled;
+    float mic_agc_target_lin; /* linear target RMS, derived from a dBFS setter */
+    float mic_agc_gain;       /* smoothed linear gain, persists across tx calls */
+    int   mic_eq_enabled;
+    zr_biquad eq_bass, eq_mid, eq_treble;
+    float mic_float_scratch[ZR_MAX_FRAMES_PER_RX * LPCNET_FRAME_SIZE];
+    short mic_scratch[ZR_MAX_FRAMES_PER_RX * LPCNET_FRAME_SIZE];
 };
+
+/* ~500ms of held "clipped" state at the 16 kHz speech rate, so a single
+ * full-scale sample is visible on a UI meter instead of flickering for one
+ * block. */
+#define ZR_MIC_CLIP_HOLD_SAMPLES 8000
 
 /* rade_text RX callback: a full, CRC-validated callsign was decoded. */
 static void zr_on_text_rx(rade_text_t rt, const char *txt, int length, void *state)
@@ -121,6 +215,16 @@ zeus_rade *zeus_rade_open(void)
     if (z->txt_rx) rade_text_set_rx_callback(z->txt_rx, zr_on_text_rx, z);
     z->txt_tx = rade_text_create();
 
+    /* Mic conditioning: off by default; flat EQ + unity AGC gain so an
+     * enable-without-a-prior-setter-call is still well-defined. */
+    z->mic_agc_enabled = 0;
+    z->mic_agc_gain = 1.0f;
+    z->mic_agc_target_lin = powf(10.0f, ZR_MIC_AGC_DEFAULT_TARGET_DB / 20.0f);
+    z->mic_eq_enabled = 0;
+    zr_biquad_low_shelf(&z->eq_bass, 200.0f, (float)RADE_SPEECH_SAMPLE_RATE, 0.0f, 1.0f);
+    zr_biquad_peaking(&z->eq_mid, 1000.0f, (float)RADE_SPEECH_SAMPLE_RATE, 0.0f, 0.7f);
+    zr_biquad_high_shelf(&z->eq_treble, 3000.0f, (float)RADE_SPEECH_SAMPLE_RATE, 0.0f, 1.0f);
+
     return z;
 }
 
@@ -144,6 +248,82 @@ int zeus_rade_snr_db(zeus_rade *z)         { return rade_snrdB_3k_est(z->r); }
 int zeus_rade_n_speech_samples(zeus_rade *z) { return z->n_speech; }
 int zeus_rade_n_tx_out(zeus_rade *z)         { return z->n_tx_out; }
 int zeus_rade_n_tx_eoo_out(zeus_rade *z)     { return z->n_tx_eoo_out; }
+
+int zeus_rade_tx_mic_level_db(zeus_rade *z)
+{
+    if (z->tx_mic_peak <= 0.0f) return -120;
+    float db = 20.0f * log10f(z->tx_mic_peak);
+    if (db < -120.0f) db = -120.0f;
+    return (int)lrintf(db);
+}
+
+int zeus_rade_tx_mic_clip(zeus_rade *z) { return z->tx_mic_clip_hold > 0 ? 1 : 0; }
+
+void zeus_rade_set_mic_agc_enabled(zeus_rade *z, int enable) { z->mic_agc_enabled = enable ? 1 : 0; }
+
+void zeus_rade_set_mic_agc_target_db(zeus_rade *z, float target_dbfs)
+{
+    z->mic_agc_target_lin = powf(10.0f, target_dbfs / 20.0f);
+}
+
+void zeus_rade_set_mic_eq_enabled(zeus_rade *z, int enable) { z->mic_eq_enabled = enable ? 1 : 0; }
+
+void zeus_rade_set_mic_eq_bass_db(zeus_rade *z, float gain_db)
+{
+    zr_biquad_low_shelf(&z->eq_bass, 200.0f, (float)RADE_SPEECH_SAMPLE_RATE, gain_db, 1.0f);
+}
+
+void zeus_rade_set_mic_eq_mid_db(zeus_rade *z, float gain_db)
+{
+    zr_biquad_peaking(&z->eq_mid, 1000.0f, (float)RADE_SPEECH_SAMPLE_RATE, gain_db, 0.7f);
+}
+
+void zeus_rade_set_mic_eq_treble_db(zeus_rade *z, float gain_db)
+{
+    zr_biquad_high_shelf(&z->eq_treble, 3000.0f, (float)RADE_SPEECH_SAMPLE_RATE, gain_db, 1.0f);
+}
+
+/* Shape (EQ) then level (AGC) — a conventional mic-processing order. Only
+ * called when at least one stage is enabled; writes n conditioned samples to
+ * z->mic_scratch, leaving pcm_in untouched (the mic meter reads the raw tap). */
+static void zr_condition_mic(zeus_rade *z, const short *pcm_in, int n)
+{
+    float *f = z->mic_float_scratch;
+    for (int i = 0; i < n; i++) f[i] = pcm_in[i] * (1.0f / 32768.0f);
+
+    if (z->mic_eq_enabled) {
+        for (int i = 0; i < n; i++) {
+            float x = f[i];
+            x = zr_biquad_process(&z->eq_bass, x);
+            x = zr_biquad_process(&z->eq_mid, x);
+            x = zr_biquad_process(&z->eq_treble, x);
+            f[i] = x;
+        }
+    }
+
+    if (z->mic_agc_enabled) {
+        double sumsq = 0.0;
+        for (int i = 0; i < n; i++) sumsq += (double)f[i] * (double)f[i];
+        float rms = (float)sqrt(sumsq / (n > 0 ? n : 1));
+        float desired = rms > 1e-6f ? z->mic_agc_target_lin / rms : z->mic_agc_gain;
+        if (desired > ZR_AGC_MAX_GAIN) desired = ZR_AGC_MAX_GAIN;
+        if (desired < ZR_AGC_MIN_GAIN) desired = ZR_AGC_MIN_GAIN;
+        /* Smooth the GAIN (not each sample) toward `desired`: attack when
+         * turning down (mic too hot), release when turning up (mic too quiet). */
+        float dt = n / (float)RADE_SPEECH_SAMPLE_RATE;
+        float tau = (desired < z->mic_agc_gain) ? ZR_AGC_ATTACK_S : ZR_AGC_RELEASE_S;
+        float coeff = 1.0f - expf(-dt / tau);
+        z->mic_agc_gain += (desired - z->mic_agc_gain) * coeff;
+        for (int i = 0; i < n; i++) f[i] *= z->mic_agc_gain;
+    }
+
+    for (int i = 0; i < n; i++) {
+        float s = f[i] * 32768.0f;
+        if (s >  32767.0f) s =  32767.0f;
+        if (s < -32768.0f) s = -32768.0f;
+        z->mic_scratch[i] = (short)lrintf(s);
+    }
+}
 
 int zeus_rade_get_eoo_callsign(zeus_rade *z, char *callsign_out)
 {
@@ -211,16 +391,47 @@ int zeus_rade_rx(zeus_rade *z, const RADE_COMP *rx_in, short *pcm_out)
 
 /* ---- Transmit ---------------------------------------------------------- */
 
+/* Scan one TX call's mic PCM for the block peak and clip-hold state. Cheap
+ * (one pass, no allocation) — safe to call every zeus_rade_tx(). */
+static void zr_update_mic_meter(zeus_rade *z, const short *pcm_in, int n)
+{
+    int peak = 0;
+    int clipped = 0;
+    for (int i = 0; i < n; i++) {
+        int s = pcm_in[i];
+        int a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+        if (a >= 32767) clipped = 1;
+    }
+    z->tx_mic_peak = peak / 32768.0f;
+    if (clipped) z->tx_mic_clip_hold = ZR_MIC_CLIP_HOLD_SAMPLES;
+    else {
+        z->tx_mic_clip_hold -= n;
+        if (z->tx_mic_clip_hold < 0) z->tx_mic_clip_hold = 0;
+    }
+}
+
 int zeus_rade_tx(zeus_rade *z, const short *pcm_in, RADE_COMP *tx_out)
 {
     if (!z->enc) return 0;
     int frames = z->n_features / NB_TOTAL_FEATURES;
     if (frames > ZR_MAX_FRAMES_PER_RX) frames = ZR_MAX_FRAMES_PER_RX;
+    int n = frames * LPCNET_FRAME_SIZE;
+    zr_update_mic_meter(z, pcm_in, n);
+
+    /* The meter above always reads the raw mic tap; conditioning (if enabled)
+     * runs on a separate scratch buffer so pcm_in itself is never mutated. */
+    const short *speech = pcm_in;
+    if (z->mic_eq_enabled || z->mic_agc_enabled) {
+        zr_condition_mic(z, pcm_in, n);
+        speech = z->mic_scratch;
+    }
+
     /* Analyze each 160-sample speech frame into 36 features, contiguously, so the
      * block matches rade_tx's expected n_features layout. */
     for (int f = 0; f < frames; f++) {
         lpcnet_compute_single_frame_features(
-            z->enc, pcm_in + (size_t)f * LPCNET_FRAME_SIZE,
+            z->enc, speech + (size_t)f * LPCNET_FRAME_SIZE,
             &z->tx_feat[f * NB_TOTAL_FEATURES], ZR_ARCH);
     }
     return rade_tx(z->r, tx_out, z->tx_feat);

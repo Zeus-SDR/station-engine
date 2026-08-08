@@ -29,6 +29,10 @@ public sealed class CwSettingsStore : IDisposable
     public const int DefaultWpm = 22;
     public const double DefaultSidetoneGainDb = -10.0;
     public const int DefaultSidetoneHz = 600;
+    public const bool DefaultBreakIn = true;
+    public const int DefaultHangMs = 300;
+    public const int DefaultWeight = 50;
+    public const bool DefaultPaddleReverse = false;
     /// <summary>Default-safe keyer mode. Straight means the HL2 gateware
     /// passes the key line through directly and ignores keyer speed — a
     /// straight/bug key is never mis-keyed as a paddle. Iambic is opt-in
@@ -76,7 +80,11 @@ public sealed class CwSettingsStore : IDisposable
                     Macros: (string[])DefaultMacros.Clone(),
                     SidetoneGainDb: DefaultSidetoneGainDb,
                     SidetoneHz: DefaultSidetoneHz,
-                    KeyerMode: DefaultKeyerMode);
+                    KeyerMode: DefaultKeyerMode,
+                    BreakIn: DefaultBreakIn,
+                    HangMs: DefaultHangMs,
+                    Weight: DefaultWeight,
+                    PaddleReverse: DefaultPaddleReverse);
 
             return new CwSettingsDto(
                 Wpm: e.Wpm,
@@ -84,7 +92,11 @@ public sealed class CwSettingsStore : IDisposable
                 Macros: SanitizeStored(e.Macros),
                 SidetoneGainDb: e.SidetoneGainDb,
                 SidetoneHz: e.SidetoneHz,
-                KeyerMode: e.KeyerMode);
+                KeyerMode: e.KeyerMode,
+                BreakIn: e.BreakIn,
+                HangMs: e.HangMs,
+                Weight: e.Weight,
+                PaddleReverse: e.PaddleReverse);
         }
     }
 
@@ -126,6 +138,14 @@ public sealed class CwSettingsStore : IDisposable
                 // Reject out-of-range enum bytes (defensive — only 0/1/2 are
                 // valid gateware modes); fall back to the safe default.
                 entry.KeyerMode = Enum.IsDefined(km) ? km : DefaultKeyerMode;
+            if (req.BreakIn is bool breakIn)
+                entry.BreakIn = breakIn;
+            if (req.HangMs is int hangMs)
+                entry.HangMs = Math.Clamp(hangMs, 0, 1000);
+            if (req.Weight is int weight)
+                entry.Weight = Math.Clamp(weight, 33, 66);
+            if (req.PaddleReverse is bool paddleReverse)
+                entry.PaddleReverse = paddleReverse;
 
             entry.UpdatedUtc = DateTime.UtcNow;
             if (existing is null) _docs.Insert(entry);
@@ -137,7 +157,11 @@ public sealed class CwSettingsStore : IDisposable
                 Macros: SanitizeStored(entry.Macros),
                 SidetoneGainDb: entry.SidetoneGainDb,
                 SidetoneHz: entry.SidetoneHz,
-                KeyerMode: entry.KeyerMode);
+                KeyerMode: entry.KeyerMode,
+                BreakIn: entry.BreakIn,
+                HangMs: entry.HangMs,
+                Weight: entry.Weight,
+                PaddleReverse: entry.PaddleReverse);
         }
     }
 
@@ -151,6 +175,10 @@ public sealed class CwSettingsStore : IDisposable
         SidetoneGainDb = DefaultSidetoneGainDb,
         SidetoneHz = DefaultSidetoneHz,
         KeyerMode = DefaultKeyerMode,
+        BreakIn = DefaultBreakIn,
+        HangMs = DefaultHangMs,
+        Weight = DefaultWeight,
+        PaddleReverse = DefaultPaddleReverse,
     };
 
     /// <summary>Normalise a persisted Macros array on read. LiteDB
@@ -193,5 +221,9 @@ public sealed class CwSettingsEntry
     public double SidetoneGainDb { get; set; } = CwSettingsStore.DefaultSidetoneGainDb;
     public int SidetoneHz { get; set; } = CwSettingsStore.DefaultSidetoneHz;
     public CwKeyerMode KeyerMode { get; set; } = CwSettingsStore.DefaultKeyerMode;
+    public bool BreakIn { get; set; } = CwSettingsStore.DefaultBreakIn;
+    public int HangMs { get; set; } = CwSettingsStore.DefaultHangMs;
+    public int Weight { get; set; } = CwSettingsStore.DefaultWeight;
+    public bool PaddleReverse { get; set; } = CwSettingsStore.DefaultPaddleReverse;
     public DateTime UpdatedUtc { get; set; }
 }

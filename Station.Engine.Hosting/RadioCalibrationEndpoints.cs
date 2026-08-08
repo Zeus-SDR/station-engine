@@ -28,11 +28,26 @@ public static class RadioCalibrationEndpoints
             });
         });
 
+        // referenceHz picks the reference station (issue #47 follow-up): WWV
+        // radiates a continuous carrier on 10 and 15 MHz, and operators who
+        // cannot hear one can usually hear the other. Optional query parameter
+        // so the original bodyless POST still means "10 MHz".
         endpoints.MapPost("/api/radio/frequency-calibration/calibrate", async (
-            FrequencyCalibrationService cal, HttpContext ctx) =>
+            FrequencyCalibrationService cal, HttpContext ctx, double? referenceHz) =>
         {
-            log.LogInformation("api.freqcal.calibrate begin");
-            var result = await cal.CalibrateAsync(ct: ctx.RequestAborted).ConfigureAwait(false);
+            double reference = referenceHz ?? FrequencyCalibrationService.DefaultReferenceFrequencyHz;
+            if (!double.IsFinite(reference) ||
+                reference < FrequencyCalibrationService.MinReferenceFrequencyHz ||
+                reference > FrequencyCalibrationService.MaxReferenceFrequencyHz)
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"referenceHz must be between {FrequencyCalibrationService.MinReferenceFrequencyHz} and {FrequencyCalibrationService.MaxReferenceFrequencyHz}",
+                });
+            }
+
+            log.LogInformation("api.freqcal.calibrate begin ref={Ref}", reference);
+            var result = await cal.CalibrateAsync(reference, ctx.RequestAborted).ConfigureAwait(false);
             log.LogInformation("api.freqcal.calibrate result={Outcome} offset={Off} factor={Factor}",
                 result.Outcome, result.OffsetHz, result.AppliedFactor);
             return Results.Ok(result);

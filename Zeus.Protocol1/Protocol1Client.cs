@@ -99,6 +99,11 @@ public sealed class Protocol1Client : IProtocol1Client
     // desired antenna here (-1 = nothing pending) instead of mutating the live
     // _antenna; it is flushed on the unkey edge in SetMox(false). -1 = none.
     private int _pendingAntenna = -1;
+    // RX-only auxiliary input: 0=base, 1=EXT1, 2=EXT2, 3=XVTR, 4=BYPASS.
+    // This is distinct from _antenna (ANT1/2/3). Changes are relay operations,
+    // so they follow the same no-hot-switch deferral while keyed.
+    private int _rxAuxInput;
+    private int _pendingRxAuxInput = -1;
     // TX-antenna relay select (Config-frame C4[1:0]) — external-port parity audit
     // (GAP-P1-1). Same MOX-deferred discipline as the RX antenna: while keyed the
     // desired TX antenna is stashed in _pendingTxAntenna and applied on the unkey
@@ -123,6 +128,7 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _adcDither;     // 0 / 1
     private int _adcRandom;     // 0 / 1
     private int _boardKind = (int)HpsdrBoardKind.HermesLite2;
+    private int _boardKindSetCount;
     private int _hasN2adr;      // 0 / 1
     private int _mox;           // 0 / 1
     // Separate TUN latch (issue #1325). P1's wire MOX bit rises for both TUN
@@ -134,6 +140,12 @@ public sealed class Protocol1Client : IProtocol1Client
     // calibration) and we send that instead of the percent mapping. Legacy
     // callers that only call SetDrive(percent) keep working untouched.
     private int _driveByteOverride = -1;
+    // Effective PA state (global PA toggle combined with per-band Disable PA)
+    // and independent transverter output enable. Both default to Thetis' normal
+    // HF baseline: PA on, XVTR off.
+    private int _paEnabled = 1;
+    private int _xvtrEnabled;
+    private int _pendingXvtrEnabled = -1;
     // Packed OC masks: bits 0..6 TX, 8..14 RX, 16..22 TUN additive. Written as
     // one int so the TX loop never observes a new-band OcTx with old-band OcTune.
     private int _ocMasksPacked;
@@ -165,11 +177,14 @@ public sealed class Protocol1Client : IProtocol1Client
     // own field. See ControlFrame.CcState.PsTxAttnOnTxDb.
     private int _psTxAttnOnTxDb = int.MinValue;
     // On-board CW keyer config (C&C 0x0B). Speed is the operator's WPM,
-    // mode is CwKeyerMode (0=straight/1=A/2=B). Sent via the round-robin so
+    // mode is CwKeyerMode (0=straight/1=A/2=B), weight is 33..66, and paddle
+    // reverse swaps dit/dah. Sent via the round-robin so
     // a dropped packet self-heals. Default mode 0 (straight) makes the write
     // a no-op until the operator opts into iambic. See zeus-bks.
     private int _cwKeyerSpeedWpm;
     private int _cwKeyerMode; // CwKeyerMode as int for Interlocked
+    private int _cwKeyerWeight = 50;
+    private int _cwKeyerPaddleReverse;
     // TX audio front-end (external-audio-jacks re-port). mic_boost / mic_linein
     // ride the 0x12 frame on codec boards; mic_trs / mic_bias / line_in_gain
     // ride the 0x14 frame on HL2 (read-modify-write — see ControlFrame). All
@@ -219,6 +234,7 @@ public sealed class Protocol1Client : IProtocol1Client
     internal int RxSoftRecoveryAttempts = 2;
     internal int RxRecoveryTransitionGuardWaitMs = 2000;
     internal int PsTransitionDrainMs = 120;
+    private const int HermesConnectHygieneDrainMs = 120;
     // PS feedback watchdog (F4): while PS is armed on C10, zero successfully
     // parsed 4-DDC packets for this long — while datagrams ARE arriving —
     // fires PsFeedbackStalled so RadioService can auto-disarm.
@@ -918,17 +934,36 @@ public sealed class Protocol1Client : IProtocol1Client
     }
 
     private static IEnumerable<LocalIpv4Address> EnumerateLocalIpv4Addresses()
+        => SelectLocalIpv4Addresses(SnapshotNetworkInterfaces());
+
+    private static IEnumerable<NicSnapshot> SnapshotNetworkInterfaces()
     {
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
-            if (nic.OperationalStatus != OperationalStatus.Up) continue;
-            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            var addresses = new List<(IPAddress Address, IPAddress? Mask)>();
             foreach (var uni in nic.GetIPProperties().UnicastAddresses)
+                addresses.Add((uni.Address, uni.IPv4Mask));
+            yield return new NicSnapshot(nic.NetworkInterfaceType, nic.OperationalStatus, addresses);
+        }
+    }
+
+    // Pure projection of NIC snapshots into bind candidates, split out from the
+    // live NetworkInterface enumeration so the tunnel tagging is unit-testable
+    // (see NetworkAddressSelectionTests). A Tunnel-typed NIC (utun/wg/tun/tap)
+    // is tagged IsTunnel so NetworkAddressSelection can rank it behind physical
+    // NICs (#1039); loopback and down interfaces are dropped as before.
+    internal static IEnumerable<LocalIpv4Address> SelectLocalIpv4Addresses(IEnumerable<NicSnapshot> nics)
+    {
+        foreach (var nic in nics)
+        {
+            if (nic.Status != OperationalStatus.Up) continue;
+            if (nic.Type == NetworkInterfaceType.Loopback) continue;
+            var isTunnel = nic.Type == NetworkInterfaceType.Tunnel;
+            foreach (var (address, mask) in nic.UnicastAddresses)
             {
-                if (uni.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                var mask = uni.IPv4Mask;
+                if (address.AddressFamily != AddressFamily.InterNetwork) continue;
                 if (mask is null || mask.Equals(IPAddress.Any)) continue;
-                yield return new LocalIpv4Address(uni.Address, mask);
+                yield return new LocalIpv4Address(address, mask, isTunnel);
             }
         }
     }
@@ -980,6 +1015,20 @@ public sealed class Protocol1Client : IProtocol1Client
         // RX/TX after the endpoint has already returned Connected.
         _loopCts = new CancellationTokenSource();
 
+        // A vanished prior host can leave Hermes streaming to a closed UDP
+        // port. Windows then returns ICMP port-unreachable, which Hermes
+        // Rx_MAC handles by clearing `run` unconditionally. If a bare start
+        // wins the race with that late ICMP, the ICMP stops the new session
+        // and another start alone can repeat the race. Stop redundantly,
+        // allow the old traffic/ICMP exchange to settle, and discard queued
+        // datagrams before issuing the first start for the new endpoint.
+        if (BoardKind == HpsdrBoardKind.Hermes)
+        {
+            SendStartStop(start: false);
+            await Task.Delay(HermesConnectHygieneDrainMs, ct).ConfigureAwait(false);
+            FlushReceiveBuffer();
+        }
+
         // Single-ADC Hermes-family (#1302 F2): pre-announce the receiver count in EP2 C&C
         // frames BEFORE the start command — piHPSDR old_protocol_run ordering
         // (old_protocol.c:2887-2905, two double-Config packets before
@@ -991,9 +1040,9 @@ public sealed class Protocol1Client : IProtocol1Client
         // PLL/power). Without this, a radio still holding 4-DDC from a prior
         // armed session would get its count flipped LIVE by our first Config
         // frame — the exact mid-frame length change that permanently
-        // sync-shifts the EP6 stream. Combined with the PsEnabled seeding in
-        // RadioService.ConnectAsync (before StartAsync), a
-        // connect-while-armed starts DIRECTLY in 4-DDC with no transition.
+        // sync-shifts the EP6 stream. RadioService now always seeds PsEnabled
+        // false before StartAsync; persisted arm intent is applied only by the
+        // completed-connect sanitize through the safe live transition below.
         // Gated to boards that change their EP6 frame geometry for PS; every
         // other board's connect wire traffic is unchanged.
         if (UsesP1PsSafeTransition(BoardKind))
@@ -1179,6 +1228,17 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _antenna, (int)ant);
     }
 
+    public void SetRxAuxInput(int input)
+    {
+        int value = input is >= 0 and <= 4 ? input : 0;
+        if (Volatile.Read(ref _mox) != 0)
+        {
+            Interlocked.Exchange(ref _pendingRxAuxInput, value);
+            return;
+        }
+        Interlocked.Exchange(ref _rxAuxInput, value);
+    }
+
     /// <summary>
     /// Select the TX antenna relay (ANT1/2/3) — Config-frame C4[1:0], external-
     /// port parity audit (GAP-P1-1). SAFETY: like <see cref="SetAntennaRx"/>, the
@@ -1198,9 +1258,15 @@ public sealed class Protocol1Client : IProtocol1Client
         }
         Interlocked.Exchange(ref _txAntenna, (int)ant);
     }
-    public void SetBoardKind(HpsdrBoardKind board) => Interlocked.Exchange(ref _boardKind, (int)board);
+    public void SetBoardKind(HpsdrBoardKind board)
+    {
+        Interlocked.Exchange(ref _boardKind, (int)board);
+        Interlocked.Increment(ref _boardKindSetCount);
+    }
 
     public HpsdrBoardKind BoardKind => (HpsdrBoardKind)Volatile.Read(ref _boardKind);
+
+    internal int BoardKindSetCountForTests => Volatile.Read(ref _boardKindSetCount);
     public void SetHasN2adr(bool hasN2adr) => Interlocked.Exchange(ref _hasN2adr, hasN2adr ? 1 : 0);
     public void SetMox(bool on)
     {
@@ -1220,6 +1286,13 @@ public sealed class Protocol1Client : IProtocol1Client
         {
             int pending = Interlocked.Exchange(ref _pendingAntenna, -1);
             if (pending >= 0) Interlocked.Exchange(ref _antenna, pending);
+            int pendingAux = Interlocked.Exchange(ref _pendingRxAuxInput, -1);
+            if (pendingAux >= 0) Interlocked.Exchange(ref _rxAuxInput, pendingAux);
+            int pendingXvtr = Interlocked.Exchange(ref _pendingXvtrEnabled, -1);
+            if (pendingXvtr >= 0)
+            {
+                Interlocked.Exchange(ref _xvtrEnabled, pendingXvtr);
+            }
             // Apply any TX-antenna change deferred while keyed (GAP-P1-1) on the
             // same unkey edge so the relay matrix switches at idle, never under
             // power.
@@ -1232,6 +1305,20 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public void SetDriveByte(byte value) =>
         Interlocked.Exchange(ref _driveByteOverride, value);
+
+    public void SetPaEnabled(bool enabled) =>
+        Interlocked.Exchange(ref _paEnabled, enabled ? 1 : 0);
+
+    public void SetXvtrEnabled(bool enabled)
+    {
+        int value = enabled ? 1 : 0;
+        if (Volatile.Read(ref _mox) != 0)
+        {
+            Interlocked.Exchange(ref _pendingXvtrEnabled, value);
+            return;
+        }
+        Interlocked.Exchange(ref _xvtrEnabled, value);
+    }
 
     public void SetOcMasks(byte txMask, byte rxMask, byte tuneMask) =>
         Interlocked.Exchange(ref _ocMasksPacked, PackOcMasks(txMask, rxMask, tuneMask));
@@ -1270,11 +1357,11 @@ public sealed class Protocol1Client : IProtocol1Client
     /// and permanently sync-shift the radio's EP6 stream — callers with a
     /// live C10 stream MUST use <see cref="SetPsEnabledAsync"/> instead,
     /// which routes the change through the stop/drain/restart transition.
-    /// Legitimate direct uses: seeding the armed state BEFORE
-    /// <see cref="StartAsync"/> (connect-while-armed starts directly in
-    /// 4-DDC), HL2 (MOX-scoped flip is sync-safe in its gateware — fixed
-    /// 512-byte countdown builder, usopenhpsdr1.v:395-480), and boards with
-    /// no P1 PS path (flag is state-tracking only).
+    /// Legitimate direct uses: seeding the disarmed state BEFORE
+    /// <see cref="StartAsync"/> (connect-time arm intent is applied later via
+    /// the safe live transition), HL2 (MOX-scoped flip is sync-safe in its
+    /// gateware — fixed 512-byte countdown builder, usopenhpsdr1.v:395-480),
+    /// and boards with no P1 PS path (flag is state-tracking only).
     /// </remarks>
     public void SetPsEnabled(bool on)
     {
@@ -1661,16 +1748,19 @@ public sealed class Protocol1Client : IProtocol1Client
     }
 
     /// <summary>
-    /// Set the on-board CW keyer config (C&amp;C 0x0B): speed in WPM and the
-    /// keyer mode (straight / iambic A / iambic B). Pushed continuously via
+    /// Set the on-board CW keyer config (C&amp;C 0x0B): speed in WPM, keyer
+    /// mode (straight / iambic A / iambic B), weight, and paddle direction.
+    /// Pushed continuously via
     /// the register round-robin so it survives packet loss; the gateware
     /// ignores speed in straight mode. Driven by RadioService from the
     /// operator's persisted CW settings. See zeus-bks.
     /// </summary>
-    public void SetCwKeyerConfig(int wpm, CwKeyerMode mode)
+    public void SetCwKeyerConfig(int wpm, CwKeyerMode mode, int weight, bool paddleReverse)
     {
         Interlocked.Exchange(ref _cwKeyerSpeedWpm, wpm);
         Interlocked.Exchange(ref _cwKeyerMode, (int)mode);
+        Interlocked.Exchange(ref _cwKeyerWeight, weight);
+        Interlocked.Exchange(ref _cwKeyerPaddleReverse, paddleReverse ? 1 : 0);
     }
 
     /// <summary>
@@ -1876,6 +1966,8 @@ public sealed class Protocol1Client : IProtocol1Client
             PsTxAttnOnTxDb: Volatile.Read(ref _psTxAttnOnTxDb),
             CwKeyerSpeedWpm: Volatile.Read(ref _cwKeyerSpeedWpm),
             CwKeyerMode: (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
+            CwKeyerWeight: Volatile.Read(ref _cwKeyerWeight),
+            CwKeyerPaddleReverse: Volatile.Read(ref _cwKeyerPaddleReverse) != 0,
             MicBoost: Volatile.Read(ref _micBoost) != 0,
             MicLineIn: Volatile.Read(ref _micLineIn) != 0,
             MicTrs: Volatile.Read(ref _micTrs) != 0,
@@ -1884,7 +1976,10 @@ public sealed class Protocol1Client : IProtocol1Client
             AtuTune: Volatile.Read(ref _atuTuneUntilTicks) > Environment.TickCount64,
             TxAntenna: (HpsdrAntenna)Volatile.Read(ref _txAntenna),
             UserDigOut: (byte)Volatile.Read(ref _userDigOut),
-            Adc1Atten: new HpsdrAtten(Volatile.Read(ref _attenAdc1Db)));
+            Adc1Atten: new HpsdrAtten(Volatile.Read(ref _attenAdc1Db)),
+            PaEnabled: Volatile.Read(ref _paEnabled) != 0,
+            RxAuxInput: Volatile.Read(ref _rxAuxInput),
+            XvtrEnabled: Volatile.Read(ref _xvtrEnabled) != 0);
     }
 
     private void RxLoop()
@@ -2520,7 +2615,7 @@ public sealed class Protocol1Client : IProtocol1Client
                 1 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.DriveFilter),
                 2 => (ControlFrame.CcRegister.Attenuator, ControlFrame.CcRegister.TxFreq),
                 3 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.Config),
-                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.RxFreq),
+                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.XvtrControl),
             };
         }
         return p switch
@@ -2529,7 +2624,7 @@ public sealed class Protocol1Client : IProtocol1Client
             1 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.DriveFilter),
             2 => (ControlFrame.CcRegister.Attenuator,    ControlFrame.CcRegister.RxFreq),
             3 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.TxFreq),
-            _ => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.RxFreq),
+            _ => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.XvtrControl),
         };
     }
 

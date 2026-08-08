@@ -57,7 +57,6 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly ILogger<NativeMicCapture> _log;
     private readonly AudioDeviceSettingsStore? _deviceSettings;
     private readonly INativeMicInputFactory _inputFactory;
-    private readonly StreamingHub? _streamingHub;
 
     private INativeMicInput? _input;
     private readonly object _deviceSync = new();
@@ -96,14 +95,12 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         TxAudioIngest ingest,
         ITxAudioPreviewProcessor previewProcessor,
         ILogger<NativeMicCapture> log,
-        AudioDeviceSettingsStore? deviceSettings = null,
-        StreamingHub? streamingHub = null)
+        AudioDeviceSettingsStore? deviceSettings = null)
     {
         _ingest = ingest;
         _previewProcessor = previewProcessor;
         _log = log;
         _deviceSettings = deviceSettings;
-        _streamingHub = streamingHub;
         _inputFactory = new NativeMicInputFactory();
         _recoveryToken = _recoveryCancellation.Token;
         _inputChannel = deviceSettings?.Get().InputChannel ?? -1;
@@ -114,9 +111,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         ITxAudioPreviewProcessor previewProcessor,
         ILogger<NativeMicCapture> log,
         AudioDeviceSettingsStore? deviceSettings,
-        INativeMicInputFactory inputFactory,
-        StreamingHub? streamingHub = null)
-        : this(ingest, previewProcessor, log, deviceSettings, streamingHub)
+        INativeMicInputFactory inputFactory)
+        : this(ingest, previewProcessor, log, deviceSettings)
     {
         _inputFactory = inputFactory;
     }
@@ -596,7 +592,6 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _log.LogWarning(ex, "audio.native.tx ingest threw on flush");
         }
-        _streamingHub?.BroadcastNativeMicPcm(_payload);
         Interlocked.Increment(ref _totalBlocksOut);
     }
 

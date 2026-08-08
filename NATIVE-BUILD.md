@@ -16,7 +16,7 @@ source tree.
 | `fftw3.dll`, `fftw3f.dll`, `libfftw3-3.dll`, `libfftw3f-3.dll`, `libfftw3.so.3`, `libfftw3f.so.3`, `libfftw3.3.dylib`, `libfftw3f.3.dylib` | Unmodified upstream FFTW; provenance and exact per-RID acquisition are below |
 | `miniaudio.dll`, `libminiaudio.so`, `libminiaudio.dylib` | `native/miniaudio/` |
 | `codec2.dll`, `libcodec2.so`, `libcodec2.dylib` | `native/codec2/`; its CMake recipe fetches codec2 1.2.0 and applies the included build-system patch |
-| `zeus_rade.dll`, `libzeus_rade.so`, `libzeus_rade.dylib` | `native/radae/`; the pinned upstream slices are identified in `native/radae/vendor/PROVENANCE.md` |
+| `zeus_rade.dll`, `libzeus_rade.so`, `libzeus_rade.dylib` | `native/radae/`; exact pinned upstream slices are materialized under `native/radae/vendor/` and bound to the binaries in `native/radae/vendor/BINARY-SOURCE-BINDING.json` |
 
 The `.gitkeep` files in otherwise-empty RID directories are packaging
 placeholders, not native artifacts.
@@ -175,10 +175,19 @@ codec2 is not currently built for win-arm64.
 
 ## RADE on each supported RID
 
-RADE is built for linux-x64, linux-arm64, win-x64, and osx-arm64. First obtain
-the three slices from the exact SHA and paths recorded in
-`native/radae/vendor/PROVENANCE.md`, then create the missing scalar-build
-placeholder files described there. Configure with Ninja:
+RADE has conveyed binaries for linux-x64, linux-arm64, win-x64, and osx-arm64.
+The matching source release already contains the three exact pinned upstream
+slices. To re-fetch and integrity-check them independently, run:
+
+```sh
+bash native/radae/vendor/fetch-sources.sh native/radae/vendor
+```
+
+The script fails closed unless the Thetis-RADE commit, each Git tree object,
+each deterministic slice content hash, and the embedded Opus pin match
+`native/radae/vendor/SOURCE-SLICES.json`. Next create the missing scalar-build
+placeholder files described in `native/radae/vendor/PROVENANCE.md`, then
+configure with Ninja:
 
 ```sh
 cmake -S native/radae -B native/build-rade -G Ninja \
@@ -192,7 +201,10 @@ For linux-arm64 add
 `-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_SYSTEM_NAME=Linux
 -DCMAKE_SYSTEM_PROCESSOR=aarch64`. Run the Windows command in an MSYS2 UCRT64
 MinGW shell. `native/radae/CMakeLists.txt` supplies the Windows static-runtime
-link options and artifact naming.
+link options and artifact naming. The osx-arm64 artifact was produced by the
+same scalar recipe using AppleClang 21.0.0, CMake 4.3.2, and Ninja 1.13.0; the
+Apple-only CMake path supplies the upstream `abs()` declaration and the Opus
+archive build-order dependency required by Ninja.
 
 ## FFTW provenance and source
 
@@ -208,5 +220,7 @@ is <https://www.fftw.org/>. The exact acquisition path used by each RID is:
 | `osx-arm64` | Homebrew `fftw`; the checked-in conveyed libraries identify themselves as FFTW 3.3.11 |
 
 Source for the exact FFTW build conveyed with any release is additionally
-available under the standing GPLv2 section 3(b) written offer supplied with
-Zeus SDR.
+available under the standing written offer for corresponding source supplied
+with Zeus SDR. The offer is governed by the licence the binary you received was
+conveyed under; this document is copied into the published source drop for a
+station engine that conveys as GPL-3.0-or-later.

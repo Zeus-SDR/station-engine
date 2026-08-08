@@ -182,7 +182,8 @@ public sealed class DisplaySettingsStore : IDisposable
                     e.DisplayMaxFrameRateHz,
                     _defaultDisplayMaxFrameRateHz),
                 DisplayDecimation: DisplayPerformanceOptions.NormalizeDisplayDecimation(e.DisplayDecimation),
-                WaterfallUpdatePeriod: DisplayPerformanceOptions.NormalizeWaterfallUpdatePeriod(e.WaterfallUpdatePeriod));
+                WaterfallUpdatePeriod: DisplayPerformanceOptions.NormalizeWaterfallUpdatePeriod(e.WaterfallUpdatePeriod),
+                WidebandSignalMarkersEnabled: e.WidebandSignalMarkersEnabled);
         }
     }
 
@@ -207,7 +208,8 @@ public sealed class DisplaySettingsStore : IDisposable
         bool? widebandDisplayEnabled = null,
         double? displayMaxFrameRateHz = null,
         int? displayDecimation = null,
-        int? waterfallUpdatePeriod = null)
+        int? waterfallUpdatePeriod = null,
+        bool? widebandSignalMarkersEnabled = null)
     {
         lock (_sync)
         {
@@ -235,6 +237,7 @@ public sealed class DisplaySettingsStore : IDisposable
             if (IsValidWindow(txDisplayWindow)) e.TxDisplayWindow = txDisplayWindow;
             if (IsValidAvgTauMs(txDisplayAvgTauMs)) e.TxDisplayAvgTauMs = txDisplayAvgTauMs;
             if (widebandDisplayEnabled.HasValue) e.WidebandDisplayEnabled = widebandDisplayEnabled.Value;
+            if (widebandSignalMarkersEnabled.HasValue) e.WidebandSignalMarkersEnabled = widebandSignalMarkersEnabled.Value;
             if (displayMaxFrameRateHz.HasValue && double.IsFinite(displayMaxFrameRateHz.Value))
             {
                 e.DisplayMaxFrameRateHz = DisplayPerformanceOptions.NormalizeFrameRate(displayMaxFrameRateHz.Value);
@@ -359,6 +362,9 @@ public sealed class DisplaySettingsEntry
     // Protocol-2 ADC snapshot display mode. False on legacy rows because bool
     // defaults to false when LiteDB materialises rows written before this field.
     public bool WidebandDisplayEnabled { get; set; }
+    // Wideband signal-marker overlay. Display-only; false on legacy rows for
+    // the same materialisation reason as WidebandDisplayEnabled.
+    public bool WidebandSignalMarkersEnabled { get; set; }
     // Max generated panadapter/waterfall display frames per second. Null on
     // legacy rows means "use the process/profile default".
     public double? DisplayMaxFrameRateHz { get; set; }

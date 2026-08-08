@@ -88,6 +88,32 @@ ZEUS_RADE_EXPORT int   zeus_rade_sync(zeus_rade *z);
 ZEUS_RADE_EXPORT float zeus_rade_freq_offset(zeus_rade *z);
 ZEUS_RADE_EXPORT int   zeus_rade_snr_db(zeus_rade *z);
 
+/* TX-side mic tap meters, updated by the most recent zeus_rade_tx() call.
+ *   zeus_rade_tx_mic_level_db: block peak |sample| as dBFS, -120 if silent.
+ *   zeus_rade_tx_mic_clip:     1 if any sample hit full scale within roughly
+ *     the last 500 ms of TX audio (a short hold so a single clipped sample is
+ *     visible on a UI meter), else 0. */
+ZEUS_RADE_EXPORT int   zeus_rade_tx_mic_level_db(zeus_rade *z);
+ZEUS_RADE_EXPORT int   zeus_rade_tx_mic_clip(zeus_rade *z);
+
+/* Pre-encoder mic conditioning (TX-side). Both stages are OFF by default
+ * (bit-exact passthrough, matching the original shim behaviour) and take
+ * effect on the next zeus_rade_tx() call after a setter changes state.
+ *
+ * AGC targets a block RMS level in dBFS with asymmetric attack (~10ms, turn a
+ * hot mic down fast) / release (~300ms, bring a quiet mic up slowly).
+ *
+ * EQ is a fixed 3-band voice shaper (bass low-shelf ~200Hz, mid peaking
+ * ~1kHz/Q0.7, treble high-shelf ~3kHz) — a per-band gain in dB, NOT a general
+ * parametric EQ (center frequency/Q are fixed, unlike Thetis's fully
+ * parametric mic EQ) to keep the API small. */
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_agc_enabled(zeus_rade *z, int enable);
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_agc_target_db(zeus_rade *z, float target_dbfs);
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_eq_enabled(zeus_rade *z, int enable);
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_eq_bass_db(zeus_rade *z, float gain_db);
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_eq_mid_db(zeus_rade *z, float gain_db);
+ZEUS_RADE_EXPORT void zeus_rade_set_mic_eq_treble_db(zeus_rade *z, float gain_db);
+
 /* Last decoded End-of-Over callsign (RADE carries up to 8 chars in the EOO
  * frame). Decoded with the FreeDV reliable-text LDPC (rade_text) — CRC-checked,
  * so it interoperates with FreeDV-GUI RADE stations. Copies into callsign_out

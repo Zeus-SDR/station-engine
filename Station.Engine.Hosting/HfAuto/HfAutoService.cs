@@ -249,7 +249,12 @@ public sealed class HfAutoService : BackgroundService
             {
                 // Configuration changed or the host is stopping.
             }
-            catch (Exception ex) when (ex is SocketException or ArgumentException)
+            catch (SocketException ex)
+            {
+                SetListenerState(active: false, error: DescribeListenerError(ex.SocketErrorCode, config));
+                _log.LogWarning(ex, "hfauto.udp.listener failed");
+            }
+            catch (ArgumentException ex)
             {
                 SetListenerState(active: false, error: ex.Message);
                 _log.LogWarning(ex, "hfauto.udp.listener failed");
@@ -341,6 +346,9 @@ public sealed class HfAutoService : BackgroundService
 
     internal static bool IsExpectedSender(IPAddress remoteAddress, string expectedSenderAddress) =>
         AddressesEqual(remoteAddress, ResolveExpectedSender(expectedSenderAddress));
+
+    internal static string DescribeListenerError(SocketError error, HfAutoRuntimeConfig config) =>
+        PortBindDiagnostics.Describe(error, config.BindAddress, config.Port, "UDP");
 
     private static bool AddressesEqual(IPAddress left, IPAddress right) =>
         left.MapToIPv6().Equals(right.MapToIPv6());

@@ -19,8 +19,9 @@ namespace Zeus.Server;
 /// <para>Not persisted: mute is a session-scoped operator control; the app
 /// starts unmuted on every launch. In-memory only, thread-safe via a volatile
 /// flag (single-bit signal). Registered unconditionally so sinks that live in
-/// both host modes can bind to it — server mode has no writer today, which is
-/// fine because server-mode operators mute via their browser AudioContext.
+/// both host modes can bind to it. Server mode writes it through
+/// <c>POST /api/audio/mute</c>: the browser keeps its decoder running while
+/// the sinks drop band frames, so mute-exempt local playback stays audible.
 /// </para>
 /// </summary>
 public sealed class RxAudioMuteState

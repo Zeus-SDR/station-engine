@@ -67,10 +67,12 @@ internal sealed class SpeTaurusService : IAsyncDisposable
     private readonly object _stateGate = new();
     private readonly object _featureIoGate = new();
     private readonly object _configIoGate = new();
+    private readonly object _identityGate = new();
     private CancellationTokenSource _featureIoCancellation = new();
     private CancellationTokenSource _configIoCancellation = new();
 
     private volatile SpeTaurusConfig _config;
+    private SpeTaurusConfig? _confirmedIdentityConfig;
     private ISpeTransport? _transport;
     private string _connectionState = "disabled";
     private string? _error;
@@ -640,6 +642,55 @@ internal sealed class SpeTaurusService : IAsyncDisposable
             return CancellationTokenSource.CreateLinkedTokenSource(
                 cancellationToken,
                 _featureIoCancellation.Token);
+    }
+
+    /// <summary>
+    /// True when checksum-valid display evidence has already proven that the
+    /// amplifier behind <paramref name="config"/> is an SPE Expert 1.5K Taurus.
+    /// </summary>
+    /// <remarks>
+    /// The Taurus answers the serial status poll with the 1.5K-FA model code,
+    /// so identity can only ever be earned from the LCD model banner — which
+    /// lives on row 0 of the standby screen and is therefore absent from most
+    /// frames. The confirmation is held here, on the owner of the config epoch,
+    /// so every consumer shares one answer: a sighting made by the panel poll
+    /// also satisfies the TUNE preflight, and a sighting made while arming TUNE
+    /// also satisfies the panel. Trust never outlives the connection it was
+    /// earned on — callers drop it on transport fault or stale status, and it is
+    /// keyed by config reference so a settings change invalidates it.
+    /// </remarks>
+    internal bool HasConfirmedTaurusIdentity(SpeTaurusConfig config)
+    {
+        lock (_identityGate)
+            return ReferenceEquals(_confirmedIdentityConfig, config);
+    }
+
+    /// <summary>Records confirmed Taurus identity for the current config epoch.</summary>
+    internal void RememberTaurusIdentity(SpeTaurusConfig config)
+    {
+        lock (_identityGate)
+        {
+            if (ReferenceEquals(config, _config))
+                _confirmedIdentityConfig = config;
+        }
+    }
+
+    /// <summary>Drops confirmed Taurus identity for the given config epoch.</summary>
+    internal void ForgetTaurusIdentity(SpeTaurusConfig config)
+    {
+        lock (_identityGate)
+        {
+            if (ReferenceEquals(_confirmedIdentityConfig, config)
+                || ReferenceEquals(config, _config))
+                _confirmedIdentityConfig = null;
+        }
+    }
+
+    /// <summary>Drops confirmed Taurus identity outright.</summary>
+    internal void ForgetTaurusIdentity()
+    {
+        lock (_identityGate)
+            _confirmedIdentityConfig = null;
     }
 
     internal CancellationTokenSource LinkConfigIo(

@@ -37,7 +37,8 @@ shipped in the corresponding Zeus release.
 The native source used by the station engine is included under `native/`:
 Zeus-modified WDSP, its statically embedded libspecbleach and RNNoise sources,
 miniaudio, the pinned codec2 fetch recipe and patch, and the RADE build glue,
-shim, and pinned upstream provenance. Artifact-to-source mapping and the exact
+shim, exact materialized upstream slices, integrity record, and binary/source
+binding. Artifact-to-source mapping and the exact
 per-platform build commands are in [`NATIVE-BUILD.md`](NATIVE-BUILD.md).
 The proprietary VST3 and Audio Unit bridge binaries are not part of the station
 engine and are not included; the published tree builds against

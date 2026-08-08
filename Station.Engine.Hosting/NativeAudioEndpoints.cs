@@ -33,6 +33,19 @@ public static class NativeAudioEndpoints
             sink.SetMuted(body.Muted);
             return Results.Ok(new { supported = true, muted = sink.IsMuted });
         });
+        // Engine-global RX master mute, readable and writable in every host
+        // mode (unlike the native-mute route above, which 404s without an
+        // enabled NativeAudioSink). Server-mode browser clients mute through
+        // here so they can keep their AudioContext decoding: the sinks drop
+        // band frames while the mute-exempt lane (Recorder local playback,
+        // TX Monitor preview) keeps flowing.
+        endpoints.MapGet("/api/audio/mute", (RxAudioMuteState mute) =>
+            Results.Ok(new { muted = mute.IsMuted }));
+        endpoints.MapPost("/api/audio/mute", (NativeMuteRequest body, RxAudioMuteState mute) =>
+        {
+            mute.SetMuted(body.Muted);
+            return Results.Ok(new { muted = mute.IsMuted });
+        });
         endpoints.MapGet("/api/audio/devices", GetNativeAudioDevices);
         endpoints.MapPut("/api/audio/devices", SetNativeAudioDevices);
 
@@ -59,7 +72,7 @@ public static class NativeAudioEndpoints
 
         try
         {
-            var snapshot = MiniAudioDevices.Enumerate();
+            var snapshot = EnumerateDevices(sp);
             return Results.Ok(BuildNativeAudioDevicesResponse(
                 sink,
                 mic,
@@ -98,7 +111,7 @@ public static class NativeAudioEndpoints
         MiniAudioDeviceSnapshot snapshot;
         try
         {
-            snapshot = MiniAudioDevices.Enumerate();
+            snapshot = EnumerateDevices(sp);
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
         {
@@ -176,8 +189,16 @@ public static class NativeAudioEndpoints
             : mic.SetInputChannelAsync(inputChannel == -1 ? null : inputChannel, ct);
     }
 
-    private static NativeAudioDeviceDto ToNativeAudioDeviceDto(MiniAudioDeviceInfo device) =>
-        new(device.Id, device.Name, device.IsDefault);
+    private static MiniAudioDeviceSnapshot EnumerateDevices(IServiceProvider sp) =>
+        sp.GetService<INativeAudioDeviceEnumerator>()?.Enumerate()
+        ?? MiniAudioDevices.Enumerate();
+
+    internal static NativeAudioDeviceDto ToNativeAudioDeviceDto(MiniAudioDeviceInfo device) =>
+        new(
+            device.Id,
+            device.Name,
+            device.IsDefault,
+            VirtualAudioCableCatalog.Match(device.Name));
 
     private static string? NormalizeDeviceId(string? deviceId)
     {
@@ -193,7 +214,15 @@ internal sealed record NativeAudioDevicesSetRequest(
     // Request only: null/omitted preserves the selection; -1 selects mix-all;
     // non-negative values select a zero-based capture channel.
     int? InputChannel = null);
-internal sealed record NativeAudioDeviceDto(string Id, string Name, bool IsDefault);
+internal sealed record NativeAudioDeviceDto(
+    string Id,
+    string Name,
+    bool IsDefault,
+    VirtualAudioCableMatchDto? VirtualCable = null);
+internal sealed record VirtualAudioCableMatchDto(
+    string Vendor,
+    string Product,
+    string InstallUrl);
 internal sealed record NativeAudioDevicesResponse(
     bool Supported,
     string? InputDeviceId,

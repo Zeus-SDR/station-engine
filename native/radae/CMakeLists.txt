@@ -13,13 +13,14 @@
 #                    feature frames). Weights compiled in (rade_enc_data.c /
 #                    rade_dec_data.c, ~24 MB each). No model files at runtime.
 #   3. freedv_text — FreeDV reliable-text LDPC for the EOO callsign (FreeDV-GUI
-#                    on-air compatible). LGPL-2.1 codec2 LDPC; dynamic-linked.
+#                    on-air compatible). Mixed per-file Codec2 LDPC with an
+#                    LGPL-2.1 section 3 election for the conveyed copies.
 #   4. zeus_rade   — Zeus's thin shim (shim/zeus_rade.c): one streaming "complex
 #                    IQ <-> int16 PCM" RX/TX surface over the three above.
 #
 # The three upstream slices are NOT committed to the Zeus git tree (~95 MB of
-# weight sources). CI (build-native-libs.yml) vendors them into ${ZEUS_RADE_VENDOR}
-# from the SHAs recorded in vendor/PROVENANCE.md before configuring this project.
+# weight sources). build-rade.yml and the source exporter share
+# vendor/fetch-sources.sh, whose pins and hashes live in SOURCE-SLICES.json.
 #
 # PROVEN: this exact composition decoded a 5-minute off-air RADE recording in WSL
 # (Ubuntu-24.04) — 2620 synced ticks, 14 dB SNR, max amplitude 0.999969
@@ -108,9 +109,10 @@ endif()
 # 3. freedv_text — FreeDV reliable-text (LDPC) EOO callsign codec. On-air
 #    compatible with FreeDV-GUI's RADE EOO frame (CRC8 + 6-bit chars + LDPC
 #    HRA_56_56 + gp_interleaver), unlike radae_c's internal 7-bit packing. Used
-#    by the shim for both TX-encode and RX-decode of the callsign. The codec2
-#    LDPC slice is LGPL-2.1; zeus_rade is a shared library, so dynamic linking
-#    satisfies it (see vendor/PROVENANCE.md).
+#    by the shim for both TX-encode and RX-decode of the callsign. The five-unit
+#    set has a mixed per-file record, composite LGPL-2.1-only disposition, and
+#    a section 3 GPL election for the conveyed copies (see vendor/PROVENANCE.md
+#    and the station-engine prominent notice).
 # ---------------------------------------------------------------------------
 set(FREEDV_TXT_SOURCES
     "${FREEDV_TXT}/src/rade_text.c"
@@ -129,6 +131,16 @@ set(SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/zeus_rade.c")
 # The one shared library
 # ---------------------------------------------------------------------------
 add_library(zeus_rade SHARED ${RADAE_C_SOURCES} ${FREEDV_TXT_SOURCES} ${SHIM_SOURCES})
+
+# AppleClang diagnoses the upstream radc_rx.c use of abs() because that file
+# does not include stdlib.h. Keep the upstream slice byte-exact and provide the
+# declaration at compile time. Ninja also needs an explicit target edge before
+# force-loading $<TARGET_FILE:opus>; the generator expression alone does not
+# guarantee that the static archive exists before the zeus_rade link step.
+if(APPLE)
+  target_compile_options(zeus_rade PRIVATE -include stdlib.h)
+  add_dependencies(zeus_rade opus)
+endif()
 
 target_include_directories(zeus_rade PRIVATE
     "${RADAE_C}/src"

@@ -15,6 +15,7 @@
 namespace Zeus.Server.SpeTaurus;
 
 internal sealed record SpeOperateRequest(bool Operate);
+internal sealed record SpePanelButtonRequest(string? Name);
 
 internal sealed class SpeTaurusWorker(SpeTaurusService service) : BackgroundService
 {
@@ -129,10 +130,46 @@ public static class SpeTaurusEndpoints
                     detail: "Timed out reading the Taurus display from Expert Amp Server.");
             }
         });
+        group.MapGet("/display/render.png", async Task<IResult> (
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control,
+            HttpContext context,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var image = await control.DisplayImageAsync(ct).ConfigureAwait(false);
+                context.Response.Headers.CacheControl = "no-store";
+                return Results.File(image.Bytes, "image/png");
+            }
+            catch (InvalidDataException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (HttpRequestException ex)
+            {
+                return Results.Problem(
+                    statusCode: StatusCodes.Status502BadGateway,
+                    title: "Expert Amp Server rendered display unavailable",
+                    detail: ex.Message);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return Results.Problem(
+                    statusCode: StatusCodes.Status504GatewayTimeout,
+                    title: "Expert Amp Server rendered display timed out",
+                    detail: "Timed out reading the rendered Taurus display from Expert Amp Server.");
+            }
+        });
         group.MapPost("/display/page", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
             Results.Ok(await control.CycleDisplayPageAsync(ct).ConfigureAwait(false)));
         group.MapPost("/cat/page", async ([Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control, CancellationToken ct) =>
             Results.Ok(await control.CycleCatPageAsync(ct).ConfigureAwait(false)));
+        group.MapPost("/panel/button", async (
+            SpePanelButtonRequest request,
+            [Microsoft.AspNetCore.Mvc.FromServices] ExpertAmpServerControl control,
+            CancellationToken ct) => Results.Ok(
+                await control.PressPanelButtonAsync(request.Name, ct)
+                    .ConfigureAwait(false)));
         group.MapPost("/atu/tune", async (
             [Microsoft.AspNetCore.Mvc.FromServices] SpeTaurusAutomaticTuneCoordinator coordinator,
             CancellationToken ct) => Results.Ok(

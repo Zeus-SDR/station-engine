@@ -13,6 +13,11 @@ internal sealed record MiniAudioDeviceSnapshot(
     public static MiniAudioDeviceSnapshot Empty { get; } = new([], []);
 }
 
+internal interface INativeAudioDeviceEnumerator
+{
+    MiniAudioDeviceSnapshot Enumerate();
+}
+
 internal static class MiniAudioDevices
 {
     public static MiniAudioDeviceSnapshot Enumerate()

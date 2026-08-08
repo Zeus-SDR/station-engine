@@ -63,7 +63,8 @@ public static class PureSignalEndpoints
         // PS-Monitor — operator-facing toggle that swaps the TX panadapter source
         // from the predistorted-IQ analyzer to the PS-feedback (post-PA) analyzer.
         // Pure UI/source-routing flag; no WDSP setter, no wire-format change.
-        // Default off; resets each session same as the PS master arm. See issue #121.
+        // Default off and session-only; unlike the distinct PS ArmIntent, this
+        // display-source preference is never rehydrated. See issue #121.
         endpoints.MapPost("/api/tx/ps/monitor",
             (PsMonitorSetRequest req, RadioService r) =>
         {

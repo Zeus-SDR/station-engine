@@ -32,29 +32,16 @@ internal static partial class MiniAudioInterop
 {
     internal const string LibraryName = "miniaudio";
 
-    private static readonly object Gate = new();
-    private static bool _registered;
-
     /// <summary>
     /// Register the DllImport resolver so probe-by-RID works under
     /// `dotnet run` / installed `.app` layouts. Idempotent; safe to call
     /// repeatedly. Always call before the first interop into miniaudio.
     /// </summary>
     internal static void EnsureResolverRegistered()
-    {
-        if (_registered) return;
-        lock (Gate)
-        {
-            if (_registered) return;
-            NativeLibrary.SetDllImportResolver(typeof(MiniAudioInterop).Assembly, Resolve);
-            _registered = true;
-        }
-    }
+        => EngineNativeLibraryResolver.EnsureRegistered();
 
-    private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    internal static IntPtr ResolveLibrary(Assembly assembly)
     {
-        if (libraryName != LibraryName) return IntPtr.Zero;
-
         string rid = CurrentRid();
         string fileName = NativeFileName();
         string? asmDir = Path.GetDirectoryName(assembly.Location);

@@ -57,6 +57,19 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     private long _rxConsecutiveMisses;
     private long _txOpenUntilTimestamp;
     private long _rxOpenUntilTimestamp;
+    // Blocks that engaged the ring and did not get a matching reply inside the
+    // response deadline. Distinct from the rest of the bypass count, which is
+    // the zero-work path (concurrent entry, or an already-open leg). The split
+    // is what separates "the product is late" from "we stopped asking", both
+    // in diagnostics and in the fail-open tests.
+    private long _txMissedDeadlineBlocks;
+    private long _rxMissedDeadlineBlocks;
+    // Monotonic count of closed->open leg transitions. Deliberately a counter
+    // and not a "currently open" flag: the open state expires on a wall clock,
+    // so asserting on it would reintroduce exactly the timing dependency this
+    // type's tests exist to avoid.
+    private long _txLegOpenedCount;
+    private long _rxLegOpenedCount;
     private bool _disposed;
 
     public ProductAudioRingPort(ILogger<ProductAudioRingPort> log)
@@ -73,7 +86,11 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         Interlocked.Read(ref _bypassedBlocks),
         Interlocked.Read(ref _rxAttemptedBlocks),
         Interlocked.Read(ref _rxProcessedBlocks),
-        Interlocked.Read(ref _rxBypassedBlocks));
+        Interlocked.Read(ref _rxBypassedBlocks),
+        Interlocked.Read(ref _txMissedDeadlineBlocks),
+        Interlocked.Read(ref _rxMissedDeadlineBlocks),
+        Interlocked.Read(ref _txLegOpenedCount),
+        Interlocked.Read(ref _rxLegOpenedCount));
 
     public bool TryCreateAttachment(
         ProductAudioAttachRequest request,
@@ -99,6 +116,13 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             if (_session is not null)
             {
                 error = "a product audio host is already attached or negotiating";
+                _log.LogWarning(
+                    "product-audio attach rejected requestedName={RequestedName} "
+                    + "existingSession={SessionId} existingLeased={Leased} existingHttpPort={HttpPort}",
+                    request.Name,
+                    _session.Owner.Endpoint.SessionId,
+                    _session.IsLeased,
+                    _session.HttpPort);
                 return false;
             }
 
@@ -140,6 +164,14 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                 session.LeaseId,
                 owner.Endpoint,
                 rxOwner.Endpoint);
+            _log.LogInformation(
+                "product-audio attach negotiating name={ProductName} version={ProductVersion} "
+                + "httpPort={HttpPort} session={SessionId} pendingLeaseSeconds={PendingSeconds}",
+                request.Name,
+                request.Version,
+                request.HttpPort,
+                owner.Endpoint.SessionId,
+                (int)PendingLeaseLifetime.TotalSeconds);
             return true;
         }
     }
@@ -184,15 +216,29 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         lock (_gate)
         {
             session = _session;
-            if (session is null
-                || !CryptographicEquals(session.LeaseId, leaseId)
-                || !session.TryLease())
+            // TryLease has a side effect (atomically claims the session) so it
+            // must run exactly once, and only once the earlier checks confirm
+            // there IS a matching pending session to claim.
+            string? rejectReason = session switch
+            {
+                null => "no attachment is currently pending",
+                _ when !CryptographicEquals(session.LeaseId, leaseId) => "leaseId does not match the pending attachment",
+                _ when !session.TryLease() => "the pending attachment was already leased",
+                _ => null,
+            };
+            if (rejectReason is not null)
             {
                 context.Response.StatusCode = StatusCodes.Status404NotFound;
+                _log.LogWarning(
+                    "product-audio lease rejected reason=\"{Reason}\" pendingSession={PendingSessionId}",
+                    rejectReason,
+                    session?.Owner.Endpoint.SessionId ?? "none");
                 return;
             }
 
-            session.PendingTimer?.Dispose();
+            // rejectReason is null only when the switch fell through the
+            // final arm, which requires session to be non-null.
+            session!.PendingTimer?.Dispose();
             session.PendingTimer = null;
         }
 
@@ -242,6 +288,8 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             ref _bypassedBlocks,
             ref _txConsecutiveMisses,
             ref _txOpenUntilTimestamp,
+            ref _txMissedDeadlineBlocks,
+            ref _txLegOpenedCount,
             "tx");
 
     public void ProcessRx(Span<float> block48k)
@@ -255,6 +303,8 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             ref _rxBypassedBlocks,
             ref _rxConsecutiveMisses,
             ref _rxOpenUntilTimestamp,
+            ref _rxMissedDeadlineBlocks,
+            ref _rxLegOpenedCount,
             "rx");
 
     private void ProcessBlock(
@@ -267,6 +317,8 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         ref long bypassedBlocks,
         ref long consecutiveMisses,
         ref long openUntilTimestamp,
+        ref long missedDeadlineBlocks,
+        ref long legOpenedCount,
         string leg)
     {
         var session = Volatile.Read(ref _session);
@@ -318,6 +370,9 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
             // Missed the reply window. A failed probe past cooldown silently
             // extends the open state; otherwise count toward opening the leg.
+            // Counted separately from the zero-work bypasses above: this is the
+            // only bypass path that waited on the product.
+            Interlocked.Increment(ref missedDeadlineBlocks);
             var cooldownTicks = (long)(LegOpenCooldown.TotalSeconds * Stopwatch.Frequency);
             if (openUntil != 0)
             {
@@ -331,6 +386,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                          Stopwatch.GetTimestamp() + cooldownTicks,
                          0) == 0)
             {
+                Interlocked.Increment(ref legOpenedCount);
                 _log.LogWarning(
                     "product-audio {Leg} leg paused after {Misses} consecutive missed deadlines; passing audio through unprocessed for {CooldownMs} ms",
                     leg, LegOpenMissThreshold, (int)LegOpenCooldown.TotalMilliseconds);
@@ -486,4 +542,15 @@ public readonly record struct ProductAudioRingSnapshot(
     long BypassedBlocks,
     long RxAttemptedBlocks = 0,
     long RxProcessedBlocks = 0,
-    long RxBypassedBlocks = 0);
+    long RxBypassedBlocks = 0,
+    // Blocks that engaged the ring and missed the response deadline. The
+    // remainder of the bypass count never touched the ring at all, so
+    // `Bypassed - MissedDeadline` is the number of blocks that returned
+    // without waiting on the product for anything.
+    long MissedDeadlineBlocks = 0,
+    long RxMissedDeadlineBlocks = 0,
+    // How many times the leg has been taken out of processing after sustained
+    // misses. While it is out, audio passes through untouched and the pump does
+    // no ring work at all.
+    long LegOpenedCount = 0,
+    long RxLegOpenedCount = 0);

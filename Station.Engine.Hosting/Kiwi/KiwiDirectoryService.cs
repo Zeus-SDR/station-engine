@@ -14,6 +14,8 @@
 // License for details.
 
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
@@ -43,14 +45,17 @@ public sealed record KiwiDirectoryEntry(
 /// <see cref="KiwiDirectoryEntry"/>, and cache for a few minutes (the upstream
 /// regenerates ~once/minute; a short cache collapses repeated panel opens).
 ///
-/// <para>Never throws to the caller: on any upstream failure it returns the last
-/// good cache if present, else an empty list.</para>
+/// <para>Never throws to the caller (caller cancellation aside): a transport
+/// failure retries once over IPv4 only (broken-IPv6 machines otherwise lose the
+/// map — see <see cref="Ipv4OnlyClient"/>), and any remaining failure returns
+/// the last good cache if present, else an empty list.</para>
 /// </summary>
 public sealed class KiwiDirectoryService
 {
     // The kiwisdr.com list, mirrored as a JS array for the dyatlov map maker.
     private const string DirectoryUrl = "http://rx.linkfanel.net/kiwisdr_com.js";
     private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan FetchTimeout = TimeSpan.FromSeconds(20);
 
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<KiwiDirectoryService> _log;
@@ -73,31 +78,93 @@ public sealed class KiwiDirectoryService
 
         try
         {
-            var http = _httpFactory.CreateClient();
-            http.Timeout = TimeSpan.FromSeconds(20);
-            using var req = new HttpRequestMessage(HttpMethod.Get, DirectoryUrl);
-            req.Headers.TryAddWithoutValidation("User-Agent", "ZeusSDR");
-            using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-            if (!resp.IsSuccessStatusCode)
-            {
-                _log.LogDebug("kiwi.directory upstream HTTP {Status}", (int)resp.StatusCode);
-                return CachedOrEmpty();
-            }
-
-            var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            var list = Parse(body);
-            if (list.Count == 0) return CachedOrEmpty();
-            lock (_gate) { _cache = (DateTimeOffset.UtcNow, list); }
-            _log.LogInformation("kiwi.directory fetched {Count} receivers", list.Count);
-            return list;
+            var http = PrimaryClientForTest?.Invoke() ?? _httpFactory.CreateClient();
+            http.Timeout = FetchTimeout;
+            return await FetchAndCacheAsync(http, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "kiwi.directory fetch failed");
-            return CachedOrEmpty();
+            // Transport-level failure — DNS, connect, or timeout (an HTTP error
+            // status or an unparseable body does NOT land here). The classic
+            // case is a machine with broken IPv6: the upstream publishes AAAA
+            // records, the local v6 route black-holes until the client timeout,
+            // and the map dies even though a plain IPv4 connect would have
+            // worked. Retry once over IPv4 only before falling back to the
+            // stale cache.
+            _log.LogDebug(ex, "kiwi.directory fetch failed — retrying IPv4-only");
+            try
+            {
+                var http = Ipv4ClientForTest?.Invoke() ?? Ipv4OnlyClient.Value;
+                return await FetchAndCacheAsync(http, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex4)
+            {
+                _log.LogDebug(ex4, "kiwi.directory IPv4-only fetch failed");
+                return CachedOrEmpty();
+            }
         }
     }
+
+    // One fetch → parse → publish-to-cache pass. A non-success HTTP status and
+    // an empty/unparseable body return the stale cache directly (retrying on
+    // another address family cannot change what the server sends); transport
+    // failures throw so GetAsync can decide whether an IPv4-only retry helps.
+    private async Task<IReadOnlyList<KiwiDirectoryEntry>> FetchAndCacheAsync(HttpClient http, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Get, DirectoryUrl);
+        req.Headers.TryAddWithoutValidation("User-Agent", "ZeusSDR");
+        using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+        {
+            _log.LogDebug("kiwi.directory upstream HTTP {Status}", (int)resp.StatusCode);
+            return CachedOrEmpty();
+        }
+
+        var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var list = Parse(body);
+        if (list.Count == 0) return CachedOrEmpty();
+        lock (_gate) { _cache = (DateTimeOffset.UtcNow, list); }
+        _log.LogInformation("kiwi.directory fetched {Count} receivers", list.Count);
+        return list;
+    }
+
+    // Fallback client that resolves and connects over IPv4 only. The default
+    // client lets the OS pick the address family, and on a broken-IPv6 machine
+    // the v6 connect eats the whole request timeout. Static + lazy: one
+    // connection pool per process, built only when the fallback actually fires.
+    private static readonly Lazy<HttpClient> Ipv4OnlyClient = new(() =>
+    {
+        var handler = new SocketsHttpHandler
+        {
+            ConnectCallback = static async (ctx, ct) =>
+            {
+                var addrs = await Dns.GetHostAddressesAsync(
+                    ctx.DnsEndPoint.Host, AddressFamily.InterNetwork, ct).ConfigureAwait(false);
+                if (addrs.Length == 0)
+                    throw new SocketException((int)SocketError.HostNotFound);
+                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(addrs, ctx.DnsEndPoint.Port, ct).ConfigureAwait(false);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            },
+        };
+        return new HttpClient(handler) { Timeout = FetchTimeout };
+    });
+
+    // Test seams: substitute the primary / IPv4-only clients so the fallback
+    // decision (transport failure → IPv4-only retry, HTTP error → no retry) is
+    // unit-testable without sockets. Production callers leave these null.
+    internal Func<HttpClient>? PrimaryClientForTest;
+    internal Func<HttpClient>? Ipv4ClientForTest;
 
     private IReadOnlyList<KiwiDirectoryEntry> CachedOrEmpty()
     {

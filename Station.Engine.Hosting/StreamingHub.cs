@@ -84,6 +84,10 @@ public sealed class StreamingHub
     // friend PTT. Audio is returned only to the requesting session as 0x3D.
     private const byte MsgTypeNativeMicStreamRequest = 0x24;
 
+    // Matches MsgType.CwDecoderRequest; clients ask to start/stop the
+    // first-party receive decoder for their session.
+    private const byte MsgTypeCwDecoderRequest = 0x25;
+
     // Largest client→server payload we'll reassemble. A mic PCM frame is
     // 1 + 960*4 = 3841 bytes; 16 KB leaves comfortable headroom if the
     // contract ever adds a control frame. Receives larger than this are
@@ -156,6 +160,11 @@ public sealed class StreamingHub
     // disconnect/reload can't leak a pinned stream.
     private int _audioStreamRequests;
 
+    // Aggregate count of clients with a mounted CW Decoder panel. The DSP tap
+    // checks this with one volatile read; per-session state prevents duplicate
+    // enables and disconnects from leaking demand.
+    private int _cwDecodeRequests;
+
     // Aggregate count of connected clients that need the high-rate display
     // stream (panadapter / waterfall / mini-pan). DspPipelineService reads
     // this once per tick to skip WDSP analyzer reads and frame serialisation
@@ -170,13 +179,22 @@ public sealed class StreamingHub
     /// </summary>
     internal bool AudioStreamRequested => Volatile.Read(ref _audioStreamRequests) > 0;
 
+    internal bool CwDecodeRequested => Volatile.Read(ref _cwDecodeRequests) > 0;
+
+    /// <summary>Raised only when aggregate CW demand crosses zero.</summary>
+    internal event Action? CwDecodeRequestChanged;
+
+    /// <summary>Raised after the last websocket client goes away, i.e. no UI is
+    /// connected any more. Subscribers must be cheap and must not throw.</summary>
+    internal event Action? LastClientDisconnected;
+
     public bool DisplayStreamRequested => Volatile.Read(ref _displayStreamRequests) > 0;
 
     internal int DisplaySubscriberCount => Volatile.Read(ref _displayStreamRequests);
 
     internal int PreferredDisplaySubscriberCount => Volatile.Read(ref _preferredDisplayStreamRequests);
 
-    /// <summary>True while at least one trusted local client needs native mic PCM.</summary>
+    /// <summary>True while at least one trusted local client needs selected live-mic PCM.</summary>
     internal bool NativeMicStreamRequested => Volatile.Read(ref _nativeMicStreamRequests) > 0;
 
     internal int NativeMicSubscriberCount => Volatile.Read(ref _nativeMicStreamRequests);
@@ -278,6 +296,7 @@ public sealed class StreamingHub
             case MsgType.PsMeters:
             case MsgType.RxMeter:
             case MsgType.RxMetersV2:
+            case MsgType.RxSignalQuality:
             case MsgType.PaTemp:
             case MsgType.MicPeak:
                 Interlocked.Increment(ref _dropsMeter);
@@ -379,7 +398,7 @@ public sealed class StreamingHub
         bool allowNativeMicStream = false,
         Func<bool>? nativeMicStreamAuthorization = null)
     {
-        if (displayRxId is < 1 or >= WireContract.MaxReceivers)
+        if (displayRxId is < 1 or >= WireContract.MaxReceiverSlots)
             throw new ArgumentOutOfRangeException(nameof(displayRxId));
 
         var id = Guid.NewGuid();
@@ -420,11 +439,19 @@ public sealed class StreamingHub
             // Release any RX-audio-stream request this client held so a
             // disconnect/reload can't pin the desktop on-demand stream on.
             session.SetWantsAudio(false);
+            session.SetWantsCwDecode(false);
             session.SetWantsDisplay(false);
             session.SetWantsNativeMic(false);
             _clients.TryRemove(id, out _);
             _webSocketClients.TryRemove(id, out _);
             _log.LogInformation("ws.client.disconnected id={Id} total={Count}", id, _clients.Count);
+            // No UI left anywhere. Anything the UI was holding open now has
+            // nobody who can release it — see TxService for the MOX case.
+            if (_clients.IsEmpty)
+            {
+                try { LastClientDisconnected?.Invoke(); }
+                catch (Exception ex) { _log.LogWarning(ex, "LastClientDisconnected handler threw"); }
+            }
         }
     }
 
@@ -465,6 +492,14 @@ public sealed class StreamingHub
     /// 0x02 RX-audio stream the same way a /ws client's 0x21 does.
     /// </summary>
     internal void AdjustAudioRequests(int delta) => Interlocked.Add(ref _audioStreamRequests, delta);
+
+    /// <summary>Adjust CW-decoder demand for a non-WebSocket remote sink.</summary>
+    internal void AdjustCwDecodeRequests(int delta)
+    {
+        int next = Interlocked.Add(ref _cwDecodeRequests, delta);
+        if ((delta > 0 && next == 1) || (delta < 0 && next == 0))
+            CwDecodeRequestChanged?.Invoke();
+    }
 
     /// <summary>Remove a previously-attached remote sink.</summary>
     internal void DetachSink(Guid id) => _clients.TryRemove(id, out _);
@@ -715,6 +750,20 @@ public sealed class StreamingHub
         }
     }
 
+    public void Broadcast(in RxSignalQualityFrame frame)
+    {
+        if (_clients.IsEmpty) return;
+
+        int total = RxSignalQualityFrame.ByteLength;
+        var payload = new byte[total];
+        var writer = new FixedBufferWriter(payload, total);
+        frame.Serialize(writer);
+        foreach (var client in _clients.Values)
+        {
+            if (!client.TryEnqueue(payload)) System.Threading.Interlocked.Increment(ref _dropsMeter);
+        }
+    }
+
     public void Broadcast(in PaTempFrame frame)
     {
         if (_clients.IsEmpty) return;
@@ -744,10 +793,10 @@ public sealed class StreamingHub
     }
 
     /// <summary>
-    /// Fan an already-sanitized 960-sample native capture block only to trusted
-    /// loopback sessions that explicitly requested it. The source buffer is
-    /// reused by NativeMicCapture, so this method takes one owned copy for all
-    /// requesting session queues.
+    /// Fan an already-sanitized 960-sample block from the live TX source selected
+    /// by <see cref="TxAudioIngest"/> only to trusted sessions that explicitly
+    /// requested it. The source buffer is reused by the host/radio capture path,
+    /// so each requesting session queue receives an owned copy.
     /// </summary>
     internal void BroadcastNativeMicPcm(ReadOnlySpan<byte> f32lePayload)
     {
@@ -761,6 +810,7 @@ public sealed class StreamingHub
                 // Product lease/origin trust can disappear after enable. Fail
                 // closed on the capture thread, clear the aggregate demand,
                 // and purge every queued native frame before sending more.
+                session.LogNativeMicAuthorizationRevoked();
                 session.SetWantsNativeMic(false);
                 continue;
             }
@@ -769,6 +819,7 @@ public sealed class StreamingHub
             BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1, sizeof(uint)), session.NativeMicGeneration);
             f32lePayload.CopyTo(payload.AsSpan(1 + sizeof(uint)));
             if (!session.TryEnqueue(payload)) Interlocked.Increment(ref _dropsAudio);
+            else session.RecordNativeMicFrameQueued();
         }
     }
 
@@ -972,8 +1023,19 @@ public sealed class StreamingHub
             Interlocked.Add(ref _hub._audioStreamRequests, want ? 1 : -1);
         }
 
+        private bool _wantsCwDecode;
+        public bool WantsCwDecode => _wantsCwDecode;
+
+        public void SetWantsCwDecode(bool want)
+        {
+            if (want == _wantsCwDecode) return;
+            _wantsCwDecode = want;
+            _hub.AdjustCwDecodeRequests(want ? 1 : -1);
+        }
+
         private int _wantsNativeMic;
         private uint _nativeMicGeneration;
+        private long _nativeMicFramesQueued;
         public bool WantsNativeMic => Volatile.Read(ref _wantsNativeMic) != 0;
         public uint NativeMicGeneration => Volatile.Read(ref _nativeMicGeneration);
 
@@ -1000,13 +1062,63 @@ public sealed class StreamingHub
             // this websocket connected, so a handshake-time bool would deny the
             // session forever. Disable/cleanup never needs authorization.
             if (want && !IsNativeMicStreamAuthorized())
+            {
+                _log.LogWarning(
+                    "ws.native-mic request denied id={Id} generation={Generation}",
+                    Id,
+                    generation);
                 want = false;
-            if (want) Volatile.Write(ref _nativeMicGeneration, generation);
+                SendNativeMicStreamDenied(generation);
+            }
+            if (want)
+            {
+                Volatile.Write(ref _nativeMicGeneration, generation);
+                Interlocked.Exchange(ref _nativeMicFramesQueued, 0);
+            }
             int next = want ? 1 : 0;
             int prev = Interlocked.Exchange(ref _wantsNativeMic, next);
             if (prev != next)
+            {
                 Interlocked.Add(ref _hub._nativeMicStreamRequests, next - prev);
+                _log.LogInformation(
+                    "ws.native-mic request enabled={Enabled} id={Id} generation={Generation} queuedBlocks={QueuedBlocks}",
+                    want,
+                    Id,
+                    NativeMicGeneration,
+                    Interlocked.Read(ref _nativeMicFramesQueued));
+            }
             if (!want) _queue.RemoveType(MsgType.NativeMicPcm);
+        }
+
+        // Lets the PTT UI report the real reason (authorization denied) the
+        // instant the press fails instead of guessing "microphone not
+        // producing audio" after the capture-side wait times out.
+        private void SendNativeMicStreamDenied(uint generation)
+        {
+            var payload = new byte[1 + sizeof(uint)];
+            payload[0] = (byte)MsgType.NativeMicStreamDenied;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1, sizeof(uint)), generation);
+            TryEnqueue(payload);
+        }
+
+        public void LogNativeMicAuthorizationRevoked() =>
+            _log.LogWarning(
+                "ws.native-mic authorization revoked id={Id} generation={Generation} queuedBlocks={QueuedBlocks}",
+                Id,
+                NativeMicGeneration,
+                Interlocked.Read(ref _nativeMicFramesQueued));
+
+        public void RecordNativeMicFrameQueued()
+        {
+            var count = Interlocked.Increment(ref _nativeMicFramesQueued);
+            if (count == 1)
+            {
+                _log.LogInformation(
+                    "ws.native-mic first-frame id={Id} generation={Generation} samples={Samples}",
+                    Id,
+                    NativeMicGeneration,
+                    MicPcmFrameSamples);
+            }
         }
 
         // Whether this client currently has any mounted display-frame consumer
@@ -1036,6 +1148,11 @@ public sealed class StreamingHub
             if (frame.Length >= 1 && frame.Span[0] == MsgTypeAudioStreamRequest)
             {
                 SetWantsAudio(frame.Length > 1 && frame.Span[1] != 0);
+                return;
+            }
+            if (frame.Length >= 1 && frame.Span[0] == MsgTypeCwDecoderRequest)
+            {
+                SetWantsCwDecode(frame.Length > 1 && frame.Span[1] != 0);
                 return;
             }
             if (frame.Length >= 1 && frame.Span[0] == MsgTypeDisplayStreamRequest)

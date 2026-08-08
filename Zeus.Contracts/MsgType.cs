@@ -90,6 +90,12 @@ public enum MsgType : byte
     // already in flight from the previous press.
     NativeMicStreamRequest = 0x24,
 
+    // Client → server (control). Enables the first-party receive-side CW
+    // decoder while at least one Telegraph Console panel is mounted. The
+    // request is refcounted per connected session and unwound on disconnect.
+    // Payload: [type:1][enable:u8] (2 bytes).
+    CwDecoderRequest = 0x25,
+
     // Server → client (TX telemetry + protection)
     TxMeters = 0x11,
     TxStatus = 0x12,
@@ -136,6 +142,11 @@ public enum MsgType : byte
     // same 5 Hz cadence as RxMeter. The legacy 5-byte 0x14 frame stays in
     // flight for older clients (e.g. SMeterLive) — 0x19 is purely additive.
     RxMetersV2 = 0x19,
+
+    // Server -> client measured RX signal quality. Additive to the legacy
+    // S-meter frames: estimated passband SNR plus separately integrated signal and
+    // noise powers. NaN fields / zero confidence mean unavailable.
+    RxSignalQuality = 0x3F,
 
     // 0x1A — reserved (previously VstHostEvent on the drifted plugin-host
     // branch). Left as a gap rather than reassigned to avoid colliding with
@@ -197,12 +208,9 @@ public enum MsgType : byte
     // builds tolerate this cleanly.
     CwEngineStatus = 0x30,
 
-    // Server → client (CW receive decoder) — RESERVED. The server-side
-    // CwDecoderService that broadcast this frame was retired, and its
-    // browser-side successor was removed; nothing emits or parses 0x31
-    // today. The value stays reserved to preserve the wire gap for the
-    // planned first-party CW decoder.
-    // Payload was: [type:1][wpm:u16 LE][snrDb:f32 LE][confidence:f32 LE]
+    // Server → client (first-party CW receive decoder). Broadcast at no
+    // more than 10 Hz while a client requests decoding and RX0 is in CWU/CWL.
+    // Payload: [type:1][wpm:u16 LE][snrDb:f32 LE][confidence:f32 LE]
     // [textLen:u16 LE][text:UTF-8…]. See CwDecodedTextFrame.cs.
     CwDecodedText = 0x31,
 
@@ -300,11 +308,24 @@ public enum MsgType : byte
     // workspace is closed from replaying on mount. See WsjtxInboundReplyFrame.cs.
     WsjtxReply = 0x3C,
 
-    // Server → client (desktop/local-attach friend PTT microphone). Emitted
-    // only to a trusted loopback websocket session while that session holds a
-    // NativeMicStreamRequest. Payload: [type:1][generation:u32 LE]
+    // Server → client (desktop/local-attach friend PTT microphone). Carries the
+    // source selected for live TX (host mic or radio-digitised mic/line/XLR)
+    // from the pre-MOX gate. Emitted only to a trusted loopback websocket
+    // session while that session holds a NativeMicStreamRequest. Payload:
+    // [type:1][generation:u32 LE]
     // [960 × f32 LE mono @ 48 kHz].
     // This is a private host-to-webview transport; friend-to-friend audio
     // continues to travel peer-to-peer as WebRTC Opus.
     NativeMicPcm = 0x3D,
+
+    // Server → client (native mic stream request denied). Sent once, right
+    // when a NativeMicStreamRequest(enable=true) fails IsNativeMicStreamAuthorized
+    // (e.g. the Zeus Link product-audio lease is not currently attached),
+    // instead of the server silently doing nothing. Without this, the client
+    // has no way to distinguish "authorization denied" from "device is slow
+    // to produce audio" and can only report a misleading timeout error after
+    // waiting out the capture-side deadline. Payload: [type:1]
+    // [generation:u32 LE] — the client discards stale generations the same
+    // way it already does for NativeMicPcm (0x3D).
+    NativeMicStreamDenied = 0x3E,
 }

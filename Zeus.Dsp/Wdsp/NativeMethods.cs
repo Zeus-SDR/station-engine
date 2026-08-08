@@ -301,6 +301,10 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void Spectrum0(int run, int disp, int ss, int LO, ref double pbuff);
 
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDisplayDetectorMode(int disp, int pixout, int mode);
+
     // Pull complex IQ samples from TXA's siphon ring. The siphon sits at
     // xsiphon's position in xtxa, which is BEFORE iqc (PureSignal correction)
     // and BEFORE cfir/rsmpout. Default run=1, mode=0, sipsize=16384 (set
@@ -327,6 +331,14 @@ internal static partial class NativeMethods
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetDisplayAvBackmult(int disp, int pixout, double mult);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDisplaySampleRate(int disp, int rate);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDisplayNormOneHz(int disp, int pixout, int norm);
 
     // GetPixels has no pixel_ref out-parameter — doc 03 predicted a 5th
     // argument but the shipped ABI is 4-parameter. Writes float[num_pixels] in place.
@@ -961,6 +973,23 @@ internal static partial class NativeMethods
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial IntPtr wisdom_get_status();
+
+    // Version of the libwdsp that actually got loaded. native/wdsp/version.c
+    // returns version_number * 100 with exactly two digits to the right of the
+    // decimal point, so v2.00 reports 200 and v1.14 reports 114. Declared at
+    // native/wdsp/wdsp.h:988.
+    //
+    // Zeus targets WDSP 2.0. Because Zeus Link supplies engine binaries out of
+    // band into a self-extracting layout, a stale libwdsp can end up next to a
+    // current managed build with no other symptom, so this is the only runtime
+    // proof of which DSP engine is in the process. Older libwdsp builds may not
+    // export the symbol at all — callers must go through
+    // WdspDspEngine.ResolveEngineVersion(), which probes the export first
+    // (see Nr4Sbnr / Nr3Rnnr for the same capability-guard pattern) rather than
+    // letting an EntryPointNotFoundException escape.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int GetWDSPVersion();
 
     // -- PureSignal (predistortion). Lives inside the TXA channel via
     //    create_calcc / create_iqc (TXA.c:405,424). Symbol set verified

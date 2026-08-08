@@ -242,9 +242,9 @@ public partial class Program
                 PluginRoot = StationFeaturePluginRoot(),
             });
         // The later registration intentionally replaces the engine's inert
-        // fallback so optional hardware behavior follows the live plugin
-        // activation state, including uninstall/deactivation without restart.
-        builder.Services.AddSingleton<IInstalledFeatureState, PluginFeatureState>();
+        // fallback so optional hardware follows Zeus Link's first-party
+        // Features state, including live enable/disable without restart.
+        builder.Services.AddSingleton<IInstalledFeatureState, ProductFeatureState>();
 
         var app = builder.Build();
         if (options.BindMode == StationEngineBindMode.Lan && options.LanHttpsPort is null)
