@@ -2178,6 +2178,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _ => AnalyzerFftSize,
     };
 
+    internal static double NormalizeTxDisplayAvgTauSec(double avgTauSec) =>
+        double.IsFinite(avgTauSec) && avgTauSec >= 0.0 && avgTauSec <= 2.0
+            ? avgTauSec
+            : TxAvgTauSec;
+
     public void ConfigureTxDisplayAnalyzer(int fftSize, int windowType, double avgTauSec)
     {
         if (_disposed != 0) return;
@@ -2187,7 +2192,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // historical defaults rather than feeding garbage to SetAnalyzer.
         int fft = NormalizeTxFftSize(fftSize);
         int win = (windowType >= 0 && windowType <= 11) ? windowType : AnalyzerWindow;
-        double tau = (avgTauSec > 0.0 && avgTauSec <= 2.0) ? avgTauSec : TxAvgTauSec;
+        double tau = NormalizeTxDisplayAvgTauSec(avgTauSec);
 
         _txFftSize = fft;
         _txWinType = win;
@@ -4247,7 +4252,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     private static void ConfigureDisplayAveragingTau(int disp, double tauSec)
     {
-        double backmult = Math.Exp(-1.0 / (PipelineFps * tauSec));
+        // tau=0 is the operator-facing "no smoothing" setting. A zero
+        // recursive multiplier makes each output use the current frame only.
+        double backmult = tauSec <= 0.0
+            ? 0.0
+            : Math.Exp(-1.0 / (PipelineFps * tauSec));
         for (int pixout = 0; pixout < 2; pixout++)
         {
             NativeMethods.SetDisplayAverageMode(disp, pixout, LogRecursiveMode);

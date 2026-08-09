@@ -7854,12 +7854,9 @@ public class DspPipelineService : BackgroundService,
     // block runs at the longest contributor; each output sample is the average
     // of the contributors PRESENT at that index (a contributor "present" means
     // its index is within its own sample count). The divisor is the number of
-    // streams that produced any samples — RX1 (when unmuted and rx1Count>0) plus
-    // every slice with Count>0 — so a stalled or muted stream never dilutes the
-    // others, and a single contributor passes through at full amplitude. With
-    // exactly one non-empty slice and an unmuted RX1 this is byte-identical to
-    // the original MixRxAudio (RX1+RX2 → /2; RX2 only when rx1Count==0 →
-    // passthrough; no RX2 → rx1 untouched).
+    // streams present at that sample, so a stalled, muted, or shorter stream
+    // never dilutes the others and a single contributor passes through at full
+    // amplitude.
     //
     // <paramref name="rx1Muted"/>: RX1's samples are dropped from both the sum
     // and the divisor (the caller has already zeroed them), but rx1Count still
@@ -7874,28 +7871,35 @@ public class DspPipelineService : BackgroundService,
         rx1Count = Math.Clamp(rx1Count, 0, rx1.Length);
 
         bool rx1Contributes = !rx1Muted && rx1Count > 0;
-        int contributors = rx1Contributes ? 1 : 0;
+        int availableStreams = rx1Contributes ? 1 : 0;
         int count = rx1Count;
         foreach (var s in slices)
         {
             int sc = Math.Clamp(s.Count, 0, s.Buffer.Length);
             if (sc <= 0) continue;
-            contributors++;
+            availableStreams++;
             if (sc > count) count = sc;
         }
         count = Math.Min(count, rx1.Length);
-        if (count == 0 || contributors == 0) return 0;
+        if (count == 0 || availableStreams == 0) return 0;
 
         for (int i = 0; i < count; i++)
         {
-            float sum = (rx1Contributes && i < rx1Count) ? rx1[i] : 0f;
+            float sum = 0f;
+            int contributors = 0;
+            if (rx1Contributes && i < rx1Count)
+            {
+                sum = rx1[i];
+                contributors = 1;
+            }
             foreach (var s in slices)
             {
                 int sc = Math.Clamp(s.Count, 0, s.Buffer.Length);
                 if (sc <= 0 || i >= sc) continue;
                 sum += s.Buffer[i];
+                contributors++;
             }
-            rx1[i] = sum / contributors;
+            rx1[i] = contributors > 0 ? sum / contributors : 0f;
         }
         return count;
     }

@@ -237,14 +237,14 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         return Task.CompletedTask;
     }
 
-    private void OpenInputLocked(string? requestedDeviceId)
+    private InputOpenOutcome OpenInputLocked(string? requestedDeviceId)
     {
         var selected = !string.IsNullOrWhiteSpace(requestedDeviceId);
         var input = OpenInputTimeboxed(requestedDeviceId, out var failure);
         if (input != null)
         {
             AdoptInputLocked(input, requestedDeviceId);
-            return;
+            return InputOpenOutcome.ConfiguredRouteOpened;
         }
 
         LogOpenGaveUp(selected ? "selected" : "default", failure);
@@ -255,14 +255,24 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 "No usable microphone input is available. Select an input device or retry.");
             _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
             ScheduleStartupOpenRecovery(null);
-            return;
+            return InputOpenOutcome.Failed;
         }
 
         var fallback = OpenInputTimeboxed(null, out var fallbackFailure);
         if (fallback != null)
         {
             AdoptInputLocked(fallback, null);
-            return;
+            if (!string.Equals(
+                    NormalizeDeviceId(requestedDeviceId),
+                    _activeInputDeviceId,
+                    StringComparison.Ordinal))
+            {
+                Volatile.Write(
+                    ref _inputError,
+                    "The selected microphone could not be opened. The system default input is active temporarily while Zeus retries the selected device.");
+            }
+            ScheduleStartupOpenRecovery(requestedDeviceId);
+            return InputOpenOutcome.DefaultFallbackOpened;
         }
 
         LogOpenGaveUp("default fallback", fallbackFailure);
@@ -271,6 +281,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             "Neither the selected microphone nor the system default input could be opened. TX microphone audio is unavailable.");
         _log.LogWarning("audio.native.tx TX uplink disabled (no usable mic input)");
         ScheduleStartupOpenRecovery(requestedDeviceId);
+        return InputOpenOutcome.Failed;
     }
 
     // Startup-open recovery: a failed FIRST open must not park the uplink
@@ -329,8 +340,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                                 Interlocked.Increment(ref _deviceGeneration);
                                 CloseInputLocked(dispose: true);
                                 ResetAccumulation();
-                                OpenInputLocked(configuredDeviceId);
-                                bool recovered = _input is not null;
+                                bool recovered = OpenInputLocked(configuredDeviceId)
+                                    == InputOpenOutcome.ConfiguredRouteOpened;
                                 if (recovered)
                                     _log.LogInformation(
                                         "audio.native.tx startup-open recovery succeeded attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
@@ -667,8 +678,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                                 Interlocked.Increment(ref _deviceGeneration);
                                 CloseInputLocked(dispose: true);
                                 ResetAccumulation();
-                                OpenInputLocked(configuredDeviceId);
-                                bool recovered = _input is not null;
+                                bool recovered = OpenInputLocked(configuredDeviceId)
+                                    == InputOpenOutcome.ConfiguredRouteOpened;
                                 if (recovered)
                                     _log.LogInformation(
                                         "audio.native.tx device-stop recovery succeeded attempt={Attempt} configuredDeviceId={ConfiguredDeviceId}",
@@ -704,6 +715,13 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
     internal static float SanitizeCapturedSample(float sample)
         => DspPipelineService.SanitizeAudioSample(sample);
+
+    private enum InputOpenOutcome
+    {
+        ConfiguredRouteOpened,
+        DefaultFallbackOpened,
+        Failed,
+    }
 
     private static string? NormalizeDeviceId(string? deviceId)
     {

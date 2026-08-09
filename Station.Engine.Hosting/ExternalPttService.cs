@@ -526,6 +526,17 @@ public sealed class ExternalPttService : IHostedService, IDisposable
             if (_effHigh) return;
             releaseNow = _owned;
             _owned = false;
+            // Re-stamp with the CURRENT transition sequence rather than the one
+            // captured at this falling edge. The release side effects run off
+            // the lock, so two falling edges can each defer their release; if a
+            // rebound rise+fall advanced _moxOpSeq before this older release
+            // wins _sync, queuing with the stale edge stamp makes ApplyMox
+            // self-drop it — while the newer fall finds _owned already cleared
+            // and no-ops — stranding MOX on until the operator clicks it off.
+            // The _effHigh guard above already confirmed the line is currently
+            // low, so releasing is correct and the latest stamp is the right one
+            // to carry. Mirrors OnHangElapsed's under-lock re-read.
+            seq = _moxOpSeq;
         }
         if (!releaseNow) return;
 
@@ -674,6 +685,15 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     internal void TestCwKeyDown(bool down) => OnCwKeyDownChanged(down);
 
     internal void TestHangElapsed() => OnHangElapsed(null);
+
+    /// <summary>Test seam: fire the voice-mode immediate-release path with an
+    /// explicit falling-edge stamp, reproducing a deferred release that only
+    /// wins <c>_sync</c> after later edges advanced the transition sequence.</summary>
+    internal void TestReleaseOwnedMox(long seq) => ReleaseOwnedMox(seq);
+
+    /// <summary>Test seam: current effective-transition stamp, so a test can
+    /// capture an edge's stamp and later replay a superseded (stale) release.</summary>
+    internal long TestMoxOpSeq { get { lock (_sync) return _moxOpSeq; } }
 
     internal void TestDisconnectP1() => OnDisconnected();
 

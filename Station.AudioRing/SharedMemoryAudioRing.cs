@@ -61,6 +61,18 @@ public sealed class AudioRingOwner : IDisposable
 
     public AudioRingEndpoint Endpoint { get; }
 
+    /// <summary>
+    /// Reads the consumer-owned realtime marker from reserved ring-header
+    /// storage. A value of zero means idle. Higher-level consumers may use
+    /// positive values to identify the operation currently in flight; the
+    /// marker survives a hard consumer crash so the owner can attribute it.
+    /// </summary>
+    public int ReadConsumerRealtimeMarker()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _output.ReadRealtimeMarker();
+    }
+
     public static AudioRingOwner Create()
     {
         var token = Guid.NewGuid().ToString("N")[..12];
@@ -207,7 +219,19 @@ public sealed class AudioRingOwner : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ValidateSamples(input);
         DrainUnmatchedOutput();
-        var sequence = Interlocked.Increment(ref _sequence);
+        return TryPublish(input, out _);
+    }
+
+    /// <summary>
+    /// Publishes one block and returns its monotonically increasing sequence,
+    /// including when the bounded ring is full and publication is dropped.
+    /// Callers can retain sequence-aligned fallback data without waiting.
+    /// </summary>
+    public bool TryPublish(ReadOnlySpan<float> input, out long sequence)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateSamples(input);
+        sequence = Interlocked.Increment(ref _sequence);
         return _input.TryWrite(sequence, input) && _inputSignal.TrySet();
     }
 
@@ -390,8 +414,14 @@ public sealed class AudioRingOwner : IDisposable
             Volatile.Write(ref Int32At(24), AudioRingProtocol.MaxSamplesPerBlock);
             Volatile.Write(ref Int32At(28), SlotBytes);
             Volatile.Write(ref Int64At(32), unchecked((long)sessionToken));
+            Volatile.Write(ref Int32At(40), 0);
             Interlocked.MemoryBarrier();
         }
+
+        public int ReadRealtimeMarker() => Volatile.Read(ref Int32At(40));
+
+        public void WriteRealtimeMarker(int value) =>
+            Volatile.Write(ref Int32At(40), value);
 
         public void Validate(ulong sessionToken)
         {
@@ -505,6 +535,16 @@ public sealed class AudioRingConsumer : IDisposable
         _outputSignal = opened.OutputSignal;
         _input = opened.Input;
         _output = opened.Output;
+    }
+
+    /// <summary>
+    /// Publishes a nonblocking owner-readable marker for the realtime operation
+    /// currently in flight. Zero clears the marker.
+    /// </summary>
+    public void SetRealtimeMarker(int value)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _output.WriteRealtimeMarker(value);
     }
 
     public void Run(AudioBlockProcessor processor, CancellationToken cancellationToken)

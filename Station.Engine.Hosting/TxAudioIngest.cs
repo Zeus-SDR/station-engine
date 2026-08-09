@@ -63,6 +63,8 @@ internal enum MicBlockSource
 {
     /// <summary>Browser / native host microphone (the default TX-audio source).</summary>
     Host = 0,
+    /// <summary>Browser microphone explicitly supplied by a LAN/mobile client.</summary>
+    BrowserMic,
     /// <summary>Radio-digitised jack audio (Saturn mic/line-in/XLR via UDP 1026).</summary>
     RadioMic,
     /// <summary>TCI client TX audio (MSHV / WSJT-X …). Operator-explicit override.</summary>
@@ -185,10 +187,11 @@ public sealed class TxAudioIngest : IDisposable
     // concurrent native-mic frame within TciHysteresisMs is suppressed -- the
     // recording replaces the live mic on the air, they never mix.
     private long _lastWavTickMs;
-    // Browser/mobile mic recency: desktop mode has NativeMicCapture running
-    // continuously, so remote WebSocket mic frames must temporarily own the
-    // "live mic" source. Otherwise mobile PTT mixes phone audio with desktop
-    // capture silence and feeds TXA at roughly 2x realtime.
+    // Browser/mobile mic recency: desktop mode can have either NativeMicCapture
+    // or a radio-digitised jack running continuously, so remote WebSocket mic
+    // frames must temporarily own the "live mic" source. Otherwise mobile PTT
+    // mixes phone audio with the station source and feeds TXA at roughly 2x
+    // realtime.
     private long _lastBrowserMicTickMs;
 
     // The currently-armed TX-audio source for HOST↔RADIO arbitration
@@ -852,7 +855,7 @@ public sealed class TxAudioIngest : IDisposable
         long now = Environment.TickCount64;
         Volatile.Write(ref _lastBrowserMicTickMs, now);
         if (ShouldSuppressForAuthoritativeSource(now)) return;
-        OnMicPcmBytes(f32lePayload, MicBlockSource.Host);
+        OnMicPcmBytes(f32lePayload, MicBlockSource.BrowserMic);
     }
 
     /// <summary>
@@ -884,6 +887,8 @@ public sealed class TxAudioIngest : IDisposable
     {
         long now = Environment.TickCount64;
         if (ShouldSuppressForAuthoritativeSource(now)) return;
+        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
+        if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.RadioMic);
     }
 
@@ -930,11 +935,15 @@ public sealed class TxAudioIngest : IDisposable
         // accumulator gate remains authoritative for the separate WDSP append,
         // since _activeSource can flip again after this lock is released. TCI/WAV
         // bypass both the live-mic bridge and this compare.
-        if (source is MicBlockSource.Host or MicBlockSource.RadioMic)
+        if (source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic)
         {
             lock (_sync)
             {
-                if (source != _activeSource) { _droppedFrames++; return; }
+                if (source != MicBlockSource.BrowserMic && source != _activeSource)
+                {
+                    _droppedFrames++;
+                    return;
+                }
                 // Friend PTT hears the same selected live source that MOX would
                 // transmit, but this pre-MOX feed never keys the radio.
                 _hub.BroadcastNativeMicPcm(f32lePayload.Span);
@@ -1071,7 +1080,7 @@ public sealed class TxAudioIngest : IDisposable
         // leveler cannot raise a tone out of exact zeros, so the gate's original
         // purpose is preserved.
         if (monitorOn && !moxNow
-            && source is MicBlockSource.Host or MicBlockSource.RadioMic
+            && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic
             && ShouldSuppressIdleMonitorPreviewBlock(samples))
         {
             samples = SilentMicBlock;

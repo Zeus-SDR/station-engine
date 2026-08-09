@@ -151,7 +151,7 @@ public static class NativeAudioEndpoints
             mic,
             snapshot,
             supported: true,
-            error: null));
+            error: mic?.InputError));
     }
 
     private static NativeAudioDevicesResponse BuildNativeAudioDevicesResponse(

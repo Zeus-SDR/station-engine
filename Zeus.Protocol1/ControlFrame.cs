@@ -337,9 +337,9 @@ internal static class ControlFrame
         // ADC1 occupies C1[4:0] plus enable C1[5], while keyer fields use C2..C4.
         HpsdrAtten Adc1Atten = default,
         // Effective PA state after the host has combined the global PA toggle
-        // with the active band's "Disable PA" / transverter policy. Thetis
-        // writes this continuously: HL2 uses DriveFilter C2[3], while legacy
-        // Hermes-class firmware uses DriveFilter C3[7].
+        // with the active band's "Disable PA" / transverter policy. HL2 writes
+        // this active-high in DriveFilter C2[3]; legacy Hermes-class firmware
+        // uses the inverse, active-high T/R-relay-disable bit in C3[7].
         bool PaEnabled = false,
         // Wire-neutral server RX-aux selector: 0=base, 1=EXT1, 2=EXT2,
         // 3=XVTR, 4=BYPASS. Kept as an int so the Hosting enum does not leak
@@ -394,9 +394,9 @@ internal static class ControlFrame
                 // C2/C3/C4 and lights C2[3] for PA enable when pa_enabled &&
                 // !txband->disablePA. Without this bit the HL2 gateware never
                 // energizes the PA regardless of drive level. Legacy Hermes-
-                // class firmware consumes the same effective state at C3[7]
-                // (Thetis networkproto1.c case 10). The enable is configuration,
-                // not PTT: firmware gates actual RF with MOX independently.
+                // class firmware uses C3[7] with the opposite polarity: it is
+                // the active-high T/R-relay-disable bit. The setting is
+                // configuration, not PTT: firmware gates actual RF with MOX.
                 cc[1] = state.DriveLevel;
                 cc[2] = 0;
                 cc[3] = 0;
@@ -416,7 +416,7 @@ internal static class ControlFrame
                 {
                     if (state.MicBoost) cc[2] |= 0x01;   // C2[0] mic_boost
                     if (state.MicLineIn) cc[2] |= 0x02;  // C2[1] mic_linein
-                    if (state.PaEnabled) cc[3] |= 0x80;  // C3[7] legacy PA enable
+                    if (!state.PaEnabled) cc[3] |= 0x80; // C3[7] T/R relay disable
                 }
                 // ATU auto-tune-start request — C2[4], register 0x09 bit [20]
                 // ("Tune request") per the HL2 protocol doc; the Apollo/Alex
