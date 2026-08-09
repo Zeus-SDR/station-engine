@@ -166,6 +166,21 @@ public sealed class SpotManager
         SpotsChanged?.Invoke();
     }
 
+    /// <summary>Remove one callsign observation owned by a specific ingest
+    /// source without disturbing another source's observation of that call.</summary>
+    public void RemoveByOwner(SpotSource source, string ownerId, string callsign)
+    {
+        var normalizedOwner = NormalizeOwner(source, ownerId);
+        lock (_sync)
+        {
+            _observations.Remove(new ObservationKey(
+                (callsign ?? "").Trim().ToUpperInvariant(),
+                source,
+                normalizedOwner));
+        }
+        SpotsChanged?.Invoke();
+    }
+
     /// <summary>
     /// Clear all spots.
     /// </summary>

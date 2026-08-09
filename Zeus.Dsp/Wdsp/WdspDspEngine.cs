@@ -111,6 +111,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private const int AnalyzerFftSize = 16_384;
     private const int SnrAnalyzerPixelWidth = RxSnrSpectrumInfo.MaxPixelCount;
     private const int AnalyzerFps = 30;
+    private const double MaxBinTauSeconds = 0.5;
     private const int AnalyzerWindow = 2;
     private const double AnalyzerKaiserPi = 14.0;
     private const double AnalyzerKeepTime = 0.1;
@@ -282,6 +283,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         public int FilterLowAbsHz = 150;
         public int FilterHighAbsHz = 2850;
         public RxaMode CurrentMode = RxaMode.USB;
+        // Hardware-NCO-relative offset of the tuned passband. The analyzer
+        // sees pre-shift IQ, so its max-bin detector must move by this amount
+        // while the demodulator shifts the same signal back to baseband.
+        public int CtunShiftHz;
         // Thetis "AGC Top" max-gain setting in dB. 90 matches the Thetis
         // default (radio.cs:1021 rx_agc_max_gain); the /api/agcGain endpoint can
         // override at runtime.
@@ -446,7 +451,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     // Latest per-stage RX meters, published atomically each time
     // GetRxStageMeters is called from the pipeline tick. The reader sees a
-    // consistent snapshot across all 7 indices without racing against a
+    // consistent snapshot across all 7 RXA indices plus max-bin without racing against a
     // concurrent re-read. Mirrors the TX path's _latestTxStageMeters /
     // _txMeterPublishLock pattern. The lock is uncontended in steady state —
     // GetRxStageMeters runs from the pipeline tick at 5 Hz; if a future
@@ -603,6 +608,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // returns without filling iout/qout and the monitor RXA hears silence
     // or stack garbage.
     private bool _moxOn;
+    // PureSignal still damps RXA on key-down. Remember that transition across
+    // an emergency mid-over PS disarm so key-up always restores RXA.
+    private bool _rxaStoppedForCurrentMox;
     // Tracked engine-side TXA state-bit so the helper can flip idempotently
     // and avoid double-priming. TXA opens at state=0; SetChannelState walks
     // it through 1 / 0 transitions explicitly.
@@ -864,6 +872,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             state.Worker = worker;
 
             _channels[id] = state;
+            ConfigureMaxBinDetector(state);
             worker.Start();
             workerStarted = true;
 
@@ -1137,6 +1146,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         state.CurrentMode = mapped;
         _log.LogInformation("wdsp.setMode channel={Id} mode={Mode}", channelId, mapped);
         ApplyBandpassForMode(state);
+        ConfigureMaxBinDetector(state);
         // Re-assert squelch on the stage matching the new mode and clear the
         // old one — squelch is mode-aware (SSQL/AMSQ/FMSQ) per Thetis §5.
         ApplySquelchLocked(state);
@@ -1157,6 +1167,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         state.FilterLowAbsHz = lo;
         state.FilterHighAbsHz = hi;
         ApplyBandpassForMode(state);
+        ConfigureMaxBinDetector(state);
     }
 
     public void SetVfoHz(int channelId, long vfoHz)
@@ -1167,7 +1178,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public void SetCtunShift(int channelId, int shiftHz)
     {
-        if (!_channels.TryGetValue(channelId, out var _)) return;
+        if (!_channels.TryGetValue(channelId, out var state)) return;
         // Mirrors Thetis radio.cs:1419-1420. Note the negation: Thetis tracks
         // an `rx_osc = -(dial - centre)` then calls SetRXAShiftFreq(-osc), so
         // the net argument is (dial - centre) = our shiftHz. Same goes to
@@ -1175,6 +1186,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         NativeMethods.SetRXAShiftFreq(channelId, shiftHz);
         NativeMethods.RXANBPSetShiftFrequency(channelId, shiftHz);
         NativeMethods.SetRXAShiftRun(channelId, shiftHz != 0 ? 1 : 0);
+        state.CtunShiftHz = shiftHz;
+        ConfigureMaxBinDetector(state);
     }
 
     public void SetRxDisplayFastAttack(int channelId, bool fast)
@@ -1983,7 +1996,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         return sAv;
     }
 
-    // Full RXA meter snapshot — fetches all 7 indices in one pass and
+    // Full RXA meter snapshot — fetches all 7 ring indices plus analyzer
+    // max-bin in one pass and
     // publishes under _rxMeterPublishLock so callers see a consistent set.
     // Indices per WDSP RXA.h:47-57 enum rxaMeterType:
     //   0  RXA_S_PK     1  RXA_S_AV     (signal peak / avg, dBm)
@@ -2011,7 +2025,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             AdcAv: (float)NativeMethods.GetRXAMeter(channelId, 3),
             AgcGain: (float)NativeMethods.GetRXAMeter(channelId, 4),
             AgcEnvPk: (float)NativeMethods.GetRXAMeter(channelId, 5),
-            AgcEnvAv: (float)NativeMethods.GetRXAMeter(channelId, 6));
+            AgcEnvAv: (float)NativeMethods.GetRXAMeter(channelId, 6),
+            SignalMaxBin: (float)NativeMethods.GetDetectMaxBin(channelId));
         lock (_rxMeterPublishLock) { _latestRxStageMeters = snap; }
         return snap;
     }
@@ -2568,6 +2583,14 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public void SetMox(bool moxOn)
     {
+        bool stopRxForPureSignal;
+        lock (_psLock)
+            stopRxForPureSignal = _psEnabled;
+        SetMox(moxOn, stopRxForPureSignal);
+    }
+
+    public void SetMox(bool moxOn, bool stopRxForPureSignal)
+    {
         if (_disposed != 0) return;
 
         int txaId;
@@ -2586,21 +2609,30 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             rxaId = r;
         }
 
-        // Thetis console.cs:31375/31387/31409 orders the transitions so the
-        // outgoing side is damped (dmp=1) before the incoming side comes up
-        // clean (dmp=0) — avoids a pop from the demuted side catching an
-        // in-flight buffer.
+        // Display-DUP keeps RXA running through ordinary MOX so its analyzer
+        // and averaging history remain continuous. RX audio is suppressed by
+        // DspPipelineService after it drains the live RXA output. PureSignal
+        // retains the established RXA damp/down transition because its keyed
+        // feedback routing is intentionally unchanged.
         //
         // TX-monitor wrinkle: when MOX falls but monitor is on, TXA must
         // stay running so fexchange2 keeps producing IQ for the monitor
         // demod path. We re-derive TXA target = (MOX || monitor) so the
         // monitor path doesn't go silent when the operator releases MOX.
-        int rxaPrior, txaPrior = -1;
+        int rxaPrior = -1, txaPrior = -1;
         bool wantTxa = moxOn || _monitorRequested;
         if (moxOn)
         {
             _moxOn = true;
-            rxaPrior = NativeMethods.SetChannelState(rxaId, 0, 1);
+            if (stopRxForPureSignal)
+            {
+                rxaPrior = NativeMethods.SetChannelState(rxaId, 0, 1);
+                _rxaStoppedForCurrentMox = true;
+            }
+            else
+            {
+                _rxaStoppedForCurrentMox = false;
+            }
             if (!_txaRunning)
             {
                 txaPrior = NativeMethods.SetChannelState(txaId, 1, 0);
@@ -2627,10 +2659,14 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 txaPrior = NativeMethods.SetChannelState(txaId, 0, 1);
                 _txaRunning = false;
             }
-            rxaPrior = NativeMethods.SetChannelState(rxaId, 1, 0);
-            // PERF_PASS_3_DEBUG: t2 — WDSP RXA brought back up. Uncommitted.
-            _log.LogInformation("wdsp.rxa.up ts={Ts}",
-                System.Diagnostics.Stopwatch.GetTimestamp());
+            if (_rxaStoppedForCurrentMox)
+            {
+                rxaPrior = NativeMethods.SetChannelState(rxaId, 1, 0);
+                _rxaStoppedForCurrentMox = false;
+                // PERF_PASS_3_DEBUG: t2 — WDSP RXA brought back up. Uncommitted.
+                _log.LogInformation("wdsp.rxa.up ts={Ts}",
+                    System.Diagnostics.Stopwatch.GetTimestamp());
+            }
             // Unkeying: clear the stage-meter snapshot so UI doesn't latch the
             // last-during-TX reading while idle. The next MOX-on will publish
             // fresh data on its first ProcessTxBlock.
@@ -4719,12 +4755,15 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // baseband (low=-high, high=-low), USB-family in positive. CW follows the
     // USB/LSB convention per its suffix. Other modes keep unsigned bounds since
     // their passbands span zero.
-    private static void ApplyBandpassForMode(ChannelState state)
+    private static (double low, double high) SignedBandpassForMode(
+        RxaMode mode,
+        int lowAbsHz,
+        int highAbsHz)
     {
-        int lo = state.FilterLowAbsHz;
-        int hi = state.FilterHighAbsHz;
+        int lo = Math.Min(Math.Abs(lowAbsHz), Math.Abs(highAbsHz));
+        int hi = Math.Max(Math.Abs(lowAbsHz), Math.Abs(highAbsHz));
         double low, high;
-        switch (state.CurrentMode)
+        switch (mode)
         {
             case RxaMode.LSB:
             case RxaMode.CWL:
@@ -4743,13 +4782,62 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // width upstream can still abs-fold back to low == high here, which WDSP
         // accepts and then passes nothing through — silent receiver, no error
         // path anywhere. See FloorPassbandWidth.
-        (low, high) = FloorPassbandWidth(low, high);
+        return FloorPassbandWidth(low, high);
+    }
+
+    private static void ApplyBandpassForMode(ChannelState state)
+    {
+        var (low, high) = SignedBandpassForMode(
+            state.CurrentMode,
+            state.FilterLowAbsHz,
+            state.FilterHighAbsHz);
         // Thetis rxa.cs:110-124: every filter change updates all three stages.
         // SetRXABandpassFreqs alone only affects bp1, which is bypassed for SSB.
         // nbp0 (RXANBPSetFreqs) is what actually carries the SSB passband.
         NativeMethods.SetRXABandpassFreqs(state.Id, low, high);
         NativeMethods.RXANBPSetFreqs(state.Id, low, high);
         NativeMethods.SetRXASNBAOutputBandwidth(state.Id, low, high);
+    }
+
+    private static void ConfigureMaxBinDetector(ChannelState state)
+    {
+        var (low, high) = SignedBandpassForMode(
+            state.CurrentMode,
+            state.FilterLowAbsHz,
+            state.FilterHighAbsHz);
+        low += state.CtunShiftHz;
+        high += state.CtunShiftHz;
+
+        // Keep SetupDetectMaxBin in the same C# call stream as Spectrum0,
+        // SetAnalyzer, and analyzer teardown. WDSP owns synchronization with
+        // its asynchronous FFT workers; this lock prevents overlapping managed
+        // reconfiguration calls or a call into a display slot being destroyed.
+        lock (state.AnalyzerLock)
+        {
+            NativeMethods.SetupDetectMaxBin(
+                run: 1,
+                disp: state.Id,
+                ss: 0,
+                lo: 0,
+                rate: state.SampleRateHz,
+                fLow: low,
+                fHigh: high,
+                tau: MaxBinTauSeconds,
+                frameRate: AnalyzerFps);
+        }
+    }
+
+    internal static (double low, double high) ComputeMaxBinPassband(
+        RxMode mode,
+        int lowHz,
+        int highHz,
+        int ctunShiftHz)
+    {
+        var (low, high) = SignedBandpassForMode(
+            MapMode(mode),
+            lowHz,
+            highHz);
+        return (low + ctunShiftHz, high + ctunShiftHz);
     }
 
     // WDSP's bandpass stages silently pass NOTHING for a zero-width passband

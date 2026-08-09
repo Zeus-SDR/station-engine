@@ -215,6 +215,8 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
     public int OpenTxChannel(int outputRateHz = 48_000) => _tx.OpenTxChannel(outputRateHz);
 
     public void SetMox(bool moxOn) => _tx.SetMox(moxOn);
+    public void SetMox(bool moxOn, bool stopRxForPureSignal) =>
+        _tx.SetMox(moxOn, stopRxForPureSignal);
 
     public double GetRxaSignalDbm(int channelId) => -140.0;
 

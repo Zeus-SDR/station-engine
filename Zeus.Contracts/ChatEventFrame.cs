@@ -17,6 +17,7 @@ namespace Zeus.Contracts;
 /// {"kind":"status","status":{...ChatStatusDto...}}
 /// {"kind":"roster","roster":[{...ChatOperator...}, ...]}
 /// {"kind":"message","message":{...ChatMessage...}}
+/// {"kind":"attachmentDownloaded","receipt":{...ChatAttachmentDownloadReceipt...}}
 /// {"kind":"history","room":"lobby","messages":[{...ChatMessage...}, ...]}
 /// {"kind":"friends","friends":{...ChatFriendsDto...}}
 /// {"kind":"ptt","ptt":{...ChatPttSignal...}}
@@ -52,6 +53,10 @@ public static class ChatEventFrame
     /// <summary>Encodes a single-message envelope into a 0x35 frame.</summary>
     public static byte[] Message(ChatMessage message) =>
         Encode(new MessageEnvelope(message));
+
+    /// <summary>Encodes a private attachment-download receipt.</summary>
+    public static byte[] AttachmentDownloaded(ChatAttachmentDownloadReceipt receipt) =>
+        Encode(new AttachmentDownloadedEnvelope(receipt));
 
     /// <summary>Encodes a history (message list) envelope for a room into a 0x35 frame.</summary>
     public static byte[] History(string room, IReadOnlyList<ChatMessage> messages) =>
@@ -129,6 +134,11 @@ public static class ChatEventFrame
     public sealed record MessageEnvelope(ChatMessage Message)
     {
         public string Kind => "message";
+    }
+
+    public sealed record AttachmentDownloadedEnvelope(ChatAttachmentDownloadReceipt Receipt)
+    {
+        public string Kind => "attachmentDownloaded";
     }
 
     public sealed record HistoryEnvelope(string Room, IReadOnlyList<ChatMessage> Messages)

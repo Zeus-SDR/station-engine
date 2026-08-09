@@ -210,6 +210,7 @@ public sealed class SyntheticDspEngine : IDspEngine
     public int OpenTxChannel(int outputRateHz = 48_000) => -1;
 
     public void SetMox(bool moxOn) { }
+    public void SetMox(bool moxOn, bool stopRxForPureSignal) { }
 
     // No live radio behind the synthetic engine; a frozen −140 dBm reads as
     // "below noise floor" on the S-meter.

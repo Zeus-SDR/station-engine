@@ -1168,11 +1168,11 @@ public class DspPipelineService : BackgroundService,
 
     private int _seq;
     private uint _audioSeq;
-    // Latched from MoxChanged so Tick can route the panadapter to the TX
-    // analyzer during keying without snapshotting RadioService. TUN also flips
-    // MOX on (TxService.cs:153-155), so this single flag covers both paths —
-    // see issue #81. volatile because MoxChanged fires on the caller's thread
-    // and Tick reads from the pipeline thread.
+    // Latched from MoxChanged so Tick can select ordinary RX display-DUP or
+    // PureSignal's established keyed TX/feedback display path without
+    // snapshotting RadioService. TUN also flips MOX on, so this single flag
+    // covers both paths. volatile because MoxChanged fires on the caller's
+    // thread and Tick reads from the pipeline thread.
     private volatile bool _keyed;
     // Measurement-only TX-turnaround latency observer (MOX→first-IQ-at-egress
     // and PTT-release→egress-drain). Pure instrumentation: never gates, delays,
@@ -1183,8 +1183,8 @@ public class DspPipelineService : BackgroundService,
     // the default tau once the LO has been quiet for FastAttackRestoreMs.
     // Debounced by design: one arm P/Invoke at gesture start, one restore
     // P/Invoke at gesture end — NOT per wheel notch. Skipped entirely while
-    // _keyed so the TX display path is never touched (PS safety; the engine
-    // method is additionally scoped to the RX analyzer). long.MinValue
+    // _keyed so RX analyzer smoothing is never retuned mid-over (PS safety;
+    // the engine method is additionally scoped to the RX analyzer). long.MinValue
     // sentinel suppresses the arm on the first state callback after connect.
     // _fastAttackLastLoHz is only touched on the state-handler thread;
     // _fastAttackLoChangedAt crosses to the RX thread via Interlocked.
@@ -1240,6 +1240,11 @@ public class DspPipelineService : BackgroundService,
     internal const int DefaultRxPostTxMuteBlocks = 6; // ~200 ms at the 30 Hz audio cadence
     private volatile bool _rxFadeOutPending;        // first RX block after MOX↑
     private volatile bool _rxAudioSuppressedForTx;  // publish silence/sidetone instead of RX while TX is keyed
+    // Ordinary display-DUP keying leaves RX analyzer history untouched. PS
+    // retains the established MOX-edge reset on both sides of an over; latch
+    // the key-down state so an emergency mid-TX PS disarm does not change the
+    // matching key-up cleanup.
+    private bool _resetDisplayPixelsForCurrentTx;
     private int _rxPostTxMuteBlocksRemaining;       // RXA transition-drain blocks after MOX↓
     private int _rxPostTxFadeInSamplesRemaining;    // final-output soft resume after post-TX drain
     private int _rxPostTxDisplayFramesRemaining;    // RXA analyzer transition frames after MOX↓
@@ -2929,10 +2934,12 @@ public class DspPipelineService : BackgroundService,
             Volatile.Write(ref _rxPostTxDisplayFramesRemaining, 0);
             _rxAudioSuppressedForTx = true;
             _rxFadeOutPending = true;
+            _resetDisplayPixelsForCurrentTx = _appliedPsEnabled;
             lock (_engineLock)
             {
-                _engine?.SetMox(true);
-                _engine?.ResetDisplayPixelBuffers();
+                _engine?.SetMox(true, _resetDisplayPixelsForCurrentTx);
+                if (_resetDisplayPixelsForCurrentTx)
+                    _engine?.ResetDisplayPixelBuffers();
             }
         }
         else
@@ -2942,8 +2949,9 @@ public class DspPipelineService : BackgroundService,
             {
                 lock (_engineLock)
                 {
-                    _engine?.SetMox(false);
-                    _engine?.ResetDisplayPixelBuffers();
+                    _engine?.SetMox(false, _resetDisplayPixelsForCurrentTx);
+                    if (_resetDisplayPixelsForCurrentTx)
+                        _engine?.ResetDisplayPixelBuffers();
                 }
             }
             finally
@@ -2957,6 +2965,7 @@ public class DspPipelineService : BackgroundService,
                 Volatile.Write(ref _rxPostTxMuteBlocksRemaining, postTxMuteBlocks);
                 Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
                 _rxAudioSuppressedForTx = false;
+                _resetDisplayPixelsForCurrentTx = false;
             }
         }
     }
@@ -8025,14 +8034,10 @@ public class DspPipelineService : BackgroundService,
                 : 0;
             bool suppressPostTxRxDisplay = ShouldSuppressRxDisplayForCurrentTick();
 
-            // While keyed (MOX or TUN — see _keyed comment) pull the panadapter
-            // from the TX analyzer so it shows the transmitted signal instead of
-            // the RX front end's TX bleed (issue #81). If the TX analyzer isn't
-            // ready (not yet produced an FFT, or engine doesn't have a TX
-            // analyzer — e.g. Synthetic), TryGetTxDisplayPixels returns false and
-            // we fall through to the RX analyzer, matching the pre-issue-#81
-            // behaviour. This fallback also covers the first ~1 tick after
-            // keying before the analyzer averaging has settled.
+            // Display-DUP keeps ordinary keyed panadapter and waterfall frames
+            // in the RX analyzer domain, preserving its averaging and waterfall
+            // history across the whole over. PureSignal keeps the established
+            // keyed TX / feedback analyzer path below.
             //
             // Issue #121 layered on top: if the operator has the "Monitor PA
             // output" toggle on AND PS is armed AND PS has converged
@@ -8042,7 +8047,7 @@ public class DspPipelineService : BackgroundService,
             // — same shape as the existing TX → RX fallback. Default-off
             // toggle: when off the codepath is identical to pre-#121, byte for
             // byte, on every board.
-            if (_keyed)
+            if (_keyed && _appliedPsEnabled)
             {
                 if (_appliedPsEnabled && _psMonitorEnabled
                     && (psFeedbackCorrecting = engine.GetPsStageMeters().Correcting))
@@ -8066,11 +8071,7 @@ public class DspPipelineService : BackgroundService,
                         _lastTxPanValid = true;
                     }
                 }
-                // PureSignal's keyed display remains on its established
-                // TX/feedback domain. Ordinary keyed operation deliberately
-                // skips the TX waterfall here and falls through to fresh RX
-                // analyzer rows below.
-                if (_appliedPsEnabled && displayPlan.IncludeWaterfall && !wf)
+                if (displayPlan.IncludeWaterfall && !wf)
                 {
                     wf = engine.TryGetTxDisplayPixels(DisplayPixout.Waterfall, wfBuf);
                     if (wf)
@@ -8107,7 +8108,7 @@ public class DspPipelineService : BackgroundService,
                         _lastTxPanValid = false;
                     }
                 }
-                if (_appliedPsEnabled && displayPlan.IncludeWaterfall && !wf && _lastTxWfValid)
+                if (displayPlan.IncludeWaterfall && !wf && _lastTxWfValid)
                 {
                     if (holdNowMs - Interlocked.Read(ref _lastTxWfCaptureMs) <= TxDisplayHoldMaxAgeMs)
                     {
@@ -8960,7 +8961,10 @@ public class DspPipelineService : BackgroundService,
             AdcAv: adcPk,
             AgcGain: agc,
             AgcEnvPk: env,
-            AgcEnvAv: env);
+            AgcEnvAv: env,
+            // Protocol 3 does not feed its display IQ through the local WDSP
+            // analyzer, so there is no honest max-bin value to publish.
+            SignalMaxBin: -200f);
 
         _hub.Broadcast(new RxMeterFrame((float)dbm));
         RxMeterUpdated?.Invoke(channel, dbm);
@@ -9096,7 +9100,8 @@ public class DspPipelineService : BackgroundService,
             AdcAv: rx.AdcAv,
             AgcGain: rx.AgcGain,
             AgcEnvPk: ApplyRxMeterCalibration(rx.AgcEnvPk, cal),
-            AgcEnvAv: ApplyRxMeterCalibration(rx.AgcEnvAv, cal));
+            AgcEnvAv: ApplyRxMeterCalibration(rx.AgcEnvAv, cal),
+            SignalMaxBin: ApplyRxMeterCalibration(rx.SignalMaxBin, cal));
     }
 
     private static double ApplyRxMeterCalibration(double value, double calOffsetDb) =>

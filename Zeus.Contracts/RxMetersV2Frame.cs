@@ -47,16 +47,18 @@ using System.Buffers.Binary;
 
 namespace Zeus.Contracts;
 
-// Extended RX-telemetry frame (v2). 29 bytes total:
+// Extended RX-telemetry frame (v2). 33 bytes total:
 //
 //   [0x19] [signalPk:f32] [signalAv:f32]
 //          [adcPk:f32]    [adcAv:f32]
 //          [agcGain:f32]
 //          [agcEnvPk:f32] [agcEnvAv:f32]
+//          [signalMaxBin:f32]
 //
 // Compatible additive extension of RxMeterFrame (0x14): carries the full
 // set of WDSP RXA stage readings — signal peak/avg, ADC peak/avg, AGC
-// gain, AGC envelope peak/avg. Mirrors the TxMetersV2Frame (0x16)
+// gain, AGC envelope peak/avg — plus analyzer max-bin. Mirrors the
+// TxMetersV2Frame (0x16)
 // design: a single bare-payload frame with no 16-byte WireFormat header
 // keeps the 5 Hz cadence light, and giving every reading its own field
 // (rather than a keyed map) matches the existing record-struct +
@@ -78,6 +80,8 @@ namespace Zeus.Contracts;
 //   AgcEnv*  — dBm, calibrated (RXA_AGC_PK / RXA_AGC_AV); the AGC
 //              envelope is downstream of the smeter tap in the WDSP
 //              RXA chain so the same cal offset applies.
+//   SignalMaxBin — dBm, calibrated strongest FFT bin inside the active
+//              receive passband, with the analyzer's decaying peak applied.
 //
 // Sentinel handling: a stage whose underlying WDSP path hasn't started
 // (channel just opened, IQ not yet flowing, etc.) returns ≈ −400. The
@@ -90,9 +94,11 @@ public readonly record struct RxMetersV2Frame(
     float AdcAv,
     float AgcGain,
     float AgcEnvPk,
-    float AgcEnvAv)
+    float AgcEnvAv,
+    float SignalMaxBin = -200f)
 {
-    public const int ByteLength = 1 + 4 * 7;
+    public const int LegacyByteLength = 1 + 4 * 7;
+    public const int ByteLength = 1 + 4 * 8;
 
     public void Serialize(IBufferWriter<byte> writer)
     {
@@ -105,13 +111,14 @@ public readonly record struct RxMetersV2Frame(
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(17, 4), AgcGain);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(21, 4), AgcEnvPk);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(25, 4), AgcEnvAv);
+        BinaryPrimitives.WriteSingleLittleEndian(span.Slice(29, 4), SignalMaxBin);
         writer.Advance(ByteLength);
     }
 
     public static RxMetersV2Frame Deserialize(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.Length < ByteLength)
-            throw new InvalidDataException($"RxMetersV2Frame requires {ByteLength} bytes, got {bytes.Length}");
+        if (bytes.Length < LegacyByteLength)
+            throw new InvalidDataException($"RxMetersV2Frame requires at least {LegacyByteLength} bytes, got {bytes.Length}");
         if (bytes[0] != (byte)MsgType.RxMetersV2)
             throw new InvalidDataException($"expected RxMetersV2 (0x{(byte)MsgType.RxMetersV2:X2}), got 0x{bytes[0]:X2}");
         return new RxMetersV2Frame(
@@ -121,6 +128,9 @@ public readonly record struct RxMetersV2Frame(
             AdcAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(13, 4)),
             AgcGain: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(17, 4)),
             AgcEnvPk: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(21, 4)),
-            AgcEnvAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(25, 4)));
+            AgcEnvAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(25, 4)),
+            SignalMaxBin: bytes.Length >= ByteLength
+                ? BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(29, 4))
+                : -200f);
     }
 }

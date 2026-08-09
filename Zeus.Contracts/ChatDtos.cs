@@ -243,6 +243,24 @@ public sealed record ChatAttachmentUploadResponse(
     int Size,
     DateTimeOffset? ExpiresUtc);
 
+/// <summary>
+/// Confirms that the browser fetched a complete blob and initiated its explicit
+/// download. The relay validates these fields against the stored source message
+/// and stamps the authenticated downloader identity.
+/// </summary>
+public sealed record ChatAttachmentDownloadRequest(
+    string MessageId,
+    string Room,
+    long MessageTs,
+    string BlobKey);
+
+/// <summary>A relay-stamped attachment download confirmation.</summary>
+public sealed record ChatAttachmentDownloadReceipt(
+    string MessageId,
+    string Room,
+    string By,
+    long Ts);
+
 /// <summary>A single-callsign request body for the friend endpoints
 /// (request / accept / deny / remove) and admin ban/unban.</summary>
 public sealed record ChatFriendRequest(string Callsign);

@@ -47,7 +47,7 @@ namespace Zeus.Dsp;
 /// <summary>
 /// Per-tick RXA stage readings sampled from the WDSP metering ring. Indices
 /// match Thetis <c>rxaMeterType</c> (RXA.h:47-57): signal peak/avg, ADC
-/// peak/avg, AGC gain, AGC envelope peak/avg.
+/// peak/avg, AGC gain, AGC envelope peak/avg, and analyzer max-bin.
 ///
 /// Units (all uncalibrated — caller applies the per-board offset before
 /// putting them on the wire):
@@ -57,6 +57,7 @@ namespace Zeus.Dsp;
 ///   <item><c>AgcGain</c>: signed dB (positive = AGC is boosting),
 ///         RXA_AGC_GAIN</item>
 ///   <item><c>AgcEnvPk</c> / <c>AgcEnvAv</c>: dBm, RXA_AGC_PK / RXA_AGC_AV</item>
+///   <item><c>SignalMaxBin</c>: dBm, strongest analyzer FFT bin in the active passband</item>
 /// </list>
 ///
 /// Sign convention for <c>AgcGain</c> deliberately differs from
@@ -80,7 +81,8 @@ public readonly record struct RxStageMeters(
     float AdcAv,
     float AgcGain,
     float AgcEnvPk,
-    float AgcEnvAv)
+    float AgcEnvAv,
+    float SignalMaxBin = -200f)
 {
     public static readonly RxStageMeters Silent = new(
         SignalPk: -200f,
@@ -89,5 +91,6 @@ public readonly record struct RxStageMeters(
         AdcAv: -200f,
         AgcGain: 0f,
         AgcEnvPk: -200f,
-        AgcEnvAv: -200f);
+        AgcEnvAv: -200f,
+        SignalMaxBin: -200f);
 }

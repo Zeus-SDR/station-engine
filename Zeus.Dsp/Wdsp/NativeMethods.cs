@@ -951,6 +951,26 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial double GetRXAMeter(int channel, int mt);
 
+    // Analyzer max-bin detector used by the S-meter reading selector. WDSP
+    // evaluates only the requested passband and applies a decaying peak with
+    // the supplied time constant; the display slot is the RX channel id.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetupDetectMaxBin(
+        int run,
+        int disp,
+        int ss,
+        int lo,
+        double rate,
+        double fLow,
+        double fHigh,
+        double tau,
+        int frameRate);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial double GetDetectMaxBin(int disp);
+
     // TXA side. Indices per Thetis TXA.h:49-68 txaMeterType — MIC_AV=1,
     // EQ_AV=3, LVLR_AV=5, LVLR_GAIN=6, CFC_AV=8, CFC_GAIN=9, COMP_AV=11,
     // ALC_AV=13, ALC_GAIN=14, OUT_AV=16. Used for per-stage TX diagnostics

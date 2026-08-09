@@ -296,10 +296,16 @@ public interface IDspEngine : IDisposable
     /// bring-up code that doesn't care.</summary>
     int OpenTxChannel(int outputRateHz = 48_000);
 
-    /// <summary>Flip MOX. When on: SetChannelState(RXA,0,1) then SetChannelState(TXA,1,0).
-    /// When off: SetChannelState(TXA,0,1) then SetChannelState(RXA,1,0). For Synthetic, no-op.
-    /// If OpenTxChannel has not been called (no TXA), this is a no-op.</summary>
+    /// <summary>Flip MOX using the engine's current PureSignal state for RXA
+    /// policy. Compatibility seam for direct engine callers; hosted operation
+    /// uses the explicit overload below.</summary>
     void SetMox(bool moxOn);
+
+    /// <summary>Flip MOX with the caller's already-latched PureSignal display
+    /// intent. Ordinary display-DUP keeps RXA running; PureSignal damps RXA on
+    /// key-down and restores it on key-up. The default keeps existing test and
+    /// alternate engines source-compatible.</summary>
+    void SetMox(bool moxOn, bool stopRxForPureSignal) => SetMox(moxOn);
 
     /// <summary>Raw RXA signal-strength meter in dBm (Thetis rxaMeterType.RXA_S_AV, idx 1).
     /// Returns a frozen −140 dBm from the synthetic engine. Safe to call from the
@@ -309,7 +315,7 @@ public interface IDspEngine : IDisposable
     double GetRxaSignalDbm(int channelId);
 
     /// <summary>RXA per-stage readings (signal peak/avg, ADC peak/avg, AGC
-    /// gain, AGC envelope peak/avg) sampled from the WDSP metering ring in a
+    /// gain, AGC envelope peak/avg) plus analyzer max-bin, sampled in a
     /// single pass. Returns <see cref="RxStageMeters.Silent"/> on the
     /// synthetic engine or when the channel is closed. Cal offset is NOT
     /// applied here — caller (DspPipelineService) decides whether to add the
