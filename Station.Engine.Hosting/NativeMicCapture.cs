@@ -69,6 +69,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly CancellationToken _recoveryToken;
     private bool _disposed;
     private string? _activeInputDeviceId;
+    private volatile bool _externalInputOpen;
+    private string? _externalInputDeviceId;
     private string? _inputError;
     private int _sampleRate;
     private int _channels;
@@ -118,7 +120,9 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     }
 
     public string? ConfiguredInputDeviceId => _deviceSettings?.Get().InputDeviceId;
-    public string? ActiveInputDeviceId => _activeInputDeviceId;
+    public string? ActiveInputDeviceId => _externalInputOpen
+        ? _externalInputDeviceId
+        : _activeInputDeviceId;
     public string? InputError => Volatile.Read(ref _inputError);
     public uint SampleRate => (uint)Math.Max(0, Volatile.Read(ref _sampleRate));
     public uint Channels => (uint)Math.Max(0, Volatile.Read(ref _channels));
@@ -150,13 +154,12 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             "audio.native.tx CAPTURE DEVICE startup resolved={DeviceId}",
             configuredDeviceId ?? "system-default");
 
+        if ((_deviceSettings?.Get().Backend ?? AudioHostApi.System) != AudioHostApi.System)
+            return Task.CompletedTask;
+
         var thread = new Thread(() =>
         {
-            lock (_deviceSync)
-            {
-                if (_shutdown || _input != null) return;
-                OpenInputLocked(configuredDeviceId);
-            }
+            ActivateSystemInput();
         })
         {
             IsBackground = true,
@@ -235,6 +238,59 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         _deviceSettings?.SetInputChannel(inputChannel);
         Volatile.Write(ref _inputChannel, inputChannel ?? -1);
         return Task.CompletedTask;
+    }
+
+    /// <summary>Opens the resumable System/miniaudio capture route.</summary>
+    internal void ActivateSystemInput()
+        => ActivateSystemInput(ConfiguredInputDeviceId, _deviceSettings?.Get().InputChannel);
+
+    internal void ActivateSystemInput(string? deviceId, int? inputChannel = null)
+    {
+        lock (_deviceSync)
+        {
+            if (_shutdown || _input is not null) return;
+            Volatile.Write(ref _inputChannel, inputChannel ?? -1);
+            _externalInputOpen = false;
+            OpenInputLocked(NormalizeDeviceId(deviceId));
+        }
+    }
+
+    /// <summary>Closes System capture without permanently stopping this service.</summary>
+    internal void DeactivateSystemInput()
+    {
+        lock (_deviceSync)
+        {
+            _intentionalStop = true;
+            Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Exchange(ref _recoveryScheduled, -1);
+            Interlocked.Increment(ref _deviceGeneration);
+            try
+            {
+                CloseInputLocked(dispose: true);
+                ResetAccumulation();
+            }
+            finally
+            {
+                _intentionalStop = false;
+            }
+        }
+    }
+
+    internal void SetExternalInputState(
+        bool open,
+        string? deviceId,
+        int sampleRate,
+        int channels)
+    {
+        lock (_deviceSync)
+        {
+            _externalInputDeviceId = open ? NormalizeDeviceId(deviceId) : null;
+            _externalInputOpen = open;
+            Volatile.Write(ref _sampleRate, open ? sampleRate : 0);
+            Volatile.Write(ref _channels, open ? channels : 0);
+            Volatile.Write(ref _inputError, null);
+            if (!open) ResetAccumulation();
+        }
     }
 
     private InputOpenOutcome OpenInputLocked(string? requestedDeviceId)
@@ -563,26 +619,60 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 // air, so its per-plugin IN / OUT / GR preview meters must not
                 // animate from it either (same source-awareness as the level
                 // meter above).
-                if (_ingest.ActiveSource == MicBlockSource.Host)
-                {
-                    try
-                    {
-                        _previewProcessor.ProcessPreview(
-                            new ReadOnlySpan<float>(_accum, 0, MicBlockSamples),
-                            sampleRate: 48_000);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (++_previewErrLogged <= 4)
-                            _log.LogWarning(ex,
-                                "audio.native.tx plugin preview threw (suppressed after 4)");
-                    }
-                }
-
-                FlushBlock();
-                _accumFill = 0;
+                CompleteAccumulatedBlock();
             }
         }
+    }
+
+    /// <summary>
+    /// Accepts exact-48-kHz mono capture already selected by a host backend.
+    /// ASIO uses this seam so the persisted System-device channel selection
+    /// cannot be applied a second time to an already-mono stream.
+    /// </summary>
+    internal void AcceptHostMonoCapture(ReadOnlySpan<float> monoSamples)
+    {
+        int sourceIndex = 0;
+        // -2 is an internal source key distinct from every System channel and
+        // from mix-all (-1). Never splice a partial System block with ASIO.
+        if (_accumChannel != -2)
+        {
+            _accumFill = 0;
+            _accumChannel = -2;
+        }
+
+        while (sourceIndex < monoSamples.Length)
+        {
+            int take = Math.Min(MicBlockSamples - _accumFill, monoSamples.Length - sourceIndex);
+            for (int i = 0; i < take; i++)
+                _accum[_accumFill + i] = SanitizeCapturedSample(monoSamples[sourceIndex + i]);
+            _accumFill += take;
+            sourceIndex += take;
+            Interlocked.Add(ref _totalSamplesIn, take);
+            if (_accumFill == MicBlockSamples)
+                CompleteAccumulatedBlock();
+        }
+    }
+
+    private void CompleteAccumulatedBlock()
+    {
+        if (_ingest.ActiveSource == MicBlockSource.Host)
+        {
+            try
+            {
+                _previewProcessor.ProcessPreview(
+                    new ReadOnlySpan<float>(_accum, 0, MicBlockSamples),
+                    sampleRate: 48_000);
+            }
+            catch (Exception ex)
+            {
+                if (++_previewErrLogged <= 4)
+                    _log.LogWarning(ex,
+                        "audio.native.tx plugin preview threw (suppressed after 4)");
+            }
+        }
+
+        FlushBlock();
+        _accumFill = 0;
     }
 
     private void FlushBlock()

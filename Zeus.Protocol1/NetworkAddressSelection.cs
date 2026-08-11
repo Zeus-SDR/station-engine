@@ -11,12 +11,18 @@ internal readonly record struct LocalIpv4Address(IPAddress Address, IPAddress Ma
 // Test-visible snapshot of a network interface, so the tunnel-tagging projection
 // in Protocol1Client.SelectLocalIpv4Addresses can be exercised without live NICs.
 internal readonly record struct NicSnapshot(
+    string Name,
     NetworkInterfaceType Type,
     OperationalStatus Status,
     IReadOnlyList<(IPAddress Address, IPAddress? Mask)> UnicastAddresses);
 
 internal static class NetworkAddressSelection
 {
+    public static bool IsTunnelInterface(string name, NetworkInterfaceType type)
+        => type == NetworkInterfaceType.Tunnel ||
+           (type == NetworkInterfaceType.Unknown &&
+            name.StartsWith("utun", StringComparison.OrdinalIgnoreCase));
+
     public static IPAddress? FindLocalAddressForSubnet(
         IPAddress radioIp,
         IEnumerable<LocalIpv4Address> localAddresses)

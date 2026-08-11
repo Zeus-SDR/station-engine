@@ -19,7 +19,11 @@ public static class TransverterFrequencyConverter
     public const int MaximumBandId = BandCount - 1;
     public const int MaximumButtonTextLength = 5;
     public const long MinimumRadioFrequencyHz = 1;
+    // Native operator tuning remains capped at 60 MHz. A configured
+    // transverter profile may deliberately use the wider Thetis-compatible
+    // hardware IF range without making 60..150 MHz a native tuning domain.
     public const long MaximumRadioFrequencyHz = 60_000_000;
+    public const long MaximumTransverterIfFrequencyHz = 150_000_000;
     public const long MaximumRfFrequencyHz = 99_000_000_000;
     public const long MinimumLoOffsetHz = -144_000_000;
     public const long MaximumLoOffsetHz = 99_000_000_000;
@@ -77,7 +81,7 @@ public static class TransverterFrequencyConverter
                 ifHz = 0;
                 return false;
             }
-            return IsRadioFrequency(ifHz);
+            return IsTransverterIfFrequency(ifHz);
         }
 
         // RF range is authoritative so RX1, RX2, extra receivers, and split TX
@@ -89,7 +93,7 @@ public static class TransverterFrequencyConverter
             return false;
         }
 
-        return TryTranslateToIf(rfHz, band, out ifHz) && IsRadioFrequency(ifHz);
+        return TryTranslateToIf(rfHz, band, out ifHz) && IsTransverterIfFrequency(ifHz);
     }
 
     public static bool TryResolveActiveBand(
@@ -153,9 +157,9 @@ public static class TransverterFrequencyConverter
     {
         ArgumentNullException.ThrowIfNull(settings);
 
-        if (!IsRadioFrequency(settings.IfFrequencyHz))
+        if (!IsTransverterIfFrequency(settings.IfFrequencyHz))
         {
-            error = $"ifFrequencyHz must be between {MinimumRadioFrequencyHz} and {MaximumRadioFrequencyHz}";
+            error = $"ifFrequencyHz must be between {MinimumRadioFrequencyHz} and {MaximumTransverterIfFrequencyHz}";
             return false;
         }
 
@@ -169,7 +173,7 @@ public static class TransverterFrequencyConverter
             try
             {
                 long offset = OffsetHz(settings);
-                _ = checked(MaximumRadioFrequencyHz + offset);
+                _ = checked(MaximumTransverterIfFrequencyHz + offset);
             }
             catch (OverflowException)
             {
@@ -235,8 +239,8 @@ public static class TransverterFrequencyConverter
             }
             if (!TryTranslateToIf(band.BeginFrequencyHz, band, out long beginIf)
                 || !TryTranslateToIf(band.EndFrequencyHz, band, out long endIf)
-                || !IsRadioFrequency(beginIf)
-                || !IsRadioFrequency(endIf))
+                || !IsTransverterIfFrequency(beginIf)
+                || !IsTransverterIfFrequency(endIf))
             {
                 error = $"band {band.Id} RF range does not translate into the radio IF range";
                 return false;
@@ -293,4 +297,7 @@ public static class TransverterFrequencyConverter
 
     private static bool IsRadioFrequency(long hz) =>
         hz is >= MinimumRadioFrequencyHz and <= MaximumRadioFrequencyHz;
+
+    private static bool IsTransverterIfFrequency(long hz) =>
+        hz is >= MinimumRadioFrequencyHz and <= MaximumTransverterIfFrequencyHz;
 }

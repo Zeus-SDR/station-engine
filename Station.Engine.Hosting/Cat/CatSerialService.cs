@@ -30,12 +30,13 @@ namespace Zeus.Server.Cat;
 /// unplugged, so a port that comes back (com0com / socat re-created) re-opens
 /// on its own.</para>
 /// </summary>
-public sealed class CatSerialService : BackgroundService
+public sealed class CatSerialService : BackgroundService, ISerialPttPinSource
 {
     private sealed class Slot
     {
         public volatile bool Open;
         public volatile string? Error;
+        public volatile string? PortName;
         // Read from the AI-broadcast event threads while RunPortAsync writes it;
         // volatile so a fan-out always sees the current open port (or null).
         public volatile CatSerialPort? Live;
@@ -89,6 +90,35 @@ public sealed class CatSerialService : BackgroundService
 
     public double LatestRxDbm => BitConverter.Int64BitsToDouble(Interlocked.Read(ref _latestRxDbmBits));
 
+    /// <summary>Borrow the live CAT handle's modem-pin view for serial PTT.
+    /// Ownership remains with this service; callers must never close or dispose
+    /// the returned object.</summary>
+    internal bool TryBorrowModemPins(
+        string portName,
+        out ISerialPttPins? pins,
+        out string? error)
+    {
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            if (!SerialPortEnumeration.PortNameEquals(_slots[i].PortName ?? string.Empty, portName))
+                continue;
+
+            var slot = _slots[i];
+            pins = slot.Live;
+            error = slot.Error;
+            return pins is not null;
+        }
+
+        pins = null;
+        error = null;
+        return false;
+    }
+
+    bool ISerialPttPinSource.TryBorrowModemPins(
+        string portName,
+        out ISerialPttPins? pins,
+        out string? error) => TryBorrowModemPins(portName, out pins, out error);
+
     private void OnSettingsChanged() => RequestReconnect();
 
     /// <summary>Break the current port set so the run loop re-reads settings and
@@ -121,6 +151,7 @@ public sealed class CatSerialService : BackgroundService
                 for (int i = 0; i < _slots.Length; i++)
                 {
                     var cfg = configs[i];
+                    _slots[i].PortName = cfg.Enabled ? cfg.PortName.Trim() : null;
                     if (!cfg.Enabled || string.IsNullOrWhiteSpace(cfg.PortName))
                     {
                         _slots[i].Error = null;

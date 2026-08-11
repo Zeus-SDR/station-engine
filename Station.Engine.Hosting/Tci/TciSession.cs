@@ -882,7 +882,7 @@ public sealed class TciSession : IDisposable
         if (args.Length < 2) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (!TciProtocol.TryParseInt(args[1], out int chan)) return;
-        if (chan is not (0 or 1)) return;
+        if (rx is not (0 or 1) || chan is not (0 or 1)) return;
 
         if (args.Length == 2)
         {
@@ -892,7 +892,7 @@ public sealed class TciSession : IDisposable
                 "vfo",
                 rx,
                 chan,
-                ResolveVfoChannelHz(state, chan, CurrentTransverterSettings)));
+                ResolveVfoChannelHz(state, rx, chan, CurrentTransverterSettings)));
         }
         else if (args.Length >= 3 && TciProtocol.TryParseLong(args[2], out long hz))
         {
@@ -903,7 +903,7 @@ public sealed class TciSession : IDisposable
             // auto-recenter heuristic so the hardware tracks the commanded
             // frequency absolutely. Mirrors Thetis CATChangesCenterFreq
             // default. Issue #461.
-            SetVfoChannel(_radio, chan, hz, CurrentTransverterSettings);
+            SetVfoChannel(_radio, rx, chan, hz, CurrentTransverterSettings);
             // Don't echo back immediately — the StateChanged event will broadcast it
         }
     }
@@ -912,17 +912,48 @@ public sealed class TciSession : IDisposable
         StateDto state,
         int channel,
         TransverterSettingsDto? transverterSettings = null)
+        => ResolveVfoChannelHz(state, 0, channel, transverterSettings);
+
+    internal static long ResolveVfoChannelHz(
+        StateDto state,
+        int receiver,
+        int channel,
+        TransverterSettingsDto? transverterSettings = null)
     {
-        return channel switch
+        if (receiver == 0)
         {
-            0 => state.VfoHz,
-            1 => RadioFrequencyResolver.TxDialFrequencyHz(state),
-            _ => throw new ArgumentOutOfRangeException(nameof(channel)),
-        };
+            return channel switch
+            {
+                0 => state.VfoHz,
+                1 => RadioFrequencyResolver.TxDialFrequencyHz(state),
+                _ => throw new ArgumentOutOfRangeException(nameof(channel)),
+            };
+        }
+
+        if (receiver == 1)
+        {
+            var rx2 = state.Rx2();
+            return channel switch
+            {
+                0 => rx2.VfoHz,
+                1 => rx2.TxVfoHz > 0 ? rx2.TxVfoHz : rx2.VfoHz,
+                _ => throw new ArgumentOutOfRangeException(nameof(channel)),
+            };
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(receiver));
     }
 
     internal static void SetVfoChannel(
         RadioService radio,
+        int channel,
+        long rfHz,
+        TransverterSettingsDto? transverterSettings = null)
+        => SetVfoChannel(radio, 0, channel, rfHz, transverterSettings);
+
+    internal static void SetVfoChannel(
+        RadioService radio,
+        int receiver,
         int channel,
         long rfHz,
         TransverterSettingsDto? transverterSettings = null)
@@ -938,17 +969,33 @@ public sealed class TciSession : IDisposable
         {
             return;
         }
-        if (channel == 0)
+        if (receiver == 1 && !radio.Snapshot().Rx2Enabled)
+        {
+            return;
+        }
+        if (receiver == 0 && channel == 0)
         {
             radio.SetVfo(rfHz, fromExternal: true);
             return;
         }
-        if (channel == 1)
+        if (receiver == 0 && channel == 1)
         {
             var state = radio.Snapshot();
             radio.SetSplitFrequency(state.TxReceiverIndex, rfHz);
             return;
         }
+        if (receiver == 1 && channel == 0)
+        {
+            radio.SetReceiverVfo(1, rfHz);
+            return;
+        }
+        if (receiver == 1 && channel == 1)
+        {
+            radio.SetSplitFrequency(1, rfHz);
+            return;
+        }
+        if (receiver is not (0 or 1))
+            throw new ArgumentOutOfRangeException(nameof(receiver));
         throw new ArgumentOutOfRangeException(nameof(channel));
     }
 
@@ -957,6 +1004,7 @@ public sealed class TciSession : IDisposable
         // dds:<rx>,<hz> or dds:<rx> (query)
         if (args.Length < 1) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
+        if (rx is not (0 or 1)) return;
 
         if (args.Length == 1)
         {
@@ -965,13 +1013,13 @@ public sealed class TciSession : IDisposable
             Send(TciProtocol.Command(
                 "dds",
                 rx,
-                CwOffset.EffectiveLoHz(state)));
+                EffectiveReceiverLoHz(state, rx)));
         }
         else if (args.Length >= 2 && TciProtocol.TryParseLong(args[1], out long hz))
         {
-            // Set DDS (same as VFO for single-RX). External source — see HandleVfo.
+            // Set DDS (same as channel-A VFO). External source — see HandleVfo.
             if (hz <= 0) return;
-            SetVfoChannel(_radio, 0, hz, CurrentTransverterSettings);
+            SetVfoChannel(_radio, rx, 0, hz, CurrentTransverterSettings);
         }
     }
 
@@ -995,11 +1043,12 @@ public sealed class TciSession : IDisposable
         // modulation:<rx>,<MODE> or modulation:<rx> (query)
         if (args.Length < 1) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
+        if (rx is not (0 or 1)) return;
 
         if (args.Length == 1)
         {
             var state = _radio.Snapshot();
-            string tciMode = TciProtocol.ModeToTci(state.Mode);
+            string tciMode = TciProtocol.ModeToTci(ReceiverState(state, rx).Mode);
             Send(TciProtocol.Command("modulation", rx, tciMode));
         }
         else if (args.Length >= 2)
@@ -1007,7 +1056,8 @@ public sealed class TciSession : IDisposable
             var mode = TciProtocol.TciToMode(args[1]);
             if (mode.HasValue)
             {
-                _radio.SetMode(mode.Value);
+                if (rx == 0 || _radio.Snapshot().Rx2Enabled)
+                    _radio.SetReceiver(rx, mode: mode.Value);
             }
         }
     }
@@ -1017,18 +1067,38 @@ public sealed class TciSession : IDisposable
         // rx_filter_band:<rx>,<lo_hz>,<hi_hz> or rx_filter_band:<rx> (query)
         if (args.Length < 1) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
+        if (rx is not (0 or 1)) return;
 
         if (args.Length == 1)
         {
             var state = _radio.Snapshot();
-            Send(TciProtocol.Command("rx_filter_band", rx, state.FilterLowHz, state.FilterHighHz));
+            var receiver = ReceiverState(state, rx);
+            Send(TciProtocol.Command("rx_filter_band", rx, receiver.FilterLowHz, receiver.FilterHighHz));
         }
         else if (args.Length >= 3 &&
                  TciProtocol.TryParseInt(args[1], out int lo) &&
                  TciProtocol.TryParseInt(args[2], out int hi))
         {
-            _radio.SetFilter(lo, hi);
+            if (rx == 0 || _radio.Snapshot().Rx2Enabled)
+                _radio.SetReceiver(rx, filterLowHz: lo, filterHighHz: hi);
         }
+    }
+
+    internal static ReceiverDto ReceiverState(StateDto state, int receiver) => receiver switch
+    {
+        0 => new ReceiverDto(
+            0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
+            state.Mode, state.FilterLowHz, state.FilterHighHz,
+            state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+            state.Rx1Muted, SplitEnabled: state.SplitEnabled, TxVfoHz: state.SplitTxHz),
+        1 => state.Rx2(),
+        _ => throw new ArgumentOutOfRangeException(nameof(receiver)),
+    };
+
+    internal static long EffectiveReceiverLoHz(StateDto state, int receiver)
+    {
+        var rx = ReceiverState(state, receiver);
+        return CwOffset.EffectiveLoHz(rx.Mode, rx.VfoHz);
     }
 
     private void HandleTrx(string[] args)

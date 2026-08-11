@@ -141,6 +141,10 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     private MiniAudioOutput? _output;
     private string? _activeOutputDeviceId;
+    private volatile bool _externalOutputOpen;
+    private string? _externalOutputDeviceId;
+    private int _externalOutputSampleRate;
+    private int _externalOutputChannels;
     private volatile bool _shutdown;
     private volatile bool _intentionalStop;
     private int _deviceGeneration;
@@ -182,8 +186,10 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     public bool IsEnabled => _previewEnabled;
     public bool OutputEnabled => _outputEnabled;
     public string? ConfiguredOutputDeviceId => _deviceSettings?.Get().OutputDeviceId;
-    public string? ActiveOutputDeviceId => _activeOutputDeviceId;
-    public bool OutputOpen => _output is not null;
+    public string? ActiveOutputDeviceId => _externalOutputOpen
+        ? _externalOutputDeviceId
+        : _activeOutputDeviceId;
+    public bool OutputOpen => _output is not null || _externalOutputOpen;
 
     /// <summary>Snapshot of native-output health: cumulative underrun/overrun
     /// sample counts (the RX crackle, issue #733), rebuffer events, and the
@@ -199,11 +205,17 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
         lock (_deviceSync)
         {
-            outputOpen = _output is not null;
-            outputSampleRateHz = _output is null ? 0 : checked((int)_output.SampleRate);
-            outputChannels = _output is null ? 0 : checked((int)_output.Channels);
+            outputOpen = _output is not null || _externalOutputOpen;
+            outputSampleRateHz = _externalOutputOpen
+                ? Volatile.Read(ref _externalOutputSampleRate)
+                : _output is null ? 0 : checked((int)_output.SampleRate);
+            outputChannels = _externalOutputOpen
+                ? Volatile.Read(ref _externalOutputChannels)
+                : _output is null ? 0 : checked((int)_output.Channels);
             configuredOutputDeviceId = ConfiguredOutputDeviceId;
-            activeOutputDeviceId = _activeOutputDeviceId;
+            activeOutputDeviceId = _externalOutputOpen
+                ? _externalOutputDeviceId
+                : _activeOutputDeviceId;
         }
 
         return new(
@@ -358,21 +370,19 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         if (!_outputEnabled)
         {
             _log.LogInformation("audio.native.rx output disabled by host configuration");
-            return Task.CompletedTask;
         }
-        var thread = new Thread(() =>
+        else if ((_deviceSettings?.Get().Backend ?? AudioHostApi.System) == AudioHostApi.System)
         {
-            lock (_deviceSync)
+            var thread = new Thread(() =>
             {
-                if (_shutdown || _output != null) return;
-                OpenOutputLocked(ConfiguredOutputDeviceId);
-            }
-        })
-        {
-            IsBackground = true,
-            Name = "zeus-output-start",
-        };
-        thread.Start();
+                ActivateSystemOutput();
+            })
+            {
+                IsBackground = true,
+                Name = "zeus-output-start",
+            };
+            thread.Start();
+        }
 
         // Subscribe to TX-active edges so we can drain the ring on TX transitions.
         // The radio sample clock and the WASAPI playback clock drift relative
@@ -439,6 +449,57 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         }
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>Opens the resumable System/miniaudio output route.</summary>
+    internal void ActivateSystemOutput()
+        => ActivateSystemOutput(ConfiguredOutputDeviceId);
+
+    internal void ActivateSystemOutput(string? deviceId)
+    {
+        if (!_outputEnabled) return;
+        lock (_deviceSync)
+        {
+            if (_shutdown || _output is not null) return;
+            _externalOutputOpen = false;
+            OpenOutputLocked(NormalizeDeviceId(deviceId));
+        }
+    }
+
+    /// <summary>Closes System output without permanently stopping this service.</summary>
+    internal void DeactivateSystemOutput()
+    {
+        lock (_deviceSync)
+        {
+            _intentionalStop = true;
+            Interlocked.Increment(ref _recoveryEpoch);
+            Interlocked.Increment(ref _deviceGeneration);
+            try
+            {
+                CloseOutputLocked(dispose: true);
+                ResetForDeviceOpen();
+            }
+            finally
+            {
+                _intentionalStop = false;
+            }
+        }
+    }
+
+    internal void SetExternalOutputState(
+        bool open,
+        string? deviceId,
+        int sampleRate,
+        int channels)
+    {
+        lock (_deviceSync)
+        {
+            _externalOutputDeviceId = open ? NormalizeDeviceId(deviceId) : null;
+            Volatile.Write(ref _externalOutputSampleRate, open ? sampleRate : 0);
+            Volatile.Write(ref _externalOutputChannels, open ? channels : 0);
+            _externalOutputOpen = open;
+            if (!open) ResetForDeviceOpen();
+        }
     }
 
     private void OpenOutputLocked(string? requestedDeviceId)
@@ -589,6 +650,9 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     internal int CurrentRingDepth => _ring.Count;
 
     internal void RenderPlaybackForTest(Span<float> output, uint frameCount, uint channels) =>
+        OnPlaybackData(output, frameCount, channels);
+
+    internal void RenderPlaybackForHost(Span<float> output, uint frameCount, uint channels) =>
         OnPlaybackData(output, frameCount, channels);
 
     public void Publish(in AudioFrame frame)

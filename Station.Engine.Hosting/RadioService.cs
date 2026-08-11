@@ -1710,7 +1710,7 @@ public sealed class RadioService : IDisposable
         try
         {
             long ifHz = checked(rfHz - band.LoOffsetHz + band.LoErrorHz);
-            return ifHz is >= 0 and <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+            return ifHz is >= 0 and <= TransverterFrequencyConverter.MaximumTransverterIfFrequencyHz
                 ? ifHz
                 : 0;
         }
@@ -1767,6 +1767,8 @@ public sealed class RadioService : IDisposable
     {
         if (!string.Equals(radioKey, ConnectedBoardKind.ToString(), StringComparison.Ordinal))
             return;
+        if (enabled && TryPromoteActiveTransverterIfToRf())
+            return;
         var current = Snapshot();
         if (!IsExternalFrequencyAvailable(current.VfoHz, allowZero: true))
         {
@@ -1776,6 +1778,131 @@ public sealed class RadioService : IDisposable
         ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(current.RadioLoHz));
         RecomputePaAndPush();
         StateChanged?.Invoke(current);
+    }
+
+    /// <summary>
+    /// A workspace can enable its selected transverter while one or more
+    /// receivers still carry physical IF values tuned in native mode. Promote
+    /// every enabled hardware receiver's matching VFO and split-TX frequency,
+    /// plus RX1's hardware-centre state, to external RF before the next state
+    /// broadcast. The selected profile's RF bounds are the guard: unrelated
+    /// native HF frequencies remain native even though transverter mode is on.
+    /// </summary>
+    private bool TryPromoteActiveTransverterIfToRf()
+    {
+        var settings = ActiveTransverterSettings();
+        if (!settings.Enabled
+            || !TransverterFrequencyConverter.TryResolveActiveBand(settings, out var active))
+            return false;
+
+        long radioLoHz = 0;
+        Mutate(
+            s =>
+            {
+                bool changed = false;
+                var next = s;
+
+                if (TryPromoteActiveBandIf(s.VfoHz, active, out long vfoRf))
+                {
+                    next = next with { VfoHz = vfoRf };
+                    changed = true;
+                    // CTUN and CW can place the hardware centre just outside
+                    // the profile's dial range. Once RX1's dial is identified
+                    // as this profile's IF, translate that native centre by the
+                    // same LO equation without imposing the dial-range guard.
+                    if (TryTranslateNativeIf(s.RadioLoHz, active, out long radioLoRf))
+                        next = next with { RadioLoHz = radioLoRf };
+                }
+
+                if (TryPromoteActiveBandIf(s.SplitTxHz, active, out long splitTxRf))
+                {
+                    next = next with { SplitTxHz = splitTxRf };
+                    changed = true;
+                }
+
+                if (s.Rx2Enabled)
+                {
+                    var rx2 = s.Rx2();
+                    long rx2VfoHz = rx2.VfoHz;
+                    long rx2TxVfoHz = rx2.TxVfoHz;
+                    bool rx2Changed = false;
+                    if (TryPromoteActiveBandIf(rx2VfoHz, active, out long rx2Rf))
+                    {
+                        rx2VfoHz = rx2Rf;
+                        rx2Changed = true;
+                    }
+                    if (TryPromoteActiveBandIf(rx2TxVfoHz, active, out long rx2TxRf))
+                    {
+                        rx2TxVfoHz = rx2TxRf;
+                        rx2Changed = true;
+                    }
+                    if (rx2Changed)
+                    {
+                        next = WithRx2(next, r => r with
+                        {
+                            VfoHz = rx2VfoHz,
+                            TxVfoHz = rx2TxVfoHz,
+                        });
+                        changed = true;
+                    }
+                }
+
+                for (int i = 2; i < _extraReceivers.Length; i++)
+                {
+                    var extra = _extraReceivers[i];
+                    if (extra is not { Enabled: true }) continue;
+                    if (TryPromoteActiveBandIf(extra.VfoHz, active, out long extraRf))
+                    {
+                        extra.VfoHz = extraRf;
+                        changed = true;
+                    }
+                    if (TryPromoteActiveBandIf(extra.TxVfoHz, active, out long extraTxRf))
+                    {
+                        extra.TxVfoHz = extraTxRf;
+                        changed = true;
+                    }
+                }
+
+                if (!changed) return null;
+                radioLoHz = next.RadioLoHz;
+                return next;
+            },
+            out bool applied);
+        if (applied)
+        {
+            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(radioLoHz));
+            RecomputePaAndPush();
+        }
+        return applied;
+    }
+
+    private static bool TryPromoteActiveBandIf(
+        long ifHz,
+        TransverterBandDto active,
+        out long rfHz)
+    {
+        if (!TryTranslateNativeIf(ifHz, active, out rfHz)) return false;
+        return rfHz >= active.BeginFrequencyHz && rfHz <= active.EndFrequencyHz;
+    }
+
+    private static bool TryTranslateNativeIf(
+        long ifHz,
+        TransverterBandDto active,
+        out long rfHz)
+    {
+        rfHz = 0;
+        if (ifHz is < TransverterFrequencyConverter.MinimumRadioFrequencyHz
+            or > TransverterFrequencyConverter.MaximumRadioFrequencyHz)
+            return false;
+        try
+        {
+            rfHz = checked(ifHz + active.LoOffsetHz - active.LoErrorHz);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
     }
 
     public StateDto SetVfo(long hz) => SetVfo(hz, fromExternal: false);
@@ -2484,6 +2611,8 @@ public sealed class RadioService : IDisposable
         long targetLo;
         lock (_sync)
         {
+            // P2 places TX with its independent DUC; keep the RX DDC parked.
+            if (_p2Active) return false;
             // Read state, compute the target, decide, and record the frozen
             // centre in ONE critical section: a concurrent state change
             // between read and record would otherwise snap to a stale target
@@ -2502,11 +2631,11 @@ public sealed class RadioService : IDisposable
     /// <summary>
     /// TX LO alignment for all modes (the phone/digi analogue of
     /// <see cref="AlignLoForCwTx"/>). When the hardware NCO sits off the dial
-    /// for RX, the shared P1/P2 VFO register would otherwise transmit on that
+    /// for RX, the shared Protocol 1 VFO register would otherwise transmit on that
     /// centre — the #470 bug (CTUN freeze) and its CTUN-off twin: XIT, and
     /// pure-pan / keep-in-view autopan (/api/radio/lo) deliberately parks the
-    /// LO off the dial while VfoHz stays put, and the P2 TX DUC follows RX0,
-    /// so keying in that window radiates on the parked centre, not the dial.
+    /// LO off the dial while VfoHz stays put, so keying in that window would
+    /// radiate on the parked centre rather than the dial.
     /// Called from <see cref="SetMox"/> on the key-down edge: snap the
     /// hardware LO to the dial's effective LO so the carrier lands on
     /// frequency, remembering the parked centre for
@@ -2521,22 +2650,10 @@ public sealed class RadioService : IDisposable
         long targetLo;
         lock (_sync)
         {
-            // True split uses the established key-down move/restore path on all
-            // protocols. P2/P3 also program their independent TX DUC, but the
-            // shared RF reference moves with it so every hardware path remains
-            // phase-aligned; un-key restores the parked RX centre.
+            // P2 places TX with its independent DUC; moving RadioLoHz here
+            // retunes the live RX DDC and restarts the DUP waterfall.
+            if (_p2Active) return false;
             var projected = ProjectedStateUnderLock();
-            // Dual-RX split TX on Protocol 2: the TX carrier is placed by the
-            // INDEPENDENT TX DUC (DspPipelineService.OnRadioStateChanged →
-            // Protocol2Client.SetTxDucFrequency), not by dragging the shared
-            // RX0/TX LO. Dragging the LO here pulled RX1 off VFO A onto VFO B, so
-            // the tune carrier showed on BOTH receivers (the two-carrier bug).
-            // Skip the drag for this case; CTUN and P1 split still drag (P1 has
-            // no independent DUC, and CTUN must move the shared LO).
-            if (!RadioFrequencyResolver.IsSplitEnabledForTx(projected)
-                && _state.TxReceiverIndex >= 1 && _state.Rx2Enabled
-                && ConnectedBoardKind == HpsdrBoardKind.OrionMkII)
-                return false;
             // Read state, compute the target, decide, and record the frozen
             // centre in ONE critical section (see AlignLoForCwTx).
             targetLo = TxEffectiveLoHz(projected);

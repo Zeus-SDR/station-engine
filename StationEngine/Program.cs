@@ -52,7 +52,7 @@ public partial class Program
             Console.Error.WriteLine($"StationEngine: {ex.Message}");
             Console.Error.WriteLine(
                 "usage: StationEngine --port <1..65535> [--bind <loopback|lan>] " +
-                "[--lan-https-port <1..65535> --product-lan-https-port <1..65535>] " +
+                "[--product-lan-https-port <1..65535>] [--lan-https-port <1..65535>] " +
                 "[--native-audio-output <true|false>]");
             diagnosticLogFileSink.Dispose();
             return 2;
@@ -119,17 +119,14 @@ public partial class Program
         var options = ParseOptions(args);
         var port = options.Port;
         var lanCertificate = options.LanHttpsPort is not null
+            || options.ProductLanHttpsPort is not null
             ? LanCertificate.GetOrCreate()
             : null;
-        var lanHttpsUrls = options.LanHttpsPort is { } lanHttpsPort
-            && options.ProductLanHttpsPort is { } productLanHttpsPort
-            ? LanCertificate.GetLanIps()
-                .Select(address =>
-                    $"https://{address}:{productLanHttpsPort}/?attach=local" +
-                    $"&port={lanHttpsPort}&productPort={productLanHttpsPort}" +
-                    "&transport=https")
-                .ToArray()
-            : Array.Empty<string>();
+        var lanHttpsUrls = options.ProductLanHttpsPort is null
+            ? []
+            : BuildProductLanHttpsUrls(
+                options.ProductLanHttpsPort,
+                LanCertificate.GetLanIps());
         PrepareEnginePreferences();
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -375,11 +372,18 @@ public partial class Program
 
         var resolvedPort = port ?? throw new ArgumentException("--port is required");
         var resolvedBindMode = bindMode ?? StationEngineBindMode.Loopback;
-        if ((lanHttpsPort is null) != (productLanHttpsPort is null))
+        if (lanHttpsPort is not null && productLanHttpsPort is null)
             throw new ArgumentException(
-                "--lan-https-port and --product-lan-https-port must be specified together");
+                "--product-lan-https-port is required with --lan-https-port");
         if (lanHttpsPort is not null && resolvedBindMode != StationEngineBindMode.Lan)
             throw new ArgumentException("LAN HTTPS ports require --bind lan");
+        if (productLanHttpsPort is not null
+            && lanHttpsPort is null
+            && resolvedBindMode != StationEngineBindMode.Loopback)
+        {
+            throw new ArgumentException(
+                "A Product-only LAN HTTPS listener requires the station engine to remain loopback-only");
+        }
         if (lanHttpsPort == resolvedPort)
             throw new ArgumentException("--lan-https-port must differ from --port");
         if (productLanHttpsPort == resolvedPort)
@@ -400,6 +404,13 @@ public partial class Program
         StationEngineBindMode bindMode,
         int? lanHttpsPort = null) =>
         bindMode == StationEngineBindMode.Lan && lanHttpsPort is null;
+
+    internal static IReadOnlyList<string> BuildProductLanHttpsUrls(
+        int? productLanHttpsPort,
+        IEnumerable<IPAddress> lanIps) =>
+        productLanHttpsPort is { } port
+            ? lanIps.Select(address => $"https://{address}:{port}").ToArray()
+            : [];
 
     internal sealed record StationEngineCommandLineOptions(
         int Port,

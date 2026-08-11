@@ -10,10 +10,10 @@ public sealed class AudioRingOwner : IDisposable
 {
     private static readonly long SignalWaitSliceTicks =
         Math.Max(1, System.Diagnostics.Stopwatch.Frequency / 1_000);
-    private const int SlotCount = 8;
-    private const int RingHeaderBytes = 64;
-    private const int SlotHeaderBytes = 32;
-    private const int SlotBytes = SlotHeaderBytes + AudioRingProtocol.MaxSamplesPerBlock * sizeof(float);
+    private const int SlotCount = AudioRingProtocol.SlotCount;
+    private const int RingHeaderBytes = AudioRingProtocol.RingHeaderBytes;
+    private const int SlotHeaderBytes = AudioRingProtocol.SlotHeaderBytes;
+    private const int SlotBytes = AudioRingProtocol.SlotBytes;
     private const int RingBytes = AudioRingProtocol.RingBytes;
     private const int MapBytes = AudioRingProtocol.MapBytes;
 
@@ -157,11 +157,14 @@ public sealed class AudioRingOwner : IDisposable
         var started = AudioRingProtocol.Timestamp();
         var sequence = Interlocked.Increment(ref _sequence);
         DrainResponses(sequence, input.Length, out _);
-        if (!_input.TryWrite(sequence, input) || !_inputSignal.TrySet())
+        if (!_input.TryWrite(sequence, input))
         {
             roundTripTicks = AudioRingProtocol.ElapsedTicks(started);
             return false;
         }
+        // The shared-memory commit is authoritative. A signal edge may be
+        // coalesced; consumers also drain on their bounded wake timeout.
+        _inputSignal.TrySet();
 
         var timeoutTicks = timeout.TotalSeconds * System.Diagnostics.Stopwatch.Frequency;
         var spinner = new SpinWait();
@@ -232,7 +235,12 @@ public sealed class AudioRingOwner : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ValidateSamples(input);
         sequence = Interlocked.Increment(ref _sequence);
-        return _input.TryWrite(sequence, input) && _inputSignal.TrySet();
+        if (!_input.TryWrite(sequence, input))
+            return false;
+        // A coalesced or failed advisory wake is not a packet loss: the block
+        // is already committed and the consumer periodically drains the ring.
+        _inputSignal.TrySet();
+        return true;
     }
 
     /// <summary>
@@ -240,11 +248,27 @@ public sealed class AudioRingOwner : IDisposable
     /// owns pacing and malformed/sequence policy.
     /// </summary>
     public bool TryReadOutput(Span<float> output, out long sequence, out int sampleCount)
+        => TryReadOutput(output, out sequence, out sampleCount, out _);
+
+    /// <summary>
+    /// Reads one bundle-produced block and its source delay without waiting.
+    /// A delay of one means the returned samples correspond to the input block
+    /// immediately before the response sequence.
+    /// </summary>
+    public bool TryReadOutput(
+        Span<float> output,
+        out long sequence,
+        out int sampleCount,
+        out int processingDelayBlocks)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (output.IsEmpty || output.Length > AudioRingProtocol.MaxSamplesPerBlock)
             throw new ArgumentException("An audio-ring output buffer must hold 1 through 1024 samples.");
-        var read = _output.TryRead(out sequence, out sampleCount, output);
+        var read = _output.TryRead(
+            out sequence,
+            out sampleCount,
+            out processingDelayBlocks,
+            output);
         if (read) _outputSignal.Drain();
         return read;
     }
@@ -438,7 +462,13 @@ public sealed class AudioRingOwner : IDisposable
             }
         }
 
-        public bool TryWrite(long sequence, ReadOnlySpan<float> samples)
+        public bool TryWrite(long sequence, ReadOnlySpan<float> samples) =>
+            TryWrite(sequence, samples, processingDelayBlocks: 0);
+
+        public bool TryWrite(
+            long sequence,
+            ReadOnlySpan<float> samples,
+            int processingDelayBlocks)
         {
             var head = Volatile.Read(ref Int64At(0));
             var tail = Volatile.Read(ref Int64At(8));
@@ -450,6 +480,7 @@ public sealed class AudioRingOwner : IDisposable
             Int64At(slotOffset) = sequence;
             Int64At(slotOffset + 8) = AudioRingProtocol.Timestamp();
             Int32At(slotOffset + 24) = samples.Length;
+            Int32At(slotOffset + 28) = processingDelayBlocks;
             samples.CopyTo(new Span<float>(Address(slotOffset + SlotHeaderBytes), samples.Length));
             Interlocked.MemoryBarrier();
             Volatile.Write(ref Int64At(slotOffset + 16), sequence);
@@ -457,7 +488,14 @@ public sealed class AudioRingOwner : IDisposable
             return true;
         }
 
-        public bool TryRead(out long sequence, out int sampleCount, Span<float> samples)
+        public bool TryRead(out long sequence, out int sampleCount, Span<float> samples) =>
+            TryRead(out sequence, out sampleCount, out _, samples);
+
+        public bool TryRead(
+            out long sequence,
+            out int sampleCount,
+            out int processingDelayBlocks,
+            Span<float> samples)
         {
             while (true)
             {
@@ -467,6 +505,7 @@ public sealed class AudioRingOwner : IDisposable
                 {
                     sequence = 0;
                     sampleCount = 0;
+                    processingDelayBlocks = 0;
                     return false;
                 }
 
@@ -475,6 +514,7 @@ public sealed class AudioRingOwner : IDisposable
                 var candidateSequence = Int64At(slotOffset);
                 var commit = Volatile.Read(ref Int64At(slotOffset + 16));
                 var candidateCount = Int32At(slotOffset + 24);
+                var candidateDelay = Int32At(slotOffset + 28);
                 if (candidateSequence == commit
                     && candidateSequence != 0
                     && candidateCount > 0
@@ -488,6 +528,7 @@ public sealed class AudioRingOwner : IDisposable
                     Volatile.Write(ref Int64At(8), tail + 1);
                     sequence = candidateSequence;
                     sampleCount = candidateCount;
+                    processingDelayBlocks = candidateDelay;
                     return true;
                 }
 
@@ -552,12 +593,39 @@ public sealed class AudioRingConsumer : IDisposable
         ArgumentNullException.ThrowIfNull(processor);
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (!_inputSignal.Wait(TimeSpan.FromMilliseconds(50)))
-                continue;
+            // The ring is authoritative and the signal is advisory. Always
+            // drain after the bounded wait so a coalesced/missed wake cannot
+            // strand committed audio indefinitely.
+            _inputSignal.Wait(TimeSpan.FromMilliseconds(50));
             while (_input.TryRead(out var sequence, out var sampleCount, _block))
             {
                 processor(_block.AsSpan(0, sampleCount));
                 if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount)))
+                    _outputSignal.TrySet();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bidirectional pump that includes the processor's source-delay metadata in
+    /// each response. This lets a nonblocking owner choose an exactly aligned dry
+    /// fallback without waiting for the consumer.
+    /// </summary>
+    public void RunWithDelay(
+        DelayAwareAudioBlockProcessor processor,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(processor);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            _inputSignal.Wait(TimeSpan.FromMilliseconds(50));
+            while (_input.TryRead(out var sequence, out var sampleCount, _block))
+            {
+                var delayBlocks = Math.Clamp(
+                    processor(_block.AsSpan(0, sampleCount)),
+                    0,
+                    AudioRingProtocol.SlotCount - 2);
+                if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), delayBlocks))
                     _outputSignal.TrySet();
             }
         }
@@ -574,8 +642,7 @@ public sealed class AudioRingConsumer : IDisposable
         ArgumentNullException.ThrowIfNull(processor);
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (!_inputSignal.Wait(TimeSpan.FromMilliseconds(50)))
-                continue;
+            _inputSignal.Wait(TimeSpan.FromMilliseconds(50));
             while (_input.TryRead(out _, out var sampleCount, _block))
                 processor(_block.AsSpan(0, sampleCount));
         }

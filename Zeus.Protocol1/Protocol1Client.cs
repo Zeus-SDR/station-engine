@@ -60,6 +60,8 @@ public sealed class Protocol1Client : IProtocol1Client
     private const int DefaultFrameChannelCapacity = 64;
     private const int RxSocketTimeoutMs = 100;
     private const int ConsecutiveTimeoutsBeforeGiveUp = 10;
+    private const int RxSinkStallTimeoutMs = 2000;
+    private const int TxLivenessPollMs = 100;
     // HL2's TX DAC runs at a fixed 48 kHz regardless of the RX sample rate;
     // each EP2 packet carries 126 IQ pairs so the target TX packet rate is
     // 381 pkt/s. Earlier attempts at using a PeriodicTimer fell to whatever
@@ -266,6 +268,8 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _txLoopManagedThreadId;
     private int _txLoopIsThreadPoolThread;
     private int _txLoopRunning;
+    private long _rxSinkCallStartedTimestamp;
+    private int _disconnectSignaled;
     private bool _disposed;
 
     internal int TxLoopManagedThreadId => Volatile.Read(ref _txLoopManagedThreadId);
@@ -444,6 +448,40 @@ public sealed class Protocol1Client : IProtocol1Client
     /// <inheritdoc />
     public void DetachRxSink() => Interlocked.Exchange(ref _rxSink, null);
 
+    private void InvokeRxSink(IRxPacketSink sink, in IqFrame frame)
+    {
+        Volatile.Write(ref _rxSinkCallStartedTimestamp, Stopwatch.GetTimestamp());
+        try
+        {
+            sink.OnIqFrame(in frame);
+        }
+        finally
+        {
+            Volatile.Write(ref _rxSinkCallStartedTimestamp, 0);
+        }
+    }
+
+    private void InvokeRxSink(IRxPacketSink sink, in PsFeedbackFrame frame)
+    {
+        Volatile.Write(ref _rxSinkCallStartedTimestamp, Stopwatch.GetTimestamp());
+        try
+        {
+            sink.OnPsFeedbackFrame(in frame);
+        }
+        finally
+        {
+            Volatile.Write(ref _rxSinkCallStartedTimestamp, 0);
+        }
+    }
+
+    private void SignalDisconnected()
+    {
+        if (Interlocked.Exchange(ref _disconnectSignaled, 1) != 0) return;
+
+        try { Disconnected?.Invoke(); }
+        catch (Exception ex) { _log.LogWarning(ex, "p1 Disconnected handler threw"); }
+    }
+
     // ---- Codec radio-mic / line-in relay (issue #992) ---------------------
     // The radio's TLV320 codec digitises the selected analog input (mic jack
     // for RadioMic source, line-in jack for RadioLineIn) and ships those 16-bit
@@ -583,7 +621,7 @@ public sealed class Protocol1Client : IProtocol1Client
             {
                 try
                 {
-                    sinkSnap.OnIqFrame(in frame);
+                    InvokeRxSink(sinkSnap, in frame);
                     publishedToIqChannel = true; // sink now owns `rented`
                 }
                 catch (Exception ex)
@@ -646,7 +684,7 @@ public sealed class Protocol1Client : IProtocol1Client
                     {
                         try
                         {
-                            psSinkSnap.OnPsFeedbackFrame(in psFrame);
+                            InvokeRxSink(psSinkSnap, in psFrame);
                             delivered = true;
                         }
                         catch (Exception ex) { _log.LogError(ex, "p1.rx.sink_threw kind=psfb"); }
@@ -764,7 +802,7 @@ public sealed class Protocol1Client : IProtocol1Client
             {
                 try
                 {
-                    sinkSnap.OnIqFrame(in frame);
+                    InvokeRxSink(sinkSnap, in frame);
                     publishedToIqChannel = true;
                 }
                 catch (Exception ex)
@@ -814,7 +852,7 @@ public sealed class Protocol1Client : IProtocol1Client
                     {
                         try
                         {
-                            psSinkSnap.OnPsFeedbackFrame(in psFrame);
+                            InvokeRxSink(psSinkSnap, in psFrame);
                             delivered = true;
                         }
                         catch (Exception ex) { _log.LogError(ex, "p1.rx.sink_threw kind=psfb"); }
@@ -943,22 +981,22 @@ public sealed class Protocol1Client : IProtocol1Client
             var addresses = new List<(IPAddress Address, IPAddress? Mask)>();
             foreach (var uni in nic.GetIPProperties().UnicastAddresses)
                 addresses.Add((uni.Address, uni.IPv4Mask));
-            yield return new NicSnapshot(nic.NetworkInterfaceType, nic.OperationalStatus, addresses);
+            yield return new NicSnapshot(nic.Name, nic.NetworkInterfaceType, nic.OperationalStatus, addresses);
         }
     }
 
     // Pure projection of NIC snapshots into bind candidates, split out from the
     // live NetworkInterface enumeration so the tunnel tagging is unit-testable
-    // (see NetworkAddressSelectionTests). A Tunnel-typed NIC (utun/wg/tun/tap)
-    // is tagged IsTunnel so NetworkAddressSelection can rank it behind physical
-    // NICs (#1039); loopback and down interfaces are dropped as before.
+    // (see NetworkAddressSelectionTests). Tunnel-typed NICs and macOS utun NICs
+    // reported as Unknown are tagged IsTunnel so NetworkAddressSelection can rank
+    // them behind physical NICs; loopback and down interfaces are dropped as before.
     internal static IEnumerable<LocalIpv4Address> SelectLocalIpv4Addresses(IEnumerable<NicSnapshot> nics)
     {
         foreach (var nic in nics)
         {
             if (nic.Status != OperationalStatus.Up) continue;
             if (nic.Type == NetworkInterfaceType.Loopback) continue;
-            var isTunnel = nic.Type == NetworkInterfaceType.Tunnel;
+            var isTunnel = NetworkAddressSelection.IsTunnelInterface(nic.Name, nic.Type);
             foreach (var (address, mask) in nic.UnicastAddresses)
             {
                 if (address.AddressFamily != AddressFamily.InterNetwork) continue;
@@ -1007,6 +1045,8 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _attenAdc1Db, 0);
         Interlocked.Exchange(ref _droppedFrames, 0);
         Interlocked.Exchange(ref _totalFrames, 0);
+        Volatile.Write(ref _rxSinkCallStartedTimestamp, 0);
+        Volatile.Write(ref _disconnectSignaled, 0);
         RecordInitialStartHandshakeSucceeded();
         ResetRxParserState();
 
@@ -1984,7 +2024,6 @@ public sealed class Protocol1Client : IProtocol1Client
 
     private void RxLoop()
     {
-        RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
         var sock = _socket!;
         var ct = _loopCts!.Token;
         var buffer = new byte[PacketParser.PacketLength];
@@ -2017,6 +2056,7 @@ public sealed class Protocol1Client : IProtocol1Client
 
         try
         {
+            RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
             while (!ct.IsCancellationRequested)
             {
                 int n;
@@ -2070,8 +2110,7 @@ public sealed class Protocol1Client : IProtocol1Client
                         ex,
                         "p1.rx.error code={Code} — RX socket failed; firing Disconnected",
                         ex.SocketErrorCode);
-                    try { Disconnected?.Invoke(); }
-                    catch (Exception handlerEx) { _log.LogWarning(handlerEx, "p1.rx Disconnected handler threw"); }
+                    SignalDisconnected();
                     return;
                 }
                 Volatile.Write(ref _lastDatagramTicks, Environment.TickCount64);
@@ -2328,7 +2367,7 @@ public sealed class Protocol1Client : IProtocol1Client
                 var sinkSnap = Volatile.Read(ref _rxSink);
                 if (sinkSnap != null)
                 {
-                    try { sinkSnap.OnIqFrame(in frame); }
+                    try { InvokeRxSink(sinkSnap, in frame); }
                     catch (Exception ex)
                     {
                         _log.LogError(ex, "p1.rx.sink_threw kind=iq");
@@ -2343,6 +2382,11 @@ public sealed class Protocol1Client : IProtocol1Client
                     _channel.Writer.TryWrite(frame);
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "p1.rx.loop_fault — firing Disconnected");
+            SignalDisconnected();
         }
         finally
         {
@@ -2389,8 +2433,7 @@ public sealed class Protocol1Client : IProtocol1Client
                         _log.LogWarning(
                             "p1.rx.timeout count={N} — no RX packets from radio",
                             failurePolicy.ConsecutiveTransientFailures);
-                    try { Disconnected?.Invoke(); }
-                    catch (Exception handlerEx) { _log.LogWarning(handlerEx, "p1.rx Disconnected handler threw"); }
+                    SignalDisconnected();
                     return true;
                 default:
                     return false;
@@ -2638,6 +2681,12 @@ public sealed class Protocol1Client : IProtocol1Client
             RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
             TxLoop(ct);
         }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "p1.tx.loop_fault — firing Disconnected");
+            SignalDisconnected();
+        }
         finally
         {
             Volatile.Write(ref _txLoopRunning, 0);
@@ -2665,6 +2714,8 @@ public sealed class Protocol1Client : IProtocol1Client
         {
             while (!ct.IsCancellationRequested)
             {
+                if (DisconnectIfRxSinkStalled()) return;
+
                 var beforeWait = SnapshotState();
                 var audioRing = _rxAudioSource as RxAudioRing;
                 bool audioMode = !beforeWait.Mox
@@ -2681,7 +2732,7 @@ public sealed class Protocol1Client : IProtocol1Client
                     TimeSpan? delay = _audioEgressPacer.DelayUntilSend(Stopwatch.GetTimestamp());
                     if (delay is null)
                     {
-                        _audioTxSignal.Wait(ct);
+                        if (!WaitForTxSignal(_audioTxSignal, ct)) return;
                     }
                     else if (delay == TimeSpan.Zero)
                     {
@@ -2695,7 +2746,7 @@ public sealed class Protocol1Client : IProtocol1Client
                 else
                 {
                     Interlocked.Exchange(ref _normalTxUsesAudioPacer, 0);
-                    _txSignal.Wait(ct);
+                    if (!WaitForTxSignal(_txSignal, ct)) return;
                 }
                 // PS safe-transition window (#1302): EP2 is paused while the
                 // stream is stopped/reconfigured — drop the pacing tick. The
@@ -2806,8 +2857,7 @@ public sealed class Protocol1Client : IProtocol1Client
                         consecutiveSendFailures);
                     if (consecutiveSendFailures >= 10)
                     {
-                        try { Disconnected?.Invoke(); }
-                        catch (Exception handlerEx) { _log.LogWarning(handlerEx, "p1.tx Disconnected handler threw"); }
+                        SignalDisconnected();
                         return;
                     }
                     // Synchronous backoff: this loop was promoted to a fully
@@ -2819,6 +2869,32 @@ public sealed class Protocol1Client : IProtocol1Client
             }
         }
         catch (OperationCanceledException) { /* expected on stop */ }
+    }
+
+    private bool WaitForTxSignal(SemaphoreSlim signal, CancellationToken ct)
+    {
+        while (!signal.Wait(TxLivenessPollMs, ct))
+        {
+            if (DisconnectIfRxSinkStalled()) return false;
+        }
+        return true;
+    }
+
+    private bool DisconnectIfRxSinkStalled()
+    {
+        long started = Volatile.Read(ref _rxSinkCallStartedTimestamp);
+        if (started == 0
+            || Stopwatch.GetElapsedTime(started).TotalMilliseconds < RxSinkStallTimeoutMs
+            || Volatile.Read(ref _rxSinkCallStartedTimestamp) != started)
+        {
+            return false;
+        }
+
+        _log.LogWarning(
+            "p1.rx.sink_stalled elapsedMs={ElapsedMs:F0} — firing Disconnected",
+            Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+        SignalDisconnected();
+        return true;
     }
 
     private void WaitForAudioDeadline(CancellationToken ct)

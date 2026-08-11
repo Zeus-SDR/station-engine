@@ -404,6 +404,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private int? _txaChannelId;
     private bool _txaNativeOwned;
     private readonly IWdspTxControlNative _txControlNative;
+    private readonly Func<int, int, int, int> _setTxMonitorChannelState;
     // Tracked so SetTxMode can re-sign bandpass bounds (LSB family wants negative,
     // USB family positive) the same way RXA does through ApplyBandpassForMode.
     private RxaMode _txCurrentMode = RxaMode.USB;
@@ -638,10 +639,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         ILogger<WdspDspEngine>? logger,
         IWdspTxControlNative txControlNative,
         bool registerNativeResolver,
-        int rxAnalyzerFftSize = AnalyzerFftSize)
+        int rxAnalyzerFftSize = AnalyzerFftSize,
+        Func<int, int, int, int>? setTxMonitorChannelState = null)
     {
         _log = logger ?? NullLogger<WdspDspEngine>.Instance;
         _txControlNative = txControlNative ?? throw new ArgumentNullException(nameof(txControlNative));
+        _setTxMonitorChannelState = setTxMonitorChannelState ?? NativeMethods.SetChannelState;
         _rxAnalyzerFftSize = NormalizeRxAnalyzerFftSize(rxAnalyzerFftSize);
         if (registerNativeResolver)
             WdspNativeLoader.EnsureResolverRegistered();
@@ -655,7 +658,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     internal void OpenTxChannelForTests(
         int txaChannelId,
         RxMode mode = RxMode.USB,
-        bool compressorEnabled = false)
+        bool compressorEnabled = false,
+        bool running = false)
     {
         lock (_txaLock)
         {
@@ -663,6 +667,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             _txaNativeOwned = false;
             _txCurrentMode = MapMode(mode);
             _txCompressorEnabled = compressorEnabled;
+            _txaRunning = running;
         }
     }
 
@@ -3156,15 +3161,24 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         bool nowRunning;
         lock (_txaLock)
         {
-            if (_txaChannelId is int txa && !_moxOn)
+            if (_txaChannelId is int txa && !_moxOn && enabled)
             {
-                bool wantTxa = enabled;  // MOX off; TXA target derived from monitor
-                if (_txaRunning != wantTxa)
+                if (!_txaRunning)
                 {
-                    txaPrior = NativeMethods.SetChannelState(txa, wantTxa ? 1 : 0, wantTxa ? 0 : 1);
-                    _txaRunning = wantTxa;
+                    txaPrior = _setTxMonitorChannelState(txa, 1, 0);
+                    _txaRunning = true;
                 }
             }
+            // Preview-off deliberately leaves an already-running TXA warm.
+            // The mic ingest gate stops calling ProcessTxBlock as soon as
+            // _monitorRequested becomes false, so a damped SetChannelState(0)
+            // cannot complete on this path: dmode=1 blocks the radio packet
+            // thread waiting for a later fexchange2, while dmode=0 leaves
+            // downflag armed and the next preview's exchange clears itself
+            // back to state=0. Keeping the idle channel armed costs no DSP
+            // work because it receives no blocks, makes the next Preview
+            // instant, and lets the normal MOX-off lifecycle perform the only
+            // damped stop while TX ingest is still clocking the fade.
             nowRunning = _txaRunning;
         }
         _log.LogInformation(

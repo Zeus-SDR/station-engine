@@ -4,7 +4,7 @@
 
 This inventory covers every external package, native library, embedded native
 component, and model conveyed by the `station-engine` source export as audited
-on 2026-07-27. The corresponding upstream license and notice files are
+on 2026-08-10. The corresponding upstream license and notice files are
 preserved verbatim in [`THIRD-PARTY-LICENSES`](THIRD-PARTY-LICENSES/).
 
 ## First-party components
@@ -22,6 +22,7 @@ license. Its full license text is preserved in
 | libspecbleach | MW0LGE-modified Thetis snapshot | LGPL-2.1-or-later | Statically embedded in WDSP for NR4/SBNR. Source: `native/libspecbleach/`. | `libspecbleach-LICENSE` |
 | RNNoise | commit `70f1d256acd4b34a572f999a05c87bf00b67730d` | BSD-3-Clause | Statically embedded in WDSP for NR3. Source: `native/rnnoise/`. The bundled `rnnoise-default.bin` model uses the same license. | `RNNoise-COPYING` |
 | miniaudio | 0.11.25 | MIT-0 or public domain | `Zeus.Dsp/runtimes/**/native/{lib,}miniaudio.*`; loaded by the local-audio interop layer. Source: `native/miniaudio/`. This distribution uses the MIT-0 option. | `Miniaudio-LICENSE` |
+| Steinberg ASIO SDK | 2.3.4, official archive SHA-256 `d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca` | GPL-3.0-only option selected | `Zeus.Dsp/runtimes/win-*/native/zeus_asio.dll`; optional Windows low-latency local-audio host bridge. Complete SDK-derived source and build controls: `native/asio/`. Zeus does not rely on the proprietary ASIO SDK license. | `Steinberg-ASIO-SDK-LICENSE.txt` |
 | codec2 | 1.2.0, commit `06d4c11e699b0351765f10398abb4f663a984f36` | LGPL-2.1 | `Zeus.Dsp/runtimes/**/native/{lib,}codec2.*`; conveyed by the exported DSP project. The pinned fetch recipe and Zeus build patch are in `native/codec2/`. | `Codec2-COPYING` |
 | RADE C modem | Thetis-RADE commit `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` | BSD-2-Clause | Compiled into `libzeus_rade.so`, `libzeus_rade.dylib`, or `zeus_rade.dll`, which is conveyed by the exported DSP project for four RIDs including osx-arm64. Build glue and pinned source provenance: `native/radae/`. | `RADE-radae_c-LICENSE` |
 | Opus DNN/FARGAN | Opus commit `940d4e5af64351ca8ba8390df3f555484c567fbb` through the pinned Thetis-RADE composition | BSD-3-Clause | Compiled into the RADE shared library; source provenance is in `native/radae/vendor/PROVENANCE.md`. | `RADE-opus_dnn-COPYING` |
@@ -57,6 +58,9 @@ license. Its full license text is preserved in
   `RADE-LGPL-SECTION-3-NOTICE.md`.
 - Operating-system libraries shown by native dependency inspection are system
   components and are not copied into this repository.
+- The ASIO bridge is classified as published GPL station-engine native code and
+  is forbidden from the proprietary `ZeusProduct` project graph and payload.
+  Boundary tests enforce both sides of that rule.
 
 The checked-in binaries are build conveniences. Corresponding-source and
 relinking obligations for GPL/LGPL components remain governed by their license
@@ -69,6 +73,7 @@ texts and upstream source links below.
 - libspecbleach: <https://github.com/lucianodato/libspecbleach>
 - RNNoise: <https://github.com/xiph/rnnoise>
 - miniaudio: <https://github.com/mackron/miniaudio>
+- Steinberg ASIO SDK: <https://www.steinberg.net/developers/asiosdk-open/>
 - codec2: <https://github.com/drowe67/codec2>
 - RADE composition: <https://github.com/sv1eia/Thetis-RADE>
 - LiteDB: <https://github.com/mbdavid/LiteDB>

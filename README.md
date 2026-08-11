@@ -12,8 +12,11 @@ The source is maintained by Douglas J. Cerrato (KB2UKA) and Christian Suarez
 
 ## License
 
-The station engine binary is conveyed under the **GNU General Public License,
-version 3 or (at your option) any later version**. The full text is in
+An engine distribution without the optional ASIO host bridge is conveyed under
+the **GNU General Public License, version 3 or (at your option) any later
+version**. A Windows distribution containing the Steinberg ASIO SDK-derived
+bridge is conveyed under **GPL-3.0-only**, because the SDK's GPL version 3
+option does not include an "or later" grant. The full version 3 text is in
 [`LICENSE`](LICENSE), which also states the scope summarised here; provenance
 and per-component attribution are in [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md);
 third-party components and their preserved license texts are inventoried in
@@ -25,20 +28,27 @@ individually remain available under that license; the version 2 text is in
 support under `Station.Engine.Hosting/SpeTaurus/` is **GPL-3.0-or-later** (its
 provenance is recorded in
 [`Station.Engine.Hosting/SpeTaurus/SOURCE.md`](Station.Engine.Hosting/SpeTaurus/SOURCE.md)).
-Because the engine combines both, the distributed binary is GPL-3.0-or-later —
-permitted by the "or later" option on the GPL-2.0-or-later portions.
+The "or later" option on the GPL-2.0-or-later portions permits both engine
+compositions. Individual source files retain their stated licenses.
 
 This repository is the **complete corresponding source** for the station engine
 binary distributed with Zeus SDR. Each release tag here matches the engine
 shipped in the corresponding Zeus release.
 
+Windows artifacts containing `zeus_asio.dll` fail packaging unless the public
+source tag is exactly `v<engineVersion>` and already exists. This rule also
+applies to dev builds; a pointer to the latest stable source is not accepted for
+an ASIO-bearing artifact. Non-Windows dev builds, which do not convey ASIO,
+retain the existing stable-source pointer and exact per-native source pins.
+
 ## Native libraries
 
 The native source used by the station engine is included under `native/`:
 Zeus-modified WDSP, its statically embedded libspecbleach and RNNoise sources,
-miniaudio, the pinned codec2 fetch recipe and patch, and the RADE build glue,
-shim, exact materialized upstream slices, integrity record, and binary/source
-binding. Artifact-to-source mapping and the exact
+miniaudio, the GPL-3.0-only ASIO 2.3.4 host bridge and SDK-derived source, the
+pinned codec2 fetch recipe and patch, and the RADE build glue, shim, exact
+materialized upstream slices, integrity record, and binary/source binding.
+Artifact-to-source mapping and the exact
 per-platform build commands are in [`NATIVE-BUILD.md`](NATIVE-BUILD.md).
 The proprietary VST3 and Audio Unit bridge binaries are not part of the station
 engine and are not included; the published tree builds against
@@ -50,7 +60,8 @@ licences — see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 The Zeus SDR client that drives this engine is a separate, proprietary program
 communicating over the loopback station protocol documented below. It is not
-part of this repository and is not covered by this license.
+part of this repository and is not covered by this license. ASIO SDK-derived
+source and binaries do not enter that product.
 
 ## Requirements
 

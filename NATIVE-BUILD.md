@@ -15,6 +15,7 @@ source tree.
 | `wdsp.dll`, `libwdsp.so`, `libwdsp.dylib` | `native/wdsp/`, with `native/libspecbleach/` and `native/rnnoise/` statically embedded by the default build |
 | `fftw3.dll`, `fftw3f.dll`, `libfftw3-3.dll`, `libfftw3f-3.dll`, `libfftw3.so.3`, `libfftw3f.so.3`, `libfftw3.3.dylib`, `libfftw3f.3.dylib` | Unmodified upstream FFTW; provenance and exact per-RID acquisition are below |
 | `miniaudio.dll`, `libminiaudio.so`, `libminiaudio.dylib` | `native/miniaudio/` |
+| `zeus_asio.dll` | `native/asio/`; Windows-only ASIO 2.3.4 host bridge, including the SDK interface source used to build it |
 | `codec2.dll`, `libcodec2.so`, `libcodec2.dylib` | `native/codec2/`; its CMake recipe fetches codec2 1.2.0 and applies the included build-system patch |
 | `zeus_rade.dll`, `libzeus_rade.so`, `libzeus_rade.dylib` | `native/radae/`; exact pinned upstream slices are materialized under `native/radae/vendor/` and bound to the binaries in `native/radae/vendor/BINARY-SOURCE-BINDING.json` |
 
@@ -172,6 +173,24 @@ cp "$dll" Zeus.Dsp/runtimes/win-x64/native/codec2.dll
 ```
 
 codec2 is not currently built for win-arm64.
+
+Build the optional ASIO host bridge from its tracked corresponding source with
+Visual Studio 2022. The source metadata and official SDK archive checksum are
+recorded in `ASIO-SOURCE.json`; no proprietary ASIO SDK license is used.
+
+```powershell
+cmake -S native\asio -B native\build-asio-x64 -G "Visual Studio 17 2022" -A x64
+cmake --build native\build-asio-x64 --config Release --parallel
+copy native\build-asio-x64\Release\zeus_asio.dll Zeus.Dsp\runtimes\win-x64\native\zeus_asio.dll
+
+cmake -S native\asio -B native\build-asio-arm64 -G "Visual Studio 17 2022" -A ARM64
+cmake --build native\build-asio-arm64 --config Release --parallel
+copy native\build-asio-arm64\Release\zeus_asio.dll Zeus.Dsp\runtimes\win-arm64\native\zeus_asio.dll
+```
+
+Only build and stage a RID for which the bridge implementation declares
+support. The station engine must remain usable through miniaudio when the ASIO
+bridge or a compatible driver is unavailable.
 
 ## RADE on each supported RID
 

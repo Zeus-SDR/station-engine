@@ -20,19 +20,17 @@ exported engine, with each component's preserved licence text, is
 
 ## License
 
-The Zeus Station Engine and the rest of this repository, except for the
-`zeus-web/` client and the native VST3 and Audio Unit bridges under
-`native/zeus-vst-bridge/` and `native/zeus-au-bridge/`, are distributed under
-the **GNU General Public License, version 2 or (at your option) any later
-version** (GPL-2.0-or-later). The full licence text is in [`LICENSE`](LICENSE).
+The Zeus Station Engine and repository files without a different per-file or
+directory-level notice are distributed under the **GNU General Public License,
+version 2 or (at your option) any later version** (GPL-2.0-or-later). The full
+licence text and composition rules are in [`LICENSE`](LICENSE).
 
-The Zeus SDR web client under [`zeus-web/`](zeus-web/) and the native VST3 and
-Audio Unit bridges are proprietary and carry proprietary per-file license
-identifiers. Their in-tree proprietary notice is
-[`zeus-web/LICENSE`](zeus-web/LICENSE). The proprietary
-client components and station engine are separate programs, and nothing in
-the proprietary notice limits the rights granted under the GPL for the
-station engine.
+The Zeus SDR web client under [`zeus-web/`](zeus-web/), the `ZeusProduct/`
+program, and the native VST3 and Audio Unit bridges are proprietary and carry
+proprietary per-file license identifiers. The web client's in-tree notice is
+[`zeus-web/LICENSE`](zeus-web/LICENSE). Proprietary client components and the
+station engine are separate programs, and nothing in a proprietary notice
+limits the rights granted under the GPL for the station engine.
 
 This licence was chosen deliberately to align Zeus with its primary
 upstreams and reference projects:
@@ -145,8 +143,10 @@ and the [FTDI D2XX Programmer's Guide](https://ftdichip.com/wp-content/uploads/2
 plus FTDI's public D2XX driver documentation.
 
 The rest of the engine is GPL-2.0-or-later, whose "or later" option permits
-combination with this GPL-3.0-or-later work. The resulting station-engine
-binary is therefore distributed as **GPL-3.0-or-later**.
+combination with this GPL-3.0-or-later work. Station-engine distributions that
+do not include the optional ASIO host bridge are therefore distributed as
+**GPL-3.0-or-later**. Windows distributions that include that bridge are
+conveyed under **GPL-3.0-only**, as described below.
 
 ## WDSP
 
@@ -287,6 +287,23 @@ distributed under the **MIT License**:
 The licence text is preserved verbatim at
 [`native/zeus-vst-bridge/third_party/vst3sdk/LICENSE.txt`](native/zeus-vst-bridge/third_party/vst3sdk/LICENSE.txt).
 Upstream: <https://github.com/steinbergmedia/vst3sdk>.
+
+## Steinberg ASIO SDK
+
+The optional Windows local-audio host bridge is built from Steinberg ASIO SDK
+2.3.4. Zeus selects the SDK's **GNU General Public License version 3** option;
+the SDK notice does not grant an "or later" option, so the bridge is classified
+as **GPL-3.0-only**. The complete SDK-derived source and Zeus build controls are
+published only with the GPL station-engine corresponding source under
+[`native/asio/`](native/asio/). The proprietary `ZeusProduct` program neither
+references that source nor contains the ASIO bridge binary.
+
+The official SDK archive is available from <https://www.steinberg.net/asiosdk>.
+The 2.3.4 archive used by Zeus has SHA-256
+`d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca`.
+Steinberg's license notice is preserved at
+`packaging/station-engine/THIRD-PARTY-LICENSES/Steinberg-ASIO-SDK-LICENSE.txt`.
+The ASIO name is used descriptively; Zeus does not ship an ASIO logo.
 
 ## ft8_lib / wsprd (moved to the Zeus Digital plugin)
 

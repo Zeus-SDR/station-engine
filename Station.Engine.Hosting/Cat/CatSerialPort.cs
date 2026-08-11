@@ -33,7 +33,7 @@ namespace Zeus.Server.Cat;
 /// in-flight read — so a settings change or shutdown always tears the loop down
 /// promptly.</para>
 /// </summary>
-internal sealed class CatSerialPort : IDisposable
+internal sealed class CatSerialPort : ISerialPttPins, IDisposable
 {
     // Longest legal Kenwood command is well under this; a token that grows past
     // it without a ';' is a misbehaving client → its buffer is dropped.
@@ -52,6 +52,9 @@ internal sealed class CatSerialPort : IDisposable
     private readonly object _writeLock = new();
 
     private SerialPort? _port;
+    private bool _rtsAsserted;
+    private bool _dtrAsserted;
+    private string? _lineControlError;
     private int _disposed;
     private int _activity;
 
@@ -103,10 +106,22 @@ internal sealed class CatSerialPort : IDisposable
         // Assert RTS/DTR after open (Thetis's "soft rock ptt" hack — some
         // level-shifter interfaces need a line high). Best-effort: a virtual
         // pty that doesn't model line control must not fail the open.
-        try { port.RtsEnable = true; } catch { /* line control unsupported */ }
-        try { port.DtrEnable = true; } catch { /* line control unsupported */ }
+        var lineFailures = new List<string>(2);
+        try { port.RtsEnable = true; _rtsAsserted = true; }
+        catch (Exception ex) { lineFailures.Add($"RTS: {ex.Message}"); }
+        try { port.DtrEnable = true; _dtrAsserted = true; }
+        catch (Exception ex) { lineFailures.Add($"DTR: {ex.Message}"); }
+        _lineControlError = lineFailures.Count == 0
+            ? null
+            : $"Unable to assert serial PTT output line(s): {string.Join("; ", lineFailures)}";
         _port = port;
     }
+
+    public bool CtsHolding => (_port ?? throw new IOException("CAT serial port is closed")).CtsHolding;
+    public bool DsrHolding => (_port ?? throw new IOException("CAT serial port is closed")).DsrHolding;
+    public bool RtsAsserted => _rtsAsserted;
+    public bool DtrAsserted => _dtrAsserted;
+    public string? LineControlError => _lineControlError;
 
     /// <summary>Read loop until cancelled or the port goes away. Frames on ';'
     /// via <see cref="CatProtocol.ExtractCommands"/> and dispatches each command
@@ -199,6 +214,8 @@ internal sealed class CatSerialPort : IDisposable
         _rateLimiter.Dispose();
         var port = _port;
         _port = null;
+        _rtsAsserted = false;
+        _dtrAsserted = false;
         if (port is null) return;
         // A surprise-removed USB adapter can wedge SerialPort.Close/Dispose in
         // the native driver. Run both on the pool and wait only a small bounded

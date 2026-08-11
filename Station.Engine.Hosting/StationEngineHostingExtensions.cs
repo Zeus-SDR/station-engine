@@ -202,6 +202,8 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<ExternalPttService>();
         services.AddSingleton<SerialPttService>();
         services.AddSingleton<NativeMicCapture>();
+        services.AddSingleton<IAsioSessionFactory, AsioSessionFactory>();
+        services.AddSingleton<NativeHostAudioCoordinator>();
         services.AddSingleton<EngineCacheJanitor>();
 
         // Each hosted registration aliases the singleton used by endpoints
@@ -239,6 +241,7 @@ public static class StationEngineHostingExtensions
         services.AddHostedService(sp => sp.GetRequiredService<SerialPttService>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeAudioSink>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeMicCapture>());
+        services.AddHostedService(sp => sp.GetRequiredService<NativeHostAudioCoordinator>());
 
         services.AddTciServices();
         services.AddCatServices();

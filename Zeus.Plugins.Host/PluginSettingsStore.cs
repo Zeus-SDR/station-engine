@@ -122,26 +122,48 @@ public sealed class PluginSettingsStore : IDisposable
     public void RestoreProfileCollection(
         string pluginId,
         IReadOnlyDictionary<string, string> snapshot)
+        => _ = RestoreProfileCollectionIfChanged(pluginId, snapshot);
+
+    /// <summary>
+    /// Restore an authoritative profile snapshot only when its operator-owned
+    /// values differ from the current collection. Returns true when the store
+    /// changed, allowing profile orchestration to avoid recycling a live native
+    /// plug-in whose settings already match.
+    /// </summary>
+    public bool RestoreProfileCollectionIfChanged(
+        string pluginId,
+        IReadOnlyDictionary<string, string> snapshot)
     {
-        if (string.IsNullOrWhiteSpace(pluginId) || snapshot is null) return;
+        if (string.IsNullOrWhiteSpace(pluginId) || snapshot is null) return false;
         lock (_lock)
         {
             var coll = CollectionFor(pluginId);
-            var existingKeys = coll.FindAll()
-                .Select(doc => doc.Key)
-                .Where(key => key is not null && !IsInternalKey(key))
-                .Distinct(StringComparer.Ordinal)
-                .ToList();
+            var existing = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var doc in coll.Query().OrderBy(x => x.Id).ToList())
+            {
+                if (doc.Key is not null && !IsInternalKey(doc.Key))
+                    existing[doc.Key] = doc.JsonValue;
+            }
+            var desired = snapshot
+                .Where(pair => !IsInternalKey(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
 
-            foreach (var key in existingKeys)
+            if (existing.Count == desired.Count
+                && existing.All(pair => desired.TryGetValue(pair.Key, out var value)
+                    && string.Equals(pair.Value, value, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            foreach (var key in existing.Keys)
                 coll.DeleteMany(doc => doc.Key == key);
 
-            foreach (var kv in snapshot)
+            foreach (var kv in desired)
             {
-                if (IsInternalKey(kv.Key)) continue;
                 coll.DeleteMany(doc => doc.Key == kv.Key);
                 coll.Insert(new SettingDoc { Key = kv.Key, JsonValue = kv.Value });
             }
+            return true;
         }
     }
 

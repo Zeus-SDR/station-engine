@@ -178,7 +178,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // sets `receiver[i].ddc = i` (not `i + 2` as for Orion/Angelia/MkII).
     private const int HermesRxDdc = 0;
 
-    // 2^32 / 122_880_000 — converts Hz to a 32-bit phase-increment word.
+    // Converts Hz to a 32-bit phase-increment word modulo the 122.88 MHz
+    // mixer clock.
     // The HPSDR Protocol-2 receiver mixers always operate on phase-word
     // input: the upstream HDL wires the host-supplied 32-bit phase
     // straight into the receiver cores (see `C122_phase_word` in
@@ -187,8 +188,24 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // Thetis both set has no decoder in `General_CC.v` (and no
     // secondary decoder elsewhere in `Hermes.v` / `Orion.v` —
     // verified). Kept for parity with pihpsdr; this constant is the
-    // unconditional Hz→phase scale. Issue #416.
+    // unconditional Hz→phase conversion. Issue #416.
+    //
+    // Retained for the PureSignal feedback DDC write below, which stays on the
+    // develop-side floating-point scale so this merge changes no PureSignal
+    // wire value. Every non-PS site uses FrequencyHzToPhaseWord instead.
     private const double HzToPhase = 34.952533333333333;
+
+    /// <summary>
+    /// Convert a frequency to the exact unsigned 32-bit phase increment used
+    /// by the 122.88 MHz DDC/DUC mixer clock. Reducing before the integer
+    /// multiply preserves the NCO's natural modulo behavior above one clock
+    /// while avoiding out-of-range floating-point-to-uint conversions.
+    /// </summary>
+    internal static uint FrequencyHzToPhaseWord(uint frequencyHz)
+    {
+        ulong remainderHz = frequencyHz % (uint)WidebandAdcSampleRateHz;
+        return (uint)((remainderHz << 32) / (uint)WidebandAdcSampleRateHz);
+    }
 
     private readonly ILogger<Protocol2Client> _log;
     private readonly Channel<IqFrame> _iqFrames = Channel.CreateUnbounded<IqFrame>(
@@ -216,14 +233,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _rx1AdcSource;
     private int _rx2AdcSource;
     private int _diversitySourceAdcSource;
-    // TX DUC NCO frequency. Normally tracks _rxFreqHz (the shared RX0/TX LO) so
-    // the TX carrier lands at the RX0 frequency — byte-identical to the historic
-    // single-frequency model. For dual-RX split TX (TX VFO = B with RX2 on) the
-    // hosting layer sets this INDEPENDENTLY to VFO B's effective LO via
-    // SetTxDucFrequency, so the TX carrier goes to VFO B WITHOUT dragging RX0/RX1
-    // off VFO A (the dual-RX TUNE "two carriers, one on each RX" bug).
-    // _txDucIndependent latches that override; it is cleared when split ends so
-    // the DUC follows RX0 again.
+    // TX DUC NCO frequency. It falls back to _rxFreqHz for isolated callers,
+    // preserving the historic single-frequency model. The Zeus host always
+    // sets it independently via SetTxDucFrequency so RX DDCs stay parked while
+    // TX follows CTUN, XIT, split, and the selected transmit receiver.
     private uint _txDucFreqHz = 14_200_000;
     private volatile bool _txDucIndependent;
     // Extra user receivers (RX3+) for full multi-DDC. Contiguous after RX2:
@@ -981,11 +994,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // Host-side multiplicative correction, applied right before the
         // phase-word feed slot (matches piHPSDR src/new_protocol.c:765,824,
         // Thetis NetworkIO.VFOfreq, deskHPSDR src/new_protocol.c:909,967).
-        // _rxFreqHz then feeds the NCO phase-word at line 951
-        // (`rxPhase = _rxFreqHz * HzToPhase`).
+        // _rxFreqHz then feeds the NCO phase-word in SendCmdHighPriority.
         long corrected = (long)Math.Round(hz * factor, MidpointRounding.AwayFromZero);
         _rxFreqHz = (uint)Math.Clamp(corrected, 0L, uint.MaxValue);
-        // The TX DUC follows RX0 unless an independent split-TX freq is latched.
+        // The TX DUC follows RX0 only until the host latches an independent NCO.
         if (!_txDucIndependent) _txDucFreqHz = _rxFreqHz;
         var running = _rxTask is not null;
         _log.LogInformation("p2.tune hz={Hz} running={Running} hpSeq={Seq}",
@@ -994,13 +1006,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Set the TX DUC NCO frequency independently of the shared RX0/TX LO. Used
-    /// for dual-RX split TX (TX VFO = B with RX2 enabled): the TX carrier must
-    /// land on VFO B while RX1 keeps receiving VFO A, so the TX DUC can no longer
-    /// be tied to RX0's frequency. <paramref name="hz"/> &lt;= 0 clears the
-    /// override and the DUC follows RX0 again (the non-split / single-VFO model,
-    /// byte-identical to before). Applies the same host-side frequency correction
-    /// as <see cref="SetVfoAHz"/>. Re-sends the high-priority packet when live.
+    /// Set the TX DUC NCO independently of the receive DDC centre. The Zeus host
+    /// uses this for every P2 state so keying does not retune the RX display.
+    /// <paramref name="hz"/> &lt;= 0 restores the RX0-following compatibility
+    /// fallback. Applies the same host-side frequency correction as
+    /// <see cref="SetVfoAHz"/> and re-sends the high-priority packet when live.
     /// </summary>
     public void SetTxDucFrequency(long hz)
     {
@@ -1300,7 +1310,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// <summary>Test accessor: the (correction-applied) TX DUC NCO frequency.</summary>
     internal uint TxDucFreqHzForTesting => _txDucFreqHz;
 
-    /// <summary>Test accessor: whether the TX DUC is on the independent split-TX override.</summary>
+    /// <summary>Test accessor: whether the TX DUC has an independent host-supplied NCO.</summary>
     internal bool TxDucIndependentForTesting => _txDucIndependent;
 
     /// <summary>Test accessor: DLE_outputs byte 1400 (XVTR/IO1/AUTO_TUNE composition).</summary>
@@ -3313,14 +3323,14 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // DDC slot 0, so the phase goes to bytes 9..12 (`9 + 0*4`). Bytes
         // not used by the active RX slot stay zero on the non-PS path. TX
         // DUC phase is written to 329..332 regardless of board.
-        uint rxPhase = (uint)(_rxFreqHz * HzToPhase);
+        uint rxPhase = FrequencyHzToPhaseWord(_rxFreqHz);
         int rxDdc = RxBaseDdc(_boardKind);
         WriteBeU32(p, 9 + rxDdc * 4, rxPhase);
-        // TX DUC NCO phase. Normally _txDucFreqHz == _rxFreqHz, so this is
-        // identical to rxPhase (DUC follows RX0). For dual-RX split TX it is set
-        // independently to VFO B (SetTxDucFrequency), so the carrier lands on B
-        // while the RX0 DDC above stays on VFO A — fixing the two-carrier bug.
-        WriteBeU32(p, 329, (uint)(_txDucFreqHz * HzToPhase));
+        // TX DUC NCO phase. The Zeus host programs this independently for every
+        // P2 state so the user RX DDC above remains parked while the carrier
+        // follows CTUN, XIT, split, and the selected TX receiver. The fallback
+        // remains RX0 for isolated callers that have not supplied a TX DUC.
+        WriteBeU32(p, 329, FrequencyHzToPhaseWord(_txDucFreqHz));
 
         // Second receiver (RX2): tune its own DDC's NCO to _rx2FreqHz so it
         // demodulates an independent band. Each DDC's phase word lives at
@@ -3331,7 +3341,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             || Volatile.Read(ref _diversitySourceEnabled) != 0)
         {
             int rx2Ddc = Rx2Ddc(_boardKind);
-            uint rx2Phase = (uint)(_rx2FreqHz * HzToPhase);
+            uint rx2Phase = FrequencyHzToPhaseWord(_rx2FreqHz);
             WriteBeU32(p, 9 + rx2Ddc * 4, rx2Phase);
         }
 
@@ -3346,28 +3356,29 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             for (int k = 0; k < extraN; k++)
             {
                 int rcvr = 2 + k;
-                uint phase = (uint)(_extraRxFreqHz[rcvr] * HzToPhase);
+                uint phase = FrequencyHzToPhaseWord(_extraRxFreqHz[rcvr]);
                 WriteBeU32(p, 9 + (baseDdc + rcvr) * 4, phase);
             }
         }
 
         int displayDdc = EffectiveDisplayDdcIndex();
         if (displayDdc is >= 2 and < MaxRxDdc)
-            WriteBeU32(p, 9 + displayDdc * 4, (uint)(_displayDdcFreqHz * HzToPhase));
+            WriteBeU32(p, 9 + displayDdc * 4, FrequencyHzToPhaseWord(_displayDdcFreqHz));
 
-        // PureSignal — when armed, DDC0 + DDC1 phase words also need to
-        // track the TX frequency during xmit so the feedback DDC samples
-        // the actual TX coupler signal. pihpsdr new_protocol.c:827-839.
-        // Board-gated via psWire so DDC0's phase is never overwritten on a
-        // single-ADC board where DDC0 carries the operator's RX (#960).
-        if (psWire && moxOn)
+        // PureSignal feedback DDCs track the transmitted carrier during a keyed
+        // burst. Dual-ADC boards reserve DDC0+DDC1 for feedback. Single-ADC
+        // HermesC10/HermesII boards time-multiplex the keyed feedback pair on
+        // DDC0, then restore that slot to the parked user RX at key-up (#960).
+        bool txKeyed = moxOn || tuneActive;
+        bool timeMuxPsBurst = _psFeedbackEnabled
+            && TimeMuxesPsFeedbackOnDdc0(_boardKind)
+            && txKeyed;
+        if ((psWire && txKeyed) || timeMuxPsBurst)
         {
-            // For now mirror the RX freq onto the TX side — the radio's
-            // single-VFO assumption today means TX = RX. Multi-VFO support
-            // is a follow-up.
-            uint txPhase = rxPhase;
+            uint txPhase = (uint)(_txDucFreqHz * HzToPhase);
             WriteBeU32(p, 9, txPhase);     // DDC0 = TX freq
-            WriteBeU32(p, 13, txPhase);    // DDC1 = TX freq
+            if (psWire)
+                WriteBeU32(p, 13, txPhase); // dual-ADC DDC1 = TX freq
         }
 
         // Drive level (0..255) at byte 345. Set by RadioService after applying

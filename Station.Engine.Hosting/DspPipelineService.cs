@@ -503,6 +503,12 @@ public class DspPipelineService : BackgroundService,
         return dbfs - 50.0;
     }
 
+    internal static double AudioRmsToFallbackDbm(double rms, double meterCorrectionDb)
+    {
+        double dbm = AudioRmsToFallbackDbm(rms);
+        return double.IsFinite(dbm) ? dbm + meterCorrectionDb : dbm;
+    }
+
     internal static double AdaptiveSquelchMarginDb() => AdaptiveSquelchOpenMarginDb;
 
     private static double AdaptiveSquelchCloseHysteresisDb(double marginDb) =>
@@ -1240,11 +1246,13 @@ public class DspPipelineService : BackgroundService,
     internal const int DefaultRxPostTxMuteBlocks = 6; // ~200 ms at the 30 Hz audio cadence
     private volatile bool _rxFadeOutPending;        // first RX block after MOX↑
     private volatile bool _rxAudioSuppressedForTx;  // publish silence/sidetone instead of RX while TX is keyed
-    // Ordinary display-DUP keying leaves RX analyzer history untouched. PS
-    // retains the established MOX-edge reset on both sides of an over; latch
-    // the key-down state so an emergency mid-TX PS disarm does not change the
-    // matching key-up cleanup.
+    // Latch key-down display/PS policy so an emergency mid-TX disarm cannot
+    // change the matching key-up cleanup. P2 keeps RX display analyzers intact;
+    // P1 PS retains its established TX-domain reset until P1 has independent
+    // receive and transmit tuning frames.
+    private bool _stopRxForPureSignalForCurrentTx;
     private bool _resetDisplayPixelsForCurrentTx;
+    private bool _p2DisplayDuplexForCurrentTx;
     private int _rxPostTxMuteBlocksRemaining;       // RXA transition-drain blocks after MOX↓
     private int _rxPostTxFadeInSamplesRemaining;    // final-output soft resume after post-TX drain
     private int _rxPostTxDisplayFramesRemaining;    // RXA analyzer transition frames after MOX↓
@@ -2934,10 +2942,12 @@ public class DspPipelineService : BackgroundService,
             Volatile.Write(ref _rxPostTxDisplayFramesRemaining, 0);
             _rxAudioSuppressedForTx = true;
             _rxFadeOutPending = true;
-            _resetDisplayPixelsForCurrentTx = _appliedPsEnabled;
+            _p2DisplayDuplexForCurrentTx = _radio.IsProtocol2Active;
+            _stopRxForPureSignalForCurrentTx = _appliedPsEnabled;
+            _resetDisplayPixelsForCurrentTx = _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx;
             lock (_engineLock)
             {
-                _engine?.SetMox(true, _resetDisplayPixelsForCurrentTx);
+                _engine?.SetMox(true, _stopRxForPureSignalForCurrentTx);
                 if (_resetDisplayPixelsForCurrentTx)
                     _engine?.ResetDisplayPixelBuffers();
             }
@@ -2949,7 +2959,7 @@ public class DspPipelineService : BackgroundService,
             {
                 lock (_engineLock)
                 {
-                    _engine?.SetMox(false, _resetDisplayPixelsForCurrentTx);
+                    _engine?.SetMox(false, _stopRxForPureSignalForCurrentTx);
                     if (_resetDisplayPixelsForCurrentTx)
                         _engine?.ResetDisplayPixelBuffers();
                 }
@@ -2965,7 +2975,9 @@ public class DspPipelineService : BackgroundService,
                 Volatile.Write(ref _rxPostTxMuteBlocksRemaining, postTxMuteBlocks);
                 Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
                 _rxAudioSuppressedForTx = false;
+                _stopRxForPureSignalForCurrentTx = false;
                 _resetDisplayPixelsForCurrentTx = false;
+                _p2DisplayDuplexForCurrentTx = false;
             }
         }
     }
@@ -4782,6 +4794,13 @@ public class DspPipelineService : BackgroundService,
     /// and tests don't exercise it.</summary>
     public Zeus.Protocol2.Protocol2Client? CurrentP2Client => _p2Client;
 
+    /// <summary>Test seam: inject a caller-owned, socketless Protocol-2 client
+    /// so service-level tests can exercise the normal P2 command fan-out and
+    /// capture its wire packets without opening a network socket. Production
+    /// composition never calls this method.</summary>
+    internal void SetP2ClientForTest(Zeus.Protocol2.Protocol2Client? client) =>
+        _p2Client = client;
+
     /// <summary>
     /// Manually set the PS TX feedback attenuation (operator alternative to
     /// AutoAttenuate). Pushes the value to the connected radio — HL2 via the
@@ -5064,26 +5083,13 @@ public class DspPipelineService : BackgroundService,
         p2?.SetVfoBHz(_radio.ToHardwareFrequencyHz(
             hiddenDiversitySource ? s.RadioLoHz : _secondaryRx[1].LoHz));
 
-        // Multi-RX split TX: when any secondary receiver is the TX target and RX2
-        // is on, drive the TX DUC to that receiver's effective LO INDEPENDENTLY so
-        // a TUNE/MOX carrier lands on the selected receiver while RX1 keeps
-        // receiving VFO A.
-        // Clearing (0) returns the DUC to following RX0 — the non-split single-
-        // VFO model, byte-identical to before. Pairs with RadioService.
-        // AlignLoForTx skipping the shared-LO drag for this P2 split case
-        // (dragging the LO is what pulled RX1 to VFO B and showed the carrier on
-        // both receivers — the two-carrier bug).
-        // Use the canonical TX effective LO — identical to what AlignLoForTx used
-        // to drag the shared LO to — so the carrier lands on exactly the same
-        // selected receiver frequency, just via the independent DUC. Both the
-        // DUC NCO (byte 329) and the alex TX low-pass derive from this, so they
-        // always agree.
-        bool independentTxToSecondary = s.TxReceiverIndex >= 1 && s.Rx2Enabled;
-        bool independentSplitTx = RadioFrequencyResolver.IsSplitEnabledForTx(s);
+        // Protocol 2 has independent RX DDC and TX DUC NCOs. Always program the
+        // TX DUC from the selected TX dial while leaving RX0/DDC2 on RadioLoHz.
+        // This is Thetis display-DUP routing: keying never drags the receiver's
+        // capture centre away and the waterfall keeps one continuous frequency
+        // frame through CTUN, XIT, split, and PureSignal overs.
         p2?.SetTxDucFrequency(
-            independentTxToSecondary || independentSplitTx
-                ? _radio.ToHardwareFrequencyHz(RadioService.TxEffectiveLoHz(s))
-                : 0);
+            _radio.ToHardwareFrequencyHz(RadioService.TxEffectiveLoHz(s)));
 
         // Issue #597 Phase 0: arm the RX display fast-attack when the LO
         // moves. First callback after construction only records the LO
@@ -8038,10 +8044,9 @@ public class DspPipelineService : BackgroundService,
                 : 0;
             bool suppressPostTxRxDisplay = ShouldSuppressRxDisplayForCurrentTick();
 
-            // Display-DUP keeps ordinary keyed panadapter and waterfall frames
-            // in the RX analyzer domain, preserving its averaging and waterfall
-            // history across the whole over. PureSignal keeps the established
-            // keyed TX / feedback analyzer path below.
+            // P2 display-DUP keeps both surfaces in one RX geometry across every
+            // keyed interval, including PureSignal. P1 retains its established
+            // keyed PS TX/feedback path until it has independent RX/TX tuning.
             //
             // Issue #121 layered on top: if the operator has the "Monitor PA
             // output" toggle on AND PS is armed AND PS has converged
@@ -8051,7 +8056,7 @@ public class DspPipelineService : BackgroundService,
             // — same shape as the existing TX → RX fallback. Default-off
             // toggle: when off the codepath is identical to pre-#121, byte for
             // byte, on every board.
-            if (_keyed && _appliedPsEnabled)
+            if (_keyed && _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx)
             {
                 if (_appliedPsEnabled && _psMonitorEnabled
                     && (psFeedbackCorrecting = engine.GetPsStageMeters().Correcting))
@@ -8064,17 +8069,6 @@ public class DspPipelineService : BackgroundService,
                     if (pan) panSource = "ps-feedback";
                     if (wf) wfSource = "ps-feedback";
                 }
-                if (!pan)
-                {
-                    pan = engine.TryGetTxDisplayPixels(DisplayPixout.Panadapter, panBuf);
-                    if (pan)
-                    {
-                        panSource = "tx";
-                        Array.Copy(panBuf, _lastTxPanBuf, _panadapterWidth);
-                        Interlocked.Exchange(ref _lastTxPanCaptureMs, holdNowMs);
-                        _lastTxPanValid = true;
-                    }
-                }
                 if (displayPlan.IncludeWaterfall && !wf)
                 {
                     wf = engine.TryGetTxDisplayPixels(DisplayPixout.Waterfall, wfBuf);
@@ -8084,6 +8078,17 @@ public class DspPipelineService : BackgroundService,
                         Array.Copy(wfBuf, _lastTxWfBuf, _panadapterWidth);
                         Interlocked.Exchange(ref _lastTxWfCaptureMs, holdNowMs);
                         _lastTxWfValid = true;
+                    }
+                }
+                if (!pan)
+                {
+                    pan = engine.TryGetTxDisplayPixels(DisplayPixout.Panadapter, panBuf);
+                    if (pan)
+                    {
+                        panSource = "tx";
+                        Array.Copy(panBuf, _lastTxPanBuf, _panadapterWidth);
+                        Interlocked.Exchange(ref _lastTxPanCaptureMs, holdNowMs);
+                        _lastTxPanValid = true;
                     }
                 }
                 // Stale-tick TX-hold (issue #162): while keyed, if neither the
@@ -8126,9 +8131,7 @@ public class DspPipelineService : BackgroundService,
                     }
                 }
             }
-            // Display-duplex waterfall: ordinary keyed P1/P2 operation requests
-            // fresh RX analyzer pixels. PureSignal retains its established
-            // TX/feedback waterfall routing above and last-resort fallback below.
+            // P2 display-DUP requests fresh RX analyzer pixels for both surfaces.
             if (_keyed && _psMonitorEnabled)
             {
                 _psMonitorTickCount++;
@@ -8163,18 +8166,11 @@ public class DspPipelineService : BackgroundService,
                     wfSource = "post-tx-muted";
             }
 
-            // Last-resort keyed source (#960 G2E freeze): on a single-ADC
-            // time-mux board (HermesC10 / ANAN-G2E) a keyed PS burst diverts
-            // the board's ONLY DDC to feedback, starving the RX analyzer, and
-            // the TX display analyzer may be unavailable or stale — including
-            // after the bounded TX hold above expires — so every source above
-            // can return stale and freeze the display. The
-            // PS-feedback analyzer is fed by the burst itself (the actual
-            // post-PA on-air signal), making it the board's one live spectrum
-            // while keyed. Ordering keeps every other board byte-identical: a
-            // dual-ADC radio's RX analyzer stays fresh during TX and wins above;
-            // this fires only when nothing else produced pixels.
-            if (_keyed && _appliedPsEnabled)
+            // Preserve the legacy P1 keyed-PS fallback: if neither the TX nor
+            // RX analyzer produced pixels, use the live feedback analyzer. P2
+            // deliberately does not substitute this TX-centred geometry into
+            // the parked receive display.
+            if (_keyed && _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx)
             {
                 if (!pan)
                 {
@@ -8807,10 +8803,12 @@ public class DspPipelineService : BackgroundService,
             // The real RX meter rides the sidecar display frames and lands via
             // PublishProtocol3RxMeters below.
             _rxMeterTickMod = 0;
+            double transverterMeterCorrectionDb =
+                _radio.TransverterMeterCorrectionDb(state.VfoHz);
             double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
                 _radio.EffectiveBoardKind,
                 _radio.EffectiveOrionMkIIVariant)
-                + _radio.TransverterMeterCorrectionDb(state.VfoHz);
+                + transverterMeterCorrectionDb;
 
             // Prefer WDSP's S-meter when it's ticking. In this
             // integration the meter tap reads -400 ("didn't run") — needs
@@ -8829,7 +8827,7 @@ public class DspPipelineService : BackgroundService,
                 // noise later. Empirical offset of -50 dBm puts typical 20m
                 // band noise near S2/S3 instead of pinning at S0.
                 double rms = double.IsFinite(rxAudioRmsForMeter) ? rxAudioRmsForMeter : 0.0;
-                dbm = AudioRmsToFallbackDbm(rms);
+                dbm = AudioRmsToFallbackDbm(rms, transverterMeterCorrectionDb);
             }
             if (!double.IsFinite(dbm)) dbm = -160.0;
             _hub.Broadcast(new RxMeterFrame((float)dbm));
@@ -8946,10 +8944,14 @@ public class DspPipelineService : BackgroundService,
         double adcHeadroomDb)
     {
         if (!_radio.IsProtocol3Active) return;
+        var state = _radio.Snapshot();
+        long? receiverVfoHz = Protocol3MeterReceiverVfoHz(state, channel);
         double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
             _radio.EffectiveBoardKind,
             _radio.EffectiveOrionMkIIVariant)
-            + _radio.TransverterMeterCorrectionDb(_radio.Snapshot().VfoHz);
+            + (receiverVfoHz is long vfoHz
+                ? _radio.TransverterMeterCorrectionDb(vfoHz)
+                : 0.0);
         double dbm = ApplyRxMeterCalibration(dbfsRaw, rxCalOffsetDb);
         if (!double.IsFinite(dbm)) dbm = -160.0;
         float adcPk = (float)(double.IsFinite(adcHeadroomDb) ? -adcHeadroomDb : -200.0);
@@ -9002,6 +9004,20 @@ public class DspPipelineService : BackgroundService,
         var unavailableQuality = RxSignalQualityFrame.Unavailable((byte)Math.Clamp(channel, 0, byte.MaxValue));
         _hub.Broadcast(unavailableQuality);
         RxSignalQualityUpdated?.Invoke(unavailableQuality);
+    }
+
+    internal static long? Protocol3MeterReceiverVfoHz(StateDto state, int channel)
+    {
+        if (channel == 0) return state.VfoHz;
+        var receivers = state.Receivers;
+        if (receivers is null) return null;
+        for (int i = 0; i < receivers.Count; i++)
+        {
+            var receiver = receivers[i];
+            if (receiver.Index == channel && receiver.Enabled)
+                return receiver.VfoHz;
+        }
+        return null;
     }
 
     internal static RxSignalQualityFrame BuildRxSignalQualityFrame(

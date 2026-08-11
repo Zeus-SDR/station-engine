@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "component": "Steinberg ASIO SDK",
+  "version": "2.3.4",
+  "licenseSelection": "GPL-3.0-only",
+  "officialPage": "https://www.steinberg.net/developers/asiosdk-open/",
+  "archive": "https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip",
+  "archiveSha256": "d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca",
+  "supportedRids": ["win-x64", "win-arm64"],
+  "correspondingSourcePath": "native/asio",
+  "buildInstructions": "NATIVE-BUILD.md"
+}

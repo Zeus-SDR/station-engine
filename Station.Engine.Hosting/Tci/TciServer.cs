@@ -298,8 +298,11 @@ public sealed class TciServer : IHostedService, IDisposable
 
         // Mode and filter are less frequent — send immediately
         string tciMode = TciProtocol.ModeToTci(state.Mode);
+        var rx2 = state.Rx2();
         Broadcast(TciProtocol.Command("modulation", 0, tciMode));
+        Broadcast(TciProtocol.Command("modulation", 1, TciProtocol.ModeToTci(rx2.Mode)));
         Broadcast(TciProtocol.Command("rx_filter_band", 0, state.FilterLowHz, state.FilterHighHz));
+        Broadcast(TciProtocol.Command("rx_filter_band", 1, rx2.FilterLowHz, rx2.FilterHighHz));
 
         // IF limits on sample rate change
         int halfRate = state.SampleRate / 2;
@@ -349,6 +352,18 @@ public sealed class TciServer : IHostedService, IDisposable
                 "dds",
                 0,
                 CwOffset.EffectiveLoHz(state)));
+        BroadcastRateLimited(
+            "vfo:1,0",
+            TciProtocol.Command(
+                "vfo", 1, 0, TciSession.ResolveVfoChannelHz(state, 1, 0)));
+        BroadcastRateLimited(
+            "vfo:1,1",
+            TciProtocol.Command(
+                "vfo", 1, 1, TciSession.ResolveVfoChannelHz(state, 1, 1)));
+        BroadcastRateLimited(
+            "dds:1",
+            TciProtocol.Command(
+                "dds", 1, TciSession.EffectiveReceiverLoHz(state, 1)));
         var txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(state);
         Broadcast(TciProtocol.Command("tx_frequency", txFrequencyHz));
         Broadcast(TciExtendedFrequency.Command(

@@ -6,6 +6,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Keep ordinary RID-less Windows development usable and retain the
+         runtime in NuGet packs, but never propagate the GPL-3-only ASIO DLL
+         into a non-Windows or explicitly product-only publish. -->
+    <ZeusIncludeAsioRuntime Condition="'$(ZeusIncludeAsioRuntime)' == '' and ('$(RuntimeIdentifier)' == '' or $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-')))">true</ZeusIncludeAsioRuntime>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,8 +33,13 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
-    <None Include="runtimes/**/*.dll" Pack="true" PackagePath="runtimes/">
+    <None Include="runtimes/**/*.dll" Exclude="runtimes/**/zeus_asio.dll" Pack="true" PackagePath="runtimes/">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </None>
+    <None Include="runtimes/**/zeus_asio.dll" Pack="true" PackagePath="runtimes/">
+      <CopyToOutputDirectory Condition="'$(ZeusIncludeAsioRuntime)' == 'true'">PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory Condition="'$(ZeusIncludeAsioRuntime)' == 'true'">PreserveNewest</CopyToPublishDirectory>
       <Link>runtimes/%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>

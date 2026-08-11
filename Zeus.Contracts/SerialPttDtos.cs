@@ -36,11 +36,17 @@ public sealed record SerialPttConfig(
 
 /// <summary>Serial-PTT status response: the persisted config plus live port
 /// state (open / last error / last asserted level) and the host's enumerable
-/// serial devices for the UI's port rows. Mirrors <see cref="CatSerialStatus"/>.</summary>
+/// serial devices for the UI's free-form port suggestions. Mirrors
+/// <see cref="CatSerialStatus"/>.</summary>
 public sealed record SerialPttStatus(
     SerialPttConfig Config,
     bool PortOpen,
     string? Error,
     bool Keyed,
     IReadOnlyList<string> AvailablePorts,
-    DateTimeOffset GeneratedUtc);
+    DateTimeOffset GeneratedUtc,
+    bool SharedWithCat = false,
+    bool CtsHolding = false,
+    bool DsrHolding = false,
+    bool RtsAsserted = false,
+    bool DtrAsserted = false);

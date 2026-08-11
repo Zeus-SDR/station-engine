@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#pragma once
+
+#define ZEUS_ASIO_SOURCE_HASH "@ZEUS_ASIO_SOURCE_HASH@"

@@ -4,10 +4,20 @@ using LiteDB;
 
 namespace Zeus.Server;
 
+public enum AudioHostApi
+{
+    System = 0,
+    Asio = 1,
+}
+
 public sealed record AudioDeviceSettings(
     string? InputDeviceId,
     string? OutputDeviceId,
-    int? InputChannel);
+    int? InputChannel,
+    AudioHostApi Backend = AudioHostApi.System,
+    string? AsioDriverId = null,
+    int AsioInputChannel = 0,
+    int AsioOutputChannel = 0);
 
 public sealed class AudioDeviceSettingsStore : IDisposable
 {
@@ -49,7 +59,11 @@ public sealed class AudioDeviceSettingsStore : IDisposable
                 : new AudioDeviceSettings(
                     InputDeviceId: Normalize(e.InputDeviceId),
                     OutputDeviceId: Normalize(e.OutputDeviceId),
-                    InputChannel: e.InputChannel is >= 0 ? e.InputChannel : null);
+                    InputChannel: e.InputChannel is >= 0 ? e.InputChannel : null,
+                    Backend: Enum.IsDefined(e.Backend) ? e.Backend : AudioHostApi.System,
+                    AsioDriverId: Normalize(e.AsioDriverId),
+                    AsioInputChannel: Math.Max(0, e.AsioInputChannel),
+                    AsioOutputChannel: Math.Max(0, e.AsioOutputChannel));
         }
     }
 
@@ -97,6 +111,29 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         }
     }
 
+    /// <summary>Replaces the complete host-audio route in one LiteDB write.</summary>
+    public void Set(AudioDeviceSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (settings.InputChannel is < 0)
+            throw new ArgumentOutOfRangeException(nameof(settings));
+        if (settings.AsioInputChannel < 0 || settings.AsioOutputChannel < 0)
+            throw new ArgumentOutOfRangeException(nameof(settings));
+
+        lock (_sync)
+        {
+            var e = GetOrCreateEntry();
+            e.InputDeviceId = Normalize(settings.InputDeviceId);
+            e.OutputDeviceId = Normalize(settings.OutputDeviceId);
+            e.InputChannel = settings.InputChannel;
+            e.Backend = settings.Backend;
+            e.AsioDriverId = Normalize(settings.AsioDriverId);
+            e.AsioInputChannel = settings.AsioInputChannel;
+            e.AsioOutputChannel = settings.AsioOutputChannel;
+            SaveEntry(e);
+        }
+    }
+
     public void Dispose() => _dbLease.Dispose();
 
     private AudioDeviceSettingsEntry GetOrCreateEntry() =>
@@ -122,5 +159,9 @@ public sealed class AudioDeviceSettingsEntry
     public string? InputDeviceId { get; set; }
     public string? OutputDeviceId { get; set; }
     public int? InputChannel { get; set; }
+    public AudioHostApi Backend { get; set; }
+    public string? AsioDriverId { get; set; }
+    public int AsioInputChannel { get; set; }
+    public int AsioOutputChannel { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

@@ -101,6 +101,14 @@ public sealed class CfcPresetStore : IDisposable
         }
     }
 
+    /// <summary>Deletes a saved preset by name, matched case-insensitively.</summary>
+    public bool Delete(string name)
+    {
+        var normalized = NormalizeName(name);
+        lock (_sync)
+            return _presets.DeleteMany(p => p.NormalizedName == normalized) > 0;
+    }
+
     public void Dispose() => _dbLease.Dispose();
 
     internal static string CleanName(string name)

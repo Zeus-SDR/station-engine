@@ -12,10 +12,19 @@ public static class AudioRingProtocol
     public const int NominalSamplesPerBlock = 960;
     public const int MaxSamplesPerBlock = 2_048;
     public const int BlockPeriodMilliseconds = 20;
-    public const int RingBytes = 131_072;
+    // Match the proven SDR-VST3 transport geometry: enough retained blocks to
+    // absorb scheduler jitter without forcing a processed/dry splice. Keep the
+    // ring dimensions in the wire contract so every peer maps identical bytes.
+    public const int SlotCount = 32;
+    public const int RingHeaderBytes = 64;
+    public const int SlotHeaderBytes = 32;
+    public const int SlotBytes = SlotHeaderBytes + MaxSamplesPerBlock * sizeof(float);
+    public const int RingBytes = RingHeaderBytes + SlotCount * SlotBytes;
     public const int MapBytes = RingBytes * 2;
     public const uint Magic = 0x5A_41_52_47; // "ZARG"
-    public const ushort Version = 2;
+    // Version 4 expands each direction from 8 to 32 slots. Reject older peers:
+    // their smaller mapped layout cannot provide the retained jitter window.
+    public const ushort Version = 4;
 
     public static long Timestamp() => Stopwatch.GetTimestamp();
 
@@ -57,3 +66,10 @@ public sealed record ProductAudioAttachResponse(
     AudioRingEndpoint? RxRing = null);
 
 public delegate void AudioBlockProcessor(Span<float> block);
+
+/// <summary>
+/// Processes one block and reports how many input blocks the returned audio is
+/// delayed. The transport uses the delay only to select the matching retained
+/// dry block when a later response is unavailable; it never changes pacing.
+/// </summary>
+public delegate int DelayAwareAudioBlockProcessor(Span<float> block);

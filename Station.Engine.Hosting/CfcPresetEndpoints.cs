@@ -32,6 +32,20 @@ public static class CfcPresetEndpoints
             return Results.Ok(saved);
         });
 
+        endpoints.MapDelete("/api/tx/cfc/presets/{name}", (
+            string name,
+            CfcPresetStore store) =>
+        {
+            if (!TryValidateName(name, out var cleanName, out var nameError))
+                return Results.BadRequest(new { error = nameError });
+
+            if (!store.Delete(cleanName))
+                return Results.NotFound(new { error = $"CFC preset '{cleanName}' not found" });
+
+            log.LogInformation("api.tx.cfc.presets.delete name={Name}", cleanName);
+            return Results.NoContent();
+        });
+
         return endpoints;
     }
 

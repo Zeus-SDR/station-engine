@@ -375,9 +375,9 @@ public sealed class PluginManager : IHostedService, IAsyncDisposable
     /// a live TX plugin must never vanish from the chain because one rehydrate
     /// failed.</para>
     /// </summary>
-    public async Task RehydratePluginSettingsAsync(string pluginId, CancellationToken ct)
+    public async Task<bool> RehydratePluginSettingsAsync(string pluginId, CancellationToken ct)
     {
-        if (!_active.TryGetValue(pluginId, out var entry)) return;
+        if (!_active.TryGetValue(pluginId, out var entry)) return false;
         // Test-injected ActivatedPlugin entries can carry a null context; a
         // rehydrate without the original context would hand the plugin a
         // different settings scope than it was activated with, so skip.
@@ -385,7 +385,7 @@ public sealed class PluginManager : IHostedService, IAsyncDisposable
         {
             _log.LogWarning(
                 "Cannot rehydrate settings for plugin {Id}: no activation context retained", pluginId);
-            return;
+            return false;
         }
 
         using var initCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -394,12 +394,14 @@ public sealed class PluginManager : IHostedService, IAsyncDisposable
         {
             await entry.Loaded.Plugin.InitializeAsync(entry.Context, initCts.Token)
                 .ConfigureAwait(false);
+            return true;
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex,
                 "InitializeAsync threw during settings rehydrate for plugin {Id} — keeping it live with prior state",
                 pluginId);
+            return false;
         }
     }
 

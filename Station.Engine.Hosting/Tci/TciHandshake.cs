@@ -65,14 +65,14 @@ public static class TciHandshake
         TransverterSettingsDto? transverterSettings = null)
     {
         var transverter = transverterSettings ?? new TransverterSettingsDto();
-        var cmds = new List<string>(40);
+        var cmds = new List<string>(52);
 
         cmds.Add(TciProtocol.Command("protocol", TciProtocol.ProtocolName, TciProtocol.ProtocolVersion));
         cmds.Add(TciProtocol.Command("device", TciProtocol.DeviceName));
 
         cmds.Add(TciProtocol.Command("receive_only", false));
-        cmds.Add(TciProtocol.Command("trx_count", 1));
-        cmds.Add(TciProtocol.Command("channels_count", 1));
+        cmds.Add(TciProtocol.Command("trx_count", 2));
+        cmds.Add(TciProtocol.Command("channels_count", 2));
 
         long minimumVfoHz = TransverterFrequencyConverter.MinimumRadioFrequencyHz;
         long maximumVfoHz = TransverterFrequencyConverter.MaximumRadioFrequencyHz;
@@ -111,12 +111,19 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("mon_volume", -20));
         cmds.Add(TciProtocol.Command("mon_enable", false));
 
+        var rx2 = state.Rx2();
         cmds.Add(TciProtocol.Command(
             "dds",
             0,
             CwOffset.EffectiveLoHz(state)));
+        cmds.Add(TciProtocol.Command(
+            "dds",
+            1,
+            CwOffset.EffectiveLoHz(rx2.Mode, rx2.VfoHz)));
         cmds.Add(TciProtocol.Command("if", 0, 0, 0));
         cmds.Add(TciProtocol.Command("if", 0, 1, 0));
+        cmds.Add(TciProtocol.Command("if", 1, 0, 0));
+        cmds.Add(TciProtocol.Command("if", 1, 1, 0));
         cmds.Add(TciProtocol.Command(
             "vfo", 0, 0, state.VfoHz));
         cmds.Add(TciProtocol.Command(
@@ -124,11 +131,17 @@ public static class TciHandshake
             0,
             1,
             RadioFrequencyResolver.TxDialFrequencyHz(state)));
+        cmds.Add(TciProtocol.Command(
+            "vfo", 1, 0, rx2.VfoHz));
+        cmds.Add(TciProtocol.Command(
+            "vfo", 1, 1, rx2.TxVfoHz > 0 ? rx2.TxVfoHz : rx2.VfoHz));
 
         string tciMode = TciProtocol.ModeToTci(state.Mode);
         cmds.Add(TciProtocol.Command("modulation", 0, tciMode));
+        cmds.Add(TciProtocol.Command("modulation", 1, TciProtocol.ModeToTci(rx2.Mode)));
 
         cmds.Add(TciProtocol.Command("rx_enable", 0, true));
+        cmds.Add(TciProtocol.Command("rx_enable", 1, state.Rx2Enabled));
         cmds.Add(TciProtocol.Command("split_enable", 0,
             RadioFrequencyResolver.IsSplitEnabledForTx(state)));
         cmds.Add(TciProtocol.Command("tx_enable", 0, moxOn || tunOn));
@@ -136,8 +149,10 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command("tune", 0, tunOn));
 
         cmds.Add(TciProtocol.Command("rx_mute", 0, state.Rx1Muted));
+        cmds.Add(TciProtocol.Command("rx_mute", 1, state.Rx2Muted));
         cmds.Add(TciProtocol.Command("lock", 0, state.VfoLocked));
         cmds.Add(TciProtocol.Command("rx_filter_band", 0, state.FilterLowHz, state.FilterHighHz));
+        cmds.Add(TciProtocol.Command("rx_filter_band", 1, rx2.FilterLowHz, rx2.FilterHighHz));
 
         // Live RIT/XIT so a reconnecting client dashboard picks up any offset
         // the operator had dialed in before the socket dropped.

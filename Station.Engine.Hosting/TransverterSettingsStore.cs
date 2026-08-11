@@ -171,7 +171,7 @@ public sealed class TransverterSettingsStore : IDisposable
                     Enabled: true,
                     LoOffsetHz: offset,
                     BeginFrequencyHz: checked(offset + TransverterFrequencyConverter.MinimumRadioFrequencyHz),
-                    EndFrequencyHz: checked(offset + TransverterFrequencyConverter.MaximumRadioFrequencyHz))
+                    EndFrequencyHz: checked(offset + TransverterFrequencyConverter.MaximumTransverterIfFrequencyHz))
                 : new TransverterBandDto(id))
             .ToArray();
         return new TransverterSettingsDto(false, ifHz, rfHz, bands, null);

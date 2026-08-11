@@ -10,9 +10,10 @@
 // Serial PTT switch input (Thetis "Bit Bang PTT" parity, mechanism only). The
 // operator wires a footswitch/hand switch between a USB-serial adapter's RTS
 // or DTR line and a modem status pin (CTS and/or DSR); this service opens the
-// port (9600/8/N/1 — baud is irrelevant, no data channel is used), asserts
-// RTS+DTR (that supplies the +V the switch pulls the sensed pin to), and polls
-// the status pins. A pin edge feeds the SHARED ExternalPttService engine via
+// port (9600/8/N/1 — baud is irrelevant, no data channel is used), or borrows
+// the already-open handle when the same device is enabled for serial CAT. It
+// asserts RTS+DTR (that supplies the +V the switch pulls the sensed pin to)
+// and polls the status pins. A pin edge feeds the SHARED ExternalPttService via
 // HandleSerialPtt, so hang/ownership/arbitration behavior is identical to the
 // radio's hardware PTT-IN — nothing about MOX release logic lives here.
 //
@@ -36,18 +37,26 @@ public sealed class SerialPttService : BackgroundService
     // keyed cadence is best-effort on Windows, matching Thetis's intent.
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan KeyedPollInterval = TimeSpan.FromMilliseconds(1);
+    private static readonly TimeSpan SharedHandleWaitInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ReopenBackoff = TimeSpan.FromSeconds(5);
 
     private readonly ILogger<SerialPttService> _log;
     private readonly SerialPttSettingsStore _store;
     private readonly ExternalPttService _externalPtt;
     private readonly Func<string, ISerialPttPort> _portFactory;
+    private readonly CatSerialConfigStore? _catStore;
+    private readonly ISerialPttPinSource? _catSerial;
 
     // Live status for the REST snapshot. Volatile: written by the run loop,
     // read by endpoint threads.
     private volatile bool _portOpen;
     private volatile string? _error;
     private volatile bool _keyed;
+    private volatile bool _sharedWithCat;
+    private volatile bool _ctsHolding;
+    private volatile bool _dsrHolding;
+    private volatile bool _rtsAsserted;
+    private volatile bool _dtrAsserted;
 
     // Per-pass wake token; a settings change cancels it to force a re-resolve.
     private volatile CancellationTokenSource? _wakeCts;
@@ -55,8 +64,10 @@ public sealed class SerialPttService : BackgroundService
     public SerialPttService(
         ILogger<SerialPttService> log,
         SerialPttSettingsStore store,
-        ExternalPttService externalPtt)
-        : this(log, store, externalPtt, portName => new SystemSerialPttPort(portName))
+        ExternalPttService externalPtt,
+        CatSerialConfigStore catStore,
+        CatSerialService catSerial)
+        : this(log, store, externalPtt, portName => new SystemSerialPttPort(portName), catStore, catSerial)
     {
     }
 
@@ -67,12 +78,26 @@ public sealed class SerialPttService : BackgroundService
         SerialPttSettingsStore store,
         ExternalPttService externalPtt,
         Func<string, ISerialPttPort> portFactory)
+        : this(log, store, externalPtt, portFactory, null, null)
+    {
+    }
+
+    internal SerialPttService(
+        ILogger<SerialPttService> log,
+        SerialPttSettingsStore store,
+        ExternalPttService externalPtt,
+        Func<string, ISerialPttPort> portFactory,
+        CatSerialConfigStore? catStore,
+        ISerialPttPinSource? catSerial)
     {
         _log = log;
         _store = store;
         _externalPtt = externalPtt;
         _portFactory = portFactory;
+        _catStore = catStore;
+        _catSerial = catSerial;
         _store.Changed += OnSettingsChanged;
+        if (_catStore is not null) _catStore.Changed += OnSettingsChanged;
     }
 
     public bool PortOpen => _portOpen;
@@ -89,7 +114,12 @@ public sealed class SerialPttService : BackgroundService
         Error: _error,
         Keyed: _keyed,
         AvailablePorts: SerialPortEnumeration.AvailablePorts(),
-        GeneratedUtc: DateTimeOffset.UtcNow);
+        GeneratedUtc: DateTimeOffset.UtcNow,
+        SharedWithCat: _sharedWithCat,
+        CtsHolding: _ctsHolding,
+        DsrHolding: _dsrHolding,
+        RtsAsserted: _rtsAsserted,
+        DtrAsserted: _dtrAsserted);
 
     private void OnSettingsChanged()
     {
@@ -111,13 +141,101 @@ public sealed class SerialPttService : BackgroundService
                 _portOpen = false;
                 _error = null;
                 _keyed = false;
+                ClearLineStatus();
                 // Disabled / unconfigured — idle until a settings change or
                 // shutdown wakes the loop.
                 await DelaySafe(Timeout.InfiniteTimeSpan, ct);
                 continue;
             }
 
-            await RunPortAsync(config, ct);
+            if (IsSharedWithCat(config))
+                await RunSharedCatPortAsync(config, ct);
+            else
+                await RunPortAsync(config, ct);
+        }
+    }
+
+    private bool IsSharedWithCat(SerialPttConfig config) =>
+        _catStore?.Get().Any(p => p.Enabled
+            && SerialPortEnumeration.PortNameEquals(p.PortName.Trim(), config.PortName)) == true;
+
+    // Poll the modem pins through CAT's live handle. This method never closes
+    // or disposes the borrowed handle; CatSerialService remains its sole owner.
+    private async Task RunSharedCatPortAsync(SerialPttConfig config, CancellationToken ct)
+    {
+        _sharedWithCat = true;
+        bool asserted = false;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                string? catError = null;
+                ISerialPttPins? pins = null;
+                if (_catSerial is null ||
+                    !_catSerial.TryBorrowModemPins(config.PortName, out pins, out catError) ||
+                    pins is null)
+                {
+                    _portOpen = false;
+                    _error = catError ?? $"Waiting for CAT to open {config.PortName}";
+                    _ctsHolding = false;
+                    _dsrHolding = false;
+                    _rtsAsserted = false;
+                    _dtrAsserted = false;
+                    if (asserted)
+                    {
+                        asserted = false;
+                        ReleaseKeyedInput();
+                    }
+                    await DelaySafe(SharedHandleWaitInterval, ct);
+                    continue;
+                }
+
+                try
+                {
+                    // Borrow once per CAT connection. Store/config lookups are
+                    // never performed at the 1-10 ms modem-pin poll cadence.
+                    while (!ct.IsCancellationRequested)
+                    {
+                        string? inputError = null;
+                        bool cts = ReadModemPin(
+                            () => pins.CtsHolding, "CTS", config.SenseCts, ref inputError);
+                        bool dsr = ReadModemPin(
+                            () => pins.DsrHolding, "DSR", config.SenseDsr, ref inputError);
+                        _ctsHolding = cts;
+                        _dsrHolding = dsr;
+                        _rtsAsserted = pins.RtsAsserted;
+                        _dtrAsserted = pins.DtrAsserted;
+                        _portOpen = true;
+                        _error = CombineErrors(pins.LineControlError, inputError);
+
+                        bool now = (config.SenseCts && cts) || (config.SenseDsr && dsr);
+                        if (now != asserted)
+                        {
+                            asserted = now;
+                            HandlePinEdge(now, config, sharedWithCat: true);
+                        }
+                        await DelaySafe(asserted ? KeyedPollInterval : IdlePollInterval, ct);
+                    }
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    _portOpen = false;
+                    _error = SerialPortEnumeration.Describe(ex);
+                    if (asserted)
+                    {
+                        asserted = false;
+                        ReleaseKeyedInput();
+                    }
+                    await DelaySafe(IdlePollInterval, ct);
+                }
+            }
+        }
+        finally
+        {
+            if (asserted) ReleaseKeyedInput();
+            _portOpen = false;
+            _sharedWithCat = false;
+            ClearLineStatus();
         }
     }
 
@@ -135,23 +253,31 @@ public sealed class SerialPttService : BackgroundService
                 port = _portFactory(config.PortName);
                 port.Open();
                 _portOpen = true;
-                _error = null;
+                _error = port.LineControlError;
+                _sharedWithCat = false;
+                _rtsAsserted = port.RtsAsserted;
+                _dtrAsserted = port.DtrAsserted;
                 _log.LogInformation("serialptt.open port={Port} cts={Cts} dsr={Dsr}",
                     config.PortName, config.SenseCts, config.SenseDsr);
 
                 while (!ct.IsCancellationRequested)
                 {
-                    // Either selected line asserting = PTT (Thetis semantics).
-                    bool now = (config.SenseCts && port.CtsHolding)
-                        || (config.SenseDsr && port.DsrHolding);
+                    // Report both raw levels; only selected lines key PTT.
+                    string? inputError = null;
+                    bool cts = ReadModemPin(
+                        () => port.CtsHolding, "CTS", config.SenseCts, ref inputError);
+                    bool dsr = ReadModemPin(
+                        () => port.DsrHolding, "DSR", config.SenseDsr, ref inputError);
+                    _ctsHolding = cts;
+                    _dsrHolding = dsr;
+                    _rtsAsserted = port.RtsAsserted;
+                    _dtrAsserted = port.DtrAsserted;
+                    _error = CombineErrors(port.LineControlError, inputError);
+                    bool now = (config.SenseCts && cts) || (config.SenseDsr && dsr);
                     if (now != asserted)
                     {
                         asserted = now;
-                        _keyed = now;
-                        // Evaluate the enable gate per edge (same hot-toggle
-                        // semantics as the PTT-IN gate): a toggle takes effect
-                        // on the next edge without a port reopen.
-                        _externalPtt.HandleSerialPtt(now, _store.Get().Enabled);
+                        HandlePinEdge(now, config, sharedWithCat: false);
                     }
                     await DelaySafe(asserted ? KeyedPollInterval : IdlePollInterval, ct);
                 }
@@ -175,11 +301,10 @@ public sealed class SerialPttService : BackgroundService
                 if (asserted)
                 {
                     asserted = false;
-                    _keyed = false;
-                    try { _externalPtt.HandleSerialPtt(false, gateOn: true); }
-                    catch (Exception ex) { _log.LogDebug(ex, "serialptt.release.faulted"); }
+                    ReleaseKeyedInput();
                 }
                 _portOpen = false;
+                ClearLineStatus();
                 if (port is not null)
                 {
                     try { port.Close(); } catch { /* teardown is best-effort */ }
@@ -198,6 +323,56 @@ public sealed class SerialPttService : BackgroundService
         _portOpen = false;
     }
 
+    private void ReleaseKeyedInput()
+    {
+        _keyed = false;
+        _log.LogInformation("serialptt.edge keyed=false reason=teardown");
+        try { _externalPtt.HandleSerialPtt(false, gateOn: true); }
+        catch (Exception ex) { _log.LogDebug(ex, "serialptt.release.faulted"); }
+    }
+
+    private void HandlePinEdge(bool keyed, SerialPttConfig config, bool sharedWithCat)
+    {
+        _keyed = keyed;
+        _log.LogInformation(
+            "serialptt.edge keyed={Keyed} source={Source} port={Port} cts={Cts} dsr={Dsr}",
+            keyed, sharedWithCat ? "cat-shared" : "dedicated", config.PortName,
+            _ctsHolding, _dsrHolding);
+        // Evaluate the enable gate per edge (same hot-toggle semantics as the
+        // PTT-IN gate): a toggle takes effect on the next edge.
+        _externalPtt.HandleSerialPtt(keyed, _store.Get().Enabled);
+    }
+
+    private void ClearLineStatus()
+    {
+        _ctsHolding = false;
+        _dsrHolding = false;
+        _rtsAsserted = false;
+        _dtrAsserted = false;
+    }
+
+    private static bool ReadModemPin(
+        Func<bool> read,
+        string pinName,
+        bool required,
+        ref string? error)
+    {
+        try { return read(); }
+        catch (Exception ex) when (!required)
+        {
+            error = CombineErrors(error, $"Unable to read {pinName}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static string? CombineErrors(string? first, string? second)
+    {
+        if (string.IsNullOrWhiteSpace(first))
+            return string.IsNullOrWhiteSpace(second) ? null : second;
+        if (string.IsNullOrWhiteSpace(second)) return first;
+        return $"{first}; {second}";
+    }
+
     private static async Task DelaySafe(TimeSpan delay, CancellationToken ct)
     {
         try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { }
@@ -206,6 +381,7 @@ public sealed class SerialPttService : BackgroundService
     public override void Dispose()
     {
         _store.Changed -= OnSettingsChanged;
+        if (_catStore is not null) _catStore.Changed -= OnSettingsChanged;
         base.Dispose();
     }
 }
@@ -213,22 +389,38 @@ public sealed class SerialPttService : BackgroundService
 /// <summary>Test seam over the serial device: just the modem status pins and
 /// open/close. Production wraps System.IO.Ports.SerialPort; tests substitute a
 /// fake so no real port is ever touched.</summary>
-internal interface ISerialPttPort : IDisposable
+internal interface ISerialPttPins
+{
+    bool CtsHolding { get; }
+    bool DsrHolding { get; }
+    bool RtsAsserted { get; }
+    bool DtrAsserted { get; }
+    string? LineControlError { get; }
+}
+
+internal interface ISerialPttPinSource
+{
+    bool TryBorrowModemPins(string portName, out ISerialPttPins? pins, out string? error);
+}
+
+internal interface ISerialPttPort : ISerialPttPins, IDisposable
 {
     void Open();
     void Close();
-    bool CtsHolding { get; }
-    bool DsrHolding { get; }
 }
 
 /// <summary>Production <see cref="ISerialPttPort"/>: fixed 9600/8/N/1,
 /// Handshake.None (baud is irrelevant — no data channel), finite timeouts like
 /// CatSerialPort. Asserts RTS+DTR after open so the switch has a +V to pull
-/// the sensed pin to (Thetis SDRSerialPortII does the same); best-effort —
-/// an adapter without line control must not fail the open.</summary>
+/// the sensed pin to (Thetis SDRSerialPortII does the same). A partial assertion
+/// failure remains usable and is surfaced in status; bring-up fails when neither
+/// output can be asserted.</summary>
 internal sealed class SystemSerialPttPort : ISerialPttPort
 {
     private readonly SerialPort _port;
+    private bool _rtsAsserted;
+    private bool _dtrAsserted;
+    private string? _lineControlError;
 
     public SystemSerialPttPort(string portName)
     {
@@ -242,18 +434,37 @@ internal sealed class SystemSerialPttPort : ISerialPttPort
 
     public void Open()
     {
+        _rtsAsserted = false;
+        _dtrAsserted = false;
+        _lineControlError = null;
         _port.Open();
-        try { _port.RtsEnable = true; } catch { /* line control unsupported */ }
-        try { _port.DtrEnable = true; } catch { /* line control unsupported */ }
+        var failures = new List<string>(2);
+        try { _port.RtsEnable = true; _rtsAsserted = true; }
+        catch (Exception ex) { failures.Add($"RTS: {ex.Message}"); }
+        try { _port.DtrEnable = true; _dtrAsserted = true; }
+        catch (Exception ex) { failures.Add($"DTR: {ex.Message}"); }
+        _lineControlError = failures.Count == 0
+            ? null
+            : $"Unable to assert serial PTT output line(s): {string.Join("; ", failures)}";
+        if (!_rtsAsserted && !_dtrAsserted)
+        {
+            try { _port.Close(); } catch { }
+            throw new IOException(_lineControlError);
+        }
     }
 
     public void Close()
     {
         if (_port.IsOpen) _port.Close();
+        _rtsAsserted = false;
+        _dtrAsserted = false;
     }
 
     public bool CtsHolding => _port.CtsHolding;
     public bool DsrHolding => _port.DsrHolding;
+    public bool RtsAsserted => _rtsAsserted;
+    public bool DtrAsserted => _dtrAsserted;
+    public string? LineControlError => _lineControlError;
 
     public void Dispose() => _port.Dispose();
 }

@@ -14,10 +14,14 @@ License, version 3 or (at your option) any later version (GPL-3.0-or-later). Its
 provenance and licensing record are documented in
 Station.Engine.Hosting/SpeTaurus/SOURCE.md.
 
-Because the engine combines both, the engine binary as distributed is conveyed
-under the GNU General Public License, version 3 or (at your option) any later
-version, whose full text follows below. This is permitted by the "or later"
-option on the GPL-2.0-or-later portions.
+Because the engine combines both, an engine distribution without the optional
+ASIO host bridge is conveyed under the GNU General Public License, version 3 or
+(at your option) any later version. Windows distributions that include the
+Steinberg ASIO SDK-derived host bridge select the SDK's GPL version 3 option,
+which does not say "or later"; to the extent the bridge and engine form a
+combined work, that distribution is conveyed under GPL-3.0-only. The verbatim
+GPL version 3 text governing either distribution follows below. Individual
+GPL-2.0-or-later and GPL-3.0-or-later files retain their stated licenses.
 
 Station.AudioRing is first-party code additionally published under the MIT
 license so it can be reused outside Zeus. Third-party components carry their own
@@ -25,7 +29,8 @@ licences — see THIRD-PARTY-NOTICES.md and THIRD-PARTY-LICENSES/.
 
 The Zeus SDR client that drives this engine is a separate, proprietary program
 communicating over the loopback station protocol. It is not part of this
-repository and is not covered by this license.
+repository and is not covered by this license. It neither links to the ASIO SDK
+source nor contains the ASIO host bridge binary.
 
 ================================================================================
 

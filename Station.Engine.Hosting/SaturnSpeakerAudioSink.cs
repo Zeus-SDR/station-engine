@@ -93,6 +93,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     private readonly RadioSpeakerSettingsStore _settings;
     private readonly RxAudioMuteState _muteState;
     private readonly ILogger<SaturnSpeakerAudioSink> _log;
+    private Action _promoteWorker;
     private readonly FloatSpscRing _ring = new(RingCapacity);
     private readonly ManualResetEventSlim _wake = new(false);
     private readonly ManualResetEventSlim _idle = new(true);
@@ -161,6 +162,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
         _radio = radio;
         _settings = settings;
         _log = log;
+        _promoteWorker = () => RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
         // Null in tests that don't exercise the mute path — a private
         // instance keeps the field non-null so IsMuted stays cheap and the
         // legacy 3-arg ctor call sites keep working.
@@ -281,6 +283,9 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
 
     private void WorkerLoop()
     {
+        // Keep the 1.33 ms codec feed from being starved by ordinary host work.
+        _promoteWorker();
+
         var ct = _cts.Token;
         Span<float> scratch = stackalloc float[PacketFrames];
 
@@ -664,6 +669,10 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
 
     /// <summary>Test-only: the catch-up clamp in Stopwatch ticks.</summary>
     internal static long MaxCatchupBehindTicksForTest => MaxCatchupBehindTicks;
+
+    /// <summary>Test-only: replace the worker's platform promotion call so its
+    /// invocation count and ordering can be observed deterministically.</summary>
+    internal Action PromoteWorkerForTest { set => _promoteWorker = value; }
 
     /// <summary>Test-only: block until the worker has processed every signal
     /// posted before this call and is parked back in its wake-wait. Lets tests

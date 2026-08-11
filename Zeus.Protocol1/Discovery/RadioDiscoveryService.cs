@@ -222,9 +222,8 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                     continue;
                 if (iface.NetworkInterfaceType == NetworkInterfaceType.Loopback)
                     continue;
-                if (iface.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+                if (NetworkAddressSelection.IsTunnelInterface(iface.Name, iface.NetworkInterfaceType))
                     continue;
-
                 var ipProps = iface.GetIPProperties();
                 foreach (var unicast in ipProps.UnicastAddresses)
                 {
@@ -240,7 +239,11 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                     if (mask == null || mask.Equals(IPAddress.Any))
                         continue;
 
-                    interfaces.Add(new DiscoveryInterfaceDescriptor(ip, mask));
+                    interfaces.Add(new DiscoveryInterfaceDescriptor(
+                        iface.Name,
+                        iface.NetworkInterfaceType,
+                        ip,
+                        mask));
                 }
             }
         }
@@ -264,6 +267,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         var plans = new List<DiscoverySocketPlan>();
         foreach (var iface in interfaces)
         {
+            if (NetworkAddressSelection.IsTunnelInterface(iface.Name, iface.Type)) continue;
             if (iface.Address.AddressFamily != AddressFamily.InterNetwork) continue;
             if (iface.Mask.AddressFamily != AddressFamily.InterNetwork) continue;
             if (iface.Mask.Equals(IPAddress.Any)) continue;
@@ -365,7 +369,11 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         catch (SocketException) { /* best effort */ }
     }
 
-    internal readonly record struct DiscoveryInterfaceDescriptor(IPAddress Address, IPAddress Mask);
+    internal readonly record struct DiscoveryInterfaceDescriptor(
+        string Name,
+        NetworkInterfaceType Type,
+        IPAddress Address,
+        IPAddress Mask);
 
     internal readonly record struct DiscoverySocketPlan(IPAddress BindAddress, IPAddress TargetAddress);
 

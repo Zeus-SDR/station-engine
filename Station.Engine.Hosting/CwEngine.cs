@@ -247,19 +247,16 @@ public sealed class CwEngine : BackgroundService
         bool loRealigned = _radio.AlignLoForCwTx();
 
         var snap = _radio.Snapshot();
-        // Baseband offset = RadioLo − VFO. After AlignLoForCwTx this is
-        // exactly ∓ CwPitchHz (negative for CWU, positive for CWL) and the
-        // carrier lands at the dial. The formula is kept rather than
-        // hard-coding ±pitch so a future caller that skips AlignLoForCwTx
-        // (e.g. an operator who genuinely wants to TX off-centre under
-        // CTUN) still gets correct baseband math.
+        // P1 baseband follows the aligned shared LO. P2 has an independent TX
+        // DUC and deliberately leaves the RX DDC parked for display DUP, so its
+        // baseband must follow the TX DUC rather than RadioLoHz.
         //
         // Sign note (HL2 IQ convention): the HL2 emits the RF carrier at
         // (LO − baseband_hz), not (LO + baseband_hz) — i.e. the "I − jQ"
         // complex-baseband convention. Verified on a live HL2 2026-05-24
         // (EA5IUE bench test).
         long txHz = RadioFrequencyResolver.TxFrequencyHz(snap);
-        int basebandHz = (int)(snap.RadioLoHz - txHz);
+        int basebandHz = ResolveBasebandHz(snap);
 
         if (!_tx.TrySetMox(true, MoxSource.Cwx, out var err))
         {
@@ -367,7 +364,7 @@ public sealed class CwEngine : BackgroundService
         bool loRealigned = _radio.AlignLoForCwTx();
         var snap = _radio.Snapshot();
         long txHz = RadioFrequencyResolver.TxFrequencyHz(snap);
-        int basebandHz = (int)(snap.RadioLoHz - txHz);
+        int basebandHz = ResolveBasebandHz(snap);
 
         if (!_tx.TrySetMox(true, MoxSource.Cwx, out var err))
         {
@@ -536,10 +533,19 @@ public sealed class CwEngine : BackgroundService
         return buf;
     }
 
+    internal static int ResolveBasebandHz(StateDto state)
+    {
+        long txCarrierHz = RadioService.TxCarrierHz(state);
+        long txLoHz = string.Equals(state.ConnectedProtocol, "P2", StringComparison.OrdinalIgnoreCase)
+            ? RadioService.TxEffectiveLoHz(state)
+            : state.RadioLoHz;
+        return checked((int)(txLoHz - txCarrierHz));
+    }
+
     /// <summary>Test seam: precompute the IQ stream for <paramref name="text"/>
     /// at <paramref name="wpm"/>. <paramref name="basebandHz"/> is the live
-    /// engine's <c>(VfoHz − RadioLoHz)</c> — pass +600 for CWU without CTUN,
-    /// -600 for CWL without CTUN, or any signed offset to exercise CTUN.</summary>
+    /// engine's signed <c>(TX effective LO − TX carrier Hz)</c> — pass -600
+    /// for CWU, +600 for CWL, or any signed offset to exercise CTUN.</summary>
     internal static float[] RenderForTest(string text, int wpm, int basebandHz)
     {
         double phase = 0.0;
