@@ -413,6 +413,12 @@ public sealed class Protocol1Client : IProtocol1Client
     private readonly float[] _psRxI = new float[PsFeedbackBlockSize];
     private readonly float[] _psRxQ = new float[PsFeedbackBlockSize];
     private long _psFeedbackBlocksDelivered;
+    // TickCount64 stamp of the most recent delivered PS feedback block. The
+    // stall classifier reads its age to tell a live-but-stalling calibration
+    // from a stream that froze mid-over: a live stream re-stamps this every
+    // block (1024 samples ≈ 2.7-21 ms depending on rate), so a stale stamp is
+    // unambiguous at every rate. 0 = no block delivered yet this session.
+    private long _lastPsBlockDeliveredTickMs;
     private readonly object _psFeedbackObservationSync = new();
     private PsFeedbackObservation? _lastPsFeedbackObservation;
     private int _psBlockFill;
@@ -693,7 +699,11 @@ public sealed class Protocol1Client : IProtocol1Client
                     {
                         delivered = _psFeedbackFrames.Writer.TryWrite(psFrame);
                     }
-                    if (delivered) Interlocked.Increment(ref _psFeedbackBlocksDelivered);
+                    if (delivered)
+                    {
+                        Interlocked.Increment(ref _psFeedbackBlocksDelivered);
+                        Volatile.Write(ref _lastPsBlockDeliveredTickMs, Environment.TickCount64);
+                    }
                     _psBlockFill = 0;
 
                     // Heartbeat: every Nth block, log block-peak magnitudes so
@@ -861,7 +871,11 @@ public sealed class Protocol1Client : IProtocol1Client
                     {
                         delivered = _psFeedbackFrames.Writer.TryWrite(psFrame);
                     }
-                    if (delivered) Interlocked.Increment(ref _psFeedbackBlocksDelivered);
+                    if (delivered)
+                    {
+                        Interlocked.Increment(ref _psFeedbackBlocksDelivered);
+                        Volatile.Write(ref _lastPsBlockDeliveredTickMs, Environment.TickCount64);
+                    }
                     _psBlockFill = 0;
 
                     if (++_psBlocksEmitted % 190 == 0)
@@ -1880,6 +1894,23 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public long PsFeedbackBlocksDelivered => Interlocked.Read(ref _psFeedbackBlocksDelivered);
 
+    /// <summary>
+    /// Milliseconds since the most recent PS feedback block was delivered, or
+    /// null when none has been delivered this session. A live PS stream
+    /// refreshes this every block (2.7-21 ms depending on sample rate), so an
+    /// age in the seconds is proof the stream froze — used by the stall
+    /// classifier to separate "stream died mid-over" from HW-peak/wiring
+    /// causes (issue #1323).
+    /// </summary>
+    public long? LastPsFeedbackBlockAgeMs
+    {
+        get
+        {
+            long stamp = Volatile.Read(ref _lastPsBlockDeliveredTickMs);
+            return stamp == 0 ? null : Math.Max(0, Environment.TickCount64 - stamp);
+        }
+    }
+
     public PsFeedbackObservation? LastPsFeedbackObservation
     {
         get { lock (_psFeedbackObservationSync) return _lastPsFeedbackObservation; }
@@ -1896,9 +1927,21 @@ public sealed class Protocol1Client : IProtocol1Client
         lock (_psFeedbackObservationSync) _lastPsFeedbackObservation = observation;
     }
 
+    // Backdate the last-delivered-block stamp so the frozen-stream stall
+    // class can be driven without real waiting. ageMs <= 0 restores "just
+    // delivered".
+    internal void BackdatePsFeedbackBlockClockForTest(long ageMs)
+        => Volatile.Write(
+            ref _lastPsBlockDeliveredTickMs,
+            Environment.TickCount64 - Math.Max(0, ageMs));
+
     internal void AdvancePsFeedbackBlocksForTest(long count = 1)
     {
-        if (count > 0) Interlocked.Add(ref _psFeedbackBlocksDelivered, count);
+        if (count > 0)
+        {
+            Interlocked.Add(ref _psFeedbackBlocksDelivered, count);
+            Volatile.Write(ref _lastPsBlockDeliveredTickMs, Environment.TickCount64);
+        }
     }
 
     internal void RetainPsFeedbackObservationForTest(float rxPeak, float txPeak)
@@ -1906,6 +1949,9 @@ public sealed class Protocol1Client : IProtocol1Client
 
     internal bool HandlePs2DdcPacketForTest(ReadOnlySpan<byte> packet)
         => HandlePs2DdcPacket(packet, new short[PacketParser.TwoDdcSamplesPerPacket]);
+
+    internal bool HandlePs4DdcPacketForTest(ReadOnlySpan<byte> packet)
+        => HandlePs4DdcPacket(packet, new short[PacketParser.Hl2Ps4DdcSamplesPerPacket]);
 
     public void Dispose()
     {

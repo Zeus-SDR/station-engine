@@ -741,6 +741,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             string? configuredDeviceId = null;
             string configuredDeviceLabel = "default";
+            bool handOffToStartupRecovery = false;
             try
             {
                 configuredDeviceId = NormalizeDeviceId(ConfiguredInputDeviceId);
@@ -785,9 +786,22 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                     _recoveryToken).ConfigureAwait(false);
 
                 if (!abandoned && result == DeviceRecoveryResult.GaveUp)
+                {
                     _log.LogError(
                         "audio.native.tx device-stop recovery gave up after 3 attempts configuredDeviceId={ConfiguredDeviceId}",
                         configuredDeviceLabel);
+
+                    // The device-stop schedule is bounded to a few fast retries.
+                    // When they leave the uplink with no open input at all — the
+                    // selected mic is still gone and no default could stand in —
+                    // don't park the TX uplink until a relaunch. Hand off to the
+                    // patient startup-open recovery so a mic that returns after
+                    // the short window is reopened with no operator action, the
+                    // same resilience a failed first open already gets.
+                    lock (_deviceSync)
+                        handOffToStartupRecovery =
+                            _input is null && !_shutdown && !_intentionalStop;
+                }
             }
             catch (Exception ex)
             {
@@ -800,6 +814,12 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             {
                 Interlocked.CompareExchange(ref _recoveryScheduled, -1, recoveryEpoch);
             }
+
+            // Reset above releases the shared single-flight so the patient
+            // recovery can claim it; scheduling here rather than inside the
+            // give-up branch is deliberate.
+            if (handOffToStartupRecovery)
+                ScheduleStartupOpenRecovery(configuredDeviceId);
         });
     }
 

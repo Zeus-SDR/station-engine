@@ -131,12 +131,29 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXABandpassWindow(int channel, int wintype);
 
-    // SSB filter rectangularity (issue #871) — sets the RXA bandpass FIR tap
-    // count, which governs the audible transition/shoulder steepness. WDSP
-    // bandpass.c:SetRXABandpassNC rebuilds rxa[ch].bp1 inside csDSP, live-safe.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void RXANBPSetNC(int channel, int nc);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void RXANBPSetMP(int channel, int mp);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void RXABPSNBASetNC(int channel, int nc);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void RXABPSNBASetMP(int channel, int mp);
+
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXABandpassNC(int channel, int nc);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXABandpassMP(int channel, int mp);
 
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -712,12 +729,17 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXABandpassWindow(int channel, int wintype);
 
-    // SSB filter rectangularity (issue #871) — sets the TXA bandpass FIR tap
-    // count (transmit shoulder steepness). WDSP bandpass.c:SetTXABandpassNC
-    // rebuilds txa[ch].bp0/bp1/bp2 inside csDSP, live-safe.
+    // TX bandpass resolution. This updates bp0/bp1/bp2, the three filters that
+    // enforce the operator's TX passband. Deliberately do not use TXASetNC:
+    // that collective also gives the unrelated P2 CIC-correction FIR the same
+    // huge coefficient count, whose frequency-sampling design is O(N^2).
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXABandpassNC(int channel, int nc);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXABandpassMP(int channel, int mp);
 
     // Correcting FIR — compensates the sinc droop introduced by TXA's
     // 48k → 192k upsample on P2. P2 firmware requires this on; P1 leaves it
@@ -886,10 +908,9 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAEQRun(int channel, int run);
 
-    // TUN carrier generator (wdsp.h:586-589) injected post-DSP. Thetis
-    // console.cs:18648 uses SetTXAPostGenMode(1) + SetTXAPostGenToneFreq(0.0)
-    // + SetTXAPostGenToneMag(mag) to key a steady tone for antenna matching.
-    // Same sequence here (see docs/prd/12-tx-feature.md §FR-7).
+    // TUN carrier generator (wdsp.h:586-589) injected post-DSP. Zeus uses
+    // mode 0 with a zero-Hz tone outside CW and a sideband-signed CW pitch
+    // that cancels the CW transmit NCO offset.
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAPostGenRun(int channel, int run);

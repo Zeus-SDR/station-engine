@@ -21,6 +21,15 @@ namespace Zeus.Server;
 internal static class FrequencyCalibrationPlan
 {
     /// <summary>
+    /// Delay between calibration measurements. WDSP's RX analyzer uses a
+    /// 100 ms log-recursive averaging time constant, so captures closer than
+    /// that are different publications but still strongly correlated. Waiting
+    /// more than three time constants makes frequency agreement meaningful for
+    /// weak-signal detection instead of repeatedly observing one noise peak.
+    /// </summary>
+    public const int MeasurementFrameGapMs = 350;
+
+    /// <summary>
     /// Widest crystal error the procedure is willing to correct, in ppm.
     /// Matches the clamp in <see cref="RadioService.SetFrequencyCorrectionFactor"/>
     /// (factor ∈ [0.9999, 1.0001]) and piHPSDR's range. Any real HPSDR-class
@@ -170,5 +179,53 @@ internal static class FrequencyCalibrationPlan
         Array.Sort(buf);
         int mid = buf.Length / 2;
         return (buf.Length % 2 == 0) ? (buf[mid - 1] + buf[mid]) / 2f : buf[mid];
+    }
+
+    /// <summary>
+    /// Return the original indices of the largest group whose measurements fit
+    /// inside <paramref name="maxSpreadHz"/>. A repeated carrier may be usable
+    /// even when fading leaves it less than 6 dB above the instantaneous noise
+    /// floor; random per-frame noise peaks will not repeatedly land at the same
+    /// frequency. Ties prefer the tighter group, then the earlier frequency.
+    /// </summary>
+    public static int[] StableClusterIndices(
+        IReadOnlyList<double> measurementsHz,
+        double maxSpreadHz)
+    {
+        if (measurementsHz.Count == 0 || !double.IsFinite(maxSpreadHz) || maxSpreadHz < 0)
+            return [];
+
+        var ordered = measurementsHz
+            .Select((frequency, index) => (Frequency: frequency, Index: index))
+            .Where(item => double.IsFinite(item.Frequency))
+            .OrderBy(item => item.Frequency)
+            .ToArray();
+        if (ordered.Length == 0) return [];
+
+        int bestStart = 0;
+        int bestCount = 1;
+        double bestSpread = 0;
+        int start = 0;
+        for (int end = 0; end < ordered.Length; end++)
+        {
+            while (ordered[end].Frequency - ordered[start].Frequency > maxSpreadHz)
+                start++;
+
+            int count = end - start + 1;
+            double spread = ordered[end].Frequency - ordered[start].Frequency;
+            if (count > bestCount || (count == bestCount && spread < bestSpread))
+            {
+                bestStart = start;
+                bestCount = count;
+                bestSpread = spread;
+            }
+        }
+
+        return ordered
+            .AsSpan(bestStart, bestCount)
+            .ToArray()
+            .Select(item => item.Index)
+            .OrderBy(index => index)
+            .ToArray();
     }
 }

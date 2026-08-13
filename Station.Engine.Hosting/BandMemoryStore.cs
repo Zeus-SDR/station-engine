@@ -55,6 +55,9 @@ public sealed class BandMemoryStore : IDisposable
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<BandMemoryEntry> _entries;
     private readonly ILogger<BandMemoryStore> _log;
+    // LiteDB updates replace the complete document. Serialize row mutations so
+    // simultaneous VFO/mode, zoom, and waterfall writes preserve one another.
+    private readonly object _mutationSync = new();
 
     public BandMemoryStore(ILogger<BandMemoryStore> log, string? dbPathOverride = null)
     {
@@ -135,12 +138,49 @@ public sealed class BandMemoryStore : IDisposable
         return e?.ZoomLevel;
     }
 
+    public IReadOnlyList<BandWaterfallSettingsDto> GetAllWaterfallSettings()
+    {
+        return _entries
+            .FindAll()
+            .Where(HasWaterfallSettings)
+            .OrderBy(e => e.Band, StringComparer.Ordinal)
+            .Select(ToWaterfallSettingsDto)
+            .ToArray();
+    }
+
+    public BandWaterfallSettingsDto? GetWaterfallSettings(string band)
+    {
+        var e = _entries.FindOne(x => x.Band == band);
+        return e is null || !HasWaterfallSettings(e)
+            ? null
+            : ToWaterfallSettingsDto(e);
+    }
+
+    private static bool HasWaterfallSettings(BandMemoryEntry e) =>
+        e.WfDbMin is not null ||
+        e.WfDbMax is not null ||
+        e.WfTxDbMin is not null ||
+        e.WfTxDbMax is not null;
+
+    private static BandWaterfallSettingsDto ToWaterfallSettingsDto(BandMemoryEntry e) =>
+        new(
+            e.Band,
+            e.WfDbMin,
+            e.WfDbMax,
+            e.WfTxDbMin,
+            e.WfTxDbMax);
+
     // Persist the per-band scope zoom level (#128). Isolated from Upsert so the
     // ZOOM slider write-back does not touch the last-used Hz/Mode row managed by
     // /api/bands/memory. Creates an entry with the current default Hz=0/Mode=0
     // when nothing exists yet. Get()/GetAll() deliberately ignore those Hz=0
     // rows for frequency/mode recall, while GetZoom still reads them.
     public void SetZoom(string band, int level)
+    {
+        lock (_mutationSync) SetZoomCore(band, level);
+    }
+
+    private void SetZoomCore(string band, int level)
     {
         var existing = _entries.FindOne(x => x.Band == band);
         if (existing is null)
@@ -167,6 +207,96 @@ public sealed class BandMemoryStore : IDisposable
         _entries.Update(existing);
     }
 
+    // Waterfall intensity is remembered independently for RX and TX on each
+    // band. This write path changes only those four values: a pre-existing
+    // frequency/mode/zoom/filter memory remains intact, while a first
+    // waterfall adjustment can create an Hz=0 row that frequency recall will
+    // continue to ignore.
+    public void SetWaterfallSettings(
+        string band,
+        double? wfDbMin,
+        double? wfDbMax,
+        double? wfTxDbMin,
+        double? wfTxDbMax)
+    {
+        lock (_mutationSync)
+            SetWaterfallSettingsCore(band, wfDbMin, wfDbMax, wfTxDbMin, wfTxDbMax);
+    }
+
+    private void SetWaterfallSettingsCore(
+        string band,
+        double? wfDbMin,
+        double? wfDbMax,
+        double? wfTxDbMin,
+        double? wfTxDbMax)
+    {
+        var hasRx = wfDbMin is not null || wfDbMax is not null;
+        var hasTx = wfTxDbMin is not null || wfTxDbMax is not null;
+        if (!hasRx && !hasTx)
+            throw new ArgumentException("At least one waterfall range is required");
+        if (hasRx)
+        {
+            if (wfDbMin is null || wfDbMax is null)
+                throw new ArgumentException("RX waterfall minimum and maximum must be provided together");
+            ValidateWaterfallRange("RX", wfDbMin.Value, wfDbMax.Value);
+        }
+        if (hasTx)
+        {
+            if (wfTxDbMin is null || wfTxDbMax is null)
+                throw new ArgumentException("TX waterfall minimum and maximum must be provided together");
+            ValidateWaterfallRange("TX", wfTxDbMin.Value, wfTxDbMax.Value);
+        }
+
+        var existing = _entries.FindOne(x => x.Band == band);
+        if (existing is null)
+        {
+            try
+            {
+                _entries.Insert(new BandMemoryEntry
+                {
+                    Band = band,
+                    WfDbMin = wfDbMin,
+                    WfDbMax = wfDbMax,
+                    WfTxDbMin = wfTxDbMin,
+                    WfTxDbMax = wfTxDbMax,
+                    UpdatedUtc = DateTime.UtcNow,
+                });
+                return;
+            }
+            catch (LiteException ex) when (ex.ErrorCode == LiteException.INDEX_DUPLICATE_KEY)
+            {
+                existing = _entries.FindOne(x => x.Band == band);
+                if (existing is null) throw;
+            }
+        }
+
+        if (hasRx)
+        {
+            existing.WfDbMin = wfDbMin;
+            existing.WfDbMax = wfDbMax;
+        }
+        if (hasTx)
+        {
+            existing.WfTxDbMin = wfTxDbMin;
+            existing.WfTxDbMax = wfTxDbMax;
+        }
+        existing.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(existing);
+    }
+
+    private static void ValidateWaterfallRange(string scope, double min, double max)
+    {
+        if (!double.IsFinite(min) || !double.IsFinite(max) ||
+            min is < -200 or > 200 || max is < -200 or > 200)
+            throw new ArgumentOutOfRangeException(
+                scope,
+                $"{scope} waterfall values must be between -200 and 200 dB");
+        if (max - min < 20)
+            throw new ArgumentException(
+                $"{scope} waterfall range must span at least 20 dB",
+                scope);
+    }
+
     public void Upsert(
         string band,
         long hz,
@@ -174,6 +304,18 @@ public sealed class BandMemoryStore : IDisposable
         int? filterLowHz = null,
         int? filterHighHz = null,
         RxMode? filterMode = null)
+    {
+        lock (_mutationSync)
+            UpsertCore(band, hz, mode, filterLowHz, filterHighHz, filterMode);
+    }
+
+    private void UpsertCore(
+        string band,
+        long hz,
+        RxMode mode,
+        int? filterLowHz,
+        int? filterHighHz,
+        RxMode? filterMode)
     {
         var hasFilterPayload = filterLowHz is not null && filterHighHz is not null;
         var existing = _entries.FindOne(x => x.Band == band);
@@ -244,5 +386,21 @@ public sealed class BandMemoryEntry
     public int? FilterLowHz { get; set; }
     public int? FilterHighHz { get; set; }
     public RxMode? FilterMode { get; set; }
+    // Per-band RX/TX waterfall intensity ranges. Nullable so rows written by
+    // older builds hydrate without migration and remain absent from the new
+    // waterfall-settings API until explicitly saved.
+    public double? WfDbMin { get; set; }
+    public double? WfDbMax { get; set; }
+    public double? WfTxDbMin { get; set; }
+    public double? WfTxDbMax { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
+
+// Hosting-local API shape: keeping this out of Zeus.Contracts avoids changing
+// the station protocol wire contract for a setting consumed only by this host.
+public sealed record BandWaterfallSettingsDto(
+    string Band,
+    double? WfDbMin,
+    double? WfDbMax,
+    double? WfTxDbMin,
+    double? WfTxDbMax);

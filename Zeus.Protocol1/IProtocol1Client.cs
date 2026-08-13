@@ -309,6 +309,12 @@ public interface IProtocol1Client : IDisposable
     /// keyed P1 feedback path is flowing; it says nothing about signal level.</summary>
     long PsFeedbackBlocksDelivered { get; }
 
+    /// <summary>Milliseconds since the most recent PS feedback block was
+    /// delivered, or null when none has been delivered this session. A live
+    /// stream refreshes it every block (2.7-21 ms by rate), so an age in the
+    /// seconds proves the stream froze mid-over (issue #1323 stall class).</summary>
+    long? LastPsFeedbackBlockAgeMs { get; }
+
     /// <summary>Last sampled keyed two-DDC feedback levels, retained across
     /// unkey so post-transmit diagnostics can report what reached the client.</summary>
     PsFeedbackObservation? LastPsFeedbackObservation { get; }

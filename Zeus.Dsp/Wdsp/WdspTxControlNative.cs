@@ -17,6 +17,10 @@ internal interface IWdspTxControlNative
     void SetTXAPHROTAutoMode(int channel, int autoMode);
     void SetTXAPHROTReverse(int channel, int reverse);
     void SetTXALevelerSt(int channel, int state);
+    void SetTXAPostGenRun(int channel, int run);
+    void SetTXAPostGenMode(int channel, int mode);
+    void SetTXAPostGenToneMag(int channel, double magnitude);
+    void SetTXAPostGenToneFreq(int channel, double frequency);
 }
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
@@ -66,4 +70,16 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXALevelerSt(int channel, int state) =>
         NativeMethods.SetTXALevelerSt(channel, state);
+
+    public void SetTXAPostGenRun(int channel, int run) =>
+        NativeMethods.SetTXAPostGenRun(channel, run);
+
+    public void SetTXAPostGenMode(int channel, int mode) =>
+        NativeMethods.SetTXAPostGenMode(channel, mode);
+
+    public void SetTXAPostGenToneMag(int channel, double magnitude) =>
+        NativeMethods.SetTXAPostGenToneMag(channel, magnitude);
+
+    public void SetTXAPostGenToneFreq(int channel, double frequency) =>
+        NativeMethods.SetTXAPostGenToneFreq(channel, frequency);
 }

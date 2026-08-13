@@ -595,6 +595,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private readonly float[] _psRxQ = new float[PsFeedbackBlockSize];
     private int _psBlockFill;
     private ulong _psBlockStartSeq;
+    private int _psBlockResetPending;
 
     // ---- Single-ADC time-mux PS wire instrumentation ----
     // Read-only ~1 Hz diagnostic of the single-ADC time-mux PS feedback burst,
@@ -1435,8 +1436,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     public void SetAttenuator(int db)
     {
-        _rxStepAttnDb = (byte)Math.Clamp(db, 0, 31);
-        if (_rxTask is not null) SendCmdHighPriority(run: true);
+        byte next = (byte)Math.Clamp(db, 0, 31);
+        if (_rxStepAttnDb == next) return;
+        _rxStepAttnDb = next;
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -1500,8 +1503,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetRx1Attenuator(int db)
     {
-        _rx1StepAttnDb = (byte)Math.Clamp(db, 0, 31);
-        if (_rxTask is not null) SendCmdHighPriority(run: true);
+        byte next = (byte)Math.Clamp(db, 0, 31);
+        if (_rx1StepAttnDb == next) return;
+        _rx1StepAttnDb = next;
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -4159,7 +4164,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
     }
 
-    private bool IsRxRecoveryBlocked(out string reason)
+    /// <summary><paramref name="reason"/> describes observed state and is only a blocking log reason when this returns true.</summary>
+    internal bool IsRxRecoveryBlocked(out string reason)
     {
         bool psArmed = _psFeedbackEnabled;
         bool txActive = _moxOn || _tuneActive;
@@ -4170,7 +4176,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             (false, true) => "tx-active",
             _ => "none"
         };
-        return psArmed || txActive;
+        return txActive;
     }
 
     private Task RequestStreamRestartForRecovery(CancellationToken ct)
@@ -4183,17 +4189,32 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         {
             try
             {
-                if (ct.IsCancellationRequested) return;
-                if (IsRxRecoveryBlocked(out _)) return;
+                bool ShouldAbort() =>
+                    ct.IsCancellationRequested || IsRxRecoveryBlocked(out _);
 
+                if (ShouldAbort()) return;
+
+                // A restart is a feedback-stream boundary. Discard any partial
+                // armed block on the RX thread so pre-restart samples cannot be
+                // completed with samples received after the radio re-latches its DDCs.
+                if (_psFeedbackEnabled)
+                    Interlocked.Exchange(ref _psBlockResetPending, 1);
+
+                if (ShouldAbort()) return;
                 SendCmdHighPriority(run: false);
                 await Task.Delay(50, ct).ConfigureAwait(false);
+                // Aborting after run=false is safe: a key-down push or the 100 ms
+                // keepalive re-latches run=true, so no stopped state can persist.
+                if (ShouldAbort()) return;
                 SendCmdGeneral();
                 await Task.Delay(50, ct).ConfigureAwait(false);
+                if (ShouldAbort()) return;
                 SendCmdRx();
                 await Task.Delay(50, ct).ConfigureAwait(false);
+                if (ShouldAbort()) return;
                 SendCmdTx();
                 await Task.Delay(50, ct).ConfigureAwait(false);
+                if (ShouldAbort()) return;
                 SendCmdHighPriority(run: true);
             }
             catch (OperationCanceledException) { }
@@ -4529,7 +4550,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                     return;
                 case RxSilenceRecoveryAction.Blocked:
                     _log.LogWarning(
-                        "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while PS or TX is active",
+                        "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while TX is active",
                         reason,
                         decision.SilenceMs);
                     return;
@@ -4537,7 +4558,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                     if (IsRxRecoveryBlocked(out reason))
                     {
                         _log.LogWarning(
-                            "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while PS or TX is active",
+                            "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while TX is active",
                             reason,
                             decision.SilenceMs);
                         return;
@@ -4872,6 +4893,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // ShouldLogSingleAdcPsWireDiag.
         bool g2eDiag = ShouldLogSingleAdcPsWireDiag(
             _boardKind, _psFeedbackEnabled, _moxOn || _tuneActive);
+
+        // Consume a pending recovery-restart reset once per packet, not per
+        // sample: the flag is set at most once per rare restart, and a packet
+        // (~85 paired samples) is already finer than the >=200 ms stream gap
+        // the reset guards, so per-packet granularity is semantically
+        // identical while keeping the full-barrier Interlocked off the
+        // per-sample RX hot path (matters on Raspberry Pi / arm64).
+        if (Interlocked.Exchange(ref _psBlockResetPending, 0) == 1)
+            _psBlockFill = 0;
 
         for (int i = 0; i < samplesPerPacket; i++)
         {

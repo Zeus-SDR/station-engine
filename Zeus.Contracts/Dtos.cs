@@ -71,13 +71,35 @@ public enum PsFeedbackSource : byte { Internal = 0, External = 1 }
 // Sharp is the current hardcoded WDSP default; an operator who never touches
 // the selector hears no change. RX and TX carry independent values.
 // SSB bandpass shoulder-steepness presets (issue #871). Drives the WDSP FIR
-// tap count (nc): Soft = fewest taps (widest transition, Yaesu-like flat
-// shoulder), Normal = today's default nc (no first-connect drift), Sharp =
-// most taps (narrowest transition, Icom-like rectangular shoulder). The byte
+// tap count (nc): Soft/Normal/Sharp retain their persisted 1024/2048/4096
+// meanings; the appended Taps* values extend from Thetis's RX ladder through
+// Zeus's preplanned 262144-tap ceiling.
+// More taps sharpen the transition at the cost of CPU and receive latency. The byte
 // values are load-bearing: persisted DspSettingsStore rows hold the byte, and
 // pre-#871 rows stored the old two-value "Sharp" as 1 — which now deserialises
 // to Normal (== today's behaviour), so legacy prefs are unchanged. Append-only.
-public enum BandpassWindow : byte { Soft = 0, Normal = 1, Sharp = 2 }
+public enum BandpassWindow : byte
+{
+    Soft = 0,
+    Normal = 1,
+    Sharp = 2,
+    Taps8192 = 3,
+    Taps16384 = 4,
+    Taps32768 = 5,
+    Taps65536 = 6,
+    Taps131072 = 7,
+    Taps262144 = 8,
+}
+
+// FIR phase response is independent of coefficient count. Linear preserves
+// the legacy constant-group-delay response; Minimum moves the same magnitude
+// response toward the start of the impulse so extreme tap counts do not add
+// seconds of operator-felt delay. Append-only: values are persisted.
+public enum FilterPhaseMode : byte
+{
+    Linear = 0,
+    Minimum = 1,
+}
 
 public enum ConnectionStatus { Disconnected, Connecting, Connected, Error }
 
@@ -1053,14 +1075,16 @@ public sealed record StateDto(
     // Default 150/2850 matches Thetis's stock SSB TX bandpass.
     int TxFilterLowHz = 150,
     int TxFilterHighHz = 2850,
-    // SSB bandpass "rectangularity" — operator-selectable WDSP fir.c window
-    // (issue #871). Sharp = BH 7-term (current WDSP default; steeper shoulder),
-    // Soft = BH 4-term (gentler shoulder). RX and TX are independent so the
-    // operator can mix sharp-receive with soft-transmit for ESSB containment,
-    // or vice versa. Default Sharp on both sides preserves byte-identical
-    // pre-#871 audio. Persisted in DspSettingsStore.
+    // Bandpass resolution. RX and TX expose the exact 1024..262144 WDSP tap
+    // ladder. Production startup explicitly
+    // seeds Normal (2048 taps) for fresh and legacy rows. Persisted in
+    // DspSettingsStore.
     BandpassWindow RxFilterWindow = BandpassWindow.Sharp,
     BandpassWindow TxFilterWindow = BandpassWindow.Sharp,
+    // Independent RX/TX FIR phase choices. Linear is the compatibility default
+    // for legacy state frames and settings rows; Minimum is explicitly opt-in.
+    FilterPhaseMode RxFilterPhase = FilterPhaseMode.Linear,
+    FilterPhaseMode TxFilterPhase = FilterPhaseMode.Linear,
     // Master RX AF gain in dB. 0 dB ≡ WDSP SetRXAPanelGain1(1.0), the
     // engine's open-time default — a fresh session that never touches this
     // field is audibly identical to pre-#77 builds. Operator slider range
@@ -1845,6 +1869,7 @@ public sealed record TxLevelingSetRequest(TxLevelingConfig TxLeveling);
 // the client posts the chosen window for the relevant side (RX or TX) and the
 // server pushes the corresponding WDSP fir.c window code into the live engine.
 public sealed record BandpassWindowSetRequest(BandpassWindow Window);
+public sealed record FilterPhaseSetRequest(FilterPhaseMode Phase);
 
 // Per-popover save requests for the NR right-click panels. Nullable shape so
 // the popover can PATCH a single field without disturbing siblings (the server

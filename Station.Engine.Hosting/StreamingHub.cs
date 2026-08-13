@@ -502,7 +502,15 @@ public sealed class StreamingHub
     }
 
     /// <summary>Remove a previously-attached remote sink.</summary>
-    internal void DetachSink(Guid id) => _clients.TryRemove(id, out _);
+    internal void DetachSink(Guid id)
+    {
+        if (!_clients.TryRemove(id, out _) || !_clients.IsEmpty) return;
+        // Match the websocket-finally path: the last remote UI disappearing is
+        // an independent in-process fail-safe for UI-owned MOX if its loopback
+        // dead-man request could not reach Station Engine.
+        try { LastClientDisconnected?.Invoke(); }
+        catch (Exception ex) { _log.LogWarning(ex, "LastClientDisconnected handler threw"); }
+    }
 
     /// <summary>
     /// Inject a mic-PCM block (f32le samples, NO type prefix) from a non-WebSocket

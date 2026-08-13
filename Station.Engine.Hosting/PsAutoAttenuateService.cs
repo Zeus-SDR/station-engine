@@ -329,10 +329,40 @@ public sealed class PsAutoAttenuateService : BackgroundService
         }
     }
 
-    private void LogCalibrationStallWarning(PsStageMeters psm, long elapsedMs)
+    // calcc bins env/hw_peak into 16 bins; bin 15 (the fill gate the stall is
+    // stuck behind) spans [0.9375, 1.0] — so a TX reference peak below
+    // 0.9375 × hw_peak can NEVER complete a fit, however long the operator
+    // keys. Used to classify the HL2 stall as an HW-peak/envelope mismatch
+    // with both numbers named (issue #1323: the generic "lower HW peak" line
+    // gave the operator no numbers and no way to tell it from a dead path).
+    private const double CalccTopBinRatio = 0.9375;
+    // Near-zero float peak → the stream carries silence, not signal. An armed
+    // client with a bad/missing external coupler still DELIVERS blocks — they
+    // are just near-zero — so blocks-flowing + rxPeak under this floor is the
+    // one stall signature that genuinely points at station wiring rather than
+    // Zeus (#841/#869 lesson: zero BLOCKS is always a client-side fault).
+    private const float PsPeakSilenceFloor = 0.001f;
+    // Frozen-stream detector floor, measured against the client's per-block
+    // delivery stamp (IProtocol1Client.LastPsFeedbackBlockAgeMs — refreshed on
+    // EVERY delivered block, not the ~190-block observation heartbeat, which
+    // would miss any freeze landing between heartbeats). A live stream
+    // re-stamps every 1024 samples (2.7 ms at 384 k .. 21 ms at 48 k), so
+    // 2.5 s without a block while keyed is unambiguous at every rate.
+    private const long FrozenStreamAgeFloorMs = 2_500;
+
+    private void LogCalibrationStallWarning(StateDto s, PsStageMeters psm, long elapsedMs)
     {
         var board = _radio.ConnectedBoardKind;
-        if (!UsesHardenedSingleAdcPsPolicy(board))
+        // Single read — the client can be swapped/nulled by a disconnect on
+        // another thread, and deriving the gate and the evidence from two
+        // different reads would let a mid-teardown race classify a disconnect
+        // as a dead feedback path.
+        var p1 = _radio.ActiveClient;
+        // HL2 joins the evidence-rich path below only on Protocol 1 — that is
+        // where the 4-DDC feedback counters live. Any other board (and a
+        // P2-connected HL2, where ActiveClient is null) keeps the generic line.
+        bool isHl2P1 = board == HpsdrBoardKind.HermesLite2 && p1 is not null;
+        if (!isHl2P1 && !UsesHardenedSingleAdcPsPolicy(board))
         {
             _log.LogWarning(
                 "psAutoAttn.stall info5=0 for {ElapsedMs}ms — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
@@ -340,7 +370,6 @@ public sealed class PsAutoAttenuateService : BackgroundService
             return;
         }
 
-        var p1 = _radio.ActiveClient;
         long blocksNow = p1?.PsFeedbackBlocksDelivered ?? 0;
         long blocksDelta = Math.Max(0, blocksNow - _stallStartFeedbackBlocks);
         bool? clientPsEnabled = p1?.PsEnabled;
@@ -354,6 +383,76 @@ public sealed class PsAutoAttenuateService : BackgroundService
         long? lastBlocksDelivered = lastFeedback?.BlocksDelivered;
         int feedback = (int)Math.Round(psm.FeedbackLevel);
         int attenuationDb = ReadRadioTxAttnDb();
+
+        if (isHl2P1)
+        {
+            // Issue #1323: classify the HL2 stall instead of always blaming
+            // HW peak. Three distinct failure classes, each with a different
+            // owner, were previously collapsed into one misleading line.
+            double hwPeak = s.PsHwPeak;
+            if (blocksDelta == 0)
+            {
+                // No feedback blocks at all while armed + keyed. An armed
+                // client with bad station wiring still delivers (near-zero)
+                // blocks, so zero blocks is ALWAYS a Zeus-side wire/parse
+                // fault — never the operator's coupler (#841/#869 lesson).
+                _log.LogWarning(
+                    "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.clientEnabled={ClientPsEnabled} ps.numRxMinus1={RequestedNumRxMinusOne} hwPeak={HwPeak:F4} — ZERO feedback blocks while keyed: the HL2 4-DDC feedback stream is not being delivered (wire arm / receiver count / parser). This is NOT an HW-peak problem; check ps.clientEnabled and ps.numRxMinus1 above.",
+                    feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                    blocksNow, blocksDelta, clientPsEnabled, requestedNumRxMinusOne, hwPeak);
+                return;
+            }
+            if (p1!.LastPsFeedbackBlockAgeMs is { } blockAgeMs
+                && blockAgeMs >= FrozenStreamAgeFloorMs)
+            {
+                // Blocks flowed earlier (blocksDelta > 0 past the branch
+                // above), then STOPPED: the per-block delivery stamp has not
+                // been refreshed for the whole floor window. A live stream
+                // re-stamps it every block (2.7-21 ms depending on rate), so
+                // a multi-second age is a Zeus-side parse/dispatch freeze at
+                // every rate — do not route the operator to HW peak or wiring.
+                _log.LogWarning(
+                    "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastBlockAgeMs={BlockAgeMs} hwPeak={HwPeak:F4} — feedback stream FROZE mid-over: no block delivered for {FrozenForMs}ms while keyed. This is a Zeus-side parse/dispatch fault, NOT an HW-peak or wiring problem.",
+                    feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                    blocksNow, blocksDelta, blockAgeMs, hwPeak, blockAgeMs);
+                return;
+            }
+            if (lastTxPeak is { } txPeak && txPeak < hwPeak * CalccTopBinRatio)
+            {
+                // Blocks flowing but the DAC-tap TX reference never reaches
+                // calcc's top bin — the #1323 signature. Name both numbers so
+                // the next report answers itself.
+                _log.LogWarning(
+                    "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.ageMs={LastAgeMs} hwPeak={HwPeak:F4} — TX reference peak {ObservedTxPeak:F4} cannot reach the calcc top bin at HW peak {ConfiguredHwPeak:F4} (needs ≥{NeededPeak:F4}). Set HW peak to ~1.02× the observed TX peak in the PURESIGNAL panel, or raise TX drive/audio level.",
+                    feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                    blocksNow, blocksDelta, lastRxPeak, txPeak, lastFeedbackAgeMs,
+                    hwPeak, txPeak, hwPeak, hwPeak * CalccTopBinRatio);
+                return;
+            }
+            if (lastTxPeak is { } okTxPeak && lastRxPeak is { } rxPeak
+                && okTxPeak >= hwPeak * CalccTopBinRatio && rxPeak < PsPeakSilenceFloor)
+            {
+                // TX reference healthy, RX feedback silent: blocks are
+                // delivered but carry nothing on the antenna-side stream —
+                // the one stall class that points at the station's feedback
+                // source (external coupler where fitted, RF leakage on a
+                // stock HL2) rather than Zeus or HW peak.
+                _log.LogWarning(
+                    "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.ageMs={LastAgeMs} hwPeak={HwPeak:F4} — TX reference is healthy but RX feedback is near zero: the feedback path (external coupler, or RF leakage on a stock HL2) is delivering no signal into the RX frontend. Check the feedback source wiring/level.",
+                    feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                    blocksNow, blocksDelta, rxPeak, okTxPeak, lastFeedbackAgeMs, hwPeak);
+                return;
+            }
+            // Blocks flowing but no peak observation yet (first ~1 s heartbeat
+            // window), or peaks that don't match a known class — emit the full
+            // evidence line so the report still carries every number.
+            _log.LogWarning(
+                "psAutoAttn.stall fb={Fb} info5={Cal} attn={Attn} for {ElapsedMs}ms blocksNow={BlocksNow} blocksDelta={BlocksDelta} ps.clientEnabled={ClientPsEnabled} ps.numRxMinus1={RequestedNumRxMinusOne} ps.lastFb.rxPeak={LastRxPeak:F4} ps.lastFb.txPeak={LastTxPeak:F4} ps.lastFb.blocksDelivered={LastBlocks} ps.lastFb.ageMs={LastAgeMs} hwPeak={HwPeak:F4} — calcc bin 15 never fills; compare ps.lastFb.txPeak with hwPeak and set HW peak to ~1.02× the observed TX peak in the PURESIGNAL panel.",
+                feedback, psm.CalibrationAttempts, attenuationDb, elapsedMs,
+                blocksNow, blocksDelta, clientPsEnabled, requestedNumRxMinusOne, lastRxPeak, lastTxPeak,
+                lastBlocksDelivered, lastFeedbackAgeMs, hwPeak);
+            return;
+        }
 
         if (board == HpsdrBoardKind.HermesII && feedback <= 0)
         {
@@ -526,7 +625,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
             {
                 _stallWarned = true;
                 _radio.SetPsCalibrationStalled(true);
-                LogCalibrationStallWarning(stallPsm, now - _stallStartTickMs);
+                LogCalibrationStallWarning(s, stallPsm, now - _stallStartTickMs);
             }
         }
         else if (_stallStartTickMs != 0)

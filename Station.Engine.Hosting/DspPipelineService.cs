@@ -204,6 +204,24 @@ public class DspPipelineService : BackgroundService,
     // leveler only nudges. The downward CUT below is unchanged — it stays the
     // blast-guard that catches a sudden strong signal.
     private const double RxLevelerMaxBoostDb = 3.0;
+    // The production constant-loudness path may use more makeup than the old
+    // audio-only helper, but only while an independent passband measurement
+    // says RX0 contains a resolved RF signal.  Noise/unavailable telemetry
+    // fails closed to zero boost; downward gain and the peak guard stay live.
+    private const double RxConstantLoudnessMaxBoostDb = 24.0;
+    private const double RxConstantLoudnessMinConfidence = 0.10;
+    // Current pre-AGC S+N power above the estimator's integrated noise power.
+    // This is deliberately a total-power excess, not signal-only SNR.
+    private const double RxConstantLoudnessMinCurrentTotalExcessDb = 1.5;
+    private const double RxConstantLoudnessReleaseTotalExcessDb = 0.25;
+    // The 5 Hz stage meter must agree for ~0.6 s to open; once open, require
+    // ~1.2 s of consecutive misses so ordinary fades cannot chatter the gate.
+    private const int RxConstantLoudnessAcquireFrames = 3;
+    private const int RxConstantLoudnessReleaseFrames = 6;
+    private const double RxConstantLoudnessAdcVetoDbfs = -3.0;
+    private const double RxConstantLoudnessAdcUnavailableDbfs = -200.0;
+    private const double RxConstantLoudnessMeterUnavailableDbm = -200.0;
+    private const long RxConstantLoudnessEvidenceMaxAgeMs = 750;
     private const double RxLevelerMaxCutDb = -24.0;
     private const double RxLevelerBoostSlewDbPerBlock = 2.0;
     private const double RxLevelerFastBoostSlewDbPerBlock = 2.5;
@@ -221,9 +239,14 @@ public class DspPipelineService : BackgroundService,
     private const double RxLevelerMemoryCatchupGatePeakDb = -56.0;
     private const double RxLevelerMemoryCatchupMinGainDb = 3.0;
     private const double RxLevelerSmoothCutDb = 6.0;
+    // Match the ordinary smooth-cut rate: +24 dB then clears in four blocks
+    // (~130 ms at 30 Hz), fast enough not to hold noise but never in one block.
+    internal const double RxLevelerEvidenceLossReleaseDbPerBlock = 6.0;
     private const int RxLevelerPauseHoldBlocks = 18;
     private const double RxLevelerPauseMemoryDecayDbPerBlock = 4.5;
     private const int RxLevelerGainRampMaxSamples = 256;
+    private const double RxLevelerLargeTransitionDb = 6.0;
+    private const int RxLevelerEmergencyCutRampSamples = 64;
     private const double RxLevelerPeakTarget = 0.74;
     private const double RxLevelerOutputSoftKnee = 0.74;
     private const double RxLevelerOutputPeakCeiling = 0.84;
@@ -249,6 +272,18 @@ public class DspPipelineService : BackgroundService,
         for (int i = 0; i < samples.Length; i++)
         {
             samples[i] = SanitizeAudioSample(samples[i]);
+        }
+    }
+
+    // Multi-receiver summing deliberately retains unity gain and may exceed
+    // full scale before the final-bus soft limiter. Remove only non-finite
+    // values here; hard-clamping would flatten coincident peaks before that
+    // limiter has a chance to preserve their shape.
+    internal static void SanitizeMixedRxAudioBuffer(Span<float> samples)
+    {
+        for (int i = 0; i < samples.Length; i++)
+        {
+            if (!float.IsFinite(samples[i])) samples[i] = 0f;
         }
     }
 
@@ -302,6 +337,28 @@ public class DspPipelineService : BackgroundService,
     internal static void ApplyRxAudioLeveler(
         Span<float> samples,
         ref RxAudioLevelerState state)
+        => ApplyRxAudioLevelerCore(
+            samples, ref state, allowBoost: true, RxLevelerMaxBoostDb);
+
+    internal static void ApplyRxAudioLeveler(
+        Span<float> samples,
+        ref RxAudioLevelerState state,
+        bool rfSignalResolved,
+        bool adcOverloadRisk,
+        double levelReferenceOffsetDb = 0.0)
+        => ApplyRxAudioLevelerCore(
+            samples,
+            ref state,
+            allowBoost: rfSignalResolved && !adcOverloadRisk,
+            RxConstantLoudnessMaxBoostDb,
+            levelReferenceOffsetDb);
+
+    private static void ApplyRxAudioLevelerCore(
+        Span<float> samples,
+        ref RxAudioLevelerState state,
+        bool allowBoost,
+        double maxBoostDb,
+        double levelReferenceOffsetDb = 0.0)
     {
         if (samples.Length == 0) return;
 
@@ -309,7 +366,11 @@ public class DspPipelineService : BackgroundService,
         double peak = 0.0;
         for (int i = 0; i < samples.Length; i++)
         {
-            float s = SanitizeAudioSample(samples[i]);
+            // The final RX bus deliberately permits finite values beyond unity
+            // until its soft limiter.  Preserve that waveform here so summed
+            // receivers are gain-reduced as a whole instead of hard-clipped
+            // sample-by-sample before the peak guard can act.
+            float s = float.IsFinite(samples[i]) ? samples[i] : 0f;
             double a = Math.Abs(s);
             if (a > peak) peak = a;
             sumSq += (double)s * s;
@@ -318,12 +379,20 @@ public class DspPipelineService : BackgroundService,
         double rms = Math.Sqrt(sumSq / samples.Length);
         double inputRmsDbfs = AudioLinearToDbfsRaw(rms);
         double inputPeakDbfs = AudioLinearToDbfsRaw(peak);
-        bool belowGate = rms <= 0.0 || !double.IsFinite(inputRmsDbfs) || inputRmsDbfs < RxLevelerGateRmsDb;
+        double targetRmsDb = RxLevelerTargetRmsDb + levelReferenceOffsetDb;
+        double gateRmsDb = RxLevelerGateRmsDb + levelReferenceOffsetDb;
+        bool belowGate = rms <= 0.0 || !double.IsFinite(inputRmsDbfs) || inputRmsDbfs < gateRmsDb;
 
         double desiredDb = belowGate
             ? 0.0
-            : RxLevelerTargetRmsDb - inputRmsDbfs;
-        desiredDb = Math.Clamp(desiredDb, RxLevelerMaxCutDb, RxLevelerMaxBoostDb);
+            : targetRmsDb - inputRmsDbfs;
+        desiredDb = Math.Clamp(desiredDb, RxLevelerMaxCutDb, maxBoostDb);
+
+        // Audio amplitude cannot distinguish weak speech from receiver noise.
+        // Positive makeup therefore requires independent, fresh RF evidence.
+        // Cuts remain unconditional so a sudden loud block is still contained.
+        if (desiredDb > 0.0 && !allowBoost)
+            desiredDb = 0.0;
 
         // Soft gate: taper the upward BOOST to zero as the input approaches the
         // floor, so crossing the gate can never snap the full boost on/off (the
@@ -333,7 +402,7 @@ public class DspPipelineService : BackgroundService,
         if (!belowGate && desiredDb > 0.0)
         {
             double gateFactor = Math.Clamp(
-                (inputRmsDbfs - RxLevelerGateRmsDb) / RxLevelerGateSoftWindowDb,
+                (inputRmsDbfs - gateRmsDb) / RxLevelerGateSoftWindowDb,
                 0.0, 1.0);
             desiredDb *= gateFactor;
         }
@@ -345,13 +414,26 @@ public class DspPipelineService : BackgroundService,
             peakHeadroomDb = 20.0 * Math.Log10(Math.Max(RxLevelerPeakTarget, 1.0e-9) / peak);
             if (double.IsFinite(peakHeadroomDb) && desiredDb > peakHeadroomDb)
             {
-                desiredDb = Math.Clamp(peakHeadroomDb, RxLevelerMaxCutDb, RxLevelerMaxBoostDb);
+                desiredDb = Math.Clamp(peakHeadroomDb, RxLevelerMaxCutDb, maxBoostDb);
                 peakLimited = true;
             }
         }
 
         double currentDb = double.IsFinite(state.GainDb) ? state.GainDb : 0.0;
-        currentDb = Math.Clamp(currentDb, RxLevelerMaxCutDb, RxLevelerMaxBoostDb);
+        currentDb = Math.Clamp(currentDb, RxLevelerMaxCutDb, maxBoostDb);
+        // GainDb is the controller's pause-memory value. AppliedGainDb is the
+        // gain that actually reached the final sample of the previous block.
+        // They intentionally differ while audio is below the gate: retain the
+        // controller memory, but fade the applied gain to unity so noise is not
+        // held up. Keeping both prevents a hard gain step at word boundaries.
+        double appliedStartDb = state.DiagnosticsValid && double.IsFinite(state.AppliedGainDb)
+            ? Math.Clamp(state.AppliedGainDb, RxLevelerMaxCutDb, maxBoostDb)
+            : currentDb;
+
+        // Evidence loss bypasses pause memory so averaged-SNR hangover cannot
+        // hold makeup on noise, but releases it over several audio blocks. Peak
+        // safety below may still cut faster when the held gain is genuinely unsafe.
+        bool evidenceLossRelease = !allowBoost && currentDb > 0.0;
 
         // True when the gain we are currently holding would, on its own, drive
         // this block's peak past the limiter target — i.e. a gain "held" high
@@ -361,10 +443,14 @@ public class DspPipelineService : BackgroundService,
         // whose input peak is modest still blasts the speaker if the held gain is
         // large. When this is set we cut as urgently as a clipping peak would.
         bool currentGainOverdrivesPeak =
-            double.IsFinite(peakHeadroomDb) && currentDb > peakHeadroomDb;
+            double.IsFinite(peakHeadroomDb) && appliedStartDb > peakHeadroomDb;
 
         double nextDb = currentDb;
-        if (belowGate)
+        if (evidenceLossRelease)
+        {
+            state.PauseHoldBlocks = 0;
+        }
+        else if (belowGate)
         {
             bool holdMemory = state.PauseHoldBlocks > 0;
             if (holdMemory)
@@ -390,7 +476,7 @@ public class DspPipelineService : BackgroundService,
         }
 
         bool boostSlewLimited = false;
-        if (!belowGate && desiredDb > currentDb)
+        if (!evidenceLossRelease && !belowGate && desiredDb > currentDb)
         {
             double boostSlewDb = RxLevelerBoostSlewDbPerBlock;
             if (double.IsFinite(peakHeadroomDb) && peakHeadroomDb >= RxLevelerFastBoostHeadroomDb)
@@ -399,7 +485,7 @@ public class DspPipelineService : BackgroundService,
             }
             if (double.IsFinite(peakHeadroomDb) &&
                 peakHeadroomDb >= RxLevelerVeryFastBoostHeadroomDb &&
-                inputRmsDbfs >= RxLevelerVeryFastBoostGateRmsDb)
+                inputRmsDbfs >= RxLevelerVeryFastBoostGateRmsDb + levelReferenceOffsetDb)
             {
                 boostSlewDb = Math.Max(boostSlewDb, RxLevelerVeryFastBoostSlewDbPerBlock);
             }
@@ -407,15 +493,15 @@ public class DspPipelineService : BackgroundService,
             double crestDb = inputPeakDbfs - inputRmsDbfs;
             if (double.IsFinite(crestDb) &&
                 crestDb >= RxLevelerCrestCatchupMinCrestDb &&
-                inputRmsDbfs <= RxLevelerCrestCatchupMaxRmsDb &&
-                inputPeakDbfs >= RxLevelerCrestCatchupMinPeakDb &&
+                inputRmsDbfs <= RxLevelerCrestCatchupMaxRmsDb + levelReferenceOffsetDb &&
+                inputPeakDbfs >= RxLevelerCrestCatchupMinPeakDb + levelReferenceOffsetDb &&
                 desiredDb - currentDb >= RxLevelerCrestCatchupMinGainGapDb)
             {
                 boostSlewDb = Math.Max(boostSlewDb, RxLevelerCrestCatchupBoostSlewDbPerBlock);
             }
             if (state.GainDb >= RxLevelerMemoryCatchupMinGainDb &&
-                inputRmsDbfs >= RxLevelerMemoryCatchupGateRmsDb &&
-                inputPeakDbfs >= RxLevelerMemoryCatchupGatePeakDb)
+                inputRmsDbfs >= RxLevelerMemoryCatchupGateRmsDb + levelReferenceOffsetDb &&
+                inputPeakDbfs >= RxLevelerMemoryCatchupGatePeakDb + levelReferenceOffsetDb)
             {
                 boostSlewDb = Math.Max(boostSlewDb, RxLevelerFastBoostSlewDbPerBlock);
             }
@@ -423,14 +509,23 @@ public class DspPipelineService : BackgroundService,
             nextDb = Math.Min(desiredDb, currentDb + boostSlewDb);
             boostSlewLimited = nextDb + 1.0e-9 < desiredDb;
         }
-        else if (!belowGate)
+        else if (!belowGate || evidenceLossRelease)
         {
-            double cutSlewDb = (peak > RxLevelerPeakTarget || peakLimited || currentGainOverdrivesPeak)
-                ? Math.Max(RxLevelerSmoothCutDb, currentDb - desiredDb)
-                : RxLevelerSmoothCutDb;
-            nextDb = Math.Max(desiredDb, currentDb - cutSlewDb);
+            bool peakUrgency = peak > RxLevelerPeakTarget || peakLimited || currentGainOverdrivesPeak;
+            // Pause memory may exceed the gain actually applied before evidence
+            // closed. Discard that hidden makeup instead of replaying it.
+            double cutStartDb = evidenceLossRelease
+                ? Math.Min(currentDb, appliedStartDb)
+                : currentDb;
+            double cutSlewDb = peakUrgency
+                ? Math.Max(RxLevelerSmoothCutDb, cutStartDb - desiredDb)
+                : evidenceLossRelease
+                    ? RxLevelerEvidenceLossReleaseDbPerBlock
+                    : RxLevelerSmoothCutDb;
+            double cutFloorDb = evidenceLossRelease ? Math.Min(desiredDb, 0.0) : desiredDb;
+            nextDb = Math.Max(cutFloorDb, cutStartDb - cutSlewDb);
         }
-        nextDb = Math.Clamp(nextDb, RxLevelerMaxCutDb, RxLevelerMaxBoostDb);
+        nextDb = Math.Clamp(nextDb, RxLevelerMaxCutDb, maxBoostDb);
 
         // Hard per-block peak guard. The smooth boost/cut slews above track
         // loudness gently; this is the safety floor that stops a held-high gain
@@ -441,24 +536,44 @@ public class DspPipelineService : BackgroundService,
         // strong signal blasts the speaker" failure this leveler exists to stop.
         // Cutting straight to the peak-safe gain is inaudible next to that blast.
         if (!belowGate && double.IsFinite(peakHeadroomDb) && nextDb > peakHeadroomDb)
-            nextDb = Math.Clamp(peakHeadroomDb, RxLevelerMaxCutDb, RxLevelerMaxBoostDb);
+            nextDb = Math.Clamp(peakHeadroomDb, RxLevelerMaxCutDb, maxBoostDb);
 
-        int rampSamples = Math.Clamp(Math.Min(samples.Length, RxLevelerGainRampMaxSamples), 1, Math.Max(1, samples.Length));
+        double appliedEndDb = belowGate ? 0.0 : nextDb;
+        double appliedTransitionDb = Math.Abs(appliedEndDb - appliedStartDb);
+        int requestedRampSamples = (int)Math.Ceiling(
+            RxLevelerGainRampMaxSamples *
+            Math.Max(1.0, appliedTransitionDb / RxLevelerLargeTransitionDb));
+        int rampSamples = Math.Clamp(
+            Math.Min(samples.Length, requestedRampSamples), 1, Math.Max(1, samples.Length));
         double preLimitPeak = 0.0;
         int outputLimitSampleCount = 0;
-        double appliedEndDb = belowGate ? 0.0 : nextDb;
-        bool emergencyCut = !belowGate && nextDb < currentDb && (peak > RxLevelerPeakTarget || peakLimited || currentGainOverdrivesPeak);
+        bool emergencyCut = !belowGate && appliedEndDb < appliedStartDb &&
+            (peak > RxLevelerPeakTarget || peakLimited || currentGainOverdrivesPeak);
+        if (emergencyCut)
+        {
+            double heldGain = DbToLinear(appliedStartDb);
+            int firstUnsafeSample = 0;
+            while (firstUnsafeSample < samples.Length &&
+                Math.Abs(samples[firstUnsafeSample] * heldGain) <= RxLevelerPeakTarget)
+            {
+                firstUnsafeSample++;
+            }
+
+            // Complete the safety cut no later than the first sample that the
+            // previously applied gain would overdrive. A block loud from sample
+            // zero still cuts immediately; a later crest gets a short dezipper
+            // ramp instead of forcing an unrelated block-boundary step.
+            rampSamples = firstUnsafeSample < samples.Length
+                ? Math.Clamp(firstUnsafeSample + 1, 1, RxLevelerEmergencyCutRampSamples)
+                : Math.Min(rampSamples, RxLevelerEmergencyCutRampSamples);
+        }
         for (int i = 0; i < samples.Length; i++)
         {
-            float clean = SanitizeAudioSample(samples[i]);
+            float clean = float.IsFinite(samples[i]) ? samples[i] : 0f;
             double ramp = i < rampSamples
                 ? (i + 1) / (double)rampSamples
                 : 1.0;
-            double gainDb = belowGate
-                ? 0.0
-                : emergencyCut
-                    ? nextDb
-                    : currentDb + (nextDb - currentDb) * ramp;
+            double gainDb = appliedStartDb + (appliedEndDb - appliedStartDb) * ramp;
             double scaled = clean * DbToLinear(gainDb);
             double absScaled = Math.Abs(scaled);
             if (absScaled > preLimitPeak) preLimitPeak = absScaled;
@@ -485,7 +600,7 @@ public class DspPipelineService : BackgroundService,
         state.OutputPeakDbfs = outputPeakDbfs;
         state.DesiredGainDb = desiredDb;
         state.AppliedGainDb = appliedEndDb;
-        state.GainDeltaDb = nextDb - currentDb;
+        state.GainDeltaDb = appliedEndDb - appliedStartDb;
         state.PeakHeadroomDb = peakHeadroomDb;
         state.PreLimitPeakDbfs = preLimitPeakDbfs;
         state.OutputLimitReductionDb = outputLimitReductionDb;
@@ -765,6 +880,7 @@ public class DspPipelineService : BackgroundService,
         public AgcConfig? AppliedAgc;
         public SquelchConfig? AppliedSquelch;
         public BandpassWindow? AppliedBandpassWindow;
+        public FilterPhaseMode? AppliedFilterPhase;
         public int AppliedZoom = int.MinValue;
         // Slewed AF-gain dB last pushed to this secondary's WDSP channel.
         // NaN sentinel = "no value applied yet" — used at channel-open so
@@ -785,6 +901,7 @@ public class DspPipelineService : BackgroundService,
             AppliedAgc = null;
             AppliedSquelch = null;
             AppliedBandpassWindow = null;
+            AppliedFilterPhase = null;
             AppliedZoom = int.MinValue;
         }
     }
@@ -1113,6 +1230,8 @@ public class DspPipelineService : BackgroundService,
     // other _applied* siblings.
     private BandpassWindow _appliedRxBandpassWindow = BandpassWindow.Normal;
     private BandpassWindow _appliedTxBandpassWindow = BandpassWindow.Normal;
+    private FilterPhaseMode _appliedRxFilterPhase = FilterPhaseMode.Linear;
+    private FilterPhaseMode _appliedTxFilterPhase = FilterPhaseMode.Linear;
     private int _appliedZoomLevel = 1;
     // PureSignal latched values — same change-detect pattern as the others
     // so OnRadioStateChanged only fires PS setters when values move.
@@ -1380,6 +1499,7 @@ public class DspPipelineService : BackgroundService,
     private float _calPanHzPerPixel;
     private long _calPanCenterHz;
     private long _calPanSnapshotMs;
+    private long _calPanSnapshotVersion;
     private readonly object _calPanLock = new();
 
     // Scratch buffer for the auto-AGC noise-floor estimate (issue #806). Filled
@@ -1391,6 +1511,13 @@ public class DspPipelineService : BackgroundService,
     // is drained at the meter cadence even when no spectrum panel is mounted.
     private readonly float[] _snrPowerBuf;
     private readonly InPassbandSnrEstimator _snrEstimator = new();
+    // RX0 passband evidence sampled at the analyzer/meter cadence. The audio
+    // hot path only reads these scalar fields; no allocation, lock or I/O.
+    private int _rxLevelerRfSignalResolved;
+    private int _rxLevelerAdcOverloadRisk;
+    private int _rxLevelerRfAcquireHits;
+    private int _rxLevelerRfReleaseMisses;
+    private long _rxLevelerRfEvidenceMs = long.MinValue;
     // Thetis-faithful band noise-floor tracker (display.cs processNoiseFloor
     // port): gated quiet-bin mean + 2-tap power smoothing + 2 s attack lerp +
     // fast-attack. Fed at the 5 Hz meter cadence; consumed by RadioService's
@@ -2533,6 +2660,7 @@ public class DspPipelineService : BackgroundService,
                     _panadapterWidth);
                 _calPanCenterHz = viewport.CenterHz;
                 _calPanSnapshotMs = (long)nowMs;
+                _calPanSnapshotVersion++;
                 if (displayPlan.IncludeWaterfall)
                     _diagWfSnapshotMs = (long)nowMs;
                 _diagDisplayFrameMs = (long)nowMs;
@@ -2677,6 +2805,7 @@ public class DspPipelineService : BackgroundService,
             _calPanHzPerPixel = DiagnosticHzPerPixel(source.HzPerPixel, source.PanDb.Length, _panadapterWidth);
             _calPanCenterHz = source.CenterHz;
             _calPanSnapshotMs = (long)nowMs;
+            _calPanSnapshotVersion++;
             if (displayPlan.IncludeWaterfall)
                 _diagWfSnapshotMs = (long)nowMs;
             _diagDisplayFrameMs = (long)nowMs;
@@ -2731,16 +2860,32 @@ public class DspPipelineService : BackgroundService,
     }
 
     private void PublishTxSuppressedAudio(float[] audioBuf, int sampleCount, double nowMs, SquelchConfig squelch)
+        => PublishTxSuppressedAudio(
+            audioBuf, sampleCount, nowMs, squelch, ReadOnlySpan<float>.Empty, 0);
+
+    private void PublishTxSuppressedAudio(
+        float[] audioBuf,
+        int sampleCount,
+        double nowMs,
+        SquelchConfig squelch,
+        ReadOnlySpan<float> externalRx,
+        int externalRxCount)
     {
         int count = sampleCount > 0
             ? Math.Min(sampleCount, audioBuf.Length)
             : Math.Min(audioBuf.Length, MonitorInjectSilentBlockSamples);
+        externalRxCount = Math.Min(
+            audioBuf.Length,
+            Math.Clamp(externalRxCount, 0, externalRx.Length));
+        count = Math.Max(count, externalRxCount);
         if (count <= 0) return;
 
         var span = audioBuf.AsSpan(0, count);
         span.Clear();
         bool sidetoneWrote = _sidetone?.RenderInto(span) ?? false;
-        if (sidetoneWrote)
+        if (externalRxCount > 0)
+            for (int i = 0; i < externalRxCount; i++) span[i] += externalRx[i];
+        if (sidetoneWrote || externalRxCount > 0)
             LimitRxAudioBuffer(span);
 
         double finalAudioRms = Rms(span);
@@ -2755,14 +2900,14 @@ public class DspPipelineService : BackgroundService,
             Samples: new ReadOnlyMemory<float>(audioBuf, 0, count));
 
         CaptureAudioDiagnostics(
-            sidetoneWrote ? "cw-sidetone" : "tx-rx-muted",
+            externalRxCount > 0 ? "external-rx" : sidetoneWrote ? "cw-sidetone" : "tx-rx-muted",
             in frame,
             finalAudioRms,
             finalAudioPeak,
             txMonitorRequested: false,
             squelch);
         PublishAudio(in frame);
-        if (sidetoneWrote)
+        if (sidetoneWrote || externalRxCount > 0)
             RxAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, count));
     }
 
@@ -3231,15 +3376,16 @@ public class DspPipelineService : BackgroundService,
         bool wdsp = engine is WdspDspEngine or OfflinePreviewDspEngine;
         int txBlock = engine?.TxBlockSamples ?? 0;
         int txOut = engine?.TxOutputSamples ?? 0;
+        int txDspRateHz = txBlock == 256 && txOut == 1024 ? 96_000 : 48_000;
         string status = engine is OfflinePreviewDspEngine
             ? "offline-preview-tx-profile"
             : wdsp
-                ? "runtime-rate-writable-fixed-profile"
+                ? "runtime-rate-phase-taps-writable-fixed-buffer-profile"
                 : engine is SyntheticDspEngine ? "synthetic-profile" : "engine-unavailable";
         int[] sampleRates = [48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000];
         int[] iqBufferSizes = [64, 128, 256, 512, 1024];
         int[] filterTapSizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
-        string[] filterTypes = ["Linear Phase", "Low Latency"];
+        string[] filterTypes = ["Linear Phase", "Minimum Phase"];
         object[] filterWindows =
         [
             new { id = 0, label = "BH-4", notes = "Thetis default in DSP Options; sharper transition." },
@@ -3285,7 +3431,7 @@ public class DspPipelineService : BackgroundService,
                 filterTapSizes,
                 filterTypes,
                 filterWindows,
-                slowModeChangeWarning = "Thetis warns that different buffer sizes, tap sizes, or filter types can force a slow mode change; Zeus keeps these fixed until RXA/TXA/analyzer rebuild can be made atomic.",
+                slowModeChangeWarning = "Tap or phase changes rebuild FIR partitions while the affected channel is quiescent. Extreme cold minimum-phase changes can take longer than cached repeats.",
                 source = "Thetis DSP Options mode defaults + Zeus WDSPwisdom 64..262144 startup planning ladder",
             },
             activeRx = new
@@ -3294,13 +3440,34 @@ public class DspPipelineService : BackgroundService,
                 filterLowHz = state.FilterLowHz,
                 filterHighHz = state.FilterHighHz,
                 filterPresetName = state.FilterPresetName,
-                inputBufferSize = 1024,
-                dspBufferSize = 1024,
+                inputBufferSize = 512,
+                dspBufferSize = 512,
+                dspRateHz = 48_000,
+                schedulingQuantumMs = Math.Round(512.0 / 48_000.0 * 1000.0, 3),
                 filterWindowId = 1,
                 filterWindow = "BH-7",
-                filterType = "Low Latency",
-                filterTaps = (int?)null,
-                status = wdsp ? "wired-fixed" : "not-wdsp",
+                filterType = state.RxFilterPhase == FilterPhaseMode.Minimum ? "Minimum Phase" : "Linear Phase",
+                filterPhase = state.RxFilterPhase.ToString(),
+                filterTaps = state.RxFilterWindow switch
+                {
+                    BandpassWindow.Soft => 1024,
+                    BandpassWindow.Normal => 2048,
+                    BandpassWindow.Sharp => 4096,
+                    BandpassWindow.Taps8192 => 8192,
+                    BandpassWindow.Taps16384 => 16384,
+                    BandpassWindow.Taps32768 => 32768,
+                    BandpassWindow.Taps65536 => 65536,
+                    BandpassWindow.Taps131072 => 131072,
+                    BandpassWindow.Taps262144 => 262144,
+                    _ => 2048,
+                },
+                linearPhaseFirDelayMs = state.RxFilterPhase == FilterPhaseMode.Linear
+                    ? Math.Round((ResolveFilterTapCount(state.RxFilterWindow) - 1.0) / (2.0 * 48_000.0) * 1000.0, 3)
+                    : (double?)null,
+                latencyAccounting = state.RxFilterPhase == FilterPhaseMode.Linear
+                    ? "Exact single-stage FIR group delay; active serial filters can add multiple stages. Scheduling quantum is reported separately and sink/network latency is excluded."
+                    : "Minimum-phase delay is impulse- and passband-dependent; scheduling quantum is exact and total sink/network latency is excluded.",
+                status = wdsp ? "operator-selectable" : "not-wdsp",
             },
             activeTx = new
             {
@@ -3308,14 +3475,37 @@ public class DspPipelineService : BackgroundService,
                 filterLowHz = state.TxFilterLowHz,
                 filterHighHz = state.TxFilterHighHz,
                 inputBufferSize = txBlock,
-                dspBufferSize = txBlock > 0 ? 1024 : 0,
+                dspBufferSize = txBlock > 0 ? 512 : 0,
+                dspRateHz = txBlock > 0 ? txDspRateHz : 0,
+                schedulingQuantumMs = txBlock > 0
+                    ? Math.Round(512.0 / txDspRateHz * 1000.0, 3)
+                    : 0.0,
                 outputBufferSize = txOut,
                 filterWindowId = 1,
                 filterWindow = "BH-7",
-                filterType = "profile-fixed",
-                filterTaps = (int?)null,
+                filterType = state.TxFilterPhase == FilterPhaseMode.Minimum ? "Minimum Phase" : "Linear Phase",
+                filterPhase = state.TxFilterPhase.ToString(),
+                filterTaps = state.TxFilterWindow switch
+                {
+                    BandpassWindow.Soft => 1024,
+                    BandpassWindow.Normal => 2048,
+                    BandpassWindow.Sharp => 4096,
+                    BandpassWindow.Taps8192 => 8192,
+                    BandpassWindow.Taps16384 => 16384,
+                    BandpassWindow.Taps32768 => 32768,
+                    BandpassWindow.Taps65536 => 65536,
+                    BandpassWindow.Taps131072 => 131072,
+                    BandpassWindow.Taps262144 => 262144,
+                    _ => 2048,
+                },
+                linearPhaseFirDelayMs = state.TxFilterPhase == FilterPhaseMode.Linear && txBlock > 0
+                    ? Math.Round((ResolveFilterTapCount(state.TxFilterWindow) - 1.0) / (2.0 * txDspRateHz) * 1000.0, 3)
+                    : (double?)null,
+                latencyAccounting = state.TxFilterPhase == FilterPhaseMode.Linear
+                    ? "Exact single-stage FIR group delay; active serial filters can add multiple stages. Scheduling quantum is reported separately and radio/network latency is excluded."
+                    : "Minimum-phase delay is impulse- and passband-dependent. The selected taps apply to one fixed master FIR and the final overshoot stage uses a short cleanup FIR; scheduling quantum is exact and total radio/network latency is excluded.",
                 cfirCompensation = txOut > txBlock && txBlock > 0,
-                status = wdsp ? "wired-fixed" : "not-wdsp",
+                status = wdsp ? "operator-selectable" : "not-wdsp",
             },
             receiverBandwidth,
             thetisMatrix = new[]
@@ -3334,10 +3524,12 @@ public class DspPipelineService : BackgroundService,
                 fftwWisdomPhase = wisdom.Phase.ToString(),
                 fftwWisdomStatus = wisdom.Status,
                 fftwWisdomCache = true,
-                filterImpulseCache = false,
+                filterImpulseCache = true,
+                cacheByteBudgetPerBucket = 64 * 1024 * 1024,
+                cacheScope = "process-wide byte-bounded LRU",
                 saveRestoreImpulseCacheFile = false,
-                status = "fftw-wisdom-only",
-                notes = "Zeus initializes WDSP FFTW wisdom at startup. Thetis's separate Filter Impulse Cache and save/restore cache-file controls are not runtime settings in Zeus yet.",
+                status = "fftw-wisdom-plus-bounded-impulse-cache",
+                notes = "WDSP self-initializes a thread-safe, byte-bounded impulse cache. Cache-file save/restore is not an operator setting.",
             },
             highResolutionFilterDisplay = new
             {
@@ -3345,10 +3537,24 @@ public class DspPipelineService : BackgroundService,
                 status = "not-exposed-as-filter-display-setting",
                 notes = "Zeus exposes live filter edges, presets, panadapter scale, and mini-pan visuals, but not Thetis's separate high-resolution filter-characteristics display toggle yet.",
             },
-            diagnosticRecommendation = "All verified hardware sample-rate sizes, Thetis mode-default DSP sizes, and the full Zeus WDSP planning ladder are visible. The live DDC sample rate is operator-writable through Settings > DSP > Bandwidth and /api/sampleRate; RXA/TXA buffer/tap/window geometry remains fixed until OpenChannel/DSP buffer/tap/window changes can be rebuilt atomically across RXA, TXA, monitor, and analyzers.",
+            diagnosticRecommendation = "The live DDC rate, exact RX/TX tap counts, and independent FIR phase are operator-writable. RXA/TXA use fixed low-latency 512-sample DSP partitions; linear FIR delay and the scheduling quantum are reported separately.",
             source = "Thetis DSP Options filter matrix + Zeus WdspDspEngine OpenChannel/SetRXABandpassWindow/SetTXABandpassWindow profile",
         };
     }
+
+    private static int ResolveFilterTapCount(BandpassWindow window) => window switch
+    {
+        BandpassWindow.Soft => 1024,
+        BandpassWindow.Normal => 2048,
+        BandpassWindow.Sharp => 4096,
+        BandpassWindow.Taps8192 => 8192,
+        BandpassWindow.Taps16384 => 16384,
+        BandpassWindow.Taps32768 => 32768,
+        BandpassWindow.Taps65536 => 65536,
+        BandpassWindow.Taps131072 => 131072,
+        BandpassWindow.Taps262144 => 262144,
+        _ => 2048,
+    };
 
     private static object BuildRuntimeSampleRateControlDiagnostics(
         StateDto state,
@@ -5243,6 +5449,17 @@ public class DspPipelineService : BackgroundService,
             engine.SetTxBandpassWindow(s.TxFilterWindow);
             _appliedTxBandpassWindow = s.TxFilterWindow;
         }
+        if (s.RxFilterPhase != _appliedRxFilterPhase)
+        {
+            engine.SetRxFilterPhase(channel, s.RxFilterPhase);
+            if (rx2Channel >= 0) engine.SetRxFilterPhase(rx2Channel, s.RxFilterPhase);
+            _appliedRxFilterPhase = s.RxFilterPhase;
+        }
+        if (s.TxFilterPhase != _appliedTxFilterPhase)
+        {
+            engine.SetTxFilterPhase(s.TxFilterPhase);
+            _appliedTxFilterPhase = s.TxFilterPhase;
+        }
         // AGC-T: rate-cap the effective ceiling pushed to WDSP. wcpAGC's
         // SetRXAAGCTop swaps max_gain instantly and recomputes min_volts /
         // slope_constant without resetting the running envelope (a->volts),
@@ -5803,6 +6020,11 @@ public class DspPipelineService : BackgroundService,
     private void ApplyStateToNewChannel(IDspEngine engine, int channelId)
     {
         _rxAudioLeveler = default;
+        Volatile.Write(ref _rxLevelerRfSignalResolved, 0);
+        Volatile.Write(ref _rxLevelerAdcOverloadRisk, 0);
+        _rxLevelerRfAcquireHits = 0;
+        _rxLevelerRfReleaseMisses = 0;
+        Interlocked.Exchange(ref _rxLevelerRfEvidenceMs, long.MinValue);
         _adaptiveSquelch = new AdaptiveSquelchState();
         var s = _radio.Snapshot();
         var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
@@ -5836,6 +6058,8 @@ public class DspPipelineService : BackgroundService,
         // shoulder shape rather than the WDSP open-time Sharp default.
         engine.SetRxBandpassWindow(channelId, s.RxFilterWindow);
         engine.SetTxBandpassWindow(s.TxFilterWindow);
+        engine.SetRxFilterPhase(channelId, s.RxFilterPhase);
+        engine.SetTxFilterPhase(s.TxFilterPhase);
         engine.SetVfoHz(channelId, s.VfoHz);
         // Replay the WDSP shift on fresh-channel open so a connect landing
         // with VfoHz != RadioLoHz (persisted across restart) is demodulating
@@ -5912,6 +6136,8 @@ public class DspPipelineService : BackgroundService,
         _appliedTxPhaseRotator = txPhaseRotator;
         _appliedRxBandpassWindow = s.RxFilterWindow;
         _appliedTxBandpassWindow = s.TxFilterWindow;
+        _appliedRxFilterPhase = s.RxFilterPhase;
+        _appliedTxFilterPhase = s.TxFilterPhase;
         _appliedZoomLevel = ddcZoomLevel;
     }
 
@@ -6208,6 +6434,11 @@ public class DspPipelineService : BackgroundService,
         {
             engine.SetRxBandpassWindow(channelId, s.RxFilterWindow);
             rx.AppliedBandpassWindow = s.RxFilterWindow;
+        }
+        if (rx.AppliedFilterPhase != s.RxFilterPhase)
+        {
+            engine.SetRxFilterPhase(channelId, s.RxFilterPhase);
+            rx.AppliedFilterPhase = s.RxFilterPhase;
         }
         int zoom = DdcZoomLevel(s.ZoomLevel);
         if (rx.AppliedZoom != zoom)
@@ -7055,10 +7286,10 @@ public class DspPipelineService : BackgroundService,
         for (int i = 0; i < channels.Count; i++)
         {
             var h = channels[i];
-            // Per-frame WDSP budget: a 1024-sample frame must be processed in
-            // (1000·1024/rate) ms on average or the queue backs up. workerMaxMs
+            // Per-frame WDSP budget: a 512-sample frame must be processed in
+            // (1000·512/rate) ms on average or the queue backs up. workerMaxMs
             // approaching this is the realtime "CPU-bound" signal.
-            double frameBudgetMs = h.SampleRateHz > 0 ? 1000.0 * 1024.0 / h.SampleRateHz : 0.0;
+            double frameBudgetMs = h.SampleRateHz > 0 ? 1000.0 * 512.0 / h.SampleRateHz : 0.0;
             double headroomPct = frameBudgetMs > 0
                 ? System.Math.Round(100.0 * (1.0 - h.WorkerMaxMs / frameBudgetMs), 1)
                 : 0.0;
@@ -7139,8 +7370,25 @@ public class DspPipelineService : BackgroundService,
         out long centerHz,
         long maxAgeMs = 200)
     {
+        return TryCapturePanadapterSnapshot(
+            dest, out hzPerPixel, out centerHz, out _, maxAgeMs);
+    }
+
+    /// <summary>
+    /// Reads the latest cached panadapter snapshot and returns its monotonically
+    /// increasing publication version. Consumers that need independent FFTs
+    /// can reject a version they have already processed.
+    /// </summary>
+    public bool TryCapturePanadapterSnapshot(
+        Span<float> dest,
+        out float hzPerPixel,
+        out long centerHz,
+        out long snapshotVersion,
+        long maxAgeMs = 200)
+    {
         hzPerPixel = 0;
         centerHz = 0;
+        snapshotVersion = 0;
         if (dest.Length != _panadapterWidth) return false;
 
         lock (_calPanLock)
@@ -7152,6 +7400,7 @@ public class DspPipelineService : BackgroundService,
             _calPanSnapshot.AsSpan().CopyTo(dest);
             hzPerPixel = _calPanHzPerPixel;
             centerHz = _calPanCenterHz;
+            snapshotVersion = _calPanSnapshotVersion;
         }
         return true;
     }
@@ -7856,16 +8105,15 @@ public class DspPipelineService : BackgroundService,
         engine.Dispose();
     }
 
-    // N-receiver generalisation of the old 2-RX 0.5*(rx1+rx2) mix. The output
-    // block runs at the longest contributor; each output sample is the average
-    // of the contributors PRESENT at that index (a contributor "present" means
-    // its index is within its own sample count). The divisor is the number of
-    // streams present at that sample, so a stalled, muted, or shorter stream
-    // never dilutes the others and a single contributor passes through at full
-    // amplitude.
+    // N-receiver additive mix. Averaging silently reduced every receiver by
+    // 6.02 dB with two streams (9.54 dB with three), which made strong signals
+    // sound weak merely because another RX was enabled. Sum configured streams
+    // at unity, as a real mixer does; the existing final-bus soft limiter owns
+    // coincident-peak headroom. A stalled, muted, or shorter stream never
+    // dilutes the receivers that remain present.
     //
-    // <paramref name="rx1Muted"/>: RX1's samples are dropped from both the sum
-    // and the divisor (the caller has already zeroed them), but rx1Count still
+    // <paramref name="rx1Muted"/>: RX1's samples are dropped from the sum (the
+    // caller has already zeroed them), but rx1Count still
     // sets the block length so the secondaries stay clocked to RX1. This lets the
     // per-RX mute model express "RX2 only" (mute RX1) without halving RX2.
     internal static int MixRxAudioN(
@@ -7892,23 +8140,72 @@ public class DspPipelineService : BackgroundService,
         for (int i = 0; i < count; i++)
         {
             float sum = 0f;
-            int contributors = 0;
+            bool contributed = false;
             if (rx1Contributes && i < rx1Count)
             {
                 sum = rx1[i];
-                contributors = 1;
+                contributed = true;
             }
             foreach (var s in slices)
             {
                 int sc = Math.Clamp(s.Count, 0, s.Buffer.Length);
                 if (sc <= 0 || i >= sc) continue;
                 sum += s.Buffer[i];
-                contributors++;
+                contributed = true;
             }
-            rx1[i] = contributors > 0 ? sum / contributors : 0f;
+            rx1[i] = contributed ? sum : 0f;
         }
         return count;
     }
+
+    // Local-radio TX suppression must never consume the independent KiwiSDR
+    // receive path. Once keyed, discard the already-mixed hardware receivers
+    // and retain only the external receiver block. This also seeds the output
+    // when a half-duplex board (notably HL2) produces no local RX samples while
+    // MOX is asserted.
+    internal static int PrepareLocalRxForExternalOutput(
+        Span<float> localRx,
+        int localRxCount,
+        int externalRxCount,
+        bool suppressLocalRx)
+    {
+        localRxCount = Math.Clamp(localRxCount, 0, localRx.Length);
+        externalRxCount = Math.Clamp(externalRxCount, 0, localRx.Length);
+        if (externalRxCount == 0) return localRxCount;
+        if (!suppressLocalRx && localRxCount > 0)
+        {
+            if (externalRxCount > localRxCount)
+                localRx.Slice(localRxCount, externalRxCount - localRxCount).Clear();
+            return Math.Max(localRxCount, externalRxCount);
+        }
+
+        int count = Math.Max(localRxCount, externalRxCount);
+        localRx[..count].Clear();
+        return externalRxCount;
+    }
+
+    internal static int MixExternalRxIntoTxMonitor(
+        Span<float> monitor,
+        int monitorCount,
+        ReadOnlySpan<float> externalRx,
+        int externalRxCount)
+    {
+        monitorCount = Math.Clamp(monitorCount, 0, monitor.Length);
+        externalRxCount = Math.Clamp(externalRxCount, 0, externalRx.Length);
+        int count = Math.Min(monitor.Length, Math.Max(monitorCount, externalRxCount));
+        int overlap = Math.Min(monitorCount, externalRxCount);
+        for (int i = 0; i < overlap; i++) monitor[i] += externalRx[i];
+        if (externalRxCount > monitorCount)
+            externalRx.Slice(monitorCount, externalRxCount - monitorCount)
+                .CopyTo(monitor[monitorCount..]);
+        return count;
+    }
+
+    internal static bool ShouldMixExternalRxIntoTxMonitor(
+        int externalRxCount,
+        bool txMonitorMeterOnly,
+        bool rxAudioMuted) =>
+        externalRxCount > 0 && !txMonitorMeterOnly && !rxAudioMuted;
 
     private bool Tick(float[] panBuf, float[] wfBuf, float[] audioBuf, bool displayOnly = false)
     {
@@ -8297,6 +8594,7 @@ public class DspPipelineService : BackgroundService,
                     _calPanHzPerPixel = hzPerPixel;
                     _calPanCenterHz = centerHz;
                     _calPanSnapshotMs = (long)nowMs;
+                    _calPanSnapshotVersion++;
                 }
             }
             if (wf)
@@ -8498,29 +8796,34 @@ public class DspPipelineService : BackgroundService,
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
-            // count toward the MixRxAudioN divisor (which would attenuate the
-            // receivers you can still hear).
+            // affect the additive MixRxAudioN bus.
             if (IsReceiverMuted(state, ri)) continue;
             _mixSlices[mixSliceCount++] = new RxAudioSlice(sec.AudioBuf, n);
         }
 
-        // Kiwi slice: an INDEPENDENT remote receiver that rides the same
-        // RX1-clocked mix bus as the hardware secondaries. Drain at most
+        // Kiwi slice: an INDEPENDENT remote receiver that shares the final
+        // output cadence but stays outside the local-radio DSP lane. Drain at most
         // audioSampleCount samples so it's fed at exactly the RX rate (its own
         // clock differs from the radio ADC; the source caps buffered latency to
-        // bound that drift), then average it in via MixRxAudioN. When the slice
+        // bound that drift), then add it after local processing. When the slice
         // is disabled/muted Active is false and this is one bool
         // read. RX1 silent (audioSampleCount==0) reads nothing this tick.
-        if (audioSampleCount > 0 && _externalRxAudioSource.Active)
+        bool externalRxActive = _externalRxAudioSource.Active;
+        int externalRxCount = 0;
+        if (externalRxActive)
         {
-            int want = Math.Min(audioSampleCount, _kiwiMixBuf.Length);
-            int n = _externalRxAudioSource.Read(_kiwiMixBuf.AsSpan(0, want));
-            if (n > 0) _mixSlices[mixSliceCount++] = new RxAudioSlice(_kiwiMixBuf, n);
+            // Half-duplex boards may stop producing local RX audio while keyed.
+            // Keep the independently clocked Kiwi draining at the normal 30 Hz
+            // output cadence even when RX1's read count is zero.
+            int requested = audioSampleCount > 0
+                ? audioSampleCount
+                : MonitorInjectSilentBlockSamples;
+            int want = Math.Min(requested, _kiwiMixBuf.Length);
+            externalRxCount = _externalRxAudioSource.Read(_kiwiMixBuf.AsSpan(0, want));
         }
 
         // RX1's own samples were already zeroed above when it's muted; tell the
-        // mixer to drop RX1 from the divisor too, so an unmuted secondary plays at
-        // full amplitude (RX2-only = mute RX1). With nothing audible the mixer
+        // mixer to drop RX1 from the bus too. With nothing audible the mixer
         // returns silence.
         audioSampleCount = MixRxAudioN(
             audioBuf, audioSampleCount, _mixSlices.AsSpan(0, mixSliceCount),
@@ -8534,10 +8837,24 @@ public class DspPipelineService : BackgroundService,
         // through the mute-exempt lane after the RX-publish block (see below).
         bool rxAudioMuted = _rxAudioMute?.IsMuted ?? false;
         bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick();
+        bool externalRxPreserved = suppressRxAudioForTx && externalRxCount > 0;
+        // Keep Kiwi outside the local-radio DSP/plugin/fade lane. That lane can
+        // be nonlinear and stateful, so subtracting raw Kiwi afterward cannot
+        // recover its contribution. Seed a silent output-sized local block when
+        // Kiwi is the only available clock source; Kiwi is added immediately
+        // before the final limiter below.
+        audioSampleCount = PrepareLocalRxForExternalOutput(
+            audioBuf,
+            audioSampleCount,
+            externalRxCount,
+            suppressRxAudioForTx);
+        // The suppression latch and post-TX drain apply to the local radio only.
+        // With Kiwi samples present, publish them through the ordinary RX path.
+        bool suppressPublishedRxAudio = suppressRxAudioForTx && !externalRxPreserved;
 
         if (audioSampleCount > 0)
         {
-            SanitizeAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
+            SanitizeMixedRxAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
             rxAudioRmsForMeter = Rms(audioBuf.AsSpan(0, audioSampleCount));
 
             // MOX-edge fade-out envelope. The post-TX fade-in is applied to the
@@ -8545,15 +8862,24 @@ public class DspPipelineService : BackgroundService,
             // not reintroduce an abrupt edge after this early demod-stage ramp.
             if (_rxFadeOutPending)
             {
-                int n = Math.Min(RxFadeSamples, audioSampleCount);
-                for (int i = 0; i < n; i++)
+                if (externalRxPreserved)
                 {
-                    float ramp = 1f - (float)(i + 1) / n;
-                    audioBuf[i] *= ramp;
+                    // Consume the local-radio fade edge without applying it to
+                    // the independent Kiwi receive samples.
+                    _rxFadeOutPending = false;
                 }
-                if (audioSampleCount > n)
-                    Array.Clear(audioBuf, n, audioSampleCount - n);
-                _rxFadeOutPending = false;
+                else
+                {
+                    int n = Math.Min(RxFadeSamples, audioSampleCount);
+                    for (int i = 0; i < n; i++)
+                    {
+                        float ramp = 1f - (float)(i + 1) / n;
+                        audioBuf[i] *= ramp;
+                    }
+                    if (audioSampleCount > n)
+                        Array.Clear(audioBuf, n, audioSampleCount - n);
+                    _rxFadeOutPending = false;
+                }
             }
 
             // The TX voice-processing audio chain (Compressor/EQ/VST etc.)
@@ -8563,7 +8889,22 @@ public class DspPipelineService : BackgroundService,
             // rx.post-demod manifest slot, wired through _rxAudioPluginHandler
             // below. The two never share plugin instances or IIR state.
 
-            if (ShouldPublishNormalRxAudio(txMonitorOn, suppressRxAudioForTx, _txMonitorMeterOnly))
+            if (externalRxPreserved && (!txMonitorOn || _txMonitorMeterOnly))
+            {
+                // Preserve the established local-TX suppressed lane (silence
+                // plus optional sidetone) and add Kiwi only at its output.
+                // Do not advance local RX plugins/decoder/squelch merely because
+                // an independent external receiver is enabled.
+                PublishTxSuppressedAudio(
+                    audioBuf,
+                    audioSampleCount,
+                    nowMs,
+                    state.Squelch ?? new SquelchConfig(),
+                    _kiwiMixBuf,
+                    externalRxCount);
+                MarkTxSuppressedAudioBlockPublished();
+            }
+            else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly))
             {
                 var squelch = state.Squelch ?? new SquelchConfig();
                 UpdateAdaptiveSquelchMeter(
@@ -8612,17 +8953,38 @@ public class DspPipelineService : BackgroundService,
                     squelch,
                     _adaptiveSquelch);
 
-                // RX loudness normalization is WDSP's AGC alone — exactly as in
-                // Thetis, where the demod->AGC->AF-panel-gain chain is the only
-                // gain path and there is NO post-demod leveler. The former
-                // always-on ApplyRxAudioLeveler stage (which Thetis lacks) was a
-                // SECOND adaptive AGC running in series with WDSP's; the two
-                // chased each other and produced pumping, weak-signal crackle and
-                // inconsistent loudness ("audio sounds like crap"). WDSP AGC
-                // (attack 1 ms, mode-aware hang/decay, max-gain top) already
-                // normalizes perceived volume across signal strengths; the hard
-                // LimitRxAudioBuffer clip below remains the only safety ceiling,
-                // matching Thetis's output clamp.
+                // Slow post-WDSP perceived-loudness correction. Positive makeup
+                // is fail-closed unless the independent RX0 passband estimator
+                // has fresh evidence of a resolved RF signal, and is vetoed near
+                // ADC overload. Thus post-AGC noise alone can never open it. Cuts
+                // and the instantaneous peak guard remain active for loud arrivals.
+                // Evidence is RX0-specific, so do not boost the shared mixed bus
+                // when a secondary/Kiwi slice is present; per-RX evidence belongs
+                // before a future per-receiver mixer, not inferred after summing.
+                if (mixSliceCount == 0 && !externalRxActive)
+                {
+                    bool loudnessBoostAllowed =
+                        RxConstantLoudnessBoostAllowed(Environment.TickCount64);
+                    // The operator AF control precedes this stage. Shift the
+                    // reference by the same requested dB so constant-loudness
+                    // makeup preserves AF changes 1:1 instead of cancelling them.
+                    double appliedAfDb = _audioModem.Active
+                        ? 20.0 * Math.Log10(Math.Max(_freeDvAfGainLinear, 1.0e-9))
+                        : _appliedRxAfGainDb;
+                    ApplyRxAudioLeveler(
+                        audioBuf.AsSpan(0, audioSampleCount),
+                        ref _rxAudioLeveler,
+                        rfSignalResolved: loudnessBoostAllowed,
+                        adcOverloadRisk: !loudnessBoostAllowed,
+                        levelReferenceOffsetDb: appliedAfDb);
+                }
+                else
+                {
+                    // A shared RMS controller would make one receiver duck the
+                    // others. Keep the mixed bus untouched and let its existing
+                    // final soft limiter handle coincident peaks.
+                    _rxAudioLeveler = default;
+                }
 
                 // CW sidetone is mixed (+=) into the RX block so every
                 // downstream sink — browser WS, native audio, TCI audio
@@ -8642,16 +9004,31 @@ public class DspPipelineService : BackgroundService,
                 // into the RX frame that the sink then drops => recorder inaudible.
                 if (!rxAudioMuted)
                     MixMonitorInject(audioBuf.AsSpan(0, audioSampleCount));
+                // Preserve the established local-radio order: limit the fully
+                // processed local block first, then apply its post-TX fade.
                 LimitRxAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
-
                 int postTxFadeRemaining = Volatile.Read(ref _rxPostTxFadeInSamplesRemaining);
-                if (postTxFadeRemaining > 0)
+                if (postTxFadeRemaining > 0 && !externalRxPreserved)
                 {
                     int next = ApplyRxPostTxFadeIn(
                         audioBuf.AsSpan(0, audioSampleCount),
                         postTxFadeRemaining,
                         RxPostTxFadeInSamples);
                     Volatile.Write(ref _rxPostTxFadeInSamplesRemaining, next);
+                }
+
+                // Kiwi is independent of the local radio, so it bypasses local
+                // RX plugins, squelch, MOX fades, and the post-TX settle fade.
+                // A final safety limit is needed only after adding that external
+                // contribution to the already-limited local output.
+                if (externalRxCount > 0)
+                {
+                    audioSampleCount = MixExternalRxIntoTxMonitor(
+                        audioBuf,
+                        audioSampleCount,
+                        _kiwiMixBuf,
+                        externalRxCount);
+                    LimitRxAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
                 }
 
                 double finalAudioRms = Rms(audioBuf.AsSpan(0, audioSampleCount));
@@ -8670,8 +9047,15 @@ public class DspPipelineService : BackgroundService,
                 _productPluginAudio?.PublishRxAudio(
                     0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
                 RxAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
+                if (externalRxPreserved)
+                {
+                    // Advance the local-radio post-TX drain without fading or
+                    // delaying the Kiwi. When the drain completes, retain the
+                    // newly armed fade for the first local-radio RX samples.
+                    MarkTxSuppressedAudioBlockPublished();
+                }
             }
-            else if (!txMonitorOn && suppressRxAudioForTx)
+            else if (!txMonitorOn && suppressPublishedRxAudio)
             {
                 PublishTxSuppressedAudio(
                     audioBuf,
@@ -8681,7 +9065,7 @@ public class DspPipelineService : BackgroundService,
                 MarkTxSuppressedAudioBlockPublished();
             }
         }
-        else if (!txMonitorOn && suppressRxAudioForTx)
+        else if (!txMonitorOn && suppressPublishedRxAudio)
         {
             PublishTxSuppressedAudio(
                 audioBuf,
@@ -8690,7 +9074,7 @@ public class DspPipelineService : BackgroundService,
                 state.Squelch ?? new SquelchConfig());
             MarkTxSuppressedAudioBlockPublished();
         }
-        else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressRxAudioForTx, _txMonitorMeterOnly) && !rxAudioMuted && MonitorBacklog > 0)
+        else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly) && !rxAudioMuted && MonitorBacklog > 0)
         {
             // FIX 4: RX produced no audio this tick (RX1 muted, or no band audio)
             // yet a local clip is playing back through the monitor-inject ring.
@@ -8730,7 +9114,7 @@ public class DspPipelineService : BackgroundService,
         // is drained exactly once per tick — no double-drain, no starvation. Like
         // FIX 4 it deliberately does NOT fire RxAudioAvailable: the RX-capture tap
         // (TCI / Recorder RX capture) must stay recorder-free and byte-identical.
-        if (rxAudioMuted && ShouldPublishNormalRxAudio(txMonitorOn, suppressRxAudioForTx, _txMonitorMeterOnly) && MonitorBacklog > 0)
+        if (rxAudioMuted && ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly) && MonitorBacklog > 0)
         {
             int monBlock = Math.Min(audioBuf.Length, MonitorInjectSilentBlockSamples);
             Array.Clear(audioBuf, 0, monBlock);
@@ -8778,21 +9162,53 @@ public class DspPipelineService : BackgroundService,
                     finalAudioPeak,
                     txMonitorOn,
                     state.Squelch ?? new SquelchConfig());
-                // Meter-only monitor (Auto Tune): the chain ran and the stage
-                // meters animated above, but suppress the broadcast so the
-                // operator hears nothing while the sample is captured in the
-                // background. The TX-air tap below still fires (read-only).
-                if (!_txMonitorMeterOnly)
-                {
-                    if (rxAudioMuted)
-                        PublishExemptAudio(in monFrame);
-                    else
-                        PublishAudio(in monFrame);
-                }
                 // TX-air tap source: the processed transmit audio (what goes on
                 // the air). Read-only fan-out to IRxAudioTapPlugin/ITxAudioTapPlugin
-                // taps; null subscriber list = no cost.
+                // taps; null subscriber list = no cost. Fire it before Kiwi is
+                // added to the operator monitor so the air tap stays TX-only.
                 TxMonitorAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, monCount));
+            }
+
+            // Meter-only monitor (Auto Tune) intentionally has no monitor
+            // broadcast; the ordinary RX path above has already carried Kiwi.
+            // For the audible TX monitor, retain Kiwi alongside the local
+            // sidetone/processed monitor instead of letting TX replace it.
+            if (!_txMonitorMeterOnly)
+            {
+                int publishCount = monCount;
+                // MON can remain enabled before, during, and after a keying
+                // cycle, so Kiwi belongs in this lane whenever it has samples,
+                // not only while the local-RX suppression latch is set. Respect
+                // master RX mute: only the local monitor is mute-exempt.
+                bool includeExternalRx = ShouldMixExternalRxIntoTxMonitor(
+                    externalRxCount,
+                    _txMonitorMeterOnly,
+                    rxAudioMuted);
+                if (includeExternalRx)
+                {
+                    publishCount = MixExternalRxIntoTxMonitor(
+                        audioBuf,
+                        monCount,
+                        _kiwiMixBuf,
+                        externalRxCount);
+                    LimitRxAudioBuffer(audioBuf.AsSpan(0, publishCount));
+                }
+
+                if (publishCount > 0)
+                {
+                    var publishFrame = new AudioFrame(
+                        Seq: monCount > 0 && !includeExternalRx ? _audioSeq : ++_audioSeq,
+                        TsUnixMs: nowMs,
+                        RxId: 0,
+                        Channels: 1,
+                        SampleRateHz: (uint)AudioOutputRateHz,
+                        SampleCount: (ushort)publishCount,
+                        Samples: new ReadOnlyMemory<float>(audioBuf, 0, publishCount));
+                    if (rxAudioMuted)
+                        PublishExemptAudio(in publishFrame);
+                    else
+                        PublishAudio(in publishFrame);
+                }
             }
         }
 
@@ -8808,13 +9224,13 @@ public class DspPipelineService : BackgroundService,
             double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
                 _radio.EffectiveBoardKind,
                 _radio.EffectiveOrionMkIIVariant)
-                + transverterMeterCorrectionDb;
+                + transverterMeterCorrectionDb
+                + RxAttenuatorMeterOffsetDb(state);
 
-            // Prefer WDSP's S-meter when it's ticking. In this
-            // integration the meter tap reads -400 ("didn't run") — needs
-            // deeper WDSP state debugging to chase down. Until then, fall
-            // back to RMS of the already-flowing post-demod audio ring, which
-            // gives a "proof of life" meter that moves with band activity.
+            // Prefer WDSP's S-meter when it is ticking. The native production-
+            // sequence regression proves S_AV escapes its -400 startup sentinel
+            // after IQ flows; retain the post-demod fallback for startup and any
+            // genuinely unavailable native-meter interval.
             double rawDbm = engine.GetRxaSignalDbm(channel);
             double dbm;
             if (double.IsFinite(rawDbm) && rawDbm > -399.0)
@@ -8827,7 +9243,9 @@ public class DspPipelineService : BackgroundService,
                 // noise later. Empirical offset of -50 dBm puts typical 20m
                 // band noise near S2/S3 instead of pinning at S0.
                 double rms = double.IsFinite(rxAudioRmsForMeter) ? rxAudioRmsForMeter : 0.0;
-                dbm = AudioRmsToFallbackDbm(rms, transverterMeterCorrectionDb);
+                dbm = AudioRmsToFallbackDbm(
+                    rms,
+                    RxFallbackMeterCorrectionDb(state, transverterMeterCorrectionDb));
             }
             if (!double.IsFinite(dbm)) dbm = -160.0;
             _hub.Broadcast(new RxMeterFrame((float)dbm));
@@ -8905,6 +9323,9 @@ public class DspPipelineService : BackgroundService,
                 Environment.TickCount64,
                 fresh: snrFresh,
                 keyed: _keyed);
+            UpdateRxConstantLoudnessEvidence(
+                snrResult, v2.SignalAv, rxCalOffsetDb, v2.AdcPk,
+                snrFresh, Environment.TickCount64);
             var quality = BuildRxSignalQualityFrame(0, snrResult, rxCalOffsetDb);
             _hub.Broadcast(quality);
             RxSignalQualityUpdated?.Invoke(quality);
@@ -8946,11 +9367,15 @@ public class DspPipelineService : BackgroundService,
         if (!_radio.IsProtocol3Active) return;
         var state = _radio.Snapshot();
         long? receiverVfoHz = Protocol3MeterReceiverVfoHz(state, channel);
+        byte? receiverAdcSource = Protocol3MeterReceiverAdcSource(state, channel);
         double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
             _radio.EffectiveBoardKind,
             _radio.EffectiveOrionMkIIVariant)
             + (receiverVfoHz is long vfoHz
                 ? _radio.TransverterMeterCorrectionDb(vfoHz)
+                : 0.0)
+            + (receiverAdcSource is byte adcSource
+                ? RxAttenuatorMeterOffsetDb(state, adcSource)
                 : 0.0);
         double dbm = ApplyRxMeterCalibration(dbfsRaw, rxCalOffsetDb);
         if (!double.IsFinite(dbm)) dbm = -160.0;
@@ -9001,6 +9426,11 @@ public class DspPipelineService : BackgroundService,
         RxMetersV2Updated?.Invoke(channel, v2);
         // Protocol 3 currently has no normalized raw-spectrum passband source.
         // Explicitly clear quality rather than falling back to a display floor.
+        Volatile.Write(ref _rxLevelerRfSignalResolved, 0);
+        Volatile.Write(ref _rxLevelerAdcOverloadRisk, 0);
+        _rxLevelerRfAcquireHits = 0;
+        _rxLevelerRfReleaseMisses = 0;
+        Interlocked.Exchange(ref _rxLevelerRfEvidenceMs, Environment.TickCount64);
         var unavailableQuality = RxSignalQualityFrame.Unavailable((byte)Math.Clamp(channel, 0, byte.MaxValue));
         _hub.Broadcast(unavailableQuality);
         RxSignalQualityUpdated?.Invoke(unavailableQuality);
@@ -9020,6 +9450,20 @@ public class DspPipelineService : BackgroundService,
         return null;
     }
 
+    internal static byte? Protocol3MeterReceiverAdcSource(StateDto state, int channel)
+    {
+        if (channel == 0) return PrimaryReceiverAdcSource(state);
+        var receivers = state.Receivers;
+        if (receivers is null) return null;
+        for (int i = 0; i < receivers.Count; i++)
+        {
+            var receiver = receivers[i];
+            if (receiver.Index == channel && receiver.Enabled)
+                return receiver.AdcSource;
+        }
+        return null;
+    }
+
     internal static RxSignalQualityFrame BuildRxSignalQualityFrame(
         byte rxId,
         InPassbandSnrEstimator.Result result,
@@ -9034,6 +9478,127 @@ public class DspPipelineService : BackgroundService,
             SignalOnlyDbm: (float)(result.SignalOnlyDb + rxCalibrationDb),
             IntegratedNoiseDbm: (float)(result.IntegratedNoiseDb + rxCalibrationDb),
             Confidence: (float)Math.Clamp(result.Confidence, 0.0, 1.0));
+    }
+
+    private void UpdateRxConstantLoudnessEvidence(
+        InPassbandSnrEstimator.Result quality,
+        double currentSignalDbm,
+        double rxCalibrationDb,
+        float adcPkDbfs,
+        bool spectrumFresh,
+        long nowMs)
+    {
+        long previousEvidenceMs = Interlocked.Read(ref _rxLevelerRfEvidenceMs);
+        bool evidenceCurrent = RxConstantLoudnessEvidenceIsCurrent(
+            previousEvidenceMs, nowMs);
+        if (!evidenceCurrent)
+        {
+            Volatile.Write(ref _rxLevelerRfSignalResolved, 0);
+            _rxLevelerRfAcquireHits = 0;
+            _rxLevelerRfReleaseMisses = 0;
+        }
+
+        bool adcRisk = !float.IsFinite(adcPkDbfs) ||
+            adcPkDbfs <= RxConstantLoudnessAdcUnavailableDbfs ||
+            adcPkDbfs > RxConstantLoudnessAdcVetoDbfs;
+        bool wasResolved = Volatile.Read(ref _rxLevelerRfSignalResolved) != 0;
+        bool measurementAllowsBoost = spectrumFresh &&
+            RxConstantLoudnessEvidenceAllowsBoost(
+                quality, currentSignalDbm, rxCalibrationDb, adcPkDbfs, wasResolved);
+        var decision = AdvanceRxConstantLoudnessEvidence(
+            spectrumFresh,
+            measurementAllowsBoost,
+            adcRisk,
+            wasResolved,
+            _rxLevelerRfAcquireHits,
+            _rxLevelerRfReleaseMisses);
+
+        _rxLevelerRfAcquireHits = decision.AcquireHits;
+        _rxLevelerRfReleaseMisses = decision.ReleaseMisses;
+        Volatile.Write(ref _rxLevelerRfSignalResolved, decision.Resolved ? 1 : 0);
+        Volatile.Write(ref _rxLevelerAdcOverloadRisk, adcRisk ? 1 : 0);
+        // A processed rejection reports RefreshAge too, but only resolved or
+        // acquiring evidence (and the immediate ADC veto) may extend usable age.
+        if (decision.RefreshAge &&
+            (decision.Resolved || decision.AcquireHits > 0 || adcRisk))
+            Interlocked.Exchange(ref _rxLevelerRfEvidenceMs, nowMs);
+    }
+
+    internal static (bool Resolved, int AcquireHits, int ReleaseMisses, bool RefreshAge)
+        AdvanceRxConstantLoudnessEvidence(
+            bool spectrumFresh,
+            bool measurementAllowsBoost,
+            bool adcRisk,
+            bool wasResolved,
+            int acquireHits,
+            int releaseMisses)
+    {
+        if (adcRisk)
+            return (false, 0, 0, true);
+        if (!spectrumFresh)
+            return (wasResolved, Math.Max(0, acquireHits), Math.Max(0, releaseMisses), false);
+
+        if (!wasResolved)
+        {
+            if (!measurementAllowsBoost)
+                return (false, 0, 0, true);
+
+            int hits = Math.Max(0, acquireHits) + 1;
+            return hits >= RxConstantLoudnessAcquireFrames
+                ? (true, 0, 0, true)
+                : (false, hits, 0, true);
+        }
+
+        if (measurementAllowsBoost)
+            return (true, 0, 0, true);
+
+        int misses = Math.Max(0, releaseMisses) + 1;
+        return misses < RxConstantLoudnessReleaseFrames
+            ? (true, 0, misses, true)
+            : (false, 0, 0, true);
+    }
+
+    internal static bool RxConstantLoudnessEvidenceIsCurrent(
+        long evidenceMs,
+        long nowMs) =>
+        evidenceMs != long.MinValue &&
+        nowMs >= evidenceMs &&
+        nowMs - evidenceMs <= RxConstantLoudnessEvidenceMaxAgeMs;
+
+    internal static bool RxConstantLoudnessEvidenceAllowsBoost(
+        InPassbandSnrEstimator.Result quality,
+        double currentSignalDbm,
+        double rxCalibrationDb,
+        float adcPkDbfs,
+        bool wasResolved = false)
+    {
+        if (!quality.IsValid ||
+            quality.Confidence < RxConstantLoudnessMinConfidence ||
+            !double.IsFinite(currentSignalDbm) ||
+            currentSignalDbm <= RxConstantLoudnessMeterUnavailableDbm ||
+            !double.IsFinite(rxCalibrationDb) ||
+            !float.IsFinite(adcPkDbfs) ||
+            adcPkDbfs <= RxConstantLoudnessAdcUnavailableDbfs ||
+            adcPkDbfs > RxConstantLoudnessAdcVetoDbfs)
+            return false;
+
+        // The passband estimator is deliberately averaged for stable reports.
+        // Cross-check its noise estimate with the current stage meter so a
+        // vanished station cannot keep old averaged SNR alive and open makeup.
+        double currentExcessDb = currentSignalDbm -
+            (quality.IntegratedNoiseDb + rxCalibrationDb);
+        double thresholdDb = wasResolved
+            ? RxConstantLoudnessReleaseTotalExcessDb
+            : RxConstantLoudnessMinCurrentTotalExcessDb;
+        return currentExcessDb >= thresholdDb;
+    }
+
+    private bool RxConstantLoudnessBoostAllowed(long nowMs)
+    {
+        long evidenceMs = Interlocked.Read(ref _rxLevelerRfEvidenceMs);
+        return RxConstantLoudnessEvidenceIsCurrent(evidenceMs, nowMs) &&
+            Volatile.Read(ref _rxLevelerRfSignalResolved) != 0 &&
+            Volatile.Read(ref _rxLevelerAdcOverloadRisk) == 0;
     }
 
     /// <summary>
@@ -9122,6 +9687,38 @@ public class DspPipelineService : BackgroundService,
             AgcEnvPk: ApplyRxMeterCalibration(rx.AgcEnvPk, cal),
             AgcEnvAv: ApplyRxMeterCalibration(rx.AgcEnvAv, cal),
             SignalMaxBin: ApplyRxMeterCalibration(rx.SignalMaxBin, cal));
+    }
+
+    /// <summary>
+    /// Hardware attenuation lowers raw ADC/DSP readings but not the signal at
+    /// the antenna connector. Add the effective manual + Auto-ATT value back
+    /// to S-meter/spectrum dBm fields, matching Thetis's step-ATT correction.
+    /// ADC dBFS remains deliberately uncorrected so overload headroom stays
+    /// truthful.
+    /// </summary>
+    internal static double RxAttenuatorMeterOffsetDb(StateDto state) =>
+        Math.Clamp(state.AttenDb + state.AttOffsetDb, 0, 31);
+
+    internal static double RxFallbackMeterCorrectionDb(
+        StateDto state,
+        double transverterMeterCorrectionDb) =>
+        transverterMeterCorrectionDb + RxAttenuatorMeterOffsetDb(state);
+
+    internal static double RxAttenuatorMeterOffsetDb(StateDto state, byte meteredAdcSource) =>
+        (meteredAdcSource == PrimaryReceiverAdcSource(state))
+            ? RxAttenuatorMeterOffsetDb(state)
+            : 0.0;
+
+    private static byte PrimaryReceiverAdcSource(StateDto state)
+    {
+        if (state.Receivers is { } receivers)
+        {
+            for (int i = 0; i < receivers.Count; i++)
+            {
+                if (receivers[i].Index == 0) return receivers[i].AdcSource;
+            }
+        }
+        return 0;
     }
 
     private static double ApplyRxMeterCalibration(double value, double calOffsetDb) =>

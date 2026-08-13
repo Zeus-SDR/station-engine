@@ -89,16 +89,6 @@ public sealed class KiwiSdrService : BackgroundService,
     // initial ~234 kHz view; every subsequent integer step halves the span.
     private int _zoomLevel = 7;
 
-    // True while the radio is transmitting (MOX or TUN). The Kiwi is a remote RX
-    // monitoring the same band the operator transmits on, so during TX it would
-    // play back the operator's own signal (delayed, off-frequency, often loud) —
-    // exactly the monitor-feedback we don't want. Mirror the local RX: drop the
-    // Kiwi out of the mix while keyed. _txActive = _moxActive || _tunActive, fed
-    // by RadioService.MoxChanged / TunActiveChanged; all guarded by _sync.
-    private bool _moxActive;
-    private bool _tunActive;
-    private bool _txActive;
-
     // RX squelch. The Kiwi demodulates server-side and rides the mix bus (no
     // WDSP), so Zeus's WDSP / adaptive squelch in DspPipelineService never
     // reaches it — the global SQL control was a no-op on the Kiwi. We gate the
@@ -236,7 +226,7 @@ public sealed class KiwiSdrService : BackgroundService,
     // -------------------------------------------------------------------------
     public bool Active
     {
-        get { lock (_sync) return _enabled && !_muted && !_txActive && _client is not null; }
+        get { lock (_sync) return _enabled && !_muted && _client is not null; }
     }
 
     public int Read(Span<float> dst)
@@ -264,9 +254,7 @@ public sealed class KiwiSdrService : BackgroundService,
     internal int EnqueueAudioForTest(ReadOnlySpan<float> samples) => _audioBus.Write(samples);
     internal int AudioBusDepthForTest => _audioBus.Count;
 
-    // Test seams for the TX-mute path: drive the keyed flag and the audio-ingest
-    // entry point so "Kiwi mutes on TX" is unit-testable without a live client.
-    internal void SetTxActiveForTest(bool active) { lock (_sync) _txActive = active; }
+    // Test seam for audio ingestion without a live KiwiSdrClient.
     internal void OnAudioForTest(float[] samples, int inRateHz) => OnAudio(samples, inRateHz);
 
     // Test seams for the issue-#1114 auto-reconnect path. The drop->reconnect
@@ -301,9 +289,6 @@ public sealed class KiwiSdrService : BackgroundService,
         // Mirror the global RX squelch config so the Kiwi audio gate (ApplySquelchGate)
         // honours the same SQL control as the hardware RXs.
         Action<StateDto> onState = s => ApplySquelchConfig(s.Squelch);
-        // Track TX (MOX/TUN) so the Kiwi mutes while the operator is keyed.
-        Action<bool> onMox = on => { lock (_sync) { _moxActive = on; _txActive = _moxActive || _tunActive; } };
-        Action<bool> onTun = on => { lock (_sync) { _tunActive = on; _txActive = _moxActive || _tunActive; } };
         if (radio is not null)
         {
             radio.Connected += onP1Connect;
@@ -311,8 +296,6 @@ public sealed class KiwiSdrService : BackgroundService,
             radio.Disconnected += onDisconnect;
             radio.P2Disconnected += onDisconnect;
             radio.StateChanged += onState;
-            radio.MoxChanged += onMox;
-            radio.TunActiveChanged += onTun;
             lock (_sync) { _radioConnected = radio.IsConnected; }
             ApplySquelchConfig(radio.Snapshot().Squelch);
         }
@@ -344,8 +327,6 @@ public sealed class KiwiSdrService : BackgroundService,
             radio.Disconnected -= onDisconnect;
             radio.P2Disconnected -= onDisconnect;
             radio.StateChanged -= onState;
-            radio.MoxChanged -= onMox;
-            radio.TunActiveChanged -= onTun;
         }
         await StopClientAsync().ConfigureAwait(false);
     }
@@ -1049,7 +1030,7 @@ public sealed class KiwiSdrService : BackgroundService,
         // the Kiwi is muted we simply stop publishing its frames so it drops out
         // of the client-side mix.
         bool muted;
-        lock (_sync) muted = _muted || _txActive;
+        lock (_sync) muted = _muted;
         if (muted) return;
         // Squelch the native-rate audio (ties to the per-frame S-meter) before
         // resampling, so the gate's attack/release constants match the ~12 kHz

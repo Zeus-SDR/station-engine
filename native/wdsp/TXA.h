@@ -76,6 +76,9 @@ struct _txa
 	int mode;
 	double f_low;
 	double f_high;
+	int filter_master_nc;
+	int filter_cleanup_nc;
+	int filter_mp;
 	double meter[TXA_METERTYPE_LAST];
 	CRITICAL_SECTION* pmtupdate[TXA_METERTYPE_LAST];
 	struct

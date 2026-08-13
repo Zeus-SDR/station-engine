@@ -23,6 +23,14 @@ public static class BandPlanEndpoints
             return Results.Ok(store.Get(band) ?? new BandMemoryDto(band, req.Hz, req.Mode));
         });
 
+        // RX and TX waterfall intensity are universal band settings: every
+        // display surface reads and writes the same backend-owned map.
+        endpoints.MapGet("/api/bands/waterfall-settings", (BandMemoryStore store) =>
+            Results.Ok(store.GetAllWaterfallSettings()));
+
+        endpoints.MapPut("/api/bands/waterfall-settings/{band}",
+            PutWaterfallSettings);
+
         // Band stack (issue #179): named per-band presets that snapshot
         // (hz, mode, filter). Distinct from the single automatic last-used slot
         // above — operators push/delete these explicitly. GET returns the full
@@ -109,4 +117,34 @@ public static class BandPlanEndpoints
 
         return endpoints;
     }
+
+    internal static IResult PutWaterfallSettings(
+        string band,
+        BandWaterfallSettingsSetRequest req,
+        BandMemoryStore store)
+    {
+        if (string.IsNullOrWhiteSpace(band))
+            return Results.BadRequest(new { error = "band name required" });
+
+        try
+        {
+            store.SetWaterfallSettings(
+                band,
+                req.WfDbMin,
+                req.WfDbMax,
+                req.WfTxDbMin,
+                req.WfTxDbMax);
+            return Results.Ok(store.GetWaterfallSettings(band));
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
 }
+
+internal sealed record BandWaterfallSettingsSetRequest(
+    double? WfDbMin,
+    double? WfDbMax,
+    double? WfTxDbMin,
+    double? WfTxDbMax);

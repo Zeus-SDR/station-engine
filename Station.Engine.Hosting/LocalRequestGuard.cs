@@ -51,6 +51,18 @@ internal static class LocalRequestGuard
             && originPort == requestPort;
     }
 
+    /// <summary>Allow non-browser websocket clients with no Origin, while
+    /// constraining browser handshakes to this server or a fixed Zeus-owned
+    /// app origin. HTTP CORS middleware does not govern websocket upgrades.</summary>
+    public static bool IsTrustedWebSocketOrigin(HttpContext ctx)
+    {
+        var origins = ctx.Request.Headers.Origin;
+        if (origins.Count == 0) return true;
+        if (origins.Count != 1 || string.IsNullOrWhiteSpace(origins[0])) return false;
+        return IsSameOriginOrNoOrigin(ctx)
+            || NativeWrapperCorsPolicy.IsAllowedOrigin(origins[0]!);
+    }
+
     /// <summary>
     /// Strong browser privilege gate: unlike ordinary local app-control calls,
     /// raw microphone access requires an explicit, single same-origin header.

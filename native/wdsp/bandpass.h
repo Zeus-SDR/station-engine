@@ -126,6 +126,8 @@ extern void setSize_bandpass (BANDPASS a, int size);
 
 extern void setGain_bandpass (BANDPASS a, double gain, int update);
 
+extern void ApplyTXABandpassProfile (int channel);
+
 extern void CalcBandpassFilter (BANDPASS a, double f_low, double f_high, double gain);
 
 extern __declspec (dllexport) void SetRXABandpassFreqs (int channel, double f_low, double f_high);

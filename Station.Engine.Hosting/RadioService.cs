@@ -44,6 +44,7 @@
 
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Zeus.Contracts;
@@ -377,7 +378,10 @@ public sealed class RadioService : IDisposable
     // floor and JUMPS the effective AGC-T to the servo target each tick —
     // Thetis does the same; the smoothing lives in the floor estimate, not the
     // follower.
-    private const double AgcDeadbandDb = 0.5;          // narrow no-move zone — closes the last bit of error
+    // Thetis's display-grid noise-floor follower requires a 2 dB move before
+    // updating. Use the same real hysteresis width here so ordinary 1–2 dB
+    // floor ripple cannot keep re-seating the quantized WDSP gain ceiling.
+    private const double AgcDeadbandDb = 2.0;
 
     // ── Auto-AGC-T threshold servo (Thetis parity) ──────────────────────────
     // Auto-AGC-T sets the AGC *threshold* (knee) to the noise floor, exactly as
@@ -419,6 +423,7 @@ public sealed class RadioService : IDisposable
     private const double AgcTopMinDb = -20.0;
     private const double AgcTopMaxDb = 120.0;
     private double _agcOffsetDb;
+    private double _agcServoSeatedTopDb = double.NaN;
     private long _lastAgcTickMs = long.MinValue;
 
     // 100 ms between 1-dB steps. Events arrive at ~1.2 kHz (192 kSps), so
@@ -608,6 +613,8 @@ public sealed class RadioService : IDisposable
         // (same byte) — also today's behaviour. RX and TX are independent.
         var persistedRxFilterWindow = _dspSettingsStore.GetRxFilterWindow() ?? BandpassWindow.Normal;
         var persistedTxFilterWindow = _dspSettingsStore.GetTxFilterWindow() ?? BandpassWindow.Normal;
+        var persistedRxFilterPhase = _dspSettingsStore.GetRxFilterPhase() ?? FilterPhaseMode.Linear;
+        var persistedTxFilterPhase = _dspSettingsStore.GetTxFilterPhase() ?? FilterPhaseMode.Linear;
 
         // TX Audio Profile startup overlay. If the operator has a "last loaded"
         // unified TX Audio Profile, its scalar/config values overlay the
@@ -783,6 +790,8 @@ public sealed class RadioService : IDisposable
             TxFilterHighHz: overlayTxFilterHigh ?? rsSnap?.TxFilterHighHz ?? 2850,
             RxFilterWindow: persistedRxFilterWindow,
             TxFilterWindow: persistedTxFilterWindow,
+            RxFilterPhase: persistedRxFilterPhase,
+            TxFilterPhase: persistedTxFilterPhase,
             RxAfGainDb: rsSnap?.RxAfGainDb ?? 0.0,
             // 0 dB unity matches the engine's TXA fresh-open default; legacy
             // rows missing the field hydrate to that same default. A last-loaded
@@ -3567,6 +3576,17 @@ public sealed class RadioService : IDisposable
         client.SetAdcAttenuator(1, adc == 1 ? effective : HpsdrAtten.Zero);
     }
 
+    private static void ApplyPrimaryAttenuatorToProtocol2Client(
+        Protocol2Client client,
+        byte adc,
+        int effectiveDb)
+    {
+        if (adc == 1)
+            client.SetRx1Attenuator(effectiveDb);
+        else
+            client.SetAttenuator(effectiveDb);
+    }
+
     public StateDto SetAutoAtt(bool enabled)
     {
         bool changed = false;
@@ -3774,6 +3794,7 @@ public sealed class RadioService : IDisposable
             if (_state.AutoAgcEnabled == enabled) return _state;
             changed = true;
             _state = _state with { AutoAgcEnabled = enabled };
+            _agcServoSeatedTopDb = double.NaN;
             if (!enabled)
             {
                 // Turning auto off: reset the offset to zero so AGC-T returns
@@ -3823,7 +3844,13 @@ public sealed class RadioService : IDisposable
     /// slope=0 for canned modes) are the same WDSP uses, so the only free term is
     /// <see cref="AgcThreshCalOffsetDb"/>.
     /// </summary>
-    internal double AutoAgcTopFromNoiseFloor(double noiseFloorDbm)
+    internal double AutoAgcTopFromNoiseFloor(double noiseFloorDbm) =>
+        Math.Clamp(
+            Math.Round(AutoAgcRawTopFromNoiseFloor(noiseFloorDbm)),
+            AgcTopMinDb,
+            AgcTopMaxDb);
+
+    private double AutoAgcRawTopFromNoiseFloor(double noiseFloorDbm)
     {
         var agc = _state.Agc ?? new AgcConfig(AgcMode.Med);
         double calOffsetDb = agc.Mode == AgcMode.Fixed ? 0.0 : AgcThreshCalOffsetDb;
@@ -3843,9 +3870,7 @@ public sealed class RadioService : IDisposable
         double slopeDb = agc.Mode == AgcMode.Custom
             ? Math.Clamp(agc.Slope ?? 0, 0, 20)
             : 0.0;
-        double top = AgcOutTargetDb - slopeDb - (thresh + noiseOffset);
-        // 4) Thetis rounds and clamps the resulting top (console.cs:45996-45998).
-        return Math.Clamp(Math.Round(top), AgcTopMinDb, AgcTopMaxDb);
+        return AgcOutTargetDb - slopeDb - (thresh + noiseOffset);
     }
 
     /// <summary>
@@ -3904,8 +3929,7 @@ public sealed class RadioService : IDisposable
             // SetAgcTop zeroes the offset and disables auto, so this never runs
             // in manual mode.
             double noiseFloor = spectrumFloorDbm;
-            double autoTop = AutoAgcTopFromNoiseFloor(noiseFloor);
-            double desiredOffset = autoTop - AgcBaseline(_state);
+            double rawAutoTop = AutoAgcRawTopFromNoiseFloor(noiseFloor);
 
             // Thetis's auto-AGC-T tick (console.cs tmrAutoAGC_Tick:46066) does ONE
             // thing: seat the AGC threshold at the SETTLED noise floor. It never
@@ -3914,12 +3938,36 @@ public sealed class RadioService : IDisposable
             // call (auto-ATT owns that path) — it is not the audio AGC loop's
             // job, and post-ADC AGC cannot un-clip an already-overdriven sample
             // anyway.
-            double delta = desiredOffset - _agcOffsetDb;
-            // Deadband: ignore sub-0.5 dB wobble so a jumpy floor estimate can't
-            // dither the gain every tick. Above it, JUMP straight to the target
-            // (no slew) — the tracker upstream is the smoother, so the target
-            // moves gently in steady state and snaps only on a real band change.
-            if (Math.Abs(delta) < AgcDeadbandDb) return;
+            // Compare unrounded servo targets: comparing already-quantized
+            // offsets makes every nonzero delta at least 1 dB and leaves a
+            // sub-dB deadband inert. The 2 dB seated-target band follows
+            // Thetis's other noise-floor follower and suppresses ordinary floor
+            // ripple while still jumping immediately on a real band change.
+            bool holdSeatedTop = double.IsFinite(_agcServoSeatedTopDb)
+                && Math.Abs(rawAutoTop - _agcServoSeatedTopDb) < AgcDeadbandDb;
+            double seatedTopToApply;
+            if (holdSeatedTop)
+            {
+                seatedTopToApply = _agcServoSeatedTopDb;
+            }
+            else
+            {
+                _agcServoSeatedTopDb = rawAutoTop;
+                seatedTopToApply = rawAutoTop;
+            }
+
+            // Preserve Thetis/WDSP whole-dB application semantics. A raw-target
+            // re-seat at a clamp rail can produce the same applied top; record
+            // the new seat above, but do not churn state or notify subscribers.
+            // On every servo tick, re-derive the offset against the current
+            // baseline. After a baseline change, the effective AGC-T therefore
+            // converges to this seated rounded top on the next eligible tick.
+            double autoTop = Math.Clamp(
+                Math.Round(seatedTopToApply),
+                AgcTopMinDb,
+                AgcTopMaxDb);
+            double desiredOffset = autoTop - AgcBaseline(_state);
+            if (desiredOffset == _agcOffsetDb) return;
 
             _agcOffsetDb = desiredOffset;
 
@@ -5043,6 +5091,7 @@ public sealed class RadioService : IDisposable
         Mutate(s =>
         {
             _agcOffsetDb = 0.0;
+            _agcServoSeatedTopDb = double.NaN;
             _lastAgcTickMs = long.MinValue;
             if ((s.Agc?.Mode ?? AgcMode.Med) == AgcMode.Fixed)
             {
@@ -5185,10 +5234,37 @@ public sealed class RadioService : IDisposable
     {
         ArgumentNullException.ThrowIfNull(cfg);
         var normalized = NormalizeAgcConfig(cfg);
-        Mutate(s => s with { Agc = normalized });
+        Mutate(s =>
+        {
+            var current = s.Agc ?? new AgcConfig(AgcMode.Med);
+            bool servoConfigChanged = current.Mode != normalized.Mode
+                || AutoAgcEffectiveSlopeDb(current) != AutoAgcEffectiveSlopeDb(normalized)
+                || AutoAgcEffectiveFixedGainDb(current) != AutoAgcEffectiveFixedGainDb(normalized);
+            if (servoConfigChanged)
+            {
+                // Only parameters used by the servo math invalidate its seat.
+                // Decay/hang edits and redundant config writes must preserve
+                // hysteresis memory and the 500 ms rate gate.
+                _agcServoSeatedTopDb = double.NaN;
+                _lastAgcTickMs = long.MinValue;
+            }
+            return s with { Agc = normalized };
+        });
         _dspSettingsStore.SetAgc(normalized);
         return Snapshot();
     }
+
+    // Match the servo's mode gates and null defaults when deciding whether an
+    // AGC edit changes its math. Inactive fields are deliberately canonical 0.
+    private static int AutoAgcEffectiveSlopeDb(AgcConfig cfg) =>
+        cfg.Mode == AgcMode.Custom
+            ? Math.Clamp(cfg.Slope ?? 0, 0, 20)
+            : 0;
+
+    private static double AutoAgcEffectiveFixedGainDb(AgcConfig cfg) =>
+        cfg.Mode == AgcMode.Fixed
+            ? Math.Clamp(cfg.FixedGainDb ?? 20.0, MinAgcFixedGainDb, MaxAgcTopDb)
+            : 0.0;
 
     internal static AgcConfig NormalizeAgcConfig(AgcConfig cfg) => cfg with
     {
@@ -5280,10 +5356,9 @@ public sealed class RadioService : IDisposable
         };
     }
 
-    // SSB bandpass "rectangularity" — issue #871. Independent RX and TX
-    // selectors push the operator's chosen WDSP FIR window (Soft = BH 4-term,
-    // Sharp = BH 7-term) through DspPipelineService's _appliedRx/TxBandpassWindow
-    // latch and persist to DspSettingsStore so the choice survives a restart.
+    // RX/TX bandpass resolution — both selectors extend beyond the Thetis tap
+    // ladder through Zeus WDSP 2.0's 262144 planning ceiling. The pipeline
+    // applies the enum live and the store preserves it across restarts.
     public StateDto SetRxBandpassWindow(BandpassWindow window)
     {
         Mutate(s => s with { RxFilterWindow = window });
@@ -5295,6 +5370,20 @@ public sealed class RadioService : IDisposable
     {
         Mutate(s => s with { TxFilterWindow = window });
         _dspSettingsStore.SetTxFilterWindow(window);
+        return Snapshot();
+    }
+
+    public StateDto SetRxFilterPhase(FilterPhaseMode phase)
+    {
+        Mutate(s => s with { RxFilterPhase = phase });
+        _dspSettingsStore.SetRxFilterPhase(phase);
+        return Snapshot();
+    }
+
+    public StateDto SetTxFilterPhase(FilterPhaseMode phase)
+    {
+        Mutate(s => s with { TxFilterPhase = phase });
+        _dspSettingsStore.SetTxFilterPhase(phase);
         return Snapshot();
     }
 
@@ -6809,6 +6898,34 @@ public sealed class RadioService : IDisposable
             {
                 _lastAppliedEffectiveDb = effective;
                 effectiveToApply = effective;
+                // P2 auto-ATT is a protection path, not an ordinary UI state
+                // update. Emit the hardware command while the decision and its
+                // physical-ADC route are still serialized by _sync. Releasing
+                // the lock first would let a newer manual attenuation,
+                // auto-off, or ADC-route mutation reach the wire before this
+                // stale protection write. Waiting for StateChanged would also
+                // route through generic engine work before CmdHighPriority.
+                if (_p2Client is { } p2Client)
+                {
+                    try
+                    {
+                        ApplyPrimaryAttenuatorToProtocol2Client(
+                            p2Client,
+                            protectedAdc,
+                            effective);
+                    }
+                    catch (SocketException ex)
+                    {
+                        // A concurrent disconnect may tear down the UDP socket.
+                        // The canonical state and telemetry broadcasts must
+                        // still complete; reconnect replay will restore it.
+                        _log.LogDebug(ex, "p2.auto_att immediate send failed during socket teardown");
+                    }
+                    catch (ObjectDisposedException ex)
+                    {
+                        _log.LogDebug(ex, "p2.auto_att immediate send raced client disposal");
+                    }
+                }
             }
 
             // Protection is operator-visible for as long as automatic
@@ -6826,6 +6943,7 @@ public sealed class RadioService : IDisposable
 
         if (effectiveToApply is int eff)
         {
+            // Protocol 1 retains its existing atomic-state/EP2-rotation path.
             ApplyPrimaryAttenuatorToActiveClient(eff);
         }
         if (changedWarning)

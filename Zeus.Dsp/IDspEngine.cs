@@ -347,9 +347,9 @@ public interface IDspEngine : IDisposable
 
     /// <summary>Set the RXA bandpass shoulder steepness / "rectangularity"
     /// (issue #871) by mapping the <see cref="BandpassWindow"/> preset to a WDSP
-    /// FIR tap count (<c>SetRXABandpassNC</c>) — more taps = sharper skirt. The
-    /// preset name is retained for wire/persistence compatibility. No-op on
-    /// Synthetic.</summary>
+    /// FIR tap count (<c>RXASetBandpassNC</c>) — more taps = sharper skirt
+    /// across the active SSB and AM/NR passband stages. The enum name is
+    /// retained for wire/persistence compatibility. No-op on Synthetic.</summary>
     void SetRxBandpassWindow(int channelId, BandpassWindow window);
 
     /// <summary>Set the TXA bandpass shoulder steepness / "rectangularity"
@@ -357,6 +357,14 @@ public interface IDspEngine : IDisposable
     /// of <see cref="SetRxBandpassWindow"/>. No-op on Synthetic and when TXA is
     /// not open.</summary>
     void SetTxBandpassWindow(BandpassWindow window);
+
+    /// <summary>Set the RX master FIR phase response independently of its tap
+    /// count. Minimum phase retains the magnitude response while concentrating
+    /// impulse energy near the start for lower operator-felt delay.</summary>
+    void SetRxFilterPhase(int channelId, FilterPhaseMode phase) { }
+
+    /// <summary>Set the TX FIR phase response independently of its tap count.</summary>
+    void SetTxFilterPhase(FilterPhaseMode phase) { }
 
     /// <summary>Process one WDSP-sized block of mic audio through TXA and return
     /// the modulated IQ. <paramref name="micMono"/> must contain exactly
