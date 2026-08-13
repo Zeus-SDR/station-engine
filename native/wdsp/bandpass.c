@@ -538,57 +538,57 @@ void SetTXABandpassWindow (int channel, int wintype)
 PORT
 void SetTXABandpassNC (int channel, int nc)
 {
+	// NOTE:  'nc' must be >= 'size'
+	double* impulse;
+	BANDPASS a;
 	EnterCriticalSection (&ch[channel].csDSP);
-	txa[channel].filter_master_nc = nc;
-	txa[channel].filter_cleanup_nc = max (2048, ch[channel].dsp_size);
-	ApplyTXABandpassProfile (channel);
-	LeaveCriticalSection (&ch[channel].csDSP);
-}
-
-static void SetTXABandpassStageNC (BANDPASS a, int nc)
-{
-	if (a->nc == nc) return;
-	a->nc = nc;
-	double* impulse = fir_bandpass (a->nc, a->f_low, a->f_high,
-		a->samplerate, a->wintype, 1, a->gain / (double)(2 * a->size));
-	setNc_fircore (a->p, a->nc, impulse);
-	_aligned_free (impulse);
-}
-
-static void SetTXABandpassStageMP (BANDPASS a, int mp)
-{
-	if (a->mp == mp) return;
-	a->mp = mp;
-	setMp_fircore (a->p, mp);
-}
-
-void ApplyTXABandpassProfile (int channel)
-{
-	BANDPASS stages[3] = { txa[channel].bp0.p, txa[channel].bp1.p, txa[channel].bp2.p };
-	if (!txa[channel].filter_mp)
+	a = txa[channel].bp0.p;
+	if (a->nc != nc)
 	{
-		for (int i = 0; i < 3; i++) SetTXABandpassStageMP (stages[i], 0);
-		for (int i = 0; i < 3; i++) SetTXABandpassStageNC (stages[i], txa[channel].filter_master_nc);
-		return;
+		a->nc = nc;
+		impulse = fir_bandpass (a->nc, a->f_low, a->f_high, a->samplerate, a->wintype, 1, a->gain / (double)(2 * a->size));
+		setNc_fircore (a->p, a->nc, impulse);
+		_aligned_free (impulse);
 	}
-
-	// The post-compressor bandpass owns the operator-selected resolution when
-	// compression is active. The final overshoot-control bandpass remains a
-	// short minimum-phase cleanup stage. Keeping this ownership fixed prevents
-	// PureSignal's established osctrl bypass/restore from moving or rebuilding
-	// an extreme master FIR during arm/disarm.
-	int master = stages[1]->run ? 1 : 0;
-	for (int i = 0; i < 3; i++)
-		if (i != master) SetTXABandpassStageNC (stages[i], txa[channel].filter_cleanup_nc);
-	for (int i = 0; i < 3; i++) SetTXABandpassStageMP (stages[i], 1);
-	SetTXABandpassStageNC (stages[master], txa[channel].filter_master_nc);
+	a = txa[channel].bp1.p;
+	if (a->nc != nc)
+	{
+		a->nc = nc;
+		impulse = fir_bandpass (a->nc, a->f_low, a->f_high, a->samplerate, a->wintype, 1, a->gain / (double)(2 * a->size));
+		setNc_fircore (a->p, a->nc, impulse);
+		_aligned_free (impulse);
+	}
+	a = txa[channel].bp2.p;
+	if (a->nc != nc)
+	{
+		a->nc = nc;
+		impulse = fir_bandpass (a->nc, a->f_low, a->f_high, a->samplerate, a->wintype, 1, a->gain / (double)(2 * a->size));
+		setNc_fircore (a->p, a->nc, impulse);
+		_aligned_free (impulse);
+	}
+	LeaveCriticalSection (&ch[channel].csDSP);
 }
 
 PORT
 void SetTXABandpassMP (int channel, int mp)
 {
-	EnterCriticalSection (&ch[channel].csDSP);
-	txa[channel].filter_mp = mp ? 1 : 0;
-	ApplyTXABandpassProfile (channel);
-	LeaveCriticalSection (&ch[channel].csDSP);
+	BANDPASS a;
+	a = txa[channel].bp0.p;
+	if (mp != a->mp)
+	{
+		a->mp = mp;
+		setMp_fircore (a->p, a->mp);
+	}
+	a = txa[channel].bp1.p;
+	if (mp != a->mp)
+	{
+		a->mp = mp;
+		setMp_fircore (a->p, a->mp);
+	}
+	a = txa[channel].bp2.p;
+	if (mp != a->mp)
+	{
+		a->mp = mp;
+		setMp_fircore (a->p, a->mp);
+	}
 }

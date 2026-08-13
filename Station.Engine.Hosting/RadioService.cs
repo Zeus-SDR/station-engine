@@ -44,7 +44,6 @@
 
 using System.Net;
 using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Zeus.Contracts;
@@ -609,8 +608,6 @@ public sealed class RadioService : IDisposable
         // (same byte) — also today's behaviour. RX and TX are independent.
         var persistedRxFilterWindow = _dspSettingsStore.GetRxFilterWindow() ?? BandpassWindow.Normal;
         var persistedTxFilterWindow = _dspSettingsStore.GetTxFilterWindow() ?? BandpassWindow.Normal;
-        var persistedRxFilterPhase = _dspSettingsStore.GetRxFilterPhase() ?? FilterPhaseMode.Linear;
-        var persistedTxFilterPhase = _dspSettingsStore.GetTxFilterPhase() ?? FilterPhaseMode.Linear;
 
         // TX Audio Profile startup overlay. If the operator has a "last loaded"
         // unified TX Audio Profile, its scalar/config values overlay the
@@ -786,8 +783,6 @@ public sealed class RadioService : IDisposable
             TxFilterHighHz: overlayTxFilterHigh ?? rsSnap?.TxFilterHighHz ?? 2850,
             RxFilterWindow: persistedRxFilterWindow,
             TxFilterWindow: persistedTxFilterWindow,
-            RxFilterPhase: persistedRxFilterPhase,
-            TxFilterPhase: persistedTxFilterPhase,
             RxAfGainDb: rsSnap?.RxAfGainDb ?? 0.0,
             // 0 dB unity matches the engine's TXA fresh-open default; legacy
             // rows missing the field hydrate to that same default. A last-loaded
@@ -3572,17 +3567,6 @@ public sealed class RadioService : IDisposable
         client.SetAdcAttenuator(1, adc == 1 ? effective : HpsdrAtten.Zero);
     }
 
-    private static void ApplyPrimaryAttenuatorToProtocol2Client(
-        Protocol2Client client,
-        byte adc,
-        int effectiveDb)
-    {
-        if (adc == 1)
-            client.SetRx1Attenuator(effectiveDb);
-        else
-            client.SetAttenuator(effectiveDb);
-    }
-
     public StateDto SetAutoAtt(bool enabled)
     {
         bool changed = false;
@@ -5296,9 +5280,10 @@ public sealed class RadioService : IDisposable
         };
     }
 
-    // RX/TX bandpass resolution — both selectors extend beyond the Thetis tap
-    // ladder through Zeus WDSP 2.0's 262144 planning ceiling. The pipeline
-    // applies the enum live and the store preserves it across restarts.
+    // SSB bandpass "rectangularity" — issue #871. Independent RX and TX
+    // selectors push the operator's chosen WDSP FIR window (Soft = BH 4-term,
+    // Sharp = BH 7-term) through DspPipelineService's _appliedRx/TxBandpassWindow
+    // latch and persist to DspSettingsStore so the choice survives a restart.
     public StateDto SetRxBandpassWindow(BandpassWindow window)
     {
         Mutate(s => s with { RxFilterWindow = window });
@@ -5310,20 +5295,6 @@ public sealed class RadioService : IDisposable
     {
         Mutate(s => s with { TxFilterWindow = window });
         _dspSettingsStore.SetTxFilterWindow(window);
-        return Snapshot();
-    }
-
-    public StateDto SetRxFilterPhase(FilterPhaseMode phase)
-    {
-        Mutate(s => s with { RxFilterPhase = phase });
-        _dspSettingsStore.SetRxFilterPhase(phase);
-        return Snapshot();
-    }
-
-    public StateDto SetTxFilterPhase(FilterPhaseMode phase)
-    {
-        Mutate(s => s with { TxFilterPhase = phase });
-        _dspSettingsStore.SetTxFilterPhase(phase);
         return Snapshot();
     }
 
@@ -6838,34 +6809,6 @@ public sealed class RadioService : IDisposable
             {
                 _lastAppliedEffectiveDb = effective;
                 effectiveToApply = effective;
-                // P2 auto-ATT is a protection path, not an ordinary UI state
-                // update. Emit the hardware command while the decision and its
-                // physical-ADC route are still serialized by _sync. Releasing
-                // the lock first would let a newer manual attenuation,
-                // auto-off, or ADC-route mutation reach the wire before this
-                // stale protection write. Waiting for StateChanged would also
-                // route through generic engine work before CmdHighPriority.
-                if (_p2Client is { } p2Client)
-                {
-                    try
-                    {
-                        ApplyPrimaryAttenuatorToProtocol2Client(
-                            p2Client,
-                            protectedAdc,
-                            effective);
-                    }
-                    catch (SocketException ex)
-                    {
-                        // A concurrent disconnect may tear down the UDP socket.
-                        // The canonical state and telemetry broadcasts must
-                        // still complete; reconnect replay will restore it.
-                        _log.LogDebug(ex, "p2.auto_att immediate send failed during socket teardown");
-                    }
-                    catch (ObjectDisposedException ex)
-                    {
-                        _log.LogDebug(ex, "p2.auto_att immediate send raced client disposal");
-                    }
-                }
             }
 
             // Protection is operator-visible for as long as automatic
@@ -6883,7 +6826,6 @@ public sealed class RadioService : IDisposable
 
         if (effectiveToApply is int eff)
         {
-            // Protocol 1 retains its existing atomic-state/EP2-rotation path.
             ApplyPrimaryAttenuatorToActiveClient(eff);
         }
         if (changedWarning)

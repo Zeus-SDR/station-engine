@@ -205,10 +205,6 @@ public static class StationEngineEndpoints
         // settings tab reads/writes /api/ft8/settings (+ autocq-ack) against
         // the engine in attach mode, and the standalone host mapped neither.
         endpoints.MapDigitalSettingsEndpoints();
-        // First-run wizard progress — served by BOTH hosts (the workspace-
-        // layout pattern) so the SPA's onboarding state persists identically
-        // whether it is talking to the engine (attach) or the full host.
-        endpoints.MapOnboardingEndpoints();
         endpoints.MapWorkspaceLayoutEndpoints();
         endpoints.MapBandPlanEndpoints();
         endpoints.MapStationFavoriteEndpoints();

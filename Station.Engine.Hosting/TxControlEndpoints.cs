@@ -182,10 +182,7 @@ public static class TxControlEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
-        static IResult GetAudioSuitePreview(
-            RadioService radio,
-            DspPipelineService pipe,
-            TxService tx)
+        static IResult GetAudioSuitePreview(RadioService radio, DspPipelineService pipe)
         {
             var enabled = radio.Snapshot().TxMonitorEnabled;
             return Results.Ok(new
@@ -193,26 +190,23 @@ public static class TxControlEndpoints
                 supported = true,
                 enabled,
                 meterOnly = enabled && pipe.TxMonitorMeterOnly,
-                monitorOnTransmit = tx.MonitorOnTransmit,
             });
         }
 
         static IResult SetAudioSuitePreview(
             PreviewSetRequest body,
-            TxService tx)
+            RadioService radio,
+            DspPipelineService pipe)
         {
+            // Meter-only is requested by Auto Tune so it can run the chain for
+            // metering without the operator hearing the demodulated monitor.
+            // Apply it before flipping the monitor on so the first monitor tick
+            // already honours suppression; clearing on disable is handled by the
+            // monitor latch in DspPipelineService.
             bool meterOnly = body.Enabled && (body.MeterOnly ?? false);
-            var state = tx.ApplyTxMonitorPreview(
-                body.Enabled,
-                meterOnly,
-                body.MonitorOnTransmit);
-            return Results.Ok(new
-            {
-                supported = true,
-                enabled = state.Enabled,
-                meterOnly = state.MeterOnly,
-                monitorOnTransmit = state.MonitorOnTransmit,
-            });
+            pipe.SetTxMonitorMeterOnly(meterOnly);
+            var state = radio.SetTxMonitor(new TxMonitorSetRequest(body.Enabled));
+            return Results.Ok(new { supported = true, enabled = state.TxMonitorEnabled, meterOnly });
         }
 
         // Audio Suite Preview toggle — operator-facing alias for TX Monitor.
@@ -231,14 +225,10 @@ public static class TxControlEndpoints
         // TX-side seam plumbing on the next tick.
         endpoints.MapPost("/api/tx/monitor", (
             TxMonitorSetRequest req,
-            TxService tx) =>
+            RadioService radio) =>
         {
             log.LogInformation("api.tx.monitor enabled={Enabled}", req.Enabled);
-            var state = tx.ApplyTxMonitorPreview(
-                req.Enabled,
-                meterOnly: false,
-                monitorOnTransmit: null);
-            return Results.Ok(state.RadioState);
+            return Results.Ok(radio.SetTxMonitor(req));
         });
 
         return endpoints;
@@ -305,7 +295,4 @@ public static class TxControlEndpoints
 
 }
 
-internal sealed record PreviewSetRequest(
-    bool Enabled,
-    bool? MeterOnly = null,
-    bool? MonitorOnTransmit = null);
+internal sealed record PreviewSetRequest(bool Enabled, bool? MeterOnly = null);

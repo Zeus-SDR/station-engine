@@ -231,8 +231,6 @@ public sealed class SyntheticDspEngine : IDspEngine
     public void SetTxFilter(int lowHz, int highHz) { }
     public void SetRxBandpassWindow(int channelId, BandpassWindow window) { }
     public void SetTxBandpassWindow(BandpassWindow window) { }
-    public void SetRxFilterPhase(int channelId, FilterPhaseMode phase) { }
-    public void SetTxFilterPhase(FilterPhaseMode phase) { }
     public int ProcessTxBlock(ReadOnlySpan<float> micMono, Span<float> iqInterleaved) => 0;
     public int TxBlockSamples => 1024;
     public int TxOutputSamples => 1024;

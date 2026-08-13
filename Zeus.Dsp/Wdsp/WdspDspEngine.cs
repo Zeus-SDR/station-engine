@@ -53,27 +53,27 @@ namespace Zeus.Dsp.Wdsp;
 
 public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 {
-    // A 512-sample host exchange and DSP partition gives RXA a 10.67 ms
-    // scheduling quantum at 48 kHz. Protocol clients already partial-frame IQ
-    // into the engine, so the radio packet geometry remains unchanged.
-    private const int RxaInSize = 512;
-    private const int RxaDspSize = 512;
+    // RXA: keep the 1024-sample window the panadapter / audio pipeline have
+    // always used. Changing it broke RX audio entirely (regression observed
+    // 2026-04-18). RXA OpenChannel uses RxaInSize / RxaDspSize.
+    private const int RxaInSize = 1024;
+    private const int RxaDspSize = 1024;
 
     // TXA profile varies by protocol — OpenTxChannel picks the right one:
-    //   P1 (48 kHz DAC) : in=512@48k, dsp=512@48k, out=512@48k, CFIR off
-    //   P2 (192 kHz DAC): in=256@48k, dsp=512@96k, out=1024@192k, CFIR on
+    //   P1 (48 kHz DAC) : in=1024@48k, dsp=1024@48k, out=1024@48k, CFIR off
+    //   P2 (192 kHz DAC): in=512@48k,  dsp=1024@96k, out=2048@192k, CFIR on
     // pihpsdr transmitter.c:954-997 (protocol switch → buffer_size / dsp_rate /
     // ratio) and Thetis audio.cs:1800-1809 (SampleRateTX + SetTXACFIRRun)
     // define these exactly. Zeus was previously hard-coded to the P1 profile
     // regardless of protocol, which on P2 left the G2 DUC starved (it runs
     // at 192 kHz but we fed 48 kHz) and generated 8-10 kHz close-in spurs
     // on TUN and MOX.
-    private const int TxaInSizeP1 = 512;
-    private const int TxaDspSizeP1 = 512;
-    private const int TxaOutSizeP1 = 512;
-    private const int TxaInSizeP2 = 256;
-    private const int TxaDspSizeP2 = 512;
-    private const int TxaOutSizeP2 = 1024;
+    private const int TxaInSizeP1 = 1024;
+    private const int TxaDspSizeP1 = 1024;
+    private const int TxaOutSizeP1 = 1024;
+    private const int TxaInSizeP2 = 512;
+    private const int TxaDspSizeP2 = 1024;
+    private const int TxaOutSizeP2 = 2048;
 
     // Latched values chosen at OpenTxChannel time; ProcessTxBlock uses them
     // to size the mic / iq spans. Default to the P1 profile so tests and
@@ -283,9 +283,6 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         public int FilterLowAbsHz = 150;
         public int FilterHighAbsHz = 2850;
         public RxaMode CurrentMode = RxaMode.USB;
-        public BandpassWindow FilterWindow = BandpassWindow.Normal;
-        public FilterPhaseMode FilterPhase = FilterPhaseMode.Linear;
-        public readonly object FilterProfileGate = new();
         // Hardware-NCO-relative offset of the tuned passband. The analyzer
         // sees pre-shift IQ, so its max-bin detector must move by this amount
         // while the demodulator shifts the same signal back to baseband.
@@ -339,7 +336,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         public volatile RxChannelHealth? LastHealth;
     }
 
-    // Each RX channel hands 512-sample IQ frames from the realtime RX sink
+    // Each RX channel hands 1024-sample IQ frames from the realtime RX sink
     // thread to its WDSP worker through a bounded queue. The frame RATE scales
     // with the RX sample rate (≈47/s at 48 kHz … ≈1500/s at 1536 kHz), so a
     // fixed frame count gave a 32× smaller TIME cushion at the top of the
@@ -605,14 +602,6 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private int _monitorFilterHigh = 2850;
     private const double TxMonitorFixedAgcGainDb = 0.0;
 
-    // The first ordinary RXA opened by the pipeline is RX1, the channel whose
-    // state MOX transitions must preserve/restore. TX Monitor later opens a
-    // second, private RXA through OpenChannelCore, and RX2+ may add more public
-    // channels. Selecting the first ConcurrentDictionary key is therefore not
-    // an identity: after the monitor opened it could resume/stop that private
-    // channel while leaving RX1 stopped after a PureSignal over.
-    private int _primaryRxaChannelId = -1;
-
     // Tracked engine-side MOX so SetTxMonitorEnabled can decide whether to
     // flip TXA state independently. SetMox writes this under _txaLock; the
     // helpers below read it under _txaLock too. Without this the "monitor
@@ -658,9 +647,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _setTxMonitorChannelState = setTxMonitorChannelState ?? NativeMethods.SetChannelState;
         _rxAnalyzerFftSize = NormalizeRxAnalyzerFftSize(rxAnalyzerFftSize);
         if (registerNativeResolver)
-        {
             WdspNativeLoader.EnsureResolverRegistered();
-        }
         // WdspWisdomInitializer registers a process-wide gate when the hosting
         // singleton is constructed. Native calls that can create FFTW plans wait
         // on that gate before entering WDSP. Tests and tools that construct a
@@ -752,7 +739,6 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public int OpenChannel(int sampleRateHz, int pixelWidth)
     {
         int id = OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: false);
-        Interlocked.CompareExchange(ref _primaryRxaChannelId, id, -1);
         ReevaluateTxDisplayGeometry();
         return id;
     }
@@ -937,7 +923,6 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public void CloseChannel(int channelId)
     {
         if (!_channels.TryRemove(channelId, out var state)) return;
-        Interlocked.CompareExchange(ref _primaryRxaChannelId, -1, channelId);
         StopChannel(state);
     }
 
@@ -1161,17 +1146,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // unrelated control (notably a secondary VFO) is moving. Reapplying the
         // same mode is unnecessary and would discard queued demodulated audio
         // below, producing a short interruption on every tuning event.
-        lock (state.FilterProfileGate)
-        {
-            if (state.CurrentMode == mapped) return;
-            RunNativeLifecycleCriticalSection(() =>
-            {
-                NativeMethods.SetRXAMode(channelId, (int)mapped);
-                state.CurrentMode = mapped;
-                ApplyBandpassForMode(state);
-            });
-        }
+        if (state.CurrentMode == mapped) return;
+        NativeMethods.SetRXAMode(channelId, (int)mapped);
+        state.CurrentMode = mapped;
         _log.LogInformation("wdsp.setMode channel={Id} mode={Mode}", channelId, mapped);
+        ApplyBandpassForMode(state);
         ConfigureMaxBinDetector(state);
         // Re-assert squelch on the stage matching the new mode and clear the
         // old one — squelch is mode-aware (SSQL/AMSQ/FMSQ) per Thetis §5.
@@ -1190,12 +1169,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         int lo = Math.Abs(lowHz);
         int hi = Math.Abs(highHz);
         if (hi < lo) (lo, hi) = (hi, lo);
-        lock (state.FilterProfileGate)
-        {
-            state.FilterLowAbsHz = lo;
-            state.FilterHighAbsHz = hi;
-            ApplyBandpassForMode(state);
-        }
+        state.FilterLowAbsHz = lo;
+        state.FilterHighAbsHz = hi;
+        ApplyBandpassForMode(state);
         ConfigureMaxBinDetector(state);
     }
 
@@ -1212,16 +1188,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // an `rx_osc = -(dial - centre)` then calls SetRXAShiftFreq(-osc), so
         // the net argument is (dial - centre) = our shiftHz. Same goes to
         // the nbp0 stage that enforces SSB sideband.
-        lock (state.FilterProfileGate)
-        {
-            RunNativeLifecycleCriticalSection(() =>
-            {
-                NativeMethods.SetRXAShiftFreq(channelId, shiftHz);
-                NativeMethods.RXANBPSetShiftFrequency(channelId, shiftHz);
-                NativeMethods.SetRXAShiftRun(channelId, shiftHz != 0 ? 1 : 0);
-                state.CtunShiftHz = shiftHz;
-            });
-        }
+        NativeMethods.SetRXAShiftFreq(channelId, shiftHz);
+        NativeMethods.RXANBPSetShiftFrequency(channelId, shiftHz);
+        NativeMethods.SetRXAShiftRun(channelId, shiftHz != 0 ? 1 : 0);
+        state.CtunShiftHz = shiftHz;
         ConfigureMaxBinDetector(state);
     }
 
@@ -1251,14 +1221,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetAgcThresh(int channelId, double threshDbm)
     {
         if (!_channels.TryGetValue(channelId, out var state)) return;
-        // WDSP converts the dBm threshold using the spectrum analyzer FFT size
-        // and sample rate. Passing the 1024-sample exchange block here places
-        // the AGC knee 12.04 dB away from a 16384-point analyzer. Thetis passes
-        // the actual analyzer FFT size, including per-channel overrides.
-        NativeMethods.SetRXAAGCThresh(channelId, threshDbm, state.AnalyzerFftSize, state.SampleRateHz);
+        // WDSP converts the dBm threshold using the channel's FFT size + sample
+        // rate (RxaInSize matches the analyzer config set in OpenChannel).
+        NativeMethods.SetRXAAGCThresh(channelId, threshDbm, RxaInSize, state.SampleRateHz);
         _log.LogInformation(
             "wdsp.setAgcThresh channel={Id} threshDbm={Thresh:F1} size={Size} rate={Rate}",
-            channelId, threshDbm, state.AnalyzerFftSize, state.SampleRateHz);
+            channelId, threshDbm, RxaInSize, state.SampleRateHz);
     }
 
     public double GetAgcTop(int channelId)
@@ -1273,7 +1241,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         if (!_channels.TryGetValue(channelId, out var state)) return 0.0;
         double thresh = 0.0;
-        NativeMethods.GetRXAAGCThresh(channelId, ref thresh, state.AnalyzerFftSize, state.SampleRateHz);
+        NativeMethods.GetRXAAGCThresh(channelId, ref thresh, RxaInSize, state.SampleRateHz);
         return thresh;
     }
 
@@ -1413,11 +1381,6 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         ArgumentNullException.ThrowIfNull(cfg);
         if (!_channels.TryGetValue(channelId, out var state)) return;
-        RunNativeLifecycleCriticalSection(() => ApplyNoiseReductionLocked(channelId, cfg, state));
-    }
-
-    private void ApplyNoiseReductionLocked(int channelId, NrConfig cfg, ChannelState state)
-    {
 
         // Mutually-exclusive NR button. When switching to a mode, re-apply its
         // Thetis defaults before toggling Run=1 — matches Thetis setup.cs order
@@ -1546,52 +1509,43 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetNotches(IReadOnlyList<NotchDto> notches)
     {
         ArgumentNullException.ThrowIfNull(notches);
-        RunNativeLifecycleCriticalSection(() =>
+        lock (_notchLock)
         {
-            lock (_notchLock)
-            {
-                _manualNotches.Clear();
-                _manualNotches.AddRange(notches);
-                // Re-apply to every open RX channel (there is normally one). The
-                // copy under the lock means the per-channel WDSP rewrite reads a
-                // stable snapshot even if another SetNotches races in.
-                foreach (var id in _channels.Keys)
-                    ApplyNotchesToChannelLocked(id);
-            }
-        });
+            _manualNotches.Clear();
+            _manualNotches.AddRange(notches);
+            // Re-apply to every open RX channel (there is normally one). The
+            // copy under the lock means the per-channel WDSP rewrite reads a
+            // stable snapshot even if another SetNotches races in.
+            foreach (var id in _channels.Keys)
+                ApplyNotchesToChannelLocked(id);
+        }
         _log.LogInformation("wdsp.setNotches count={Count}", notches.Count);
     }
 
     public void SetNotchTuneFrequencyHz(double loHz)
     {
-        RunNativeLifecycleCriticalSection(() =>
+        lock (_notchLock)
         {
-            lock (_notchLock)
+            if (loHz == _notchTuneFreqHz) return;
+            _notchTuneFreqHz = loHz;
+            if (_notchDbUnavailable) return;
+            try
             {
-                if (loHz == _notchTuneFreqHz) return;
-                _notchTuneFreqHz = loHz;
-                if (_notchDbUnavailable) return;
-                try
-                {
-                    foreach (var id in _channels.Keys)
-                        NativeMethods.RXANBPSetTuneFrequency(id, loHz);
-                }
-                catch (EntryPointNotFoundException)
-                {
-                    MarkNotchDbUnavailable();
-                }
+                foreach (var id in _channels.Keys)
+                    NativeMethods.RXANBPSetTuneFrequency(id, loHz);
             }
-        });
+            catch (EntryPointNotFoundException)
+            {
+                MarkNotchDbUnavailable();
+            }
+        }
     }
 
     // Re-apply the current notch list to one channel. Public-facing callers
     // take _notchLock first; OpenChannel calls the lock-acquiring wrapper.
     private void ApplyNotchesToChannel(int channelId)
     {
-        RunNativeLifecycleCriticalSection(() =>
-        {
-            lock (_notchLock) ApplyNotchesToChannelLocked(channelId);
-        });
+        lock (_notchLock) ApplyNotchesToChannelLocked(channelId);
     }
 
     // Rewrite WDSP's notch database for `channelId` from _manualNotches: clear
@@ -2038,11 +1992,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             _lastRxMeterLogUtc = now;
             // Indices per WDSP RXA.h:47-57 enum rxaMeterType.
             double adcAv = NativeMethods.GetRXAMeter(channelId, 3);   // RXA_ADC_AV
-            // WDSP meters volts/out_target; the applied insertion multiplier is
-            // its reciprocal. Negate the dB value, as Thetis does, so positive
-            // means boost and negative means gain reduction everywhere above
-            // this native seam.
-            double agcGain = -NativeMethods.GetRXAMeter(channelId, 4); // RXA_AGC_GAIN
+            double agcGain = NativeMethods.GetRXAMeter(channelId, 4); // RXA_AGC_GAIN
             double agcAv = NativeMethods.GetRXAMeter(channelId, 6);   // RXA_AGC_AV
             _log.LogInformation(
                 "wdsp.rx.meter sAv={SAv:F1} adcAv={AdcAv:F1} agcGain={AgcGain:F1} agcAv={AgcAv:F1}",
@@ -2078,7 +2028,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             SignalAv: (float)NativeMethods.GetRXAMeter(channelId, 1),
             AdcPk: (float)NativeMethods.GetRXAMeter(channelId, 2),
             AdcAv: (float)NativeMethods.GetRXAMeter(channelId, 3),
-            AgcGain: (float)-NativeMethods.GetRXAMeter(channelId, 4),
+            AgcGain: (float)NativeMethods.GetRXAMeter(channelId, 4),
             AgcEnvPk: (float)NativeMethods.GetRXAMeter(channelId, 5),
             AgcEnvAv: (float)NativeMethods.GetRXAMeter(channelId, 6),
             SignalMaxBin: (float)NativeMethods.GetDetectMaxBin(channelId));
@@ -2660,13 +2610,13 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_txaChannelId is not int txa) return;
             txaId = txa;
 
-            // MOX acts on RX1 only. The monitor RXA and RX2+ are also present in
-            // _channels, so dictionary enumeration cannot identify RX1.
-            rxaId = Volatile.Read(ref _primaryRxaChannelId);
-            if (rxaId < 0
-                || !_channels.TryGetValue(rxaId, out var primary)
-                || primary.Stopped)
-                return;
+            // v0.1 always has exactly one RXA open; take the first key. If
+            // there's no RXA (shouldn't happen in practice) the SetMox call is
+            // meaningless — bail without touching TXA so we don't desync state.
+            int? rxa = null;
+            foreach (var key in _channels.Keys) { rxa = key; break; }
+            if (rxa is not int r) return;
+            rxaId = r;
         }
 
         // Display-DUP keeps RXA running through ordinary MOX so its analyzer
@@ -2844,7 +2794,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             (!_txLevelerForcedOff && !_txRogerBeepBypass && cfg.LevelerEnabled) ? 1 : 0);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
         _txCompressorEnabled = cfg.CompressorEnabled;
-        ApplyTxCompressorRunLocked(txa);
+        _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(cfg.CompressorEnabled));
         NativeMethods.SetTXACompressorGain(txa, cfg.CompressorGainDb);
         _txLevelerEnabled = cfg.LevelerEnabled;
     }
@@ -2949,8 +2899,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // Caller holds _txaLock. Digital-mode bypass gates only the compressor run;
     // the operator's compressor gain stays exactly as configured.
     private void ApplyTxCompressorRunLocked(int txa) =>
-        RunNativeLifecycleCriticalSection(() =>
-            _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(_txCompressorEnabled)));
+        _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(_txCompressorEnabled));
 
     public void SetTxTune(bool on)
     {
@@ -3014,7 +2963,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             if (_txaChannelId is not int txa) return;
-            RunNativeLifecycleCriticalSection(() => _txControlNative.SetTXAMode(txa, (int)mapped));
+            _txControlNative.SetTXAMode(txa, (int)mapped);
             _txCurrentMode = mapped;
             ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
             ApplyCfcMasterRunLocked(txa, _cfcConfig);
@@ -3103,7 +3052,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // routes through SetFilter -> ApplyBandpassForMode, which floors on
             // its own.
             var (txLow, txHigh) = FloorPassbandWidth(lowHz, highHz);
-            RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXABandpassFreqs(txa, txLow, txHigh));
+            NativeMethods.SetTXABandpassFreqs(txa, txLow, txHigh);
         }
         // Mirror the filter onto the monitor channel so the preview stays at
         // the same bandwidth as the on-air signal. Stash the values regardless
@@ -3132,38 +3081,37 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // open-time BH-7 default for best stopband. SetRX/TXABandpassNC rebuild the
     // FIR impulse in-place inside csDSP, so it is safe during live audio.
     //
-    // Enum values identify absolute tap requests. WDSP requires nc >= its DSP
-    // partition and an integer multiple of it. The 1024-sample RXA partition
-    // therefore preserves every operator-visible value exactly.
+    // The preset -> nc map (resolved against the channel's WDSP block 'size'):
+    //   Soft   -> size            (legal floor; widest transition)
+    //   Normal -> max(2048, size) (== the WDSP create_bandpass open value, so a
+    //                              fresh/default session is byte-identical to
+    //                              pre-#871 RF — no default drift)
+    //   Sharp  -> 2 * Normal      (narrowest transition, ~Thetis 4096 default)
+    // nc is clamped to WDSP's legality rule: nc >= size and an integer multiple
+    // of size (bandpass.c NOTE; firmin nfor = nc/size).
     internal static int ResolveBandpassNc(BandpassWindow shape, int size)
     {
-        int requestedNc = shape switch
+        int openNc = Math.Max(2048, size);
+        int nc = shape switch
         {
-            BandpassWindow.Soft => 1024,
-            BandpassWindow.Normal => 2048,
-            BandpassWindow.Sharp => 4096,
-            BandpassWindow.Taps8192 => 8192,
-            BandpassWindow.Taps16384 => 16384,
-            BandpassWindow.Taps32768 => 32768,
-            BandpassWindow.Taps65536 => 65536,
-            BandpassWindow.Taps131072 => 131072,
-            BandpassWindow.Taps262144 => 262144,
-            _ => 2048,
+            BandpassWindow.Soft => size,
+            BandpassWindow.Normal => openNc,
+            BandpassWindow.Sharp => openNc * 2,
+            _ => openNc,
         };
-        int nc = Math.Max(requestedNc, size);
-        return ((nc + size - 1) / size) * size;
+        if (nc < size) nc = size;
+        if (nc % size != 0) nc = (nc / size) * size;
+        if (nc < size) nc = size;
+        return nc;
     }
 
     public void SetRxBandpassWindow(int channelId, BandpassWindow window)
     {
         if (_disposed != 0) return;
-        if (!_channels.TryGetValue(channelId, out var state)) return;
-        lock (state.FilterProfileGate)
-        {
-            state.FilterWindow = window;
-            ApplyRxFilterProfile(state);
-        }
+        if (!_channels.TryGetValue(channelId, out _)) return;
         int nc = ResolveBandpassNc(window, RxaDspSize);
+        WdspWisdomInitializer.WaitUntilReady();
+        NativeMethods.SetRXABandpassNC(channelId, nc);
         _log.LogInformation("wdsp.setRxBandpassShape ch={Ch} shape={Win} nc={Nc} size={Size}",
             channelId, window, nc, RxaDspSize);
     }
@@ -3176,62 +3124,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_txaChannelId is not int txa) return;
             int nc = ResolveBandpassNc(window, _txaDspSize);
             WdspWisdomInitializer.WaitUntilReady();
-            RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXABandpassNC(txa, nc));
+            NativeMethods.SetTXABandpassNC(txa, nc);
             _log.LogInformation("wdsp.setTxBandpassShape txa={Txa} shape={Win} nc={Nc} size={Size}",
                 txa, window, nc, _txaDspSize);
-        }
-    }
-
-    public void SetRxFilterPhase(int channelId, FilterPhaseMode phase)
-    {
-        if (!_channels.TryGetValue(channelId, out var state)) return;
-        if (!Enum.IsDefined(phase)) throw new ArgumentOutOfRangeException(nameof(phase));
-        lock (state.FilterProfileGate)
-        {
-            state.FilterPhase = phase;
-            ApplyRxFilterProfile(state);
-        }
-    }
-
-    private static void ApplyRxFilterProfile(ChannelState state)
-    {
-        int masterNc = ResolveBandpassNc(state.FilterWindow, RxaDspSize);
-        int cleanupNc = Math.Max(2048, RxaDspSize);
-        int mp = state.FilterPhase == FilterPhaseMode.Minimum ? 1 : 0;
-        WdspWisdomInitializer.WaitUntilReady();
-        RunNativeLifecycleCriticalSection(() =>
-        {
-            int oldState = NativeMethods.SetChannelState(state.Id, 0, 1);
-            try
-            {
-                if (mp != 0) NativeMethods.SetRXABandpassNC(state.Id, cleanupNc);
-                NativeMethods.RXANBPSetMP(state.Id, mp);
-                NativeMethods.RXABPSNBASetMP(state.Id, mp);
-                NativeMethods.SetRXABandpassMP(state.Id, mp);
-                NativeMethods.RXANBPSetNC(state.Id, masterNc);
-                NativeMethods.RXABPSNBASetNC(state.Id, masterNc);
-                NativeMethods.SetRXABandpassNC(state.Id, mp != 0 ? cleanupNc : masterNc);
-            }
-            finally
-            {
-                NativeMethods.SetChannelState(state.Id, oldState, 0);
-            }
-        });
-    }
-
-    public void SetTxFilterPhase(FilterPhaseMode phase)
-    {
-        if (!Enum.IsDefined(phase)) throw new ArgumentOutOfRangeException(nameof(phase));
-        if (_disposed != 0) return;
-        lock (_txaLock)
-        {
-            if (_txaChannelId is not int channelId) return;
-            RunNativeLifecycleCriticalSection(() =>
-            {
-                int oldState = NativeMethods.SetChannelState(channelId, 0, 1);
-                try { NativeMethods.SetTXABandpassMP(channelId, phase == FilterPhaseMode.Minimum ? 1 : 0); }
-                finally { NativeMethods.SetChannelState(channelId, oldState, 0); }
-            });
         }
     }
 
@@ -3607,7 +3502,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // here = the reference topology (Thetis/pi/desk keep it out of
                 // the PS path). Restored to the established default (ON) on disarm — so
                 // non-PS operators keep the ~1-1.5 dB average-power win.
-                RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXAosctrlRun(id, 0));
+                NativeMethods.SetTXAosctrlRun(id, 0);
             }
             else
             {
@@ -3639,7 +3534,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // Restore CESSB/osctrl ON — the established default for non-PS voice
                 // SSB (~1-1.5 dB average power; bd zeus-5cg). Only held off
                 // while PS is armed (see the enable branch above).
-                RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXAosctrlRun(id, 1));
+                NativeMethods.SetTXAosctrlRun(id, 1);
             }
         }
         _log.LogInformation("wdsp.setPsEnabled enabled={Enabled}", enabled);
@@ -4915,24 +4810,16 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     private static void ApplyBandpassForMode(ChannelState state)
     {
-        lock (state.FilterProfileGate)
-        {
-            var (low, high) = SignedBandpassForMode(
-                state.CurrentMode,
-                state.FilterLowAbsHz,
-                state.FilterHighAbsHz);
-            // Thetis rxa.cs:110-124: every filter change updates all three stages.
-            // SetRXABandpassFreqs alone only affects bp1, which is bypassed for SSB.
-            // nbp0 (RXANBPSetFreqs) is what actually carries the SSB passband.
-            // In minimum-phase mode these setters can regenerate an impulse and
-            // create FFTW plans, so share the process-wide planner lifecycle gate.
-            RunNativeLifecycleCriticalSection(() =>
-            {
-                NativeMethods.SetRXABandpassFreqs(state.Id, low, high);
-                NativeMethods.RXANBPSetFreqs(state.Id, low, high);
-                NativeMethods.SetRXASNBAOutputBandwidth(state.Id, low, high);
-            });
-        }
+        var (low, high) = SignedBandpassForMode(
+            state.CurrentMode,
+            state.FilterLowAbsHz,
+            state.FilterHighAbsHz);
+        // Thetis rxa.cs:110-124: every filter change updates all three stages.
+        // SetRXABandpassFreqs alone only affects bp1, which is bypassed for SSB.
+        // nbp0 (RXANBPSetFreqs) is what actually carries the SSB passband.
+        NativeMethods.SetRXABandpassFreqs(state.Id, low, high);
+        NativeMethods.RXANBPSetFreqs(state.Id, low, high);
+        NativeMethods.SetRXASNBAOutputBandwidth(state.Id, low, high);
     }
 
     private static void ConfigureMaxBinDetector(ChannelState state)

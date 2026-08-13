@@ -45,13 +45,25 @@ mw0lge@grange-lane.co.uk
 #include <stdint.h>
 #include <stddef.h>
 
-extern uint64_t fnv1a_hash64(const void* data, size_t len);
-#define HASH_T       uint64_t
-#define fnv1a_hash   fnv1a_hash64
-#define GOLDEN_RATIO 0x9E3779B97F4A7C15ULL
+#if defined(_WIN64)
+  // 64-bit build
+  extern uint64_t fnv1a_hash64(const void* data, size_t len);
+  #define GOLDEN_RATIO_64 0x9E3779B97F4A7C15ULL
 
-#define MAX_CACHE_ENTRIES   4096  // secondary guard; byte budget is authoritative
-#define MAX_CACHE_BYTES (64ULL * 1024ULL * 1024ULL)
+  #define HASH_T     uint64_t
+  #define fnv1a_hash   fnv1a_hash64
+  #define GOLDEN_RATIO GOLDEN_RATIO_64
+#else
+  // 32-bit build
+  extern uint32_t fnv1a_hash32(const void* data, size_t len);
+  #define GOLDEN_RATIO_32 0x9e3779b9U
+
+  #define HASH_T     uint32_t
+  #define fnv1a_hash   fnv1a_hash32
+  #define GOLDEN_RATIO GOLDEN_RATIO_32
+#endif
+
+#define MAX_CACHE_ENTRIES   4096  // max number of cache entires per cache bucket
 #define CACHE_BUCKETS     4   // 4 cache buckets, for fir_bandpass, mp, eq, fc. Unique indexes in the #defines below
 
 #define FIR_CACHE 0
@@ -61,9 +73,6 @@ extern uint64_t fnv1a_hash64(const void* data, size_t len);
 
 double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N);
 void add_impulse_to_cache(size_t bucket, HASH_T hash, int N, double* impulse);
-void ensure_impulse_cache_initialized(void);
-void lock_mp_generation(void);
-void unlock_mp_generation(void);
 
 __declspec (dllexport) int save_impulse_cache(const char* path);
 __declspec (dllexport) int read_impulse_cache(const char* path);

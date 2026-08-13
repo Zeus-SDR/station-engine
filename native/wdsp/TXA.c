@@ -33,9 +33,6 @@ void create_txa (int channel)
 	txa[channel].mode   = TXA_LSB;
 	txa[channel].f_low  = -5000.0;
 	txa[channel].f_high = - 100.0;
-	txa[channel].filter_master_nc = max (2048, ch[channel].dsp_size);
-	txa[channel].filter_cleanup_nc = max (2048, ch[channel].dsp_size);
-	txa[channel].filter_mp = 0;
 	txa[channel].inbuff  = (double *) malloc0 (1 * ch[channel].dsp_insize  * sizeof (complex));
 	txa[channel].outbuff = (double *) malloc0 (1 * ch[channel].dsp_outsize * sizeof (complex));
 	txa[channel].midbuff = (double *) malloc0 (2 * ch[channel].dsp_size    * sizeof (complex));
@@ -894,7 +891,6 @@ void TXASetupBPFilters (int channel)
 		}
 		break;
 	}
-	ApplyTXABandpassProfile (channel);
 }
 
 /********************************************************************************************************

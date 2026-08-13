@@ -46,9 +46,8 @@ using System.Buffers;
 
 namespace Zeus.Contracts;
 
-// MOX/TUN state edge frame. 6 bytes:
+// MOX/TUN state edge frame. 4 bytes:
 //   [0x1C][moxOn:u8][tunOn:u8][source:u8]
-//   [txMonitorEnabled:u8][monitorOnTransmit:u8]
 //
 // Broadcast on every MOX or TUN edge from any source (UI, TCI, SWR trip,
 // TX timeout). The frontend updates useTxStore.moxOn / tunOn on receipt so
@@ -64,15 +63,9 @@ namespace Zeus.Contracts;
 // MoxSource.Tci/Cat/Plugin/etc. must NOT arm it: those sources carry their
 // own audio and dual-feeding the browser mic in parallel corrupts
 // TxAudioIngest's accumulator (issue #346).
-public readonly record struct MoxStateFrame(
-    bool MoxOn,
-    bool TunOn,
-    MoxSource Source = MoxSource.UI,
-    bool TxMonitorEnabled = false,
-    bool MonitorOnTransmit = false)
+public readonly record struct MoxStateFrame(bool MoxOn, bool TunOn, MoxSource Source = MoxSource.UI)
 {
-    public const int LegacyByteLength = 4;
-    public const int ByteLength = 6;
+    public const int ByteLength = 4;
 
     public void Serialize(IBufferWriter<byte> writer)
     {
@@ -81,22 +74,15 @@ public readonly record struct MoxStateFrame(
         span[1] = MoxOn ? (byte)1 : (byte)0;
         span[2] = TunOn ? (byte)1 : (byte)0;
         span[3] = (byte)Source;
-        span[4] = TxMonitorEnabled ? (byte)1 : (byte)0;
-        span[5] = MonitorOnTransmit ? (byte)1 : (byte)0;
         writer.Advance(ByteLength);
     }
 
     public static MoxStateFrame Deserialize(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.Length < LegacyByteLength)
-            throw new InvalidDataException($"MoxStateFrame requires at least {LegacyByteLength} bytes, got {bytes.Length}");
+        if (bytes.Length < ByteLength)
+            throw new InvalidDataException($"MoxStateFrame requires {ByteLength} bytes, got {bytes.Length}");
         if (bytes[0] != (byte)MsgType.MoxState)
             throw new InvalidDataException($"expected MoxState (0x{(byte)MsgType.MoxState:X2}), got 0x{bytes[0]:X2}");
-        return new MoxStateFrame(
-            MoxOn: bytes[1] != 0,
-            TunOn: bytes[2] != 0,
-            Source: (MoxSource)bytes[3],
-            TxMonitorEnabled: bytes.Length >= 5 && bytes[4] != 0,
-            MonitorOnTransmit: bytes.Length >= 6 && bytes[5] != 0);
+        return new MoxStateFrame(MoxOn: bytes[1] != 0, TunOn: bytes[2] != 0, Source: (MoxSource)bytes[3]);
     }
 }

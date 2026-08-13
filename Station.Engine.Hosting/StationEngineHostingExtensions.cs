@@ -137,10 +137,6 @@ public static class StationEngineHostingExtensions
         // the operator between hosts on the same machine.
         services.AddSingleton<Ft8SettingsStore>();
         services.AddSingleton<OperatorAckStore>();
-        // First-run / onboarding-wizard progress. Same exportable prefs DB as
-        // the ack stamp above so wizard completion follows the operator
-        // between hosts on the same machine (and rides database backups).
-        services.AddSingleton<OnboardingStateStore>();
 
         services.AddSingleton<TxIqRing>();
         services.AddSingleton<ITxIqSource>(sp => sp.GetRequiredService<TxIqRing>());

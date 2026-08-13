@@ -64,10 +64,6 @@ public sealed class TxService
     private long _transitionRevision;
     private bool _moxOn;
     private bool _tunOn;
-    // Session-only operator intent for Thetis-style MON during ordinary MOX.
-    // TUN and two-tone clear it alongside Preview so their generators never
-    // become audible through a stale voice-TX monitor choice.
-    private int _monitorOnTransmit;
     private DateTime? _moxStartedAt;
     private DateTime? _tunStartedAt;
     // Who currently owns MOX, set on the rising edge and cleared on the
@@ -132,68 +128,6 @@ public sealed class TxService
 
     public bool IsMoxOn { get { lock (_sync) return _moxOn; } }
     public bool IsTunOn { get { lock (_sync) return _tunOn; } }
-    public bool MonitorOnTransmit => Volatile.Read(ref _monitorOnTransmit) != 0;
-
-    private void SetMonitorOnTransmitUnsafe(bool enabled) =>
-        Volatile.Write(ref _monitorOnTransmit, enabled ? 1 : 0);
-
-    internal Action? TxMonitorPreviewMutationEnteredForTest { get; set; }
-
-    internal TxMonitorPreviewState ApplyTxMonitorPreview(
-        bool enabled,
-        bool meterOnly,
-        bool? monitorOnTransmit = null)
-    {
-        lock (_transitionSync)
-        {
-            TxMonitorPreviewMutationEnteredForTest?.Invoke();
-
-            bool appliedMeterOnly = enabled && meterOnly;
-            bool appliedMonitorOnTransmit = monitorOnTransmit ?? MonitorOnTransmit;
-
-            TransmitIntent? active;
-            MoxSource source;
-            lock (_sync)
-            {
-                active = _activeIntent;
-                source = active == TransmitIntent.Mox
-                    ? _moxOwner ?? MoxSource.UI
-                    : active == TransmitIntent.Tun
-                        ? _tunOwner ?? MoxSource.UI
-                        : MoxSource.UI;
-            }
-            if (active is TransmitIntent.Tun or TransmitIntent.TwoTone)
-            {
-                enabled = false;
-                appliedMeterOnly = false;
-                appliedMonitorOnTransmit = false;
-            }
-            else if (active == TransmitIntent.Mox)
-            {
-                // While keyed, the audible monitor follows the independent TX
-                // arm. The ordinary Preview request is strictly an RX/idle
-                // tool and cannot turn monitoring on during transmission.
-                enabled = appliedMonitorOnTransmit;
-                appliedMeterOnly = false;
-            }
-
-            SetMonitorOnTransmitUnsafe(appliedMonitorOnTransmit);
-            _pipeline.SetTxMonitorMeterOnly(appliedMeterOnly);
-            var state = _radio.SetTxMonitor(new TxMonitorSetRequest(enabled));
-            var result = new TxMonitorPreviewState(
-                state,
-                state.TxMonitorEnabled && appliedMeterOnly,
-                appliedMonitorOnTransmit);
-            if (active is not null)
-            {
-                BroadcastMoxState(
-                    moxOn: active is TransmitIntent.Mox or TransmitIntent.TwoTone,
-                    tunOn: active == TransmitIntent.Tun,
-                    source);
-            }
-            return result;
-        }
-    }
 
     /// <summary>
     /// Runs a short safety-critical operation only when every Zeus transmit
@@ -370,15 +304,11 @@ public sealed class TxService
         {
             bool wasActive;
             lock (_sync) wasActive = _activeIntent is not null;
-            PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
             _safety.RecordTrip();
             ConvergeToSafeIdle(faultLatched: true);
-            if (wasActive)
-                _log.LogInformation("tx.disconnect.clear");
-            // The session-only TX monitor arm can be set while RX/idle. Always
-            // publish its authoritative cleared state so connected clients do
-            // not leave the TX button visibly armed after a radio disconnect.
-            BroadcastMoxState(moxOn: false, tunOn: false);
+            if (!wasActive) return;
+            _log.LogInformation("tx.disconnect.clear");
+            _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
         }
     }
 
@@ -598,32 +528,11 @@ public sealed class TxService
         return l?.VfoHz == r?.VfoHz && l?.Mode == r?.Mode;
     }
 
-    private void PrepareTxMonitorForTransmitStart(bool clearTransmitIntent = false)
+    private void ClearTxMonitorForTransmitStart()
     {
-        if (clearTransmitIntent) SetMonitorOnTransmitUnsafe(false);
-        _pipeline.SetTxMonitorMeterOnly(false);
         if (!_radio.Snapshot().TxMonitorEnabled) return;
         _radio.SetTxMonitor(new TxMonitorSetRequest(false));
     }
-
-    private void ActivateTxMonitorForMox()
-    {
-        _pipeline.SetTxMonitorMeterOnly(false);
-        bool enabled = MonitorOnTransmit;
-        if (_radio.Snapshot().TxMonitorEnabled == enabled) return;
-        _radio.SetTxMonitor(new TxMonitorSetRequest(enabled));
-    }
-
-    private void BroadcastMoxState(
-        bool moxOn,
-        bool tunOn,
-        MoxSource source = MoxSource.UI) =>
-        _hub.Broadcast(new MoxStateFrame(
-            MoxOn: moxOn,
-            TunOn: tunOn,
-            Source: source,
-            TxMonitorEnabled: _radio.Snapshot().TxMonitorEnabled,
-            MonitorOnTransmit: MonitorOnTransmit));
 
     private long NextTransitionRevision()
     {
@@ -696,10 +605,7 @@ public sealed class TxService
         }
     }
 
-    private void ConvergeToSafeIdle(
-        bool faultLatched,
-        Action? onPostWireIdle = null,
-        bool stopTxMonitor = true)
+    private void ConvergeToSafeIdle(bool faultLatched, Action? onPostWireIdle = null)
     {
         long revision = NextTransitionRevision();
         bool failed = false;
@@ -746,18 +652,6 @@ public sealed class TxService
         }
 
         Safe("dsp.mox.off", () => _pipeline.SetMox(false));
-        if (stopTxMonitor) Safe("txMonitor.off", () =>
-        {
-            // Keep the monitor request asserted through WDSP's MOX-off edge.
-            // That makes SetMox(false) leave TXA warm instead of attempting a
-            // damped stop after the wire edge has already stopped mic blocks;
-            // the latter can wait forever for a final fexchange and strand RX
-            // suppression on. SetTxMonitor(false) intentionally leaves an idle
-            // TXA warm, so clearing the request after MOX-off is non-blocking.
-            _pipeline.SetTxMonitorMeterOnly(false);
-            if (_radio.Snapshot().TxMonitorEnabled)
-                _radio.SetTxMonitor(new TxMonitorSetRequest(false));
-        });
         if (!hostClearedEarly)
         {
             ClearHostIntent(revision);
@@ -821,7 +715,7 @@ public sealed class TxService
                 _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
-                PrepareTxMonitorForTransmitStart();
+                ClearTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
                 _radio.SetTxSafetyAuthority(true);
                 _pipeline.SetTxTune(false);
@@ -836,13 +730,12 @@ public sealed class TxService
                 _log.LogInformation("tx.mox.on.recv ts={Ts}",
                     _stopwatchTicks());
                 _radio.SetMox(true);
-                ActivateTxMonitorForMox();
                 _pipeline.CommitTxEgress(revision);
                 _pipeline.SetPsMox(true);
                 CommitActiveIntent(TransmitIntent.Mox, source, revision, armPreKey);
                 RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
                 _log.LogInformation("tx.mox on=true revision={Revision}", revision);
-                BroadcastMoxState(moxOn: true, tunOn: false, source);
+                _hub.Broadcast(new MoxStateFrame(MoxOn: true, TunOn: false, Source: source));
                 error = null;
                 return true;
             }
@@ -936,12 +829,9 @@ public sealed class TxService
 
         if (active == TransmitIntent.Mox)
             DrainMoxTailBestEffort();
-        ConvergeToSafeIdle(
-            faultLatched: false,
-            onPostWireIdle: onPostWireIdle,
-            stopTxMonitor: active is not null);
+        ConvergeToSafeIdle(faultLatched: false, onPostWireIdle);
         _log.LogInformation("tx.mox on=false");
-        BroadcastMoxState(moxOn: false, tunOn: false);
+        _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
         error = null;
         return true;
     }
@@ -978,7 +868,7 @@ public sealed class TxService
 
             ConvergeToSafeIdle(faultLatched: false);
             _log.LogInformation("tx.mox dead-man release source={Source}", source);
-            BroadcastMoxState(moxOn: false, tunOn: false);
+            _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
             error = null;
             return true;
         }
@@ -1012,11 +902,9 @@ public sealed class TxService
                     error = $"TX held by {active}; unkey it before changing two-tone";
                     return false;
                 }
-                ConvergeToSafeIdle(
-                    faultLatched: false,
-                    stopTxMonitor: active is not null);
+                ConvergeToSafeIdle(faultLatched: false);
                 _log.LogInformation("tx.twoTone on=false");
-                BroadcastMoxState(moxOn: false, tunOn: false);
+                _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
                 error = null;
                 return true;
             }
@@ -1044,7 +932,7 @@ public sealed class TxService
             _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
-                PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
+                ClearTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
                 _radio.SetTxSafetyAuthority(true);
                 _pipeline.SetTxTune(false);
@@ -1061,7 +949,7 @@ public sealed class TxService
                 _log.LogInformation(
                     "tx.twoTone on=true f1={F1} f2={F2} mag={Mag} revision={Revision}",
                     req.Freq1, req.Freq2, req.Mag, revision);
-                BroadcastMoxState(moxOn: true, tunOn: false);
+                _hub.Broadcast(new MoxStateFrame(MoxOn: true, TunOn: false));
                 error = null;
                 return true;
             }
@@ -1102,11 +990,9 @@ public sealed class TxService
                     error = $"TUN held by {owner}; only UI can override";
                     return false;
                 }
-                ConvergeToSafeIdle(
-                    faultLatched: false,
-                    stopTxMonitor: active is not null);
+                ConvergeToSafeIdle(faultLatched: false);
                 _log.LogInformation("tx.tun on=false");
-                BroadcastMoxState(moxOn: false, tunOn: false);
+                _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
                 error = null;
                 return true;
             }
@@ -1121,7 +1007,7 @@ public sealed class TxService
             _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
-                PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
+                ClearTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
                 _radio.SetTxSafetyAuthority(true);
                 _radio.SetTwoToneRuntimeEnabled(false);
@@ -1142,7 +1028,7 @@ public sealed class TxService
                 CommitActiveIntent(TransmitIntent.Tun, source, revision, preKeyDelayTicks > 0);
                 RebasePreKeyDeadlineIfStillActive(tune: true, preKeyDelayTicks);
                 _log.LogInformation("tx.tun on=true revision={Revision}", revision);
-                BroadcastMoxState(moxOn: false, tunOn: true);
+                _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: true));
                 error = null;
                 return true;
             }
@@ -1176,15 +1062,7 @@ public sealed class TxService
             // Decision 7: trip output is level-triggered and operator-visible
             // even when stale latches claimed TX was already idle.
             _hub.Broadcast(new AlertFrame(kind, reason));
-            BroadcastMoxState(moxOn: false, tunOn: false);
+            _hub.Broadcast(new MoxStateFrame(MoxOn: false, TunOn: false));
         }
     }
-}
-
-internal readonly record struct TxMonitorPreviewState(
-    StateDto RadioState,
-    bool MeterOnly,
-    bool MonitorOnTransmit)
-{
-    public bool Enabled => RadioState.TxMonitorEnabled;
 }
