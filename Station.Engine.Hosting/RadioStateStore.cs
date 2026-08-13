@@ -157,6 +157,7 @@ public sealed class RadioStateEntry
     public int AdcProtectionReleaseHoldMs { get; set; } = 2000;
     public int AttenDb { get; set; }
     public bool AutoAgcEnabled { get; set; }
+    public bool RxLevelerEnabled { get; set; }
     // RX preamp toggle (PRE). Not part of older rows; default false matches
     // RadioService's historical startup state.
     public bool PreampOn { get; set; }

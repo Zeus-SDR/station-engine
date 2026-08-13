@@ -5,7 +5,7 @@ using Zeus.Protocol1;
 
 namespace Zeus.Server;
 
-/// <summary>Maps sample-rate, gain, AGC, squelch, and TX-leveling routes.</summary>
+/// <summary>Maps sample-rate, gain, AGC, squelch, and RX/TX-leveling routes.</summary>
 public static class RadioDspControlEndpoints
 {
     public static IEndpointRouteBuilder MapRadioDspControlEndpoints(
@@ -45,6 +45,12 @@ public static class RadioDspControlEndpoints
             if (!Enum.IsDefined(req.Agc.Mode))
                 return Results.BadRequest(new { error = $"unknown AgcMode {req.Agc.Mode}" });
             return Results.Ok(r.SetAgc(req.Agc));
+        });
+
+        endpoints.MapPost("/api/rx/leveler", (RxLevelerSetRequest req, RadioService r) =>
+        {
+            log.LogInformation("api.rx.leveler enabled={Enabled}", req.Enabled);
+            return Results.Ok(r.SetRxLeveler(req.Enabled));
         });
 
         endpoints.MapPost("/api/rx/squelch", (SquelchSetRequest req, RadioService r) =>

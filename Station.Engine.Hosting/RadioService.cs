@@ -801,6 +801,7 @@ public sealed class RadioService : IDisposable
             // widened to 0..20 for Thetis parity (radio.cs leveler top 0..20).
             LevelerMaxGainDb: overlayLevelerMaxGain ?? Math.Clamp(rsSnap?.LevelerMaxGainDb ?? 8.0, 0.0, 20.0),
             AutoAgcEnabled: rsSnap?.AutoAgcEnabled ?? false,
+            RxLevelerEnabled: rsSnap?.RxLevelerEnabled ?? false,
             AgcOffsetDb: 0.0,       // always reset — control-loop accumulator
             // AGC knee removed: AGC-T is the single manual AGC control, so the
             // threshold is never operator-driven (it and AGC-T are the same WDSP
@@ -3822,6 +3823,25 @@ public sealed class RadioService : IDisposable
         return snap;
     }
 
+    public StateDto SetRxLeveler(bool enabled)
+    {
+        bool changed = false;
+        lock (_sync)
+        {
+            if (_state.RxLevelerEnabled == enabled) return _state;
+            changed = true;
+            _state = _state with { RxLevelerEnabled = enabled };
+        }
+        var snap = Snapshot();
+        if (changed)
+        {
+            _stateDirty = true;
+            FlushState();
+        }
+        StateChanged?.Invoke(snap);
+        return snap;
+    }
+
     /// <summary>
     /// Set by DspPipelineService at construction: the RX display-analyzer FFT
     /// size (DisplayPerformanceOptions.RxAnalyzerFftSize, 16384 stock / 8192
@@ -6145,6 +6165,7 @@ public sealed class RadioService : IDisposable
                 AdcProtectionReleaseHoldMs = adcProtection.ReleaseHoldMs,
                 AttenDb = snap.AttenDb,
                 AutoAgcEnabled = snap.AutoAgcEnabled,
+                RxLevelerEnabled = snap.RxLevelerEnabled,
                 PreampOn = snap.PreampOn,
                 RxAfGainDb = snap.RxAfGainDb,
                 MicGainDb = snap.MicGainDb,

@@ -164,6 +164,7 @@ public class DspPipelineService : BackgroundService,
         public bool BoostSlewLimited;
         public bool PeakLimited;
         public bool OutputLimited;
+        public bool ReleaseToUnity;
     }
 
     private RxAudioLevelerState _rxAudioLeveler;
@@ -352,6 +353,29 @@ public class DspPipelineService : BackgroundService,
             allowBoost: rfSignalResolved && !adcOverloadRisk,
             RxConstantLoudnessMaxBoostDb,
             levelReferenceOffsetDb);
+
+    internal static void ApplyRxAudioLeveler(
+        Span<float> samples,
+        ref RxAudioLevelerState state,
+        bool enabled,
+        bool rfSignalResolved,
+        bool adcOverloadRisk,
+        double levelReferenceOffsetDb = 0.0)
+    {
+        if (!enabled && (state.GainDb > 0.0 || state.AppliedGainDb > 0.0))
+            state.ReleaseToUnity = true;
+
+        ApplyRxAudioLevelerCore(
+            samples,
+            ref state,
+            allowBoost: enabled && !state.ReleaseToUnity &&
+                rfSignalResolved && !adcOverloadRisk,
+            RxConstantLoudnessMaxBoostDb,
+            levelReferenceOffsetDb);
+
+        if (state.ReleaseToUnity && state.GainDb <= 0.0 && state.AppliedGainDb <= 0.0)
+            state.ReleaseToUnity = false;
+    }
 
     private static void ApplyRxAudioLevelerCore(
         Span<float> samples,
@@ -3867,6 +3891,7 @@ public class DspPipelineService : BackgroundService,
     private AudioPathDiagnosticsDto SnapshotAudioDiagnostics()
     {
         long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        bool rxLevelerEnabled = _radio.Snapshot().RxLevelerEnabled;
         bool valid;
         long frameMs;
         uint lastSeq;
@@ -3978,7 +4003,8 @@ public class DspPipelineService : BackgroundService,
             levelerOutputLimited,
             squelchMode,
             squelchGateSource,
-            squelchOpenKnown);
+            squelchOpenKnown,
+            rxLevelerEnabled);
     }
 
     internal static AudioPathDiagnosticsDto BuildAudioPathDiagnostics(
@@ -4016,7 +4042,8 @@ public class DspPipelineService : BackgroundService,
         bool levelerOutputLimited = false,
         string? squelchMode = null,
         string? squelchGateSource = null,
-        bool? squelchOpenKnown = null)
+        bool? squelchOpenKnown = null,
+        bool rxLevelerEnabled = false)
     {
         source = string.IsNullOrWhiteSpace(source) ? "none" : source;
         squelchMode = NormalizeSquelchMode(squelchMode, squelchEnabled);
@@ -4097,6 +4124,7 @@ public class DspPipelineService : BackgroundService,
             SquelchOpen: squelchOpen,
             SquelchTailActive: squelchTailActive,
             SquelchGateGain: double.IsFinite(squelchGain) ? Math.Round(Math.Clamp(squelchGain, 0.0, 1.0), 3) : null,
+            RxAudioLevelerEnabled: rxLevelerEnabled,
             RxAudioLevelerInputRmsDbfs: RoundLevelerDb(levelerValid, levelerInputRmsDbfs),
             RxAudioLevelerOutputRmsDbfs: RoundLevelerDb(levelerValid, levelerOutputRmsDbfs),
             RxAudioLevelerInputPeakDbfs: RoundLevelerDb(levelerValid, levelerInputPeakDbfs),
@@ -4952,6 +4980,7 @@ public class DspPipelineService : BackgroundService,
             AgcMode: agc.Mode.ToString(),
             AgcTopDb: Math.Round(state.AgcTopDb, 1),
             AutoAgcEnabled: state.AutoAgcEnabled,
+            RxLevelerEnabled: state.RxLevelerEnabled,
             AgcOffsetDb: Math.Round(state.AgcOffsetDb, 1),
             EffectiveAgcTopDb: effectiveAgcTopDb,
             SquelchEnabled: squelch.Enabled,
@@ -8974,6 +9003,7 @@ public class DspPipelineService : BackgroundService,
                     ApplyRxAudioLeveler(
                         audioBuf.AsSpan(0, audioSampleCount),
                         ref _rxAudioLeveler,
+                        enabled: state.RxLevelerEnabled,
                         rfSignalResolved: loudnessBoostAllowed,
                         adcOverloadRisk: !loudnessBoostAllowed,
                         levelReferenceOffsetDb: appliedAfDb);
@@ -9747,6 +9777,7 @@ internal sealed record DspRxChainDiagnosticsDto(
     string AgcMode,
     double AgcTopDb,
     bool AutoAgcEnabled,
+    bool RxLevelerEnabled,
     double AgcOffsetDb,
     double EffectiveAgcTopDb,
     bool SquelchEnabled,
@@ -9863,6 +9894,7 @@ internal sealed record AudioPathDiagnosticsDto(
     bool SquelchOpen,
     bool SquelchTailActive,
     double? SquelchGateGain,
+    bool RxAudioLevelerEnabled,
     double? RxAudioLevelerInputRmsDbfs,
     double? RxAudioLevelerOutputRmsDbfs,
     double? RxAudioLevelerInputPeakDbfs,

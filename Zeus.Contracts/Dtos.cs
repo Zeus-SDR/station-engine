@@ -1114,6 +1114,11 @@ public sealed record StateDto(
     // Default is OFF — operator must explicitly enable. The control loop
     // adjusts AgcOffsetDb, which is added to the user baseline AgcTopDb.
     bool AutoAgcEnabled = false,
+    // RX constant-loudness leveler. Auto raises qualifying weak receive audio
+    // toward a consistent listening level; Off prevents makeup gain while
+    // keeping peak protection active.
+    // Default is OFF — operator must explicitly enable.
+    bool RxLevelerEnabled = false,
     double AgcOffsetDb = 0.0,
     // AGC threshold ("knee") in operator/displayed dBm — the signal-relative
     // level below which the AGC applies increasing gain (up to the AgcTopDb
@@ -1960,6 +1965,8 @@ public sealed record AdcProtectionStatusDto(
     DateTimeOffset? LastTelemetryUtc);
 
 public sealed record AutoAgcSetRequest(bool Enabled);
+
+public sealed record RxLevelerSetRequest(bool Enabled);
 
 public sealed record TunSetRequest(bool On);
 
