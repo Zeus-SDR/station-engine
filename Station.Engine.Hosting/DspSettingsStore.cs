@@ -427,11 +427,10 @@ public sealed class DspSettingsStore : IDisposable
         e.TxPhaseRotatorAutoMode = c.AutoMode;
     }
 
-    // SSB bandpass "rectangularity" — operator-selectable WDSP FIR window (issue
-    // #871). Null on legacy rows / never-written → caller falls back to
-    // BandpassWindow.Sharp, the current hardcoded WDSP default at
-    // OpenChannel/OpenTxChannel time, so a fresh install hears no behaviour
-    // change. RX and TX are stored independently.
+    // Bandpass resolution. The append-only enum preserves legacy shape values
+    // and adds operator-selectable RX/TX tap sizes through 262144. Null on
+    // legacy rows is resolved by RadioService to Normal (2048 taps); both paths
+    // remain independently persisted.
     public BandpassWindow? GetRxFilterWindow(string profileId = "default")
     {
         var e = _entries.FindOne(x => x.ProfileId == profileId);
@@ -449,6 +448,53 @@ public sealed class DspSettingsStore : IDisposable
 
     public void SetTxFilterWindow(BandpassWindow window, string profileId = "default")
         => UpsertFilterWindow(rx: null, tx: window, profileId);
+
+    public FilterPhaseMode? GetRxFilterPhase(string profileId = "default")
+    {
+        var e = _entries.FindOne(x => x.ProfileId == profileId);
+        return e?.RxFilterPhase;
+    }
+
+    public FilterPhaseMode? GetTxFilterPhase(string profileId = "default")
+    {
+        var e = _entries.FindOne(x => x.ProfileId == profileId);
+        return e?.TxFilterPhase;
+    }
+
+    public void SetRxFilterPhase(FilterPhaseMode phase, string profileId = "default")
+        => UpsertFilterPhase(rx: phase, tx: null, profileId);
+
+    public void SetTxFilterPhase(FilterPhaseMode phase, string profileId = "default")
+        => UpsertFilterPhase(rx: null, tx: phase, profileId);
+
+    private void UpsertFilterPhase(FilterPhaseMode? rx, FilterPhaseMode? tx, string profileId)
+    {
+        var existing = _entries.FindOne(x => x.ProfileId == profileId);
+        if (existing is null)
+        {
+            var nrSeed = new NrConfig();
+            existing = new DspSettingsEntry
+            {
+                ProfileId = profileId,
+                NrMode = nrSeed.NrMode,
+                AnfEnabled = nrSeed.AnfEnabled,
+                SnbEnabled = nrSeed.SnbEnabled,
+                NbpNotchesEnabled = nrSeed.NbpNotchesEnabled,
+                NbMode = nrSeed.NbMode,
+                NbThreshold = nrSeed.NbThreshold,
+                RxFilterPhase = rx,
+                TxFilterPhase = tx,
+                UpdatedUtc = DateTime.UtcNow,
+            };
+            _entries.Insert(existing);
+            return;
+        }
+
+        if (rx.HasValue) existing.RxFilterPhase = rx.Value;
+        if (tx.HasValue) existing.TxFilterPhase = tx.Value;
+        existing.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(existing);
+    }
 
     private void UpsertFilterWindow(BandpassWindow? rx, BandpassWindow? tx, string profileId)
     {
@@ -746,5 +792,7 @@ public sealed class DspSettingsEntry
     // default at OpenChannel/OpenTxChannel time. Stored as the byte enum value.
     public BandpassWindow? RxFilterWindow { get; set; }
     public BandpassWindow? TxFilterWindow { get; set; }
+    public FilterPhaseMode? RxFilterPhase { get; set; }
+    public FilterPhaseMode? TxFilterPhase { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

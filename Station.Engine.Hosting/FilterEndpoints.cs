@@ -47,6 +47,22 @@ public static class FilterEndpoints
             return Results.Ok(r.SetTxBandpassWindow(req.Window));
         });
 
+        endpoints.MapPost("/api/rx/filter-phase", (FilterPhaseSetRequest req, RadioService r) =>
+        {
+            if (!Enum.IsDefined(req.Phase))
+                return Results.BadRequest(new { error = $"unknown FilterPhaseMode {req.Phase}" });
+            log.LogInformation("api.rx.filterPhase phase={Phase}", req.Phase);
+            return Results.Ok(r.SetRxFilterPhase(req.Phase));
+        });
+
+        endpoints.MapPost("/api/tx/filter-phase", (FilterPhaseSetRequest req, RadioService r) =>
+        {
+            if (!Enum.IsDefined(req.Phase))
+                return Results.BadRequest(new { error = $"unknown FilterPhaseMode {req.Phase}" });
+            log.LogInformation("api.tx.filterPhase phase={Phase}", req.Phase);
+            return Results.Ok(r.SetTxFilterPhase(req.Phase));
+        });
+
         // Filter preset endpoints (PRD §5.2). These are the preferred filter surface;
         // /api/bandwidth remains for backward compat. POST /api/filter also accepts
         // an optional PresetName to track which chip is active.

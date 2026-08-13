@@ -28,8 +28,8 @@ namespace Zeus.Server;
 //      band, refine it to sub-pixel with parabolic interpolation, and convert
 //      it to an absolute frequency using the centre frequency the pipeline
 //      stamped on that very snapshot — never an assumption about where the LO
-//      "should" be. Reject unless the peak rises ≥ 6 dB above the spectrum
-//      median and the per-frame measurements agree with each other.
+//      "should" be. The peak must repeat at the same frequency across the
+//      captured frames, which admits faint carriers while rejecting noise.
 //   6. Compose the measured residual with the factor already in force
 //      (FrequencyCalibrationPlan.ComposeFactor) and persist it via
 //      RadioService.SetFrequencyCorrectionFactor (write-through to
@@ -61,25 +61,17 @@ public sealed class FrequencyCalibrationService
     public const double MinReferenceFrequencyHz = 1_000_000.0;
     public const double MaxReferenceFrequencyHz = 30_000_000.0;
 
-    // Peak must stand out from the spectrum median by at least this much.
-    // Catches the case where the "peak" is just slightly-warm noise — a
-    // real WWV carrier sits well above the surrounding median (typically
-    // 20-40 dB). Relative threshold only: an absolute dB floor would
-    // reject perfectly real but faint signals on quieter SDRs (P2 at
-    // 192 kHz commonly has a -125 dB analyzer median, where even a
-    // -99 dB carrier is unambiguously a signal).
-    private const float MinPeakAboveMedianDb = 6f;
-
     private const int SettleMs = 2500;
-    private const int CaptureRetries = 12;
+    // Covers one full publication interval even at the supported 1 Hz display
+    // refresh, so every measurement can wait for a distinct analyzer frame.
+    private const int CaptureRetries = 35;
     private const int CaptureRetryDelayMs = 40;
 
     // Independent measurements folded into one median. The panadapter cache
-    // refills at 30 Hz, so 60 ms between reads guarantees distinct frames;
-    // seven of them span ~0.4 s of ionosphere, which is enough to out-vote a
-    // single frame that caught a noise burst or a fading null.
+    // publications are versioned, and the gap exceeds three times WDSP's
+    // 100 ms display-averaging time constant so successive maxima are not
+    // correlated views of the same noise burst.
     private const int MeasureFrames = 7;
-    private const int MeasureFrameGapMs = 60;
     private const int MinAgreeingFrames = 4;
 
     // How far apart per-frame measurements may sit and still be believed,
@@ -170,18 +162,20 @@ public sealed class FrequencyCalibrationService
 
                 await Task.Delay(SettleMs, ct).ConfigureAwait(false);
 
-                var measurements = new List<double>(MeasureFrames);
-                var peakDbs = new List<double>(MeasureFrames);
+                var candidates = new List<FrameMeasurement>(MeasureFrames);
                 var pixels = new float[_pipeline.ConfiguredPanadapterWidth];
                 float hzPerPixel = 0f;
                 float lastPeakDb = float.NegativeInfinity;
                 float lastMedianDb = float.NaN;
                 bool captured = false;
+                long lastSnapshotVersion = 0;
 
                 for (int frame = 0; frame < MeasureFrames; frame++)
                 {
                     if (frame > 0)
-                        await Task.Delay(MeasureFrameGapMs, ct).ConfigureAwait(false);
+                        await Task.Delay(
+                            FrequencyCalibrationPlan.MeasurementFrameGapMs,
+                            ct).ConfigureAwait(false);
 
                     // hzPerPixel and centreHz come out of the same call as the
                     // pixels, so all three describe THESE samples. centreHz is
@@ -189,12 +183,14 @@ public sealed class FrequencyCalibrationService
                     // using it instead of assuming "centre pixel == commanded
                     // LO" is what keeps the measurement honest across CTUN, a
                     // mid-retune frame, and the P2 wideband-detail path.
-                    var capture = await TryCaptureWithRetryAsync(pixels, ct).ConfigureAwait(false);
+                    var capture = await TryCaptureWithRetryAsync(
+                        pixels, lastSnapshotVersion, ct).ConfigureAwait(false);
                     if (capture is null) continue;
-                    (float frameHzPerPixel, long frameCenterHz) = capture.Value;
+                    (float frameHzPerPixel, long frameCenterHz, long snapshotVersion) = capture.Value;
                     if (frameHzPerPixel <= 0f) continue;
 
                     captured = true;
+                    lastSnapshotVersion = snapshotVersion;
                     hzPerPixel = frameHzPerPixel;
 
                     double centerIdx = pixels.Length / 2.0;
@@ -228,23 +224,35 @@ public sealed class FrequencyCalibrationService
                     float medianDb = FrequencyCalibrationPlan.Median(pixels);
                     lastPeakDb = peakDb;
                     lastMedianDb = medianDb;
-                    if (peakDb - medianDb < MinPeakAboveMedianDb) continue;
-
                     double refinedIdx = FrequencyCalibrationPlan.InterpolatePeakIndex(pixels, peakIndex);
                     double measuredHz = FrequencyCalibrationPlan.PixelToHz(
                         refinedIdx, frameCenterHz, frameHzPerPixel, pixels.Length);
-                    measurements.Add(measuredHz);
-                    peakDbs.Add(peakDb);
+                    candidates.Add(new FrameMeasurement(
+                        measuredHz,
+                        peakDb));
                 }
 
                 if (!captured) return CalibrationResult.CaptureFailed;
-                if (measurements.Count < MinAgreeingFrames)
-                    return CalibrationResult.NoSignal(lastPeakDb, lastMedianDb, measurements.Count, MeasureFrames);
-
-                double spreadHz = measurements.Max() - measurements.Min();
                 double maxSpreadHz = MaxFrameSpreadPixels * hzPerPixel;
-                if (spreadHz > maxSpreadHz)
-                    return CalibrationResult.Unstable(spreadHz, maxSpreadHz, (float)FrequencyCalibrationPlan.Median(peakDbs));
+                // Frequency agreement across independent frames is the signal
+                // discriminator. Unlike the former per-frame 6 dB cut, this
+                // admits a faint carrier without accepting scattered noise.
+                var pool = candidates.ToArray();
+                int[] stableIndices = FrequencyCalibrationPlan.StableClusterIndices(
+                    pool.Select(candidate => candidate.MeasuredHz).ToArray(),
+                    maxSpreadHz);
+                if (stableIndices.Length < MinAgreeingFrames)
+                    return CalibrationResult.NoSignal(
+                        lastPeakDb,
+                        lastMedianDb,
+                        stableIndices.Length,
+                        MeasureFrames,
+                        MinAgreeingFrames);
+
+                var stable = stableIndices.Select(index => pool[index]).ToArray();
+                var measurements = stable.Select(candidate => candidate.MeasuredHz).ToArray();
+                var peakDbs = stable.Select(candidate => (double)candidate.PeakDb).ToArray();
+                double spreadHz = measurements.Max() - measurements.Min();
 
                 double measuredCarrierHz = FrequencyCalibrationPlan.Median(measurements);
                 double medianPeakDb = FrequencyCalibrationPlan.Median(peakDbs);
@@ -268,7 +276,7 @@ public sealed class FrequencyCalibrationService
                 _log.LogInformation(
                     "freqcal.success ref={Ref}Hz measured={Meas:F2}Hz deviation={Dev:F2}Hz spread={Spread:F2}Hz frames={N}/{Total} peakDb={Db:F1} hzPerPx={Hpp:F2} priorFactor={Prior:F9} factor={Factor:F9} applied={Applied:F9}",
                     referenceFrequencyHz, measuredCarrierHz, deviationHz, spreadHz,
-                    measurements.Count, MeasureFrames, medianPeakDb, hzPerPixel,
+                    measurements.Length, MeasureFrames, medianPeakDb, hzPerPixel,
                     currentFactor, factor, applied);
 
                 return CalibrationResult.Success(
@@ -313,17 +321,28 @@ public sealed class FrequencyCalibrationService
     /// first frame after SetVfo's re-tune, or the analyzer reconfig from
     /// SetZoom is still settling), so retry briefly.
     /// </summary>
-    private async Task<(float HzPerPixel, long CenterHz)?> TryCaptureWithRetryAsync(
-        float[] dest, CancellationToken ct)
+    private async Task<(float HzPerPixel, long CenterHz, long SnapshotVersion)?> TryCaptureWithRetryAsync(
+        float[] dest, long afterSnapshotVersion, CancellationToken ct)
     {
         for (int attempt = 0; attempt < CaptureRetries; attempt++)
         {
-            if (_pipeline.TryCapturePanadapterSnapshot(dest, out float hzPerPixel, out long centerHz))
-                return (hzPerPixel, centerHz);
+            if (_pipeline.TryCapturePanadapterSnapshot(
+                    dest,
+                    out float hzPerPixel,
+                    out long centerHz,
+                    out long snapshotVersion) &&
+                snapshotVersion > afterSnapshotVersion)
+            {
+                return (hzPerPixel, centerHz, snapshotVersion);
+            }
             await Task.Delay(CaptureRetryDelayMs, ct).ConfigureAwait(false);
         }
         return null;
     }
+
+    private sealed record FrameMeasurement(
+        double MeasuredHz,
+        float PeakDb);
 }
 
 /// <summary>
@@ -355,15 +374,21 @@ public sealed record CalibrationResult(
         "Panadapter snapshot was not available — engine offline or pipeline stalled.");
 
     public static CalibrationResult NoSignal(
-        float peakDb, float medianDb = float.NaN, int goodFrames = 0, int totalFrames = 0)
+        float peakDb,
+        float medianDb = float.NaN,
+        int goodFrames = 0,
+        int totalFrames = 0,
+        int requiredFrames = 0)
     {
-        string frames = totalFrames > 0 ? $" ({goodFrames} of {totalFrames} frames usable)" : string.Empty;
+        string frames = totalFrames > 0
+            ? $" ({goodFrames} of {totalFrames} frames agreed; at least {requiredFrames} required)"
+            : string.Empty;
         return new(
             CalibrationOutcome.NoSignal, null,
             float.IsNegativeInfinity(peakDb) ? null : peakDb, null,
             float.IsNaN(medianDb)
-                ? $"No signal detected at the reference frequency{frames}."
-                : $"No signal detected at the reference frequency (peak {peakDb:F1} dB, median {medianDb:F1} dB — peak must rise ≥ 6 dB above median){frames}.");
+                ? $"No stable signal detected at the reference frequency{frames}."
+                : $"No stable signal detected at the reference frequency (peak {peakDb:F1} dB, median {medianDb:F1} dB){frames}.");
     }
 
     public static CalibrationResult Unstable(double spreadHz, double allowedHz, float peakDb) => new(

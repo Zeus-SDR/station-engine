@@ -147,21 +147,22 @@ typedef struct _fircore
 	double* imp;
 	int nfor;				// number of buffers in delay line
 	double* fftin;			// fft input buffer
+	double* fftstage;		// shared forward-FFT output, copied into the delay line
 	double*** fmask;		// frequency domain masks
 	double** fftout;		// fftout delay line
 	double* accum;			// frequency domain accumulator
 	int buffidx;			// fft out buffer index
 	int idxmask;			// mask for index computations
 	double* maskgen;		// input for mask generation FFT
-	fftw_plan* pcfor;		// array of forward FFT plans
+	double** maskstage;		// shared mask-FFT outputs, one per coefficient set
+	fftw_plan pcfor;			// forward FFT plan
 	fftw_plan crev;			// reverse fft plan
-	fftw_plan** maskplan;	// plans for frequency domain masks
+	fftw_plan* maskplan;	// mask FFT plans, one per coefficient set
 	CRITICAL_SECTION update;
 	int cset;
 	int mp;
 	int masks_ready;
 	int pfactor;
-	MINPHASE pminphase;
 } fircore, *FIRCORE;
 
 extern FIRCORE create_fircore (int size, double* in, double* out, 

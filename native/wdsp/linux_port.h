@@ -54,6 +54,7 @@ john.d.melton@googlemail.com
   #define InterlockedBitTestAndReset(base,bit) __sync_fetch_and_and(base,~(1L<<bit))
 
   #define InterlockedExchange(target,value) __sync_lock_test_and_set(target,value)
+  #define InterlockedCompareExchange(destination,exchange,comparand) __sync_val_compare_and_swap(destination,comparand,exchange)
   #define InterlockedAnd(base,mask) __sync_fetch_and_and(base,mask)
   #define _InterlockedAnd(base,mask) __sync_fetch_and_and(base,mask)
   #define __declspec(x)

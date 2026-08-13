@@ -1435,8 +1435,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     public void SetAttenuator(int db)
     {
-        _rxStepAttnDb = (byte)Math.Clamp(db, 0, 31);
-        if (_rxTask is not null) SendCmdHighPriority(run: true);
+        byte next = (byte)Math.Clamp(db, 0, 31);
+        if (_rxStepAttnDb == next) return;
+        _rxStepAttnDb = next;
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>
@@ -1500,8 +1502,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetRx1Attenuator(int db)
     {
-        _rx1StepAttnDb = (byte)Math.Clamp(db, 0, 31);
-        if (_rxTask is not null) SendCmdHighPriority(run: true);
+        byte next = (byte)Math.Clamp(db, 0, 31);
+        if (_rx1StepAttnDb == next) return;
+        _rx1StepAttnDb = next;
+        if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     /// <summary>

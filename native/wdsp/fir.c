@@ -362,9 +362,9 @@ void analytic (int N, double* in, double* out)
 	double two_inv_N = 2.0 * inv_N;
 	double* x = (double *) malloc0 (N * sizeof (complex));
 	fftw_plan pfor = fftw_plan_dft_1d (N, (fftw_complex *) in,
-			(fftw_complex *) x, FFTW_FORWARD, FFTW_PATIENT);
+			(fftw_complex *) x, FFTW_FORWARD, FFTW_ESTIMATE);
 	fftw_plan prev = fftw_plan_dft_1d (N, (fftw_complex *) x,
-			(fftw_complex *) out, FFTW_BACKWARD, FFTW_PATIENT);
+			(fftw_complex *) out, FFTW_BACKWARD, FFTW_ESTIMATE);
 	fftw_execute (pfor);
 	x[0] *= inv_N;
 	x[1] *= inv_N;
@@ -384,6 +384,7 @@ void analytic (int N, double* in, double* out)
 
 void mp_imp (int N, double* fir, double* mpfir, int pfactor, int polarity)
 {
+	lock_mp_generation();
 	// check for previous in the cache
 	struct Params 
 	{
@@ -409,6 +410,7 @@ void mp_imp (int N, double* fir, double* mpfir, int pfactor, int polarity)
 	{
 		memcpy(mpfir, imp, N * sizeof(complex));
 		_aligned_free (imp);
+		unlock_mp_generation();
 		return;
 	}
 	//
@@ -424,9 +426,9 @@ void mp_imp (int N, double* fir, double* mpfir, int pfactor, int polarity)
 	double* newfreq = (double *) malloc0 (size * sizeof (complex));
 	memcpy (firpad, fir, N * sizeof (complex));
 	fftw_plan pfor = fftw_plan_dft_1d (size, (fftw_complex *) firpad,
-			(fftw_complex *) firfreq, FFTW_FORWARD, FFTW_PATIENT);
+			(fftw_complex *) firfreq, FFTW_FORWARD, FFTW_ESTIMATE);
 	fftw_plan prev = fftw_plan_dft_1d (size, (fftw_complex *) newfreq,
-			(fftw_complex *) impulse, FFTW_BACKWARD, FFTW_PATIENT);
+			(fftw_complex *) impulse, FFTW_BACKWARD, FFTW_ESTIMATE);
 	// print_impulse("orig_imp.txt", N, fir, 1, 0);
 	fftw_execute (pfor);
 	for (i = 0; i < size; i++)
@@ -463,6 +465,7 @@ void mp_imp (int N, double* fir, double* mpfir, int pfactor, int polarity)
 
 	// store in cache
 	add_impulse_to_cache(MP_CACHE, h, N, mpfir);
+	unlock_mp_generation();
 }
 
 // impulse response of a zero frequency filter comprising a cascade of two resonators, 

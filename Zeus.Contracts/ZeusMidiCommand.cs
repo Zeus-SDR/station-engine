@@ -9,11 +9,11 @@
 //
 // GENERATED — the ZeusMidiCommand enum, the UI catalogue, and the dispatch
 // switch are produced from one shared command table so the three never drift.
-// Full Thetis-parity command surface (PureSignal arm DELIBERATELY excluded).
+// Stable Zeus MIDI command identifiers (PureSignal arm DELIBERATELY excluded).
 
 namespace Zeus.Contracts;
 
-/// <summary>Every Thetis MIDI/controller command Zeus exposes for mapping.
+/// <summary>Stable MIDI/controller command identifiers used by Zeus mappings.
 /// Append-only: never reorder or remove a value. Saved bindings persist the
 /// command as this enum's <b>numeric ordinal</b> — <c>MidiConfigStore</c>
 /// serializes the binding document with default System.Text.Json (no
@@ -22,9 +22,9 @@ namespace Zeus.Contracts;
 /// stored bindings to the wrong command, so ordinal stability is load-bearing.
 /// (The REST/learn pipeline does add the string-enum converter, so on-the-wire
 /// DTOs use names; only the LiteDB blob is ordinal-keyed.) <c>Supported</c>
-/// commands route to a real Zeus seam; the rest are parity-only placeholders
-/// selectable in the UI that log a Debug no-op. PureSignal arm is intentionally
-/// absent from this surface.</summary>
+/// Only commands marked supported in the catalog are exposed in the UI; legacy
+/// identifiers remain reserved so persisted ordinals never shift. PureSignal
+/// arm is intentionally absent from this surface.</summary>
 public enum ZeusMidiCommand
 {
     VfoAtoB,

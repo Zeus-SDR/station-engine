@@ -237,6 +237,14 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
 
     public void SetTxBandpassWindow(BandpassWindow window) => _tx.SetTxBandpassWindow(window);
 
+    public void SetRxFilterPhase(int channelId, FilterPhaseMode phase)
+    {
+        _control.SetRxFilterPhase(channelId, phase);
+        _tx.SetRxFilterPhase(TxChannelFor(channelId), phase);
+    }
+
+    public void SetTxFilterPhase(FilterPhaseMode phase) => _tx.SetTxFilterPhase(phase);
+
     public int ProcessTxBlock(ReadOnlySpan<float> micMono, Span<float> iqInterleaved) =>
         _tx.ProcessTxBlock(micMono, iqInterleaved);
 

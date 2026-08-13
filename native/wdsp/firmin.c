@@ -287,37 +287,60 @@ void setFreqs_firopt (FIROPT a, double f_low, double f_high)
 ********************************************************************************************************/
 
 
-void plan_fircore (FIRCORE a)
+static void alloc_fircore_partitions (FIRCORE a)
 {
-	// must call for change in 'nc', 'size', 'out', 'pfactor'
 	int i;
 	a->nfor = a->nc / a->size;
 	a->cset = 0;
 	a->buffidx = 0;
 	a->idxmask = a->nfor - 1;
-	a->fftin = (double *) malloc0 (2 * a->size * sizeof (complex));
 	a->fftout   = (double **) malloc0 (a->nfor * sizeof (double *));
 	a->fmask    = (double ***) malloc0 (2 * sizeof (double **));
 	a->fmask[0] = (double **) malloc0 (a->nfor * sizeof (double *));
 	a->fmask[1] = (double **) malloc0 (a->nfor * sizeof (double *));
-	a->maskgen = (double *) malloc0 (2 * a->size * sizeof (complex));
-	a->pcfor = (fftw_plan *) malloc0 (a->nfor * sizeof (fftw_plan));
-	a->maskplan    = (fftw_plan **) malloc0 (2 * sizeof (fftw_plan *));
-	a->maskplan[0] = (fftw_plan *) malloc0 (a->nfor * sizeof (fftw_plan));
-	a->maskplan[1] = (fftw_plan *) malloc0 (a->nfor * sizeof (fftw_plan));
 	for (i = 0; i < a->nfor; i++)
 	{
 		a->fftout[i]   = (double *) malloc0 (2 * a->size * sizeof (complex));
 		a->fmask[0][i] = (double *) malloc0 (2 * a->size * sizeof (complex));
 		a->fmask[1][i] = (double *) malloc0 (2 * a->size * sizeof (complex));
-		a->pcfor[i] = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->fftin, (fftw_complex *)a->fftout[i], FFTW_FORWARD, FFTW_PATIENT);
-		a->maskplan[0][i] = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->maskgen, (fftw_complex *)a->fmask[0][i], FFTW_FORWARD, FFTW_PATIENT);
-		a->maskplan[1][i] = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->maskgen, (fftw_complex *)a->fmask[1][i], FFTW_FORWARD, FFTW_PATIENT);
 	}
+}
+
+static void dealloc_fircore_partitions (FIRCORE a)
+{
+	for (int i = 0; i < a->nfor; i++)
+	{
+		_aligned_free (a->fftout[i]);
+		_aligned_free (a->fmask[0][i]);
+		_aligned_free (a->fmask[1][i]);
+	}
+	_aligned_free (a->fmask[0]);
+	_aligned_free (a->fmask[1]);
+	_aligned_free (a->fmask);
+	_aligned_free (a->fftout);
+}
+
+void plan_fircore (FIRCORE a)
+{
+	// must call for change in 'size', 'out', or 'pfactor'. A pure nc change
+	// only resizes the partition storage and deliberately retains these plans.
+	a->fftin = (double *) malloc0 (2 * a->size * sizeof (complex));
+	a->fftstage = (double *) malloc0 (2 * a->size * sizeof (complex));
+	a->maskgen = (double *) malloc0 (2 * a->size * sizeof (complex));
+	a->maskstage    = (double **) malloc0 (2 * sizeof (double *));
+	a->maskstage[0] = (double *) malloc0 (2 * a->size * sizeof (complex));
+	a->maskstage[1] = (double *) malloc0 (2 * a->size * sizeof (complex));
+	a->maskplan = (fftw_plan *) malloc0 (2 * sizeof (fftw_plan));
+	alloc_fircore_partitions (a);
+	// Every partition has identical FFT geometry.  Plan once into aligned
+	// staging buffers and copy the result to the selected ring/mask slot.  This
+	// replaces 3*nfor duplicate FFTW_PATIENT plans with three total plans.
+	a->pcfor = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->fftin, (fftw_complex *)a->fftstage, FFTW_FORWARD, FFTW_PATIENT);
+	a->maskplan[0] = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->maskgen, (fftw_complex *)a->maskstage[0], FFTW_FORWARD, FFTW_PATIENT);
+	a->maskplan[1] = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->maskgen, (fftw_complex *)a->maskstage[1], FFTW_FORWARD, FFTW_PATIENT);
 	a->accum = (double *) malloc0 (2 * a->size * sizeof (complex));
 	a->crev = fftw_plan_dft_1d(2 * a->size, (fftw_complex *)a->accum, (fftw_complex *)a->out, FFTW_BACKWARD, FFTW_PATIENT);
 	a->masks_ready = 0;
-	a->pminphase = create_minphase (a->nc, a->pfactor);
 }
 
 void calc_fircore (FIRCORE a, int flip)
@@ -326,7 +349,13 @@ void calc_fircore (FIRCORE a, int flip)
 	// must also call after a call to plan_firopt()
 	int i;
 	if (a->mp)
-		mp_imp_exec (a->pminphase, a->impulse, a->imp);
+	{
+		// Use the process-wide, byte-bounded impulse cache instead of retaining
+		// a pfactor*N FFT workspace in every FIRCORE. Cap the cold transform at
+		// one million points while retaining at least 4x oversampling.
+		int mpfactor = min (a->pfactor, max (4, 1048576 / a->nc));
+		mp_imp (a->nc, a->impulse, a->imp, mpfactor, 0);
+	}
 	else
 		memcpy (a->imp, a->impulse, a->nc * sizeof (complex));
 	for (i = 0; i < a->nfor; i++)
@@ -334,7 +363,9 @@ void calc_fircore (FIRCORE a, int flip)
 		// I right-justified the impulse response => take output from left side of output buff, discard right side
 		// Be careful about flipping an asymmetrical impulse response.
 		memcpy (&(a->maskgen[2 * a->size]), &(a->imp[2 * a->size * i]), a->size * sizeof(complex));
-		fftw_execute (a->maskplan[1 - a->cset][i]);
+		int next_cset = 1 - a->cset;
+		fftw_execute (a->maskplan[next_cset]);
+		memcpy (a->fmask[next_cset][i], a->maskstage[next_cset], 2 * a->size * sizeof(complex));
 	}
 	a->masks_ready = 1;
 	if (flip)
@@ -367,27 +398,18 @@ FIRCORE create_fircore (int size, double* in, double* out, int nc,
 
 void deplan_fircore (FIRCORE a)
 {
-	destroy_minphase(a->pminphase);
 	fftw_destroy_plan (a->crev);
 	_aligned_free (a->accum);
-	for (int i = 0; i < a->nfor; i++)
-	{
-		_aligned_free (a->fftout[i]);
-		_aligned_free (a->fmask[0][i]);
-		_aligned_free (a->fmask[1][i]);
-		fftw_destroy_plan (a->pcfor[i]);
-		fftw_destroy_plan (a->maskplan[0][i]);
-		fftw_destroy_plan (a->maskplan[1][i]);
-	}
-	_aligned_free (a->maskplan[0]);
-	_aligned_free (a->maskplan[1]);
+	fftw_destroy_plan (a->pcfor);
+	fftw_destroy_plan (a->maskplan[0]);
+	fftw_destroy_plan (a->maskplan[1]);
+	dealloc_fircore_partitions (a);
 	_aligned_free (a->maskplan);
-	_aligned_free (a->pcfor);
+	_aligned_free (a->maskstage[0]);
+	_aligned_free (a->maskstage[1]);
+	_aligned_free (a->maskstage);
 	_aligned_free (a->maskgen);
-	_aligned_free (a->fmask[0]);
-	_aligned_free (a->fmask[1]);
-	_aligned_free (a->fmask);
-	_aligned_free (a->fftout);
+	_aligned_free (a->fftstage);
 	_aligned_free (a->fftin);
 }
 
@@ -413,7 +435,8 @@ void xfircore (FIRCORE a)
 {
 	int i, j, k;
 	memcpy (&(a->fftin[2 * a->size]), a->in, a->size * sizeof (complex));
-	fftw_execute (a->pcfor[a->buffidx]);
+	fftw_execute (a->pcfor);
+	memcpy (a->fftout[a->buffidx], a->fftstage, 2 * a->size * sizeof(complex));
 	k = a->buffidx;
 	memset (a->accum, 0, 2 * a->size * sizeof (complex));
 	EnterCriticalSection (&a->update);
@@ -464,12 +487,14 @@ void setImpulse_fircore (FIRCORE a, double* impulse, int update)
 
 void setNc_fircore (FIRCORE a, int nc, double* impulse)
 {
-	// because of FFT planning, this will probably cause a glitch in audio if done during dataflow
-	deplan_fircore (a);
+	// FFT geometry depends on size, not coefficient count. Retain the three
+	// shared FFTW plans and only resize the partition/mask storage. The channel
+	// collectives quiesce dataflow around this operation.
+	dealloc_fircore_partitions (a);
 	_aligned_free (a->impulse);
 	_aligned_free (a->imp);
 	a->nc = nc;
-	plan_fircore (a);
+	alloc_fircore_partitions (a);
 	a->imp     = (double *) malloc0 (a->nc * sizeof (complex));
 	a->impulse = (double *) malloc0 (a->nc * sizeof (complex));
 	memcpy (a->impulse, impulse, a->nc * sizeof (complex));
@@ -478,6 +503,8 @@ void setNc_fircore (FIRCORE a, int nc, double* impulse)
 
 void setMp_fircore (FIRCORE a, int mp)
 {
+	if (a->mp == mp)
+		return;
 	a->mp = mp;
 	calc_fircore (a, 1);
 }

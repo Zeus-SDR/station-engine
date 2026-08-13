@@ -296,6 +296,21 @@ public sealed record ChatFreqVisibilityRequest(bool Public);
 /// <summary>Enable or disable chat notification audio and select its synthesized cue.</summary>
 public sealed record ChatNotifySoundRequest(bool Enabled, string SoundId);
 
+/// <summary>Browser Web Push subscription keys. These values are opaque bearer
+/// capabilities and must never be written to logs.</summary>
+public sealed record ChatPushSubscriptionKeys(string P256dh, string Auth);
+
+/// <summary>A device-specific Web Push subscription forwarded to the chat relay
+/// over the already QRZ-authenticated backend connection.</summary>
+public sealed record ChatPushSubscriptionRequest(
+    string Endpoint,
+    double? ExpirationTime,
+    string LaunchMode,
+    ChatPushSubscriptionKeys Keys);
+
+/// <summary>Removes one device subscription by its opaque endpoint.</summary>
+public sealed record ChatPushUnsubscribeRequest(string Endpoint);
+
 /// <summary>Admin: toggle the "see all frequencies" override — while on, every
 /// connected operator's frequency is revealed to this admin regardless of
 /// friendship or the owner's eye toggle.</summary>

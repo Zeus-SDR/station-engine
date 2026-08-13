@@ -48,7 +48,6 @@ mw0lge@grange-lane.co.uk
 *                                                   *
 ********************************************************************************************************/
 
-#if defined(_WIN64)
 static const uint64_t FNV_OFFSET_BASIS_64 = 14695981039346656037ULL;  // 0xcbf29ce484222325
 static const uint64_t FNV_PRIME_64 = 1099511628211ULL;          // 0x100000001b3
 
@@ -63,22 +62,6 @@ uint64_t fnv1a_hash64(const void* data, size_t len) {
 
   return hash;
 }
-#else
-static const uint32_t FNV_OFFSET_BASIS_32 = 2166136261U;    // 0x811C9DC5
-static const uint32_t FNV_PRIME_32 = 16777619U;         // 0x01000193
-
-uint32_t fnv1a_hash32(const void* data, size_t len) {
-  const uint8_t* bytes = (const uint8_t*)data;
-  uint32_t hash = FNV_OFFSET_BASIS_32;
-
-  for (size_t i = 0; i < len; i++) {
-    hash ^= bytes[i];
-    hash *= FNV_PRIME_32;
-  }
-
-  return hash;
-}
-#endif
 
 typedef struct _cache_entry {
   HASH_T  hash;
@@ -88,12 +71,15 @@ typedef struct _cache_entry {
 } cache_entry;
 
 static size_t _cache_counts[CACHE_BUCKETS] = { 0 };
+static size_t _cache_bytes[CACHE_BUCKETS] = { 0 };
 static cache_entry* _cache_heads[CACHE_BUCKETS] = { NULL };
 static CRITICAL_SECTION _cs_use_cache;
-static int _run = 0;
+static CRITICAL_SECTION _cs_mp_generation;
+static CRITICAL_SECTION _cs_cache;
+static volatile LONG _init_state = 0;
 static int _use_cache = 1;
 
-void remove_impulse_cache_tail(size_t bucket) {
+static void remove_impulse_cache_tail_unlocked(size_t bucket) {
   if (bucket >= CACHE_BUCKETS) { return; }
 
   cache_entry** pp = &_cache_heads[bucket];
@@ -103,6 +89,7 @@ void remove_impulse_cache_tail(size_t bucket) {
   }
 
   if (*pp) {
+    _cache_bytes[bucket] -= (size_t)(*pp)->N * sizeof(complex);
     _aligned_free((*pp)->impulse);
     _aligned_free(*pp);
     *pp = NULL;
@@ -110,7 +97,7 @@ void remove_impulse_cache_tail(size_t bucket) {
   }
 }
 
-void free_impulse_cache(void) {
+static void free_impulse_cache_unlocked(void) {
   for (size_t b = 0; b < CACHE_BUCKETS; ++b) {
     cache_entry* e = _cache_heads[b];
 
@@ -123,12 +110,34 @@ void free_impulse_cache(void) {
 
     _cache_heads[b] = NULL;
     _cache_counts[b] = 0;
+    _cache_bytes[b] = 0;
   }
 }
 
-double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N) {
-  if (!_run) { return NULL; }
+void ensure_impulse_cache_initialized(void) {
+  if (InterlockedCompareExchange(&_init_state, 2, 2) == 2) { return; }
 
+  if (InterlockedCompareExchange(&_init_state, 1, 0) == 0) {
+    InitializeCriticalSectionAndSpinCount(&_cs_use_cache, 2500);
+    InitializeCriticalSectionAndSpinCount(&_cs_mp_generation, 2500);
+    InitializeCriticalSectionAndSpinCount(&_cs_cache, 2500);
+    _use_cache = 1;
+    InterlockedExchange(&_init_state, 2);
+    return;
+  }
+
+  while (InterlockedCompareExchange(&_init_state, 2, 2) != 2) { Sleep(1); }
+}
+
+void free_impulse_cache(void) {
+  ensure_impulse_cache_initialized();
+  EnterCriticalSection(&_cs_cache);
+  free_impulse_cache_unlocked();
+  LeaveCriticalSection(&_cs_cache);
+}
+
+double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N) {
+  ensure_impulse_cache_initialized();
   int use;
   EnterCriticalSection(&_cs_use_cache);
   use = _use_cache;
@@ -136,6 +145,11 @@ double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N) {
 
   if (!use || bucket >= CACHE_BUCKETS) { return NULL; }
 
+  EnterCriticalSection(&_cs_cache);
+  EnterCriticalSection(&_cs_use_cache);
+  use = _use_cache;
+  LeaveCriticalSection(&_cs_use_cache);
+  if (!use) { LeaveCriticalSection(&_cs_cache); return NULL; }
   // lru, least recently used, moves cache hit to head
   // old cache entries will move towards the tail and eventually be dumped
   cache_entry* prev = NULL;
@@ -151,6 +165,7 @@ double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N) {
 
       double* imp = (double*) malloc0(e->N * sizeof(complex));
       memcpy(imp, e->impulse, e->N * sizeof(complex));
+      LeaveCriticalSection(&_cs_cache);
       return imp;
     }
 
@@ -158,12 +173,12 @@ double* get_impulse_cache_entry(size_t bucket, HASH_T hash, int N) {
     e = e->next;
   }
 
+  LeaveCriticalSection(&_cs_cache);
   return NULL;
 }
 
 void add_impulse_to_cache(size_t bucket, HASH_T hash, int N, double* impulse) {
-  if (!_run) { return; }
-
+  ensure_impulse_cache_initialized();
   int use;
   EnterCriticalSection(&_cs_use_cache);
   use = _use_cache;
@@ -171,7 +186,20 @@ void add_impulse_to_cache(size_t bucket, HASH_T hash, int N, double* impulse) {
 
   if (!use || bucket >= CACHE_BUCKETS) { return; }
 
-  if (_cache_counts[bucket] >= MAX_CACHE_ENTRIES) { remove_impulse_cache_tail(bucket); }
+  EnterCriticalSection(&_cs_cache);
+  EnterCriticalSection(&_cs_use_cache);
+  use = _use_cache;
+  LeaveCriticalSection(&_cs_use_cache);
+  if (!use) { LeaveCriticalSection(&_cs_cache); return; }
+  size_t entry_bytes = (size_t)N * sizeof(complex);
+  while (_cache_counts[bucket] > 0 &&
+    (_cache_counts[bucket] >= MAX_CACHE_ENTRIES || _cache_bytes[bucket] + entry_bytes > MAX_CACHE_BYTES))
+    remove_impulse_cache_tail_unlocked(bucket);
+
+  if (entry_bytes > MAX_CACHE_BYTES) {
+    LeaveCriticalSection(&_cs_cache);
+    return;
+  }
 
   cache_entry* e = malloc0(sizeof(cache_entry));
   e->hash = hash;
@@ -181,12 +209,19 @@ void add_impulse_to_cache(size_t bucket, HASH_T hash, int N, double* impulse) {
   e->next = _cache_heads[bucket];
   _cache_heads[bucket] = e;
   _cache_counts[bucket]++;
+  _cache_bytes[bucket] += entry_bytes;
+  LeaveCriticalSection(&_cs_cache);
 }
+
+void lock_mp_generation(void) {
+  ensure_impulse_cache_initialized();
+  EnterCriticalSection(&_cs_mp_generation);
+}
+void unlock_mp_generation(void) { LeaveCriticalSection(&_cs_mp_generation); }
 
 PORT
 int save_impulse_cache(const char* path) {
-  if (!_run) { return 0; }
-
+  ensure_impulse_cache_initialized();
   int use;
   EnterCriticalSection(&_cs_use_cache);
   use = _use_cache;
@@ -198,35 +233,44 @@ int save_impulse_cache(const char* path) {
 
   if (!fp) { return -1; }
 
+  EnterCriticalSection(&_cs_cache);
+  EnterCriticalSection(&_cs_use_cache);
+  use = _use_cache;
+  LeaveCriticalSection(&_cs_use_cache);
+  if (!use) { LeaveCriticalSection(&_cs_cache); fclose(fp); return 0; }
+
+  const uint32_t magic = 0x5A464952U; // "ZFIR"
+  const uint32_t version = 2U;       // v2 standardizes 64-bit hashes on every OS
   uint32_t buckets = CACHE_BUCKETS;
 
-  if (fwrite(&buckets, sizeof(buckets), 1, fp) != 1) { fclose(fp); return -1; }
+  if (fwrite(&magic, sizeof(magic), 1, fp) != 1
+    || fwrite(&version, sizeof(version), 1, fp) != 1
+    || fwrite(&buckets, sizeof(buckets), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
   for (size_t b = 0; b < CACHE_BUCKETS; b++) {
     uint32_t count = 0;
 
     for (cache_entry * e = _cache_heads[b]; e; e = e->next) { count++; }
 
-    if (fwrite(&count, sizeof(count), 1, fp) != 1) { fclose(fp); return -1; }
+    if (fwrite(&count, sizeof(count), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
     for (cache_entry * e = _cache_heads[b]; e; e = e->next) {
-      if (fwrite(&e->hash, sizeof(HASH_T), 1, fp) != 1) { fclose(fp); return -1; }
+      if (fwrite(&e->hash, sizeof(HASH_T), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      if (fwrite(&e->N, sizeof(e->N), 1, fp) != 1) { fclose(fp); return -1; }
+      if (fwrite(&e->N, sizeof(e->N), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      if (fwrite(e->impulse, sizeof(complex), e->N, fp) != (size_t)e->N) { fclose(fp); return -1; }
+      if (fwrite(e->impulse, sizeof(complex), e->N, fp) != (size_t)e->N) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
     }
   }
 
+  LeaveCriticalSection(&_cs_cache);
   fclose(fp);
   return 0;
 }
 
 PORT
 int read_impulse_cache(const char* path) {
-  if (!_run) { return 0; }
-
-  free_impulse_cache();
+  ensure_impulse_cache_initialized();
   int use;
   EnterCriticalSection(&_cs_use_cache);
   use = _use_cache;
@@ -238,16 +282,27 @@ int read_impulse_cache(const char* path) {
 
   if (!fp) { return -1; }
 
+  EnterCriticalSection(&_cs_cache);
+  EnterCriticalSection(&_cs_use_cache);
+  use = _use_cache;
+  LeaveCriticalSection(&_cs_use_cache);
+  if (!use) { LeaveCriticalSection(&_cs_cache); fclose(fp); return 0; }
+  free_impulse_cache_unlocked();
+
+  uint32_t magic;
+  uint32_t version;
   uint32_t buckets;
 
-  if (fread(&buckets, sizeof(buckets), 1, fp) != 1) { fclose(fp); return -1; }
+  if (fread(&magic, sizeof(magic), 1, fp) != 1
+    || fread(&version, sizeof(version), 1, fp) != 1
+    || fread(&buckets, sizeof(buckets), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-  if (buckets != CACHE_BUCKETS) { fclose(fp); return -1; }
+  if (magic != 0x5A464952U || version != 2U || buckets != CACHE_BUCKETS) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
   for (size_t b = 0; b < buckets; b++) {
     uint32_t count;
 
-    if (fread(&count, sizeof(count), 1, fp) != 1) { fclose(fp); return -1; }
+    if (fread(&count, sizeof(count), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
     cache_entry* tail = NULL;
 
@@ -255,19 +310,26 @@ int read_impulse_cache(const char* path) {
       HASH_T hash;
       int    N;
 
-      if (fread(&hash, sizeof(HASH_T), 1, fp) != 1) { fclose(fp); return -1; }
+      if (fread(&hash, sizeof(HASH_T), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      if (fread(&N, sizeof(N), 1, fp) != 1) { fclose(fp); return -1; }
+      if (fread(&N, sizeof(N), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
       double* data = (double*)malloc0(N * sizeof(complex));
 
-      if (fread(data, sizeof(complex), N, fp) != (size_t)N) { _aligned_free(data); fclose(fp); return -1; }
+      if (fread(data, sizeof(complex), N, fp) != (size_t)N) { _aligned_free(data); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
       cache_entry* e = (cache_entry*)malloc0(sizeof(cache_entry));
       e->hash = hash;
       e->N = N;
       e->impulse = data;
       e->next = NULL;
+
+      size_t entry_bytes = (size_t)N * sizeof(complex);
+      if (_cache_counts[b] >= MAX_CACHE_ENTRIES || _cache_bytes[b] + entry_bytes > MAX_CACHE_BYTES) {
+        _aligned_free(data);
+        _aligned_free(e);
+        continue;
+      }
 
       if (tail) {
         tail->next = e;
@@ -277,15 +339,18 @@ int read_impulse_cache(const char* path) {
 
       tail = e;
       _cache_counts[b]++;
+      _cache_bytes[b] += entry_bytes;
     }
   }
 
+  LeaveCriticalSection(&_cs_cache);
   fclose(fp);
   return 0;
 }
 
 PORT
 void use_impulse_cache(int use) {
+  ensure_impulse_cache_initialized();
   EnterCriticalSection(&_cs_use_cache);
   _use_cache = use;
   LeaveCriticalSection(&_cs_use_cache);
@@ -293,17 +358,17 @@ void use_impulse_cache(int use) {
 
 PORT
 void init_impulse_cache(int use) {
-  //InitializeCriticalSection(&_cs_use_cache);
-  InitializeCriticalSectionAndSpinCount(&_cs_use_cache, 2500);
+  ensure_impulse_cache_initialized();
   EnterCriticalSection(&_cs_use_cache);
   _use_cache = use;
   LeaveCriticalSection(&_cs_use_cache);
-  _run = 1;
 }
 
 PORT
 void destroy_impulse_cache(void) {
-  _run = 0;
-  DeleteCriticalSection(&_cs_use_cache);
+  ensure_impulse_cache_initialized();
+  EnterCriticalSection(&_cs_use_cache);
+  _use_cache = 0;
+  LeaveCriticalSection(&_cs_use_cache);
   free_impulse_cache();
 }
