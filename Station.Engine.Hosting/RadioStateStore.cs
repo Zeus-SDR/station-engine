@@ -158,6 +158,12 @@ public sealed class RadioStateEntry
     public int AttenDb { get; set; }
     public bool AutoAgcEnabled { get; set; }
     public bool RxLevelerEnabled { get; set; }
+    public RxLevelerMode RxLevelerMode { get; set; } = RxLevelerMode.Auto;
+    public double RxLevelerTargetRmsDb { get; set; } = RxLevelerConfig.DefaultTargetRmsDb;
+    public double RxLevelerMaxBoostDb { get; set; } = RxLevelerConfig.DefaultMaxBoostDb;
+    public int RxLevelerAttackMs { get; set; } = RxLevelerConfig.DefaultAttackMs;
+    public int RxLevelerReleaseMs { get; set; } = RxLevelerConfig.DefaultReleaseMs;
+    public int RxLevelerHangMs { get; set; } = RxLevelerConfig.DefaultHangMs;
     // RX preamp toggle (PRE). Not part of older rows; default false matches
     // RadioService's historical startup state.
     public bool PreampOn { get; set; }

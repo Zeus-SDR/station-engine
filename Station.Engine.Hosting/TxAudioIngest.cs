@@ -322,6 +322,7 @@ public sealed class TxAudioIngest : IDisposable
         _hub.MicPcmReceived += _handler;
         _productPluginAudio?.ConfigureTxSink(OnProductPluginTxAudio);
         _productPluginAudio?.ConfigureTxActiveSink(SetProductPluginInjectionActive);
+        _productPluginAudio?.ConfigureTxSpeechBypassSink(SetProductPluginSpeechBypass);
     }
 
     /// <summary>
@@ -791,6 +792,8 @@ public sealed class TxAudioIngest : IDisposable
     private readonly IProductTxAudioPort _productAudio;
     private readonly ProductPluginAudioPort? _productPluginAudio;
     private int _productPluginInjectionActive;
+    private readonly object _productPluginSpeechBypassGate = new();
+    private long _productPluginSpeechBypassGeneration;
 
     private readonly Action<ReadOnlyMemory<float>>? _forwardP2;
     private readonly Func<TimeSpan, bool>? _drainTxTransport;
@@ -830,6 +833,12 @@ public sealed class TxAudioIngest : IDisposable
     public void Dispose()
     {
         _hub.MicPcmReceived -= _handler;
+        lock (_productPluginSpeechBypassGate)
+        {
+            _engineProvider()?.SetTxInjectedAudioBypass(false);
+            _productPluginSpeechBypassGeneration = 0;
+        }
+        _productPluginAudio?.ConfigureTxSpeechBypassSink(null);
     }
 
     /// <summary>
@@ -990,6 +999,31 @@ public sealed class TxAudioIngest : IDisposable
             if (!active) _ring.Clear();
         }
     }
+
+    private bool SetProductPluginSpeechBypass(long generation, bool bypass)
+    {
+        lock (_productPluginSpeechBypassGate)
+        {
+            if (bypass)
+            {
+                if (generation < _productPluginSpeechBypassGeneration) return false;
+                if (generation == _productPluginSpeechBypassGeneration) return true;
+                var engine = _engineProvider();
+                if (engine is null) return false;
+                _productPluginSpeechBypassGeneration = generation;
+                engine.SetTxInjectedAudioBypass(true);
+                return true;
+            }
+
+            if (generation != _productPluginSpeechBypassGeneration) return true;
+            _productPluginSpeechBypassGeneration = 0;
+            _engineProvider()?.SetTxInjectedAudioBypass(false);
+            return true;
+        }
+    }
+
+    internal bool SetProductPluginSpeechBypassForTest(long generation, bool bypass) =>
+        SetProductPluginSpeechBypass(generation, bypass);
 
     private void ProcessMicPcm(ReadOnlySpan<float> samples, MicBlockSource source)
     {

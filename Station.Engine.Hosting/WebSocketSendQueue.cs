@@ -35,10 +35,12 @@ internal readonly record struct SendQueueResult(
 /// </summary>
 internal sealed class WebSocketSendQueue
 {
+    private const int MaxConsecutiveTelemetryBypasses = 4;
     private readonly int _capacity;
     private readonly object _sync = new();
     private readonly LinkedList<byte[]> _items = new();
     private readonly SemaphoreSlim _available = new(0);
+    private int _consecutiveTelemetryBypasses;
     private bool _completed;
 
     public WebSocketSendQueue(int capacity)
@@ -70,11 +72,23 @@ internal sealed class WebSocketSendQueue
             MsgType? droppedType = null;
             if (_items.Count == _capacity)
             {
-                var discardable = FindOldestDiscardable();
-                if (discardable is null && IsDiscardable(payload))
-                    return new(SendQueueChange.DroppedIncoming, FrameType(payload));
+                var incomingType = FrameType(payload);
+                // Audible PCM is realtime data, not ordinary telemetry. Prefer
+                // throwing away a replaceable display/meter snapshot first.
+                // When a low-priority snapshot arrives to a queue containing
+                // only PCM and control edges, discard the new snapshot instead
+                // of punching a hole in RX audio.
+                var discardable = FindOldestLowPriorityTelemetry();
+                if (discardable is null && incomingType is { } pcmType && IsRealtimePcm(pcmType))
+                    discardable = FindOldestType(pcmType);
+                if (discardable is null &&
+                    (IsLowPriorityTelemetry(incomingType) || IsRealtimePcm(incomingType)))
+                    return new(SendQueueChange.DroppedIncoming, incomingType);
 
-                var dropped = discardable ?? _items.First!;
+                var dropped = discardable ??
+                    FindOldestAudio() ??
+                    FindOldestType(MsgType.NativeMicPcm) ??
+                    _items.First!;
                 droppedType = FrameType(dropped.Value);
                 _items.Remove(dropped);
             }
@@ -99,8 +113,22 @@ internal sealed class WebSocketSendQueue
             {
                 if (_items.First is { } first)
                 {
-                    _items.RemoveFirst();
-                    return first.Value;
+                    // Once the socket falls behind, sending a replaceable
+                    // display/meter snapshot before already-queued PCM extends
+                    // the audible gap. Skip only when PCM directly follows the
+                    // leading telemetry run: control/product ordering is never
+                    // crossed.
+                    var next = first;
+                    if (_consecutiveTelemetryBypasses < MaxConsecutiveTelemetryBypasses)
+                        next = FirstPcmAfterLeadingTelemetry(first);
+
+                    if (ReferenceEquals(next, first))
+                        _consecutiveTelemetryBypasses = 0;
+                    else
+                        _consecutiveTelemetryBypasses++;
+
+                    _items.Remove(next);
+                    return next.Value;
                 }
 
                 if (_completed) return null;
@@ -148,19 +176,44 @@ internal sealed class WebSocketSendQueue
     private static MsgType? FrameType(byte[] payload) =>
         payload.Length == 0 ? null : (MsgType)payload[0];
 
-    private LinkedListNode<byte[]>? FindOldestDiscardable()
+    private LinkedListNode<byte[]>? FindOldestLowPriorityTelemetry()
     {
         for (var node = _items.First; node is not null; node = node.Next)
         {
-            if (IsDiscardable(node.Value)) return node;
+            var queuedType = FrameType(node.Value);
+            if (IsLowPriorityTelemetry(queuedType)) return node;
         }
 
         return null;
     }
 
-    private static bool IsDiscardable(byte[] payload) => FrameType(payload) is
+    private LinkedListNode<byte[]>? FindOldestAudio() => FindOldestType(MsgType.AudioPcm);
+
+    private LinkedListNode<byte[]>? FindOldestType(MsgType type)
+    {
+        for (var node = _items.First; node is not null; node = node.Next)
+        {
+            if (FrameType(node.Value) == type) return node;
+        }
+        return null;
+    }
+
+    private static LinkedListNode<byte[]> FirstPcmAfterLeadingTelemetry(
+        LinkedListNode<byte[]> first)
+    {
+        if (!IsLowPriorityTelemetry(FrameType(first.Value))) return first;
+        var node = first.Next;
+        while (node is not null && IsLowPriorityTelemetry(FrameType(node.Value)))
+            node = node.Next;
+
+        return node is not null && IsRealtimePcm(FrameType(node.Value)) ? node : first;
+    }
+
+    private static bool IsRealtimePcm(MsgType? type) =>
+        type is MsgType.AudioPcm or MsgType.NativeMicPcm;
+
+    private static bool IsLowPriorityTelemetry(MsgType? type) => type is
         MsgType.DisplayFrame or
-        MsgType.AudioPcm or
         MsgType.TxMeters or
         MsgType.TxMetersV2 or
         MsgType.PsMeters or
@@ -169,7 +222,6 @@ internal sealed class WebSocketSendQueue
         MsgType.RxSignalQuality or
         MsgType.PaTemp or
         MsgType.MicPeak or
-        MsgType.NativeMicPcm or
         MsgType.DiagnosticsHealth;
 
     private static bool TryGetDisplayStream(byte[] payload, out byte stream)

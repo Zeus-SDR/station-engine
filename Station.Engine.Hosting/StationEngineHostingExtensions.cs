@@ -3,6 +3,7 @@
 
 using Zeus.Dsp.Wdsp;
 using Zeus.Protocol1;
+using Zeus.Server.Tdoa;
 
 namespace Zeus.Server;
 
@@ -184,6 +185,10 @@ public static class StationEngineHostingExtensions
         services.AddProtocol2ConnectionServices();
         services.AddSingleton<FrequencyCalibrationService>();
         services.AddSingleton<ImdMeasureService>();
+        services.AddSingleton<TdoaSolver>();
+        services.AddSingleton<IKiwiTdoaCaptureTransport, KiwiTdoaCaptureTransport>();
+        services.AddSingleton<ITdoaContributionSource, KiwiTdoaContributionSource>();
+        services.AddSingleton<TdoaContributionCoordinator>();
         services.AddSingleton<TxService>();
         services.AddSingleton<IInstalledFeatureState, NoInstalledFeatureState>();
         services.AddSingleton<TuneCarrierCommandCoordinator>();

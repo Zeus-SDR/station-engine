@@ -106,6 +106,30 @@ internal static class LocalRequestGuard
         return null;
     }
 
+    public static IResult? RejectIfNotLiteralLocalHost(HttpContext ctx, string action)
+    {
+        var host = ctx.Request.Host.Host;
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (IPAddress.TryParse(host, out var address))
+        {
+            address = address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+            if (IPAddress.IsLoopback(address))
+                return null;
+            var local = ctx.Connection.LocalIpAddress;
+            if (local is not null)
+            {
+                local = local.IsIPv4MappedToIPv6 ? local.MapToIPv4() : local;
+                if (address.Equals(local))
+                    return null;
+            }
+        }
+
+        return Results.Json(
+            new { error = $"Zeus can only {action} through a literal local address." },
+            statusCode: StatusCodes.Status403Forbidden);
+    }
+
     private static int DefaultPort(string scheme)
         => string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase)
             ? 443

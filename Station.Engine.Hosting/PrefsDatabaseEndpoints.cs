@@ -12,13 +12,10 @@ using Zeus.Contracts;
 namespace Zeus.Server;
 
 /// <summary>
-/// Prefs-database (profile) management routes, shared by the product host
+/// Single user-facing database backup routes, shared by the product host
 /// (ZeusEndpoints) and the standalone station engine
-/// (StationEngineEndpoints). The handlers were extracted verbatim from the
-/// product host so both surfaces behave identically; the only intentional
-/// enhancement is the export route, which now serves a merged snapshot (see
-/// PrefsProfileExport) so an exported profile carries the CURRENT engine-side
-/// settings instead of the stale pre-split copies.
+/// (StationEngineEndpoints). The live stores retain separate process-owned
+/// files, but export/import presents them as one versioned .zeusdb container.
 /// </summary>
 public static class PrefsDatabaseEndpoints
 {
@@ -27,13 +24,10 @@ public static class PrefsDatabaseEndpoints
     {
         ArgumentNullException.ThrowIfNull(app);
 
-        // Prefs-database (profile) selector. All Zeus prefs/settings/layouts live
-        // in a single LiteDB resolved by PrefsDbPath.Get() at startup; the active
-        // choice is a pointer file (NOT inside any DB). Switching applies on the
-        // next launch, so /api/prefs/active-database flags restartRequired and the
-        // frontend follows up with POST /api/app/restart.
+        // Compatibility inventory: Zeus now exposes one canonical database to
+        // the operator. Keep the route shape while older frontends roll forward.
         app.MapGet("/api/prefs/databases", () =>
-            Results.Ok(new PrefsDatabasesDto(PrefsDbPath.ActiveRelativePath(), PrefsDbPath.ListProfiles())));
+            Results.Ok(CanonicalDatabaseDto()));
 
         app.MapPost("/api/prefs/active-database", (SetActiveDatabaseRequest req) =>
         {
@@ -41,8 +35,17 @@ public static class PrefsDatabaseEndpoints
                 return Results.BadRequest(new { error = "relativePath required" });
             try
             {
-                PrefsDbPath.SetActive(req.RelativePath);
-                return Results.Ok(new { restartRequired = true });
+                if (!string.Equals(
+                    req.RelativePath,
+                    PrefsDbPath.LegacyFileName,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return Results.BadRequest(new
+                    {
+                        error = "Zeus uses one database; database switching is no longer available.",
+                    });
+                }
+                return Results.Ok(new { restartRequired = false });
             }
             catch (Exception ex)
             {
@@ -54,8 +57,10 @@ public static class PrefsDatabaseEndpoints
         {
             try
             {
-                PrefsDbPath.CreateProfile(req.Name);
-                return Results.Ok(new PrefsDatabasesDto(PrefsDbPath.ActiveRelativePath(), PrefsDbPath.ListProfiles()));
+                return Results.BadRequest(new
+                {
+                    error = "Zeus uses one database; creating additional databases is no longer available.",
+                });
             }
             catch (Exception ex)
             {
@@ -63,12 +68,19 @@ public static class PrefsDatabaseEndpoints
             }
         });
 
-        app.MapPost("/api/prefs/databases/import", (ImportDatabaseRequest req) =>
+        app.MapPost("/api/prefs/databases/import", (HttpContext ctx, ImportDatabaseRequest req) =>
         {
+            if (LocalRequestGuard.RejectIfNotLocalSameOrigin(
+                    ctx, "import the Zeus settings database") is { } rejected)
+                return rejected;
+            if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
+                    ctx, "import the Zeus settings database") is { } hostRejected)
+                return hostRejected;
             try
             {
-                PrefsDbPath.ImportProfile(req.SourcePath, req.Name);
-                return Results.Ok(new PrefsDatabasesDto(PrefsDbPath.ActiveRelativePath(), PrefsDbPath.ListProfiles()));
+                using var source = File.OpenRead(req.SourcePath);
+                UnifiedDatabaseBackup.StageImport(source);
+                return Results.Ok(new { restartRequired = true });
             }
             catch (Exception ex)
             {
@@ -77,13 +89,20 @@ public static class PrefsDatabaseEndpoints
         });
 
         // File-picker import: the webview can't hand the server a filesystem
-        // path, so the chosen .db is uploaded as multipart and written into the
-        // profiles dir here. Antiforgery is disabled — this is a loopback /
-        // LAN-token API, not a cookie-auth form post.
-        app.MapPost("/api/prefs/databases/upload", async (HttpRequest req) =>
+        // path, so the chosen backup is uploaded as multipart. The route is
+        // still explicitly restricted to the local same-origin app before the
+        // multipart body is read.
+        app.MapPost("/api/prefs/databases/upload", async (HttpContext ctx) =>
         {
+            if (LocalRequestGuard.RejectIfNotLocalSameOrigin(
+                    ctx, "import the Zeus settings database") is { } rejected)
+                return rejected;
+            if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
+                    ctx, "import the Zeus settings database") is { } hostRejected)
+                return hostRejected;
             try
             {
+                var req = ctx.Request;
                 if (!req.HasFormContentType)
                     return Results.BadRequest(new { error = "Expected a multipart file upload." });
                 var form = await req.ReadFormAsync();
@@ -91,23 +110,9 @@ public static class PrefsDatabaseEndpoints
                 if (file is null || file.Length == 0)
                     return Results.BadRequest(new { error = "No file uploaded." });
 
-                var nameField = form.TryGetValue("name", out var n) ? n.ToString() : null;
-                // Strip any directory portion the browser might send. Modern
-                // browsers submit the bare file name, but a full Windows path
-                // (C:\dir\profile.db) must not become the profile name — on
-                // Linux/macOS Path.GetFileName treats '\' as a normal
-                // character and the whole mangled string would survive.
-                var uploadedName = file.FileName;
-                var lastSeparator = uploadedName.LastIndexOfAny(['/', '\\']);
-                if (lastSeparator >= 0)
-                    uploadedName = uploadedName[(lastSeparator + 1)..];
-                var profileName = string.IsNullOrWhiteSpace(nameField)
-                    ? Path.GetFileNameWithoutExtension(uploadedName)
-                    : nameField;
-
                 await using var stream = file.OpenReadStream();
-                PrefsDbPath.ImportProfileFromStream(stream, profileName);
-                return Results.Ok(new PrefsDatabasesDto(PrefsDbPath.ActiveRelativePath(), PrefsDbPath.ListProfiles()));
+                UnifiedDatabaseBackup.StageImport(stream);
+                return Results.Ok(new { restartRequired = true });
             }
             catch (Exception ex)
             {
@@ -115,37 +120,30 @@ public static class PrefsDatabaseEndpoints
             }
         }).DisableAntiforgery();
 
-        // Download an existing profile so the operator can back it up or move
-        // it to another machine (the download is named *.zeusdb — see below).
-        // The payload is a MERGED snapshot: the profile's product prefs file
-        // with every mergeable engine-owned collection replaced by the current
-        // contents of the profile's engine database (PrefsProfileExport —
-        // PureSignal's ps_settings is deliberately excluded), so the backup
-        // captures the engine settings that have lived in station-engine.db
-        // since the persistence split.
+        // Download the one operator-facing Zeus backup. The versioned container
+        // captures both authoritative settings stores and deliberately
+        // excludes PureSignal's ps_settings collection.
+        // The ".zeusdb" extension (#64) avoids collisions with ham-radio
+        // logbook apps that register ".db" in the Windows shell.
         //
-        // The download filename is rewritten from ".db" to ".zeusdb" (#64):
-        // Windows ham-radio logbook apps (N1MM+, Log4OM, HRD, ...) register
+        // Legacy imports remain supported as raw LiteDB, but new exports are
+        // ZIP containers with a manifest and per-entry integrity hashes.
+        //
+        // Historical context: Windows ham-radio logbook apps (N1MM+, Log4OM,
+        // HRD, ...) register
         // ".db" as their file type in the shell, so a double-clicked export
         // used to open the last-viewed logbook instead of anything Zeus. The
         // ".zeusdb" extension keeps a Zeus-specific identity so no other app
-        // silently claims it. The bytes are raw LiteDB either way and Import
-        // validates content, not the file extension.
+        // silently claims it.
         app.MapGet("/api/prefs/databases/export", (string? relativePath) =>
         {
-            if (string.IsNullOrWhiteSpace(relativePath))
-                return Results.BadRequest(new { error = "relativePath required" });
             try
             {
-                var productPath = PrefsDbPath.ResolveProfileFullPath(relativePath);
-                var enginePath = PrefsDbPath.EnginePathForProductPath(productPath);
-                var bytes = PrefsProfileExport.BuildMergedSnapshot(productPath, enginePath);
-                var downloadName = Path.ChangeExtension(Path.GetFileName(productPath), ".zeusdb");
-                return Results.File(bytes, "application/octet-stream", downloadName);
-            }
-            catch (FileNotFoundException)
-            {
-                return Results.NotFound(new { error = "Database not found." });
+                // relativePath is intentionally ignored as a compatibility
+                // alias for older frontends. There is only one export target.
+                var bytes = UnifiedDatabaseBackup.BuildContainer();
+                var downloadName = $"zeus-backup-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zeusdb";
+                return Results.File(bytes, "application/x-zeus-database", downloadName);
             }
             catch (Exception ex)
             {
@@ -154,5 +152,20 @@ public static class PrefsDatabaseEndpoints
         });
 
         return app;
+    }
+
+    private static PrefsDatabasesDto CanonicalDatabaseDto()
+    {
+        var path = PrefsDbPath.Get();
+        var info = new FileInfo(path);
+        var database = new PrefsDatabaseInfo(
+            Name: "Zeus",
+            RelativePath: PrefsDbPath.LegacyFileName,
+            SizeBytes: info.Exists ? info.Length : 0,
+            ModifiedUtcMs: info.Exists
+                ? new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero).ToUnixTimeMilliseconds()
+                : 0,
+            Active: true);
+        return new PrefsDatabasesDto(PrefsDbPath.LegacyFileName, [database]);
     }
 }

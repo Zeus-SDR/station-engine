@@ -75,6 +75,7 @@ public sealed class TxService
     // the owning source can drop MOX, except UI (master override) and
     // <see cref="TryTripForAlert"/> (always wins). Null when MOX is off.
     private MoxSource? _moxOwner;
+    private long _productPluginMoxGeneration;
     private MoxSource? _tunOwner;
     // TX pre-key (MOX/TUNE) delay window deadline, in Stopwatch ticks (issue #630).
     // 0 = no active window. Armed on a UI voice-MOX or UI TUNE rising edge when
@@ -90,6 +91,49 @@ public sealed class TxService
     /// Read by <see cref="TxAudioIngest"/> and <see cref="TxTuneDriver"/> on
     /// their producer threads.</summary>
     public long PreKeyOpenAtTicks => Interlocked.Read(ref _preKeyOpenAtTicks);
+
+    /// <summary>Apply or clear the engine-owned, lease-scoped product injection
+    /// drive cap. This never mutates or persists the operator's DrivePct.</summary>
+    internal void SetProductPluginDriveCap(long generation, int? percent) =>
+        _radio.SetProductPluginDriveCap(generation, percent);
+
+    internal void ClearProductPluginDriveCap(long generation) =>
+        _radio.ClearProductPluginDriveCap(generation);
+
+    internal bool TrySetProductPluginMox(long generation, out string? error)
+    {
+        lock (_transitionSync)
+        {
+            if (!TrySetMox(true, MoxSource.ProductPlugin, out error)) return false;
+            lock (_sync)
+            {
+                if (!_moxOn || _moxOwner != MoxSource.ProductPlugin)
+                {
+                    error = "the product-plugin key was preempted during admission";
+                    return false;
+                }
+                _productPluginMoxGeneration = generation;
+            }
+            return true;
+        }
+    }
+
+    internal bool TryReleaseProductPluginMox(long generation, out string? error)
+    {
+        lock (_transitionSync)
+        {
+            lock (_sync)
+            {
+                if (_moxOwner != MoxSource.ProductPlugin
+                    || _productPluginMoxGeneration != generation)
+                {
+                    error = null;
+                    return true;
+                }
+            }
+            return TryReleaseMoxImmediately(MoxSource.ProductPlugin, out error);
+        }
+    }
 
     // Only voice UI MOX uses the pre-key window. CW would clip the first dit,
     // and digital/FreeDV timing is owned by external modem sequencing.
@@ -666,6 +710,7 @@ public sealed class TxService
             _moxStartedAt = null;
             _tunStartedAt = null;
             _moxOwner = null;
+            _productPluginMoxGeneration = 0;
             _tunOwner = null;
             IsTwoToneOn = false;
             Interlocked.Exchange(ref _preKeyOpenAtTicks, 0);

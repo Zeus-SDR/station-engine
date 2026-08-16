@@ -55,6 +55,13 @@ using Zeus.Protocol1;
 
 namespace Zeus.Server;
 
+public sealed record Protocol3TxEngineConnection(
+    string Engine,
+    int EngineRateHz,
+    int TxIqRateHz,
+    bool External,
+    bool PureSignal);
+
 public class DspPipelineService : BackgroundService,
     Zeus.Protocol1.IRxPacketSink,
     Zeus.Protocol2.IRxPacketSink
@@ -78,6 +85,8 @@ public class DspPipelineService : BackgroundService,
     private readonly RxAudioMuteState? _rxAudioMute;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<DspPipelineService> _log;
+    private readonly ExternalDspEngineProviderLoader _externalDspProvider;
+    private Protocol3TxEngineConnection? _protocol3TxEngineConnection;
     private readonly int _rxAnalyzerFftSize;
     private readonly int _panadapterWidth;
     private double _displayMaxFrameRateHz;
@@ -210,6 +219,7 @@ public class DspPipelineService : BackgroundService,
     // says RX0 contains a resolved RF signal.  Noise/unavailable telemetry
     // fails closed to zero boost; downward gain and the peak guard stay live.
     private const double RxConstantLoudnessMaxBoostDb = 24.0;
+    private static readonly RxLevelerConfig DefaultRxLevelerConfig = new();
     private const double RxConstantLoudnessMinConfidence = 0.10;
     // Current pre-AGC S+N power above the estimator's integrated noise power.
     // This is deliberately a total-power excess, not signal-only SNR.
@@ -360,8 +370,11 @@ public class DspPipelineService : BackgroundService,
         bool enabled,
         bool rfSignalResolved,
         bool adcOverloadRisk,
-        double levelReferenceOffsetDb = 0.0)
+        double levelReferenceOffsetDb = 0.0,
+        RxLevelerConfig? config = null)
     {
+        var profile = config ?? DefaultRxLevelerConfig;
+        bool custom = profile.Mode == RxLevelerMode.Custom;
         if (!enabled && (state.GainDb > 0.0 || state.AppliedGainDb > 0.0))
             state.ReleaseToUnity = true;
 
@@ -370,8 +383,13 @@ public class DspPipelineService : BackgroundService,
             ref state,
             allowBoost: enabled && !state.ReleaseToUnity &&
                 rfSignalResolved && !adcOverloadRisk,
-            RxConstantLoudnessMaxBoostDb,
-            levelReferenceOffsetDb);
+            maxBoostDb: custom ? profile.MaxBoostDb : RxConstantLoudnessMaxBoostDb,
+            levelReferenceOffsetDb,
+            targetRmsDb: custom ? profile.TargetRmsDb : RxLevelerTargetRmsDb,
+            customAttackMs: custom ? profile.AttackMs : null,
+            customReleaseMs: custom ? profile.ReleaseMs : null,
+            customHangMs: custom ? profile.HangMs : null,
+            forceReleaseToUnity: state.ReleaseToUnity);
 
         if (state.ReleaseToUnity && state.GainDb <= 0.0 && state.AppliedGainDb <= 0.0)
             state.ReleaseToUnity = false;
@@ -382,9 +400,28 @@ public class DspPipelineService : BackgroundService,
         ref RxAudioLevelerState state,
         bool allowBoost,
         double maxBoostDb,
-        double levelReferenceOffsetDb = 0.0)
+        double levelReferenceOffsetDb = 0.0,
+        double targetRmsDb = RxLevelerTargetRmsDb,
+        int? customAttackMs = null,
+        int? customReleaseMs = null,
+        int? customHangMs = null,
+        bool forceReleaseToUnity = false)
     {
         if (samples.Length == 0) return;
+
+        double blockDurationMs = samples.Length * 1000.0 / AudioOutputRateHz;
+        double customBoostSlewDb = customAttackMs.HasValue
+            ? maxBoostDb * blockDurationMs / customAttackMs.Value
+            : double.NaN;
+        // Release time is defined against the fixed +24 dB safety-bounded
+        // makeup range, so reducing Max Boost never accidentally makes release
+        // slower. Peak-urgent cuts continue to bypass this audible timing.
+        double customReleaseSlewDb = customReleaseMs.HasValue
+            ? RxConstantLoudnessMaxBoostDb * blockDurationMs / customReleaseMs.Value
+            : double.NaN;
+        int customPauseHoldBlocks = customHangMs.HasValue
+            ? (int)Math.Ceiling(customHangMs.Value / blockDurationMs)
+            : -1;
 
         double sumSq = 0.0;
         double peak = 0.0;
@@ -403,7 +440,7 @@ public class DspPipelineService : BackgroundService,
         double rms = Math.Sqrt(sumSq / samples.Length);
         double inputRmsDbfs = AudioLinearToDbfsRaw(rms);
         double inputPeakDbfs = AudioLinearToDbfsRaw(peak);
-        double targetRmsDb = RxLevelerTargetRmsDb + levelReferenceOffsetDb;
+        targetRmsDb += levelReferenceOffsetDb;
         double gateRmsDb = RxLevelerGateRmsDb + levelReferenceOffsetDb;
         bool belowGate = rms <= 0.0 || !double.IsFinite(inputRmsDbfs) || inputRmsDbfs < gateRmsDb;
 
@@ -457,7 +494,8 @@ public class DspPipelineService : BackgroundService,
         // Evidence loss bypasses pause memory so averaged-SNR hangover cannot
         // hold makeup on noise, but releases it over several audio blocks. Peak
         // safety below may still cut faster when the held gain is genuinely unsafe.
-        bool evidenceLossRelease = !allowBoost && currentDb > 0.0;
+        bool evidenceLossRelease = !allowBoost &&
+            (currentDb > 0.0 || forceReleaseToUnity);
 
         // True when the gain we are currently holding would, on its own, drive
         // this block's peak past the limiter target — i.e. a gain "held" high
@@ -480,7 +518,9 @@ public class DspPipelineService : BackgroundService,
             if (holdMemory)
                 state.PauseHoldBlocks--;
 
-            double releaseStep = RxLevelerPauseMemoryDecayDbPerBlock;
+            double releaseStep = customReleaseMs.HasValue
+                ? customReleaseSlewDb
+                : RxLevelerPauseMemoryDecayDbPerBlock;
             if (holdMemory)
             {
                 nextDb = currentDb;
@@ -496,18 +536,24 @@ public class DspPipelineService : BackgroundService,
         }
         else
         {
-            state.PauseHoldBlocks = RxLevelerPauseHoldBlocks;
+            state.PauseHoldBlocks = customHangMs.HasValue
+                ? customPauseHoldBlocks
+                : RxLevelerPauseHoldBlocks;
         }
 
         bool boostSlewLimited = false;
         if (!evidenceLossRelease && !belowGate && desiredDb > currentDb)
         {
-            double boostSlewDb = RxLevelerBoostSlewDbPerBlock;
-            if (double.IsFinite(peakHeadroomDb) && peakHeadroomDb >= RxLevelerFastBoostHeadroomDb)
+            double boostSlewDb = customAttackMs.HasValue
+                ? customBoostSlewDb
+                : RxLevelerBoostSlewDbPerBlock;
+            if (!customAttackMs.HasValue &&
+                double.IsFinite(peakHeadroomDb) && peakHeadroomDb >= RxLevelerFastBoostHeadroomDb)
             {
                 boostSlewDb = Math.Max(boostSlewDb, RxLevelerFastBoostSlewDbPerBlock);
             }
-            if (double.IsFinite(peakHeadroomDb) &&
+            if (!customAttackMs.HasValue &&
+                double.IsFinite(peakHeadroomDb) &&
                 peakHeadroomDb >= RxLevelerVeryFastBoostHeadroomDb &&
                 inputRmsDbfs >= RxLevelerVeryFastBoostGateRmsDb + levelReferenceOffsetDb)
             {
@@ -515,7 +561,8 @@ public class DspPipelineService : BackgroundService,
             }
 
             double crestDb = inputPeakDbfs - inputRmsDbfs;
-            if (double.IsFinite(crestDb) &&
+            if (!customAttackMs.HasValue &&
+                double.IsFinite(crestDb) &&
                 crestDb >= RxLevelerCrestCatchupMinCrestDb &&
                 inputRmsDbfs <= RxLevelerCrestCatchupMaxRmsDb + levelReferenceOffsetDb &&
                 inputPeakDbfs >= RxLevelerCrestCatchupMinPeakDb + levelReferenceOffsetDb &&
@@ -523,7 +570,8 @@ public class DspPipelineService : BackgroundService,
             {
                 boostSlewDb = Math.Max(boostSlewDb, RxLevelerCrestCatchupBoostSlewDbPerBlock);
             }
-            if (state.GainDb >= RxLevelerMemoryCatchupMinGainDb &&
+            if (!customAttackMs.HasValue &&
+                state.GainDb >= RxLevelerMemoryCatchupMinGainDb &&
                 inputRmsDbfs >= RxLevelerMemoryCatchupGateRmsDb + levelReferenceOffsetDb &&
                 inputPeakDbfs >= RxLevelerMemoryCatchupGatePeakDb + levelReferenceOffsetDb)
             {
@@ -541,11 +589,14 @@ public class DspPipelineService : BackgroundService,
             double cutStartDb = evidenceLossRelease
                 ? Math.Min(currentDb, appliedStartDb)
                 : currentDb;
+            double smoothCutDb = customReleaseMs.HasValue
+                ? customReleaseSlewDb
+                : RxLevelerSmoothCutDb;
             double cutSlewDb = peakUrgency
-                ? Math.Max(RxLevelerSmoothCutDb, cutStartDb - desiredDb)
+                ? Math.Max(smoothCutDb, cutStartDb - desiredDb)
                 : evidenceLossRelease
                     ? RxLevelerEvidenceLossReleaseDbPerBlock
-                    : RxLevelerSmoothCutDb;
+                    : smoothCutDb;
             double cutFloorDb = evidenceLossRelease ? Math.Min(desiredDb, 0.0) : desiredDb;
             nextDb = Math.Max(cutFloorDb, cutStartDb - cutSlewDb);
         }
@@ -1267,6 +1318,9 @@ public class DspPipelineService : BackgroundService,
     private double _appliedPsAmpDelayNs = 150.0;
     private double _appliedPsHwPeak = 0.4072;
     private PsFeedbackSource _appliedPsFeedbackSource = PsFeedbackSource.Internal;
+    private int _appliedExternalPsFeedbackAttenuationDb = -1;
+    private int _appliedExternalPsCorrectionMode = -1;
+    private int _externalPsFailCloseLatched;
     // PS-Monitor toggle (issue #121). Pure source-routing flag — Tick reads
     // it on each tick to choose between the TX analyzer (predistorted IQ)
     // and the PS-feedback analyzer (post-PA loopback IQ). volatile because
@@ -1683,6 +1737,7 @@ public class DspPipelineService : BackgroundService,
         _loggerFactory = loggerFactory;
         _txIngestFactory = txIngestFactory;
         _log = loggerFactory.CreateLogger<DspPipelineService>();
+        _externalDspProvider = new ExternalDspEngineProviderLoader(configuration, _log);
         _txTurnaround = new TxTurnaroundTelemetry(_log);
         var displayPerformance = DisplayPerformanceOptions.Resolve(configuration);
         _rxAnalyzerFftSize = displayPerformance.RxAnalyzerFftSize;
@@ -3251,6 +3306,10 @@ public class DspPipelineService : BackgroundService,
             schemaVersion = 1,
             engine = engine?.GetType().Name ?? "None",
             engineKind = wdspActive ? "WDSP" : offlinePreview ? "OfflinePreview" : synthetic ? "Synthetic" : engine is null ? "None" : "Other",
+            protocol3TxEngine = CurrentProtocol3TxEngine,
+            externalPureSignal = engine is ExternalProtocol3TxDspEngine { PureSignalEnabled: true } externalPs
+                ? externalPs.GetPureSignalStatus()
+                : (ExternalPureSignalStatus?)null,
             wdspActive = nrRuntime.WdspActive,
             synthetic,
             offlinePreview,
@@ -5680,11 +5739,42 @@ public class DspPipelineService : BackgroundService,
             _appliedPsAuto = s.PsAuto;
             _appliedPsSingle = s.PsSingle;
         }
+        if (engine is ExternalProtocol3TxDspEngine { PureSignalEnabled: true } externalPs)
+        {
+            int feedbackAttenuationDb = Math.Clamp(s.PsTxFeedbackAttenuationDb, 0, 31);
+            int requestedCorrectionMode = s.PsSingle ? 2 : s.PsAuto ? 1 : 0;
+            // Match the existing native control deferral above: source and
+            // attenuation may remain live controls, but switching the
+            // correction/calibration mode mid-over would split radio-route
+            // state from the corrector until key-up.
+            int correctionMode = _keyed && _appliedExternalPsCorrectionMode >= 0
+                ? _appliedExternalPsCorrectionMode
+                : requestedCorrectionMode;
+            if (resync ||
+                s.PsFeedbackSource != _appliedPsFeedbackSource ||
+                feedbackAttenuationDb != _appliedExternalPsFeedbackAttenuationDb ||
+                correctionMode != _appliedExternalPsCorrectionMode)
+            {
+                externalPs.SetPureSignalRouteSettings(
+                    new ExternalPureSignalRouteSettings(
+                        s.PsFeedbackSource == PsFeedbackSource.External,
+                        feedbackAttenuationDb,
+                        correctionMode));
+                _appliedExternalPsFeedbackAttenuationDb = feedbackAttenuationDb;
+                _appliedExternalPsCorrectionMode = correctionMode;
+            }
+        }
         var p1Active = _radio.ActiveClient;
         bool p1ArmMismatch = p1Active is not null
             && p1Active.PsEnabled != s.PsEnabled
             && IsPsArmWorkComplete();
-        if (resync || s.PsEnabled != _appliedPsEnabled || p1ArmMismatch)
+        bool externalArmMismatch = engine is ExternalProtocol3TxDspEngine
+            {
+                PureSignalEnabled: true
+            } externalArmEngine
+            && externalArmEngine.PureSignalArmed != s.PsEnabled
+            && IsPsArmWorkComplete();
+        if (resync || s.PsEnabled != _appliedPsEnabled || p1ArmMismatch || externalArmMismatch)
         {
             if (s.PsEnabled && _keyed)
             {
@@ -5716,8 +5806,11 @@ public class DspPipelineService : BackgroundService,
                 // freeze RX audio + waterfall (GH #426) — skip the engine arm
                 // there. The wire calls are board-gated no-ops on those
                 // boards (WriteAttenuatorPayload + SnapshotState).
-                bool psEngineSupported = P1PsEngineArmSupported(
-                    p1Connected: p1Active is not null, _radio.ConnectedBoardKind);
+                bool psEngineSupported =
+                    engine is ExternalProtocol3TxDspEngine { PureSignalEnabled: true } ||
+                    P1PsEngineArmSupported(
+                        p1Connected: p1Active is not null,
+                        _radio.ConnectedBoardKind);
                 // #1302 F1/F6: the arm/disarm sequence is async now — on a
                 // HermesC10 the wire flip rides a stop/drain/restart
                 // transition (SetPsEnabledAsync) that must never run inline
@@ -5906,6 +5999,33 @@ public class DspPipelineService : BackgroundService,
         lock (_psArmWorkSync) return _psArmWork.IsCompleted;
     }
 
+    internal void ReconcileExternalPureSignalStatusForTick(IDspEngine engine, StateDto state)
+    {
+        if (engine is not ExternalProtocol3TxDspEngine { PureSignalEnabled: true } externalPs ||
+            !state.PsEnabled)
+        {
+            Interlocked.Exchange(ref _externalPsFailCloseLatched, 0);
+            return;
+        }
+
+        if (!IsPsArmWorkComplete() || externalPs.GetPureSignalStatus().Armed)
+            return;
+        if (Interlocked.Exchange(ref _externalPsFailCloseLatched, 1) != 0)
+            return;
+
+        _log.LogWarning(
+            "ps.external.fail-close provider reported disarmed while runtime state was armed; clearing runtime arm state");
+        _ = Task.Run(() =>
+        {
+            try { _radio.FailClosedPureSignalRuntime(); }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref _externalPsFailCloseLatched, 0);
+                _log.LogWarning(ex, "ps.external.fail-close runtime disarm failed");
+            }
+        });
+    }
+
     private void SchedulePsArmTransition(
         bool enable, IProtocol1Client? p1, IDspEngine engine, bool engineArmSupported)
     {
@@ -5956,6 +6076,20 @@ public class DspPipelineService : BackgroundService,
     private async Task RunPsArmTransitionAsync(
         bool enable, IProtocol1Client? p1, IDspEngine engine, bool engineArmSupported)
     {
+        // A capability-gated external P3 engine owns its matching p3app route
+        // transaction. Zeus still owns operator intent and serialization;
+        // startup remains disarmed and P1/P2 retain their wire-first ordering.
+        if (engine is ExternalProtocol3TxDspEngine { PureSignalEnabled: true })
+        {
+            lock (_engineLock)
+            {
+                if (ReferenceEquals(engine, _engine))
+                    engine.SetPsEnabled(enable);
+            }
+            if (!enable) DrainPsFeedback();
+            return;
+        }
+
         if (enable)
         {
             _p2Client?.SetPsFeedbackEnabled(true);
@@ -6536,6 +6670,37 @@ public class DspPipelineService : BackgroundService,
         await _radio.RadioLifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            return await ConnectP2WithLifecycleGateHeldAsync(
+                radioEndpoint,
+                sampleRateKhz,
+                numAdc,
+                ct,
+                boardKind,
+                firmware,
+                sampleRateExplicit).ConfigureAwait(false);
+        }
+        finally
+        {
+            _radio.RadioLifecycleGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Connects while the caller owns <see cref="RadioService.RadioLifecycleGate"/>.
+    /// Used by the P2 reclaim endpoint so stop, stable-Idle verification, and
+    /// start form one server-side lifecycle transaction.
+    /// </summary>
+    internal async Task<int> ConnectP2WithLifecycleGateHeldAsync(
+        IPEndPoint radioEndpoint,
+        int sampleRateKhz,
+        byte numAdc,
+        CancellationToken ct,
+        HpsdrBoardKind boardKind = HpsdrBoardKind.Unknown,
+        string? firmware = null,
+        bool sampleRateExplicit = true)
+    {
+        try
+        {
             await _radio.DisconnectSupersededP1AutomaticRetryAsync().ConfigureAwait(false);
             return await ConnectP2CoreAsync(
                 radioEndpoint,
@@ -6561,7 +6726,6 @@ public class DspPipelineService : BackgroundService,
         finally
         {
             _p2ConnectingClient = null;
-            _radio.RadioLifecycleGate.Release();
         }
     }
 
@@ -7141,28 +7305,71 @@ public class DspPipelineService : BackgroundService,
         };
 
     /// <summary>
-    /// Protocol 3 RX/display/audio is supplied by the hosted sidecar, but Zeus
-    /// still owns the local WDSP TXA chain. Open that TX path explicitly on P3
-    /// connect so MOX/TUN can produce 192 kHz IQ for the sidecar TX ingress.
+    /// Protocol 3 RX/display/audio is supplied by the hosted sidecar. Zeus still
+    /// owns the local TX-audio-to-IQ engine and opens it explicitly on connect so
+    /// MOX/TUN can produce 192 kHz IQ for the existing sidecar ingress. WDSP is
+    /// the unchanged default. An external engine is loaded only after explicit
+    /// configuration and is never silently replaced with WDSP if loading fails.
     /// </summary>
-    public int ConnectP3TxEngine(int sampleRateHz)
+    public Protocol3TxEngineConnection ConnectP3TxEngine(int sampleRateHz)
     {
         int rateHz = sampleRateHz > 0 ? sampleRateHz : 192_000;
+        var mode = _externalDspProvider.Mode;
 
         var current = Volatile.Read(ref _engine);
-        if (current is WdspDspEngine && Volatile.Read(ref _sampleRateHz) == rateHz)
-            return rateHz;
-
-        var wdsp = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
-        int channelId = wdsp.OpenChannel(rateHz, _panadapterWidth);
-        SeedTxDisplayConfig(wdsp);
-        // Saturn/G2 DUC-compatible host-IQ mode is 48 kHz mic -> 96 kHz DSP ->
-        // 192 kHz IQ, matching the proven P2 G2 path.
-        wdsp.OpenTxChannel(outputRateHz: 192_000);
-        try { ApplyStateToNewChannel(wdsp, channelId); }
-        catch (EntryPointNotFoundException ex)
+        var existingConnection = Volatile.Read(ref _protocol3TxEngineConnection);
+        if (current is not null &&
+            existingConnection is not null &&
+            existingConnection.EngineRateHz == rateHz &&
+            existingConnection.External == (mode == Protocol3TxEngineMode.External))
         {
-            _log.LogWarning(ex, "dsp.pipeline p3 wdsp missing entry point - partial config applied");
+            return existingConnection;
+        }
+
+        IDspEngine next;
+        string engineName;
+        bool external;
+        if (mode == Protocol3TxEngineMode.External)
+        {
+            bool pureSignal = _externalDspProvider.Capabilities.HasFlag(
+                ExternalDspEngineCapabilities.PureSignal);
+            var externalEngine = _externalDspProvider.CreateEngine(
+                new ExternalDspEngineRequest(
+                    ExternalDspEngineRole.Transmit,
+                    rateHz,
+                    _panadapterWidth,
+                    TxOutputRateHz: 192_000,
+                    PureSignalEnabled: pureSignal),
+                out engineName);
+            next = new ExternalProtocol3TxDspEngine(externalEngine, pureSignal);
+            external = true;
+        }
+        else
+        {
+            next = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
+            engineName = "WDSP";
+            external = false;
+        }
+
+        int channelId = -1;
+        try
+        {
+            channelId = next.OpenChannel(rateHz, _panadapterWidth);
+            SeedTxDisplayConfig(next);
+            // Saturn/G2 DUC-compatible host-IQ mode is 48 kHz mic to 192 kHz
+            // IQ, matching the proven P2 G2 path and the sidecar ingest rate.
+            next.OpenTxChannel(outputRateHz: 192_000);
+            try { ApplyStateToNewChannel(next, channelId); }
+            catch (EntryPointNotFoundException ex) when (!external)
+            {
+                _log.LogWarning(ex, "dsp.pipeline p3 wdsp missing entry point - partial config applied");
+            }
+
+        }
+        catch
+        {
+            TeardownEngine(next, channelId);
+            throw;
         }
 
         IDspEngine? old;
@@ -7171,20 +7378,38 @@ public class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, wdsp);
+            Volatile.Write(ref _engine, next);
             Volatile.Write(ref _channelId, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, rateHz);
         }
 
         TeardownEngine(old, oldChannel);
+        var connection = new Protocol3TxEngineConnection(
+            engineName,
+            rateHz,
+            TxIqRateHz: 192_000,
+            external,
+            PureSignal: next is ExternalProtocol3TxDspEngine { PureSignalEnabled: true });
+        Volatile.Write(ref _protocol3TxEngineConnection, connection);
         _psResyncRequired = true;
         _appliedTxMonitorEnabled = false;
-        _log.LogInformation("dsp.pipeline p3 tx engine=wdsp channel={Id} rxRate={Rate} txIqRate=192000", channelId, rateHz);
-        RaiseEngineChanged(wdsp);
+        _log.LogInformation(
+            "dsp.pipeline p3 tx engine={Engine} external={External} channel={Id} rxRate={Rate} txIqRate=192000",
+            engineName,
+            external,
+            channelId,
+            rateHz);
+        RaiseEngineChanged(next);
         OnRadioStateChanged(_radio.Snapshot());
-        return rateHz;
+        return connection;
     }
+
+    public Protocol3TxEngineConnection? CurrentProtocol3TxEngine =>
+        Volatile.Read(ref _protocol3TxEngineConnection);
+
+    public ExternalDspEngineCapabilities Protocol3ExternalCapabilities =>
+        _externalDspProvider.Capabilities;
 
     public void DisconnectP3TxEngine()
     {
@@ -7206,6 +7431,7 @@ public class DspPipelineService : BackgroundService,
         }
 
         TeardownEngine(old, oldChannel);
+        Volatile.Write(ref _protocol3TxEngineConnection, null);
         _psResyncRequired = true;
         _appliedTxMonitorEnabled = false;
         RaiseEngineChanged(disconnectedEngine);
@@ -8131,7 +8357,7 @@ public class DspPipelineService : BackgroundService,
     {
         if (engine is null) return;
         try { engine.CloseChannel(channelId); } catch { /* best-effort */ }
-        engine.Dispose();
+        try { engine.Dispose(); } catch { /* best-effort; never mask the initiating failure */ }
     }
 
     // N-receiver additive mix. Averaging silently reduced every receiver by
@@ -8257,6 +8483,7 @@ public class DspPipelineService : BackgroundService,
         if (engine is null) return true;
 
         var state = _radio.Snapshot();
+        ReconcileExternalPureSignalStatusForTick(engine, state);
         // Synthetic engine stays open while disconnected so SetMode/SetFilter
         // etc. have somewhere to land, but its sweep+static placeholder used
         // to render a misleading "fake spectrum" before any radio existed.
@@ -9006,7 +9233,8 @@ public class DspPipelineService : BackgroundService,
                         enabled: state.RxLevelerEnabled,
                         rfSignalResolved: loudnessBoostAllowed,
                         adcOverloadRisk: !loudnessBoostAllowed,
-                        levelReferenceOffsetDb: appliedAfDb);
+                        levelReferenceOffsetDb: appliedAfDb,
+                        config: state.RxLeveler);
                 }
                 else
                 {

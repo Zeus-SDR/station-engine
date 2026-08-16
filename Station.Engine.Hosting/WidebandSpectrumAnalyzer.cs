@@ -14,6 +14,16 @@ namespace Zeus.Server;
 internal sealed class WidebandSpectrumAnalyzer
 {
     public const int DisplayWidth = 4096;
+    // Internal analysis grid, finer than the wire grid. The Saturn snapshot
+    // yields ~16,000 real 3.75 kHz bins across 0-60 MHz, so a 4,096-cell grid
+    // folded ~3.9 real bins into every wire pixel; averaging them cost a
+    // narrow carrier ~5.9 dB before it ever reached the screen. Analysing on
+    // a 16,384-cell grid puts roughly one cell on one real bin at zoom 1, and
+    // the peak reduction to DisplayWidth then keeps each signal at its true
+    // amplitude. The wire format is untouched: DisplayWidth still leaves the
+    // server, so no client, contract, or bandwidth budget changes.
+    public const int AnalysisWidth = 16_384;
+    private const int AnalysisPerDisplay = AnalysisWidth / DisplayWidth;
     public const double DisplaySpanHz = 60_000_000.0;
     public const long DisplayCenterHz = 30_000_000;
     public const float HzPerPixel = (float)(DisplaySpanHz / DisplayWidth);
@@ -30,6 +40,13 @@ internal sealed class WidebandSpectrumAnalyzer
     // least ~1.7 real bins per pixel. Overview zooms (where one 3.75 kHz
     // bin is already far finer than one 14.6 kHz pixel) qualify; deep
     // zooms keep the full-length transform and its native resolution.
+    //
+    // Measured against the WIRE pixel deliberately. Measuring against the
+    // finer analysis cell suppresses segmentation entirely and doubles the
+    // overview RBW, but the resulting single periodogram costs more in floor
+    // grass than the extra resolution buys: at zoom 1 the wire pixel is
+    // 14.6 kHz wide, so a 7.5 kHz bin is already sub-pixel, and the peak
+    // detector below is what keeps narrow carriers at full height there.
     private const double MaxSegmentBinToPixelRatio = 0.6;
     private const int MaxSegments = 8;
     private const double MinAmplitude = 1e-12;
@@ -53,8 +70,9 @@ internal sealed class WidebandSpectrumAnalyzer
 
     private readonly double[] _real = new double[FftSize];
     private readonly double[] _binPower = new double[(FftSize / 2) + 1];
-    private readonly double[] _avgPanPower = new double[DisplayWidth];
-    private readonly double[] _avgWfPower = new double[DisplayWidth];
+    private readonly double[] _avgPanPower = new double[AnalysisWidth];
+    private readonly double[] _avgWfPower = new double[AnalysisWidth];
+    private readonly double[] _wfReduced = new double[DisplayWidth];
     private readonly Dictionary<int, FftPlan> _fftPlans = new();
     private readonly Dictionary<int, WindowPlan> _windowPlans = new();
     private int _activeBinCount;
@@ -187,10 +205,11 @@ internal sealed class WidebandSpectrumAnalyzer
         double panDecayAlpha = EmaAlpha(frameIntervalMs, PanTauMsForZoom(viewport.ZoomLevel));
         double panAttackAlpha = EmaAlpha(frameIntervalMs, PanAttackTauMs);
         double wfAlpha = EmaAlpha(frameIntervalMs, WfTauMs);
-        for (int pixel = 0; pixel < DisplayWidth; pixel++)
+        double analysisHzPerCell = viewport.SpanHz / AnalysisWidth;
+        for (int pixel = 0; pixel < AnalysisWidth; pixel++)
         {
-            double loHz = startHz + pixel * viewport.HzPerPixel;
-            double hiHz = loHz + viewport.HzPerPixel;
+            double loHz = startHz + pixel * analysisHzPerCell;
+            double hiHz = loHz + analysisHzPerCell;
             double power = 0.0;
             if (hiHz > 0.0 && loHz < nyquistHz)
             {
@@ -228,23 +247,68 @@ internal sealed class WidebandSpectrumAnalyzer
         _smoothedValid = true;
         double sideWeight = SpatialSideWeightForZoom(viewport.ZoomLevel);
         double centerWeight = 1.0 - (2.0 * sideWeight);
+        // Split detectors, the way a lab analyzer and Thetis do it, because the
+        // two surfaces answer different questions.
+        //
+        // The TRACE reduces by PEAK: a carrier narrower than one wire pixel
+        // keeps its true height instead of being averaged down toward the
+        // floor, so weak narrow signals stay visible on the 0-60 MHz overview.
+        //
+        // The WATERFALL reduces by MEAN: it is a noise-texture surface, and
+        // peak-picking there would amplify the upper tail of the noise into
+        // visible grass. Averaging the analysis cells also buys back the
+        // variance reduction the frequency-domain Welch segmentation used to
+        // provide — but in a way that costs no resolution, since the cells
+        // being averaged are finer than one wire pixel to begin with.
         for (int pixel = 0; pixel < DisplayWidth; pixel++)
         {
-            panDb[pixel] = SpatiallySmoothedDb(_avgPanPower, pixel, sideWeight, centerWeight);
-            wfDb[pixel] = SpatiallySmoothedDb(_avgWfPower, pixel, sideWeight, centerWeight);
+            int start = pixel * AnalysisPerDisplay;
+            double panPeak = 0.0;
+            double wfSum = 0.0;
+            for (int cell = start; cell < start + AnalysisPerDisplay; cell++)
+            {
+                // The trace smooths on the ANALYSIS grid, so the kernel spans a
+                // quarter of the frequency width it used to and de-grasses
+                // without blunting the peak that follows.
+                double pan = SpatiallySmoothedPower(_avgPanPower, cell, sideWeight, centerWeight);
+                if (pan > panPeak) panPeak = pan;
+                wfSum += _avgWfPower[cell];
+            }
+
+            panDb[pixel] = ToDb(panPeak);
+            _wfReduced[pixel] = wfSum / AnalysisPerDisplay;
+        }
+
+        // The waterfall smooths AFTER reduction, on the wire grid, so its
+        // kernel keeps the full pixel-scale span it had before. Smoothing it on
+        // the analysis grid instead measurably increased floor grass (the taps
+        // land on near-neighbours that carry correlated noise), which is the
+        // one thing a waterfall must not do.
+        for (int pixel = 0; pixel < DisplayWidth; pixel++)
+        {
+            double p = _wfReduced[pixel];
+            double smoothed =
+                pixel == 0 || pixel == DisplayWidth - 1
+                    ? p
+                    : _wfReduced[pixel - 1] * sideWeight + p * centerWeight + _wfReduced[pixel + 1] * sideWeight;
+            wfDb[pixel] = ToDb(smoothed);
         }
 
         return viewport;
     }
 
-    private static float SpatiallySmoothedDb(double[] power, int pixel, double sideWeight, double centerWeight)
+    private static float ToDb(double power) =>
+        (float)(10.0 * Math.Log10(Math.Max(power, MinPower)));
+
+    private static double SpatiallySmoothedPower(double[] power, int cell, double sideWeight, double centerWeight)
     {
-        double p = power[pixel];
-        double smoothed =
-            pixel == 0 || pixel == DisplayWidth - 1
-                ? p
-                : power[pixel - 1] * sideWeight + p * centerWeight + power[pixel + 1] * sideWeight;
-        return (float)(10.0 * Math.Log10(Math.Max(smoothed, MinPower)));
+        double p = power[cell];
+        // The 3-tap kernel now spans three ANALYSIS cells rather than three
+        // wire pixels, so it de-grasses the floor over a quarter of the
+        // frequency width it used to blur a signal across.
+        return cell == 0 || cell == AnalysisWidth - 1
+            ? p
+            : power[cell - 1] * sideWeight + p * centerWeight + power[cell + 1] * sideWeight;
     }
 
     private void PlanSegments(int sampleCount, int sampleRateHz, double hzPerPixel)
@@ -350,9 +414,16 @@ internal sealed class WidebandSpectrumAnalyzer
         }
         else
         {
-            double halfSpanHz = spanHz / 2.0;
-            double requestedCenterHz = Math.Clamp((double)targetCenterHz, 0.0, DisplaySpanHz);
-            centerHz = (long)Math.Round(Math.Clamp(requestedCenterHz, halfSpanHz, DisplaySpanHz - halfSpanHz));
+            // Only the CENTRE is held inside 0-60 MHz; the window is allowed to
+            // straddle an edge. Forcing the whole window inside the band (the
+            // old halfSpan clamp) meant a zoom near the bottom of HF could not
+            // put the operator's frequency in the middle of the screen: at 15
+            // MHz span, 3.9 MHz clamped to a 7.5 MHz centre and the view slid
+            // left to 0-15 MHz instead of staying anchored where the operator
+            // was pointing. The projection loop already scores sub-zero and
+            // above-Nyquist pixels as no-signal, so the exposed margin renders
+            // as empty spectrum rather than wrapped or duplicated data.
+            centerHz = (long)Math.Round(Math.Clamp((double)targetCenterHz, 0.0, DisplaySpanHz));
         }
 
         return new WidebandSpectrumViewport(

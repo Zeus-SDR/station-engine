@@ -53,6 +53,33 @@ public static class RadioDspControlEndpoints
             return Results.Ok(r.SetRxLeveler(req.Enabled));
         });
 
+        endpoints.MapPost("/api/rx/leveler/config", (RxLevelerConfigSetRequest req, RadioService r) =>
+        {
+            if (req.RxLeveler is not { } cfg)
+                return Results.BadRequest(new { error = "rxLeveler required" });
+            log.LogInformation(
+                "api.rx.leveler.config enabled={Enabled} mode={Mode} targetRmsDb={Target:F1} maxBoostDb={Boost:F1} attackMs={Attack} releaseMs={Release} hangMs={Hang}",
+                req.Enabled, cfg.Mode, cfg.TargetRmsDb, cfg.MaxBoostDb,
+                cfg.AttackMs, cfg.ReleaseMs, cfg.HangMs);
+            if (!Enum.IsDefined(cfg.Mode))
+                return Results.BadRequest(new { error = $"unknown RxLevelerMode {cfg.Mode}" });
+            if (!double.IsFinite(cfg.TargetRmsDb) ||
+                cfg.TargetRmsDb < RxLevelerConfig.MinTargetRmsDb ||
+                cfg.TargetRmsDb > RxLevelerConfig.MaxTargetRmsDb)
+                return Results.BadRequest(new { error = "targetRmsDb must be -30..-6 dBFS" });
+            if (!double.IsFinite(cfg.MaxBoostDb) ||
+                cfg.MaxBoostDb < RxLevelerConfig.MinBoostDb ||
+                cfg.MaxBoostDb > RxLevelerConfig.MaxBoostLimitDb)
+                return Results.BadRequest(new { error = "maxBoostDb must be 0..24 dB" });
+            if (cfg.AttackMs < RxLevelerConfig.MinAttackMs || cfg.AttackMs > RxLevelerConfig.MaxAttackMs)
+                return Results.BadRequest(new { error = "attackMs must be 20..2000 ms" });
+            if (cfg.ReleaseMs < RxLevelerConfig.MinReleaseMs || cfg.ReleaseMs > RxLevelerConfig.MaxReleaseMs)
+                return Results.BadRequest(new { error = "releaseMs must be 20..5000 ms" });
+            if (cfg.HangMs < RxLevelerConfig.MinHangMs || cfg.HangMs > RxLevelerConfig.MaxHangMs)
+                return Results.BadRequest(new { error = "hangMs must be 0..2000 ms" });
+            return Results.Ok(r.SetRxLevelerConfig(req.Enabled, cfg));
+        });
+
         endpoints.MapPost("/api/rx/squelch", (SquelchSetRequest req, RadioService r) =>
         {
             log.LogInformation(

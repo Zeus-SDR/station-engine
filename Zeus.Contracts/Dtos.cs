@@ -840,6 +840,46 @@ public sealed record AgcConfig(
     int? HangThreshold = null,
     double? FixedGainDb = null);
 
+// Operator-facing RX constant-loudness leveler profile. Auto deliberately
+// preserves the established adaptive controller exactly. Custom replaces only
+// the audible target/makeup/timing values; RF-evidence qualification, ADC veto,
+// sudden-signal peak guard, output limiter, and the -24 dB cut floor remain
+// fixed safety policy. AttackMs is the nominal time to travel from unity to
+// MaxBoostDb, ReleaseMs is the nominal +24 dB-to-unity time, and HangMs retains
+// controller memory across short speech pauses. Enabled remains on StateDto as
+// the backwards-compatible master switch and is set atomically with this
+// profile by /api/rx/leveler/config.
+public enum RxLevelerMode
+{
+    Auto,
+    Custom,
+}
+
+public sealed record RxLevelerConfig(
+    RxLevelerMode Mode = RxLevelerMode.Auto,
+    double TargetRmsDb = RxLevelerConfig.DefaultTargetRmsDb,
+    double MaxBoostDb = RxLevelerConfig.DefaultMaxBoostDb,
+    int AttackMs = RxLevelerConfig.DefaultAttackMs,
+    int ReleaseMs = RxLevelerConfig.DefaultReleaseMs,
+    int HangMs = RxLevelerConfig.DefaultHangMs)
+{
+    public const double MinTargetRmsDb = -30.0;
+    public const double MaxTargetRmsDb = -6.0;
+    public const double DefaultTargetRmsDb = -18.0;
+    public const double MinBoostDb = 0.0;
+    public const double MaxBoostLimitDb = 24.0;
+    public const double DefaultMaxBoostDb = 24.0;
+    public const int MinAttackMs = 20;
+    public const int MaxAttackMs = 2000;
+    public const int DefaultAttackMs = 400;
+    public const int MinReleaseMs = 20;
+    public const int MaxReleaseMs = 5000;
+    public const int DefaultReleaseMs = 150;
+    public const int MinHangMs = 0;
+    public const int MaxHangMs = 2000;
+    public const int DefaultHangMs = 600;
+}
+
 // Operator-facing RX squelch configuration (issue: DSP controls Thetis parity
 // §5). A single mode-aware control: the engine routes run + threshold to the
 // WDSP squelch stage matching the current RX mode (SSB/CW → SSQL, AM/SAM →
@@ -1119,6 +1159,10 @@ public sealed record StateDto(
     // keeping peak protection active.
     // Default is OFF — operator must explicitly enable.
     bool RxLevelerEnabled = false,
+    // RX leveler Auto/Custom profile. Nullable for older state frames; null
+    // means the established Auto profile. The separate Enabled field remains
+    // the master switch so legacy clients keep their current on/off behavior.
+    RxLevelerConfig? RxLeveler = null,
     double AgcOffsetDb = 0.0,
     // AGC threshold ("knee") in operator/displayed dBm — the signal-relative
     // level below which the AGC applies increasing gain (up to the AgcTopDb
@@ -1456,14 +1500,10 @@ public sealed record ConnectRequest(
     // "P2 active ⇒ assume OrionMkII" fallback. Null/omitted = legacy
     // behaviour. Issue #171.
     byte? BoardId = null,
-    // Operator opt-in to take over a radio another controller is already
-    // driving. /api/connect/p2 normally refuses to become a SECOND master on a
-    // radio whose discovery reply reports Busy — connecting alongside another
-    // controller makes the band/antenna/T-R relay matrix chatter and can brown
-    // out the radio (observed on a co-located Saturn all-in-one running
-    // saturn-go + p2app). The takeover flow sends a reclaim stop first and sets
-    // this so the post-reclaim re-connect isn't re-blocked by the busy guard
-    // while the radio is still settling. Default false = guard enforced.
+    // Protocol 1 compatibility takeover. Protocol 2 never bypasses its Busy
+    // guard: the P2 reclaim endpoint sends run=0 and proves stable Idle before
+    // reconnecting normally, because the protocol cannot terminate a live
+    // controller process on another host. Default false = guard enforced.
     bool Force = false);
 
 public sealed record VfoSetRequest(long Hz, int Receiver = 0);
@@ -1967,6 +2007,12 @@ public sealed record AdcProtectionStatusDto(
 public sealed record AutoAgcSetRequest(bool Enabled);
 
 public sealed record RxLevelerSetRequest(bool Enabled);
+
+// Replace-style RX leveler update. Enabled and the profile travel together so
+// Off/Auto/Custom mode changes are one atomic state mutation.
+public sealed record RxLevelerConfigSetRequest(
+    bool Enabled,
+    RxLevelerConfig RxLeveler);
 
 public sealed record TunSetRequest(bool On);
 

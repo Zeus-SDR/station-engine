@@ -225,6 +225,7 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetTxMode(RxMode mode) => _tx.SetTxMode(mode);
 
     public void SetTxDigitalBypass(bool bypass) => _tx.SetTxDigitalBypass(bypass);
+    public void SetTxInjectedAudioBypass(bool bypass) => _tx.SetTxInjectedAudioBypass(bypass);
     public void SetTxRogerBeepBypass(bool bypass) => _tx.SetTxRogerBeepBypass(bypass);
 
     public void SetTxFilter(int lowHz, int highHz) => _tx.SetTxFilter(lowHz, highHz);

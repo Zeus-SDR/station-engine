@@ -33,7 +33,12 @@ public sealed record KiwiDirectoryEntry(
     int UsersMax,
     bool Online,
     string? Location,
-    string? Snr);
+    string? Snr,
+    int GpsGood,
+    int FixesPerMinute,
+    int FixesPerHour,
+    int TdoaChannels,
+    bool TdoaReady);
 
 /// <summary>
 /// Proxies the public KiwiSDR directory (the kiwisdr.com receiver list, mirrored
@@ -207,6 +212,10 @@ public sealed class KiwiDirectoryService
                 if (string.IsNullOrWhiteSpace(url)) continue;
                 if (!TryParseGps(Str(el, "gps"), out var lat, out var lon)) continue;
 
+                int gpsGood = Int(el, "gps_good");
+                int fixesPerMinute = Int(el, "fixes_min");
+                int fixesPerHour = Int(el, "fixes_hour");
+                int tdoaChannels = Int(el, "tdoa_ch");
                 result.Add(new KiwiDirectoryEntry(
                     Name: Str(el, "name") ?? url!,
                     Url: url!,
@@ -219,7 +228,17 @@ public sealed class KiwiDirectoryService
                     Online: !string.Equals(Str(el, "offline"), "yes", StringComparison.OrdinalIgnoreCase)
                             && !string.Equals(Str(el, "status"), "offline", StringComparison.OrdinalIgnoreCase),
                     Location: Str(el, "loc"),
-                    Snr: Str(el, "snr")));
+                    Snr: Str(el, "snr"),
+                    GpsGood: gpsGood,
+                    FixesPerMinute: fixesPerMinute,
+                    FixesPerHour: fixesPerHour,
+                    TdoaChannels: tdoaChannels,
+                    // A map position is not enough for TDoA. The receiver must
+                    // currently be producing GNSS sample-clock fixes; otherwise
+                    // capture waits for anchors that can never arrive and hits
+                    // the job deadline. The directory refreshes about once per
+                    // minute, so a receiver becomes selectable after lock returns.
+                    TdoaReady: gpsGood > 0 && (fixesPerMinute > 0 || fixesPerHour > 0)));
             }
         }
         return result;

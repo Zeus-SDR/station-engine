@@ -42,6 +42,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
     private readonly object _gate = new();
     private readonly ILogger<ProductAudioRingPort> _log;
+    private readonly IWindowsFirewallService? _windowsFirewall;
     private readonly float[] _txProcessed = new float[AudioRingProtocol.MaxSamplesPerBlock];
     private readonly float[] _rxProcessed = new float[AudioRingProtocol.MaxSamplesPerBlock];
     private Session? _session;
@@ -71,6 +72,14 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     public ProductAudioRingPort(ILogger<ProductAudioRingPort> log)
     {
         _log = log;
+    }
+
+    public ProductAudioRingPort(
+        ILogger<ProductAudioRingPort> log,
+        IWindowsFirewallService windowsFirewall)
+    {
+        _log = log;
+        _windowsFirewall = windowsFirewall;
     }
 
     public bool Active => Volatile.Read(ref _session)?.IsLeased == true;
@@ -249,6 +258,14 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         context.Response.Headers.CacheControl = "no-store";
         await context.Response.StartAsync(context.RequestAborted).ConfigureAwait(false);
 
+        // A claimed local product lease is the first lifecycle point that proves
+        // Zeus Link has attached to this engine. Apply from this process so the
+        // program-scoped inbound rule names StationEngine.exe, which owns the
+        // radio UDP sockets, rather than the launcher. Run it in the background
+        // so an elevation prompt cannot hold up the product's audio attachment.
+        if (_windowsFirewall is not null)
+            _ = Task.Run(() => ApplyFirewallRuleAsync(CancellationToken.None));
+
         try
         {
             while (!context.RequestAborted.IsCancellationRequested)
@@ -270,6 +287,22 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         finally
         {
             Detach(session, "station-protocol lease disconnected");
+        }
+    }
+
+    private async Task ApplyFirewallRuleAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _windowsFirewall!.ApplyAllowRuleAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "product-audio firewall rule apply failed");
         }
     }
 

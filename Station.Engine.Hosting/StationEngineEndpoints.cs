@@ -8,6 +8,7 @@ using Microsoft.Extensions.Primitives;
 using Zeus.Contracts;
 using Zeus.Server.Diagnostics;
 using Zeus.Server.SpeTaurus;
+using Zeus.Server.Tdoa;
 
 namespace Zeus.Server;
 
@@ -171,6 +172,8 @@ public static class StationEngineEndpoints
         // the route used to be mapped only by the product host, so the IMD
         // tool 404'd against a standalone engine (attach mode).
         endpoints.MapImdMeasure();
+        endpoints.MapTdoaEndpoints();
+        endpoints.MapTdoaContributionEndpoints();
         // Same field gap as ImdMeasure: the SPA's Windows Firewall control
         // (/api/system/windows-firewall[+ /allow]) was product-host-only, so
         // it 404'd against a standalone engine in attach mode.

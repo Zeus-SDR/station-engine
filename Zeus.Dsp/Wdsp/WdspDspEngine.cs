@@ -413,6 +413,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private RxaMode _txCurrentMode = RxaMode.USB;
     private bool _txDigitalBypass;
     private bool _txRogerBeepBypass;
+    private bool _txInjectedAudioBypass;
     // Operator configs last applied to TXA. Digital TX modes gate the effective
     // run bits only; these cached configs keep voice-mode restore exact.
     private TxPhaseRotatorConfig _txPhaseRotatorConfig = new();
@@ -2841,7 +2842,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // operator's intent below so the un-key restore lands correctly.
         _txControlNative.SetTXALevelerSt(
             txa,
-            (!_txLevelerForcedOff && !_txRogerBeepBypass && cfg.LevelerEnabled) ? 1 : 0);
+            (!_txLevelerForcedOff && !_txRogerBeepBypass
+                && !_txInjectedAudioBypass && cfg.LevelerEnabled) ? 1 : 0);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
         _txCompressorEnabled = cfg.CompressorEnabled;
         ApplyTxCompressorRunLocked(txa);
@@ -2918,6 +2920,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         && !IsDigitalTxMode(_txCurrentMode)
         && !_txDigitalBypass
         && !_txRogerBeepBypass
+        && !_txInjectedAudioBypass
             ? 1
             : 0;
 
@@ -3003,7 +3006,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 _txLevelerForcedOff = false;
                 _txControlNative.SetTXALevelerSt(
                     txa,
-                    (_txLevelerEnabled && !_txRogerBeepBypass) ? 1 : 0);
+                    (_txLevelerEnabled && !_txRogerBeepBypass
+                        && !_txInjectedAudioBypass) ? 1 : 0);
                 _log.LogInformation("wdsp.setTxTune on=false leveler={Leveler}",
                     _txLevelerEnabled ? "on" : "off");
             }
@@ -3074,6 +3078,27 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setTxDigitalBypass bypass={Bypass}", bypass);
     }
 
+    public void SetTxInjectedAudioBypass(bool bypass)
+    {
+        if (_disposed != 0) return;
+        lock (_txaLock)
+        {
+            if (_txInjectedAudioBypass == bypass) return;
+            _txInjectedAudioBypass = bypass;
+            if (_txaChannelId is int txa)
+            {
+                ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
+                ApplyCfcMasterRunLocked(txa, _cfcConfig);
+                ApplyTxCompressorRunLocked(txa);
+                _txControlNative.SetTXALevelerSt(
+                    txa,
+                    (_txLevelerEnabled && !_txLevelerForcedOff
+                        && !_txRogerBeepBypass && !bypass) ? 1 : 0);
+            }
+        }
+        _log.LogInformation("wdsp.setTxInjectedAudioBypass bypass={Bypass}", bypass);
+    }
+
     public void SetTxRogerBeepBypass(bool bypass)
     {
         if (_disposed != 0) return;
@@ -3088,7 +3113,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 ApplyTxCompressorRunLocked(txa);
                 _txControlNative.SetTXALevelerSt(
                     txa,
-                    (_txLevelerEnabled && !_txLevelerForcedOff && !bypass) ? 1 : 0);
+                    (_txLevelerEnabled && !_txLevelerForcedOff
+                        && !_txInjectedAudioBypass && !bypass) ? 1 : 0);
             }
         }
         _log.LogInformation("wdsp.setTxRogerBeepBypass bypass={Bypass}", bypass);
@@ -3452,7 +3478,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 _txLevelerForcedOff = false;
                 _txControlNative.SetTXALevelerSt(
                     txa,
-                    (_txLevelerEnabled && !_txRogerBeepBypass) ? 1 : 0);
+                    (_txLevelerEnabled && !_txRogerBeepBypass
+                        && !_txInjectedAudioBypass) ? 1 : 0);
                 _log.LogInformation(
                     "wdsp.setTwoTone on=false f1={F1} f2={F2} mag={Mag:F3} leveler={Leveler}",
                     freq1, freq2, mag, _txLevelerEnabled ? "on" : "off");
@@ -4076,7 +4103,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_txaChannelId is not int id) return 0;
             txa = id;
             skipTxAudioPlugins =
-                _txDigitalBypass || _txRogerBeepBypass || IsDigitalTxMode(_txCurrentMode);
+                _txDigitalBypass || _txRogerBeepBypass || _txInjectedAudioBypass
+                || IsDigitalTxMode(_txCurrentMode);
         }
 
         // fexchange2 wants mutable refs to the first float of each buffer.

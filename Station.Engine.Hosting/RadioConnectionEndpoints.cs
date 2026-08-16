@@ -12,8 +12,19 @@ using P2Radio = Zeus.Protocol2.Discovery.DiscoveredRadio;
 
 namespace Zeus.Server;
 
-internal sealed record ReclaimRadioRequest(string? Endpoint, string? Protocol);
+internal sealed record ReclaimRadioRequest(
+    string? Endpoint,
+    string? Protocol,
+    int SampleRate = 192_000,
+    byte? BoardId = null);
 internal sealed record P1ConnectionIdentity(P1Radio? Probe, HpsdrBoardKind BoardKind);
+internal enum P2TakeoverPreflight
+{
+    Ready,
+    AlreadyConnected,
+    ConnectedElsewhere,
+    DspNotReady,
+}
 
 /// <summary>Maps engine-owned radio discovery and P1/P2 lifecycle routes.</summary>
 public static class RadioConnectionEndpoints
@@ -51,13 +62,16 @@ public static class RadioConnectionEndpoints
 
         // Take over a Busy radio. Discovery reports status 0x03 when another
         // client owns the radio; the UI normally disables Connect for those.
-        // This sends a protocol stop to the radio so it drops the current owner,
-        // freeing it for an immediate connect. Outward-facing and deliberate —
-        // the Connect panel gates it behind an explicit operator confirmation,
-        // because it can kick another (possibly transmitting) operator off.
+        // This is outward-facing and deliberate: the Connect panel gates it
+        // behind an explicit confirmation because the stop can interrupt an
+        // active transmission. P2 only continues after stable Idle proves the
+        // old stream is abandoned; a live controller makes the attempt fail.
         endpoints.MapPost("/api/radios/reclaim", async (
             ReclaimRadioRequest req,
             RadioReclaimService reclaim,
+            IProtocol2ConnectionConnector p2Connection,
+            RadioService radio,
+            DspPipelineService dsp,
             HttpContext ctx) =>
         {
             if (!TryParseIpEndpoint(req.Endpoint ?? string.Empty, out var ipEndpoint))
@@ -69,9 +83,133 @@ public static class RadioConnectionEndpoints
                 ipEndpoint.Address,
                 isP2 ? "P2" : "P1");
 
-            await reclaim.ReclaimAsync(ipEndpoint.Address, isP2, ctx.RequestAborted)
-                .ConfigureAwait(false);
-            return Results.Ok(new { freed = true });
+            if (!isP2)
+            {
+                await reclaim.ReclaimAsync(
+                        ipEndpoint.Address,
+                        isProtocol2: false,
+                        ct: ctx.RequestAborted)
+                    .ConfigureAwait(false);
+                return Results.Ok(new { freed = true });
+            }
+
+            // Keep the stop/verify/connect handoff under the same lifecycle gate.
+            // This closes the local TOCTOU window: no competing API request can
+            // connect between the final fail-closed probe and the first P2 start.
+            radio.NotifyOperatorConnectionAction();
+            await radio.RadioLifecycleGate.WaitAsync(ctx.RequestAborted).ConfigureAwait(false);
+            try
+            {
+                var currentState = radio.Snapshot();
+                var preflight = ClassifyP2TakeoverPreflight(
+                    radio.IsConnected,
+                    currentState.ConnectedProtocol,
+                    currentState.Endpoint,
+                    ipEndpoint.Address,
+                    p2Connection.IsConnectReady);
+                if (preflight == P2TakeoverPreflight.AlreadyConnected)
+                {
+                    // A stale Busy row or a repeated confirmation must never
+                    // send run=0 to Zeus's own active P2 session.
+                    return Results.Ok(new
+                    {
+                        freed = false,
+                        connected = true,
+                        alreadyConnected = true,
+                        protocol = "P2",
+                        endpoint = currentState.Endpoint,
+                        sampleRateKhz = Math.Max(1, currentState.SampleRate / 1000),
+                    });
+                }
+
+                if (preflight == P2TakeoverPreflight.ConnectedElsewhere)
+                {
+                    // ConnectP2CoreAsync rejects a second local connection. Do
+                    // that preflight before run=0 so a queued/stale takeover
+                    // cannot interrupt its target and then discover that this
+                    // Zeus instance is already committed to another radio.
+                    return Results.Conflict(new
+                    {
+                        error =
+                            $"Zeus is already connected via {currentState.ConnectedProtocol ?? "another protocol"}. " +
+                            "Disconnect it before taking over a different radio.",
+                    });
+                }
+
+                // Do not interrupt the incumbent unless this Zeus instance can
+                // proceed immediately once exclusivity is confirmed.
+                if (preflight == P2TakeoverPreflight.DspNotReady)
+                {
+                    return Results.Json(
+                        new { error = "DSP is preparing FFTW plans — try again in a moment." },
+                        statusCode: StatusCodes.Status503ServiceUnavailable);
+                }
+
+                await reclaim.ReclaimAsync(
+                        ipEndpoint.Address,
+                        isProtocol2: true,
+                        ct: ctx.RequestAborted)
+                    .ConfigureAwait(false);
+
+                var stableIdle = await WaitForStableP2IdleAsync(
+                    cancellationToken => p2Connection.ProbeAsync(ipEndpoint, cancellationToken),
+                    TimeSpan.FromMilliseconds(250),
+                    samples: 3,
+                    cancellationToken: ctx.RequestAborted).ConfigureAwait(false);
+                var finalProbe = stableIdle
+                    ? await p2Connection.ProbeAsync(ipEndpoint, ctx.RequestAborted).ConfigureAwait(false)
+                    : null;
+                if (finalProbe is null || finalProbe.Busy)
+                {
+                    log.LogWarning(
+                        "api.radios.reclaim P2 radio {Ip} did not remain Idle; refusing second-master connect",
+                        ipEndpoint.Address);
+                    return Results.Json(
+                        new
+                        {
+                            error =
+                                "The radio stream stopped, but exclusive control could not be confirmed. " +
+                                "The other controller may still be active; disconnect it there before trying again.",
+                            busy = true,
+                            reclaimable = false,
+                        },
+                        statusCode: StatusCodes.Status409Conflict);
+                }
+
+                var boardKind = req.BoardId is byte rawBoardId
+                    ? MapBoardByteP2(rawBoardId)
+                    : finalProbe.BoardKind;
+                var rateKhz = ResolveP2RateKhz(req.SampleRate);
+                rateKhz = await dsp.ConnectP2WithLifecycleGateHeldAsync(
+                    ipEndpoint,
+                    rateKhz,
+                    numAdc: 2,
+                    ct: ctx.RequestAborted,
+                    boardKind: boardKind,
+                    firmware: finalProbe.Firmware,
+                    sampleRateExplicit: true).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    freed = true,
+                    connected = true,
+                    protocol = "P2",
+                    endpoint = req.Endpoint,
+                    sampleRateKhz = rateKhz,
+                });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.LogError(ex, "api.radios.reclaim P2 takeover failed");
+                return Results.Problem(ex.Message, statusCode: 500);
+            }
+            finally
+            {
+                radio.RadioLifecycleGate.Release();
+            }
         });
 
         endpoints.MapPost("/api/connect", async (
@@ -119,7 +257,7 @@ public static class RadioConnectionEndpoints
             var probe = identity.Probe;
             var firmware = probe?.FirmwareString;
             if (TryParseIpEndpoint(req.Endpoint, out var firmwareEndpoint)
-                && !req.Force
+                && !CanBypassBusyProbe(isP2: false, req.Force)
                 && probe?.Details.Busy == true)
             {
                 log.LogWarning(
@@ -208,17 +346,19 @@ public static class RadioConnectionEndpoints
             // out a shared PSU and reboot the host (observed 2026-06-23 on a
             // co-located CM5 Saturn all-in-one). A single Zeus master is fine —
             // the danger requires a second, disagreeing controller. The operator
-            // takes over deliberately via Reclaim, which stops the other owner
-            // and re-connects with force=true. The probe fails OPEN: a radio that
+            // can reclaim an abandoned stream deliberately. Reclaim sends run=0,
+            // requires the radio to remain Idle beyond the normal keepalive
+            // cadence, and then re-connects through this same guard. A live old
+            // controller therefore reasserts Busy and the takeover aborts. The
+            // probe fails OPEN for ordinary connects: a radio that
             // doesn't answer the probe is NOT blocked, so this never strands a
             // legitimate connect. The probe must NOT weaken the co-located
             // ephemeral-port bind — it only reads discovery, it doesn't touch the
             // connect socket.
             // Probe result is reused after the busy-gate to capture the
-            // firmware version for the diagnostics snapshot — null on a forced
-            // connect, which deliberately skips the probe.
+            // firmware version for the diagnostics snapshot.
             Protocol2ConnectionProbe? probe = null;
-            if (!req.Force)
+            if (!CanBypassBusyProbe(isP2: true, req.Force))
             {
                 try
                 {
@@ -244,7 +384,7 @@ public static class RadioConnectionEndpoints
                                 "This radio is already in use by another controller. Connecting Zeus as a " +
                                 "second master would make the band/antenna/T-R relays chatter and can brown " +
                                 "out the radio. Stop the other controller (e.g. saturn-go / another client), " +
-                                "or use Reclaim to take exclusive control, then connect again.",
+                                "or use Take over to safely clear an abandoned radio stream.",
                             busy = true,
                             reclaimable = true,
                         },
@@ -252,16 +392,7 @@ public static class RadioConnectionEndpoints
                 }
             }
 
-            var rateKhz = req.SampleRate switch
-            {
-                48_000 => 48,
-                96_000 => 96,
-                192_000 => 192,
-                384_000 => 384,
-                768_000 => 768,      // P2 only (ANAN G2)
-                1_536_000 => 1536,   // P2 only (ANAN G2)
-                _ => 192,
-            };
+            var rateKhz = ResolveP2RateKhz(req.SampleRate);
 
             // Plumb the discovered board byte through so RadioService can
             // surface the real board kind instead of defaulting to OrionMkII
@@ -334,6 +465,66 @@ public static class RadioConnectionEndpoints
         });
 
         return endpoints;
+    }
+
+    internal static bool CanBypassBusyProbe(bool isP2, bool force) =>
+        force && !isP2;
+
+    internal static P2TakeoverPreflight ClassifyP2TakeoverPreflight(
+        bool isConnected,
+        string? connectedProtocol,
+        string? connectedEndpoint,
+        IPAddress targetAddress,
+        bool isConnectReady)
+    {
+        ArgumentNullException.ThrowIfNull(targetAddress);
+
+        if (isConnected
+            && string.Equals(connectedProtocol, "P2", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(connectedEndpoint)
+            && TryParseIpEndpoint(connectedEndpoint, out var currentEndpoint)
+            && currentEndpoint.Address.Equals(targetAddress))
+        {
+            return P2TakeoverPreflight.AlreadyConnected;
+        }
+
+        if (isConnected) return P2TakeoverPreflight.ConnectedElsewhere;
+        return isConnectReady
+            ? P2TakeoverPreflight.Ready
+            : P2TakeoverPreflight.DspNotReady;
+    }
+
+    internal static int ResolveP2RateKhz(int sampleRate) => sampleRate switch
+    {
+        48_000 => 48,
+        96_000 => 96,
+        192_000 => 192,
+        384_000 => 384,
+        768_000 => 768,      // P2 only (ANAN G2)
+        1_536_000 => 1536,   // P2 only (ANAN G2)
+        _ => 192,
+    };
+
+    internal static async Task<bool> WaitForStableP2IdleAsync(
+        Func<CancellationToken, Task<Protocol2ConnectionProbe?>> probe,
+        TimeSpan interval,
+        int samples,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+        if (samples < 1) throw new ArgumentOutOfRangeException(nameof(samples));
+
+        for (var sample = 0; sample < samples; sample++)
+        {
+            var result = await probe(cancellationToken).ConfigureAwait(false);
+            // Reclaim is deliberately fail-closed: unlike an ordinary connect,
+            // silence cannot prove that the incumbent stream was released.
+            if (result is null || result.Busy) return false;
+            if (sample + 1 < samples && interval > TimeSpan.Zero)
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+        }
+
+        return true;
     }
 
     private static RadioInfo MapP1(P1Radio radio) => new(

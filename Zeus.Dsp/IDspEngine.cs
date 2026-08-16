@@ -334,6 +334,11 @@ public interface IDspEngine : IDisposable
     /// open.</summary>
     void SetTxDigitalBypass(bool bypass);
 
+    /// <summary>Temporarily bypass speech-only TX processing for a linear
+    /// product-plugin injection source. The engine must restore the operator's
+    /// configured stages when the source releases its lease.</summary>
+    void SetTxInjectedAudioBypass(bool bypass) { }
+
     /// <summary>Temporarily bypass speech-only TX processing while a synthesized
     /// roger beep is clocked through TXA. Implementations must preserve the
     /// independent mode-owned digital bypass state when this window closes.</summary>

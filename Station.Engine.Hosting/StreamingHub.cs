@@ -55,7 +55,13 @@ public sealed class StreamingHub
     // Attach primes wisdom, spots, diagnostics, and five chat snapshots before
     // the send loop starts. Keep enough bounded room for that control-plane
     // burst plus live edges that can race it.
-    private const int MaxBacklogPerClient = 16;
+    // RX audio shares this queue with display snapshots and control-plane
+    // traffic. A rich 3D draw or a burst of VFO updates can keep a WebView from
+    // draining its socket for several hundred milliseconds; 16 entries held
+    // only ~350 ms of 46 Hz audio and caused audible dropouts. Keep enough
+    // bounded room for a 1 s UI stall while the queue's priority policy below
+    // discards replaceable display/meter telemetry before PCM.
+    private const int MaxBacklogPerClient = 48;
 
     // Matches MsgType.MicPcm; the client→server uplink type-byte.
     private const byte MsgTypeMicPcm = 0x20;

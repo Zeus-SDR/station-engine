@@ -451,6 +451,17 @@ interface, unless explicitly stated otherwise in an adjacent caption or
 `NOTICE` entry. No FlexRadio, Apache Labs (ANAN), or Thetis marketing
 imagery is reproduced in this repository.
 
+### Amateur-license map data
+
+The optional map overlay queries [HamInfo](https://haminfo.tetranz.com/map),
+which geocodes active amateur licenses from the public
+[FCC Universal Licensing System](https://opendata.fcc.gov/Wireless/FCC-Universal-Licensing-System-ULS-/x28i-i4z4/data).
+Zeus does not ship or mirror that database. The local host performs bounded,
+cached queries only while the operator enables the layer, and removes licensee
+names and street-address text before the response reaches the UI. Plotted
+coordinates represent license mailing addresses, not verified transmitter
+locations.
+
 ## Per-file header format
 
 Every first-party Zeus source file begins with an SPDX identifier,

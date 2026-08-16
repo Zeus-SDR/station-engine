@@ -19,7 +19,21 @@ public static class StationAccessTokenAuthorization
     {
         ArgumentNullException.ThrowIfNull(app);
         if (stationAccessToken is null)
-            return app;
+        {
+            // The contribution adapter is meaningful only to the separately
+            // launched product host. Unlike legacy in-process station routes,
+            // it fails closed when no launcher token was provisioned.
+            return app.Use(async (context, next) =>
+            {
+                if (IsContributionPath(context.Request.Path))
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    context.Response.Headers.WWWAuthenticate = "Bearer";
+                    return;
+                }
+                await next(context).ConfigureAwait(false);
+            });
+        }
         if (stationAccessToken.Length == 0)
         {
             throw new InvalidOperationException(
@@ -60,8 +74,14 @@ public static class StationAccessTokenAuthorization
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(
                 "/api/station/key",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
+                "/api/tdoa/contribution",
                 StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsContributionPath(PathString path) =>
+        path.StartsWithSegments("/api/tdoa/contribution", StringComparison.OrdinalIgnoreCase);
 
     private static bool HasExpectedBearerToken(HttpRequest request, byte[] expectedHash)
     {

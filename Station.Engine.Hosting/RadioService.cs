@@ -188,6 +188,14 @@ public sealed class RadioService : IDisposable
     // edge is crossed or a PA setting is edited, we recompute without needing
     // to wait for the next SetDrive call.
     private int _drivePct;
+    // Engine-owned, non-persisted cap for a keyed product-plugin injection
+    // lease. -1 means inactive. The operator's DrivePct remains untouched, so
+    // lease loss, engine restart, or process death cannot persist the temporary
+    // reduction. ProductPluginAudioPort owns the apply/clear lifecycle.
+    private int _productPluginDriveCapPct = -1;
+    private long _productPluginDriveCapGeneration;
+    private readonly object _productPluginDriveCapGate = new();
+    internal Action<long>? ProductPluginDriveCapClearAttemptedForTest { get; set; }
     // On-board CW keyer config, forwarded to the connected client and
     // re-pushed on reconnect. Seeded from CwSettingsStore in the ctor; updated
     // at runtime via SetCwKeyerConfig from the CW settings endpoint. Default
@@ -802,6 +810,15 @@ public sealed class RadioService : IDisposable
             LevelerMaxGainDb: overlayLevelerMaxGain ?? Math.Clamp(rsSnap?.LevelerMaxGainDb ?? 8.0, 0.0, 20.0),
             AutoAgcEnabled: rsSnap?.AutoAgcEnabled ?? false,
             RxLevelerEnabled: rsSnap?.RxLevelerEnabled ?? false,
+            RxLeveler: NormalizeRxLevelerConfig(rsSnap is null
+                ? null
+                : new RxLevelerConfig(
+                    rsSnap.RxLevelerMode,
+                    rsSnap.RxLevelerTargetRmsDb,
+                    rsSnap.RxLevelerMaxBoostDb,
+                    rsSnap.RxLevelerAttackMs,
+                    rsSnap.RxLevelerReleaseMs,
+                    rsSnap.RxLevelerHangMs)),
             AgcOffsetDb: 0.0,       // always reset — control-loop accumulator
             // AGC knee removed: AGC-T is the single manual AGC control, so the
             // threshold is never operator-driven (it and AGC-T are the same WDSP
@@ -3842,6 +3859,50 @@ public sealed class RadioService : IDisposable
         return snap;
     }
 
+    public StateDto SetRxLevelerConfig(bool enabled, RxLevelerConfig config)
+    {
+        var normalized = NormalizeRxLevelerConfig(config);
+        bool changed = false;
+        lock (_sync)
+        {
+            if (_state.RxLevelerEnabled == enabled && _state.RxLeveler == normalized)
+                return _state;
+            changed = true;
+            _state = _state with
+            {
+                RxLevelerEnabled = enabled,
+                RxLeveler = normalized,
+            };
+        }
+        var snap = Snapshot();
+        if (changed)
+        {
+            _stateDirty = true;
+            FlushState();
+        }
+        StateChanged?.Invoke(snap);
+        return snap;
+    }
+
+    internal static RxLevelerConfig NormalizeRxLevelerConfig(RxLevelerConfig? config)
+    {
+        var value = config ?? new RxLevelerConfig();
+        var mode = Enum.IsDefined(value.Mode) ? value.Mode : RxLevelerMode.Auto;
+        double target = double.IsFinite(value.TargetRmsDb)
+            ? Math.Clamp(value.TargetRmsDb, RxLevelerConfig.MinTargetRmsDb, RxLevelerConfig.MaxTargetRmsDb)
+            : RxLevelerConfig.DefaultTargetRmsDb;
+        double maxBoost = double.IsFinite(value.MaxBoostDb)
+            ? Math.Clamp(value.MaxBoostDb, RxLevelerConfig.MinBoostDb, RxLevelerConfig.MaxBoostLimitDb)
+            : RxLevelerConfig.DefaultMaxBoostDb;
+        return new RxLevelerConfig(
+            mode,
+            target,
+            maxBoost,
+            Math.Clamp(value.AttackMs, RxLevelerConfig.MinAttackMs, RxLevelerConfig.MaxAttackMs),
+            Math.Clamp(value.ReleaseMs, RxLevelerConfig.MinReleaseMs, RxLevelerConfig.MaxReleaseMs),
+            Math.Clamp(value.HangMs, RxLevelerConfig.MinHangMs, RxLevelerConfig.MaxHangMs));
+    }
+
     /// <summary>
     /// Set by DspPipelineService at construction: the RX display-analyzer FFT
     /// size (DisplayPerformanceOptions.RxAnalyzerFftSize, 16384 stock / 8192
@@ -4061,6 +4122,42 @@ public sealed class RadioService : IDisposable
     // CAT bridge, tests) gets the same range guarantee.
     public void SetDrive(int percent)
         => SetDriveCore(percent, persist: true);
+
+    internal int? ProductPluginDriveCapPct
+    {
+        get
+        {
+            int value = Volatile.Read(ref _productPluginDriveCapPct);
+            return value < 0 ? null : value;
+        }
+    }
+
+    internal void SetProductPluginDriveCap(long generation, int? percent)
+    {
+        lock (_productPluginDriveCapGate)
+        {
+            if (generation < _productPluginDriveCapGeneration) return;
+            int ceiling = Math.Clamp(Snapshot().DriveMaxPct, 1, 100);
+            int value = percent is int requested ? Math.Clamp(requested, 0, ceiling) : -1;
+            _productPluginDriveCapGeneration = generation;
+            if (Interlocked.Exchange(ref _productPluginDriveCapPct, value) != value)
+                RecomputePaAndPush();
+        }
+    }
+
+    internal void ClearProductPluginDriveCap(long generation)
+    {
+        lock (_productPluginDriveCapGate)
+        {
+            if (_productPluginDriveCapGeneration == generation)
+            {
+                _productPluginDriveCapGeneration = 0;
+                if (Interlocked.Exchange(ref _productPluginDriveCapPct, -1) != -1)
+                    RecomputePaAndPush();
+            }
+        }
+        ProductPluginDriveCapClearAttemptedForTest?.Invoke(generation);
+    }
 
     internal bool SetDriveIfCurrent(int percent, int expectedCurrent)
         => SetDriveCore(percent, persist: false, expectedCurrent, abortIfTxActive: true);
@@ -4912,6 +5009,12 @@ public sealed class RadioService : IDisposable
     public StateDto SetDriveMaximum(int percent)
     {
         int maximum = Math.Clamp(percent, 1, 100);
+        lock (_productPluginDriveCapGate)
+        {
+            int productCap = Volatile.Read(ref _productPluginDriveCapPct);
+            if (productCap > maximum)
+                Interlocked.Exchange(ref _productPluginDriveCapPct, maximum);
+        }
         Mutate(s =>
         {
             int drive = Math.Min(s.DrivePct, maximum);
@@ -4955,6 +5058,9 @@ public sealed class RadioService : IDisposable
         // prevents any racing legacy/internal source from producing a drive
         // byte above the persisted amplifier ceiling.
         int activePct = Math.Min(requestedPct, Math.Clamp(stateSnap.DriveMaxPct, 1, 100));
+        int productCap = Volatile.Read(ref _productPluginDriveCapPct);
+        if (!tunActive && productCap >= 0)
+            activePct = Math.Min(activePct, productCap);
         if (txThroughTransverter)
             activePct = Math.Min(activePct, txXvtrBand.Power);
         // Route through the per-board drive-profile so HL2's 4-bit drive
@@ -5558,6 +5664,17 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
+    /// <summary>
+    /// Clear only the live PureSignal arm after a transport/provider safety
+    /// failure. The persisted operator decision deliberately survives, matching
+    /// the existing feedback-watchdog and disconnect safety semantics.
+    /// </summary>
+    internal StateDto FailClosedPureSignalRuntime()
+    {
+        Mutate(s => s.PsEnabled ? s with { PsEnabled = false } : s);
+        return Snapshot();
+    }
+
     public StateDto SetPsAdvanced(PsAdvancedSetRequest req)
     {
         ArgumentNullException.ThrowIfNull(req);
@@ -6143,6 +6260,7 @@ public sealed class RadioService : IDisposable
         }
 
         var rx2Snap = snap.Rx2();
+        var rxLeveler = snap.RxLeveler ?? new RxLevelerConfig();
         try
         {
             _radioStateStore.Save(new RadioStateEntry
@@ -6166,6 +6284,12 @@ public sealed class RadioService : IDisposable
                 AttenDb = snap.AttenDb,
                 AutoAgcEnabled = snap.AutoAgcEnabled,
                 RxLevelerEnabled = snap.RxLevelerEnabled,
+                RxLevelerMode = rxLeveler.Mode,
+                RxLevelerTargetRmsDb = rxLeveler.TargetRmsDb,
+                RxLevelerMaxBoostDb = rxLeveler.MaxBoostDb,
+                RxLevelerAttackMs = rxLeveler.AttackMs,
+                RxLevelerReleaseMs = rxLeveler.ReleaseMs,
+                RxLevelerHangMs = rxLeveler.HangMs,
                 PreampOn = snap.PreampOn,
                 RxAfGainDb = snap.RxAfGainDb,
                 MicGainDb = snap.MicGainDb,
@@ -6359,6 +6483,15 @@ public sealed class RadioService : IDisposable
         P2Disconnected?.Invoke();
     }
 
+    /// <summary>
+    /// Sends one radio-speaker packet through the active Protocol-2 transport.
+    /// Commands, TX IQ, and speaker audio must share its bound source port so
+    /// radios that learn the host reply endpoint cannot redirect RX IQ to a
+    /// second audio-only socket (issue #1457).
+    /// </summary>
+    internal int SendProtocol2SpeakerAudio(ReadOnlySpan<byte> packet) =>
+        Volatile.Read(ref _p2Client)?.SendSpeakerAudio(packet) ?? 0;
+
     public void MarkProtocol3Connected(
         string endpoint,
         int sampleRateHz,
@@ -6400,10 +6533,10 @@ public sealed class RadioService : IDisposable
             Status = ConnectionStatus.Connected,
             Endpoint = endpoint,
             SampleRate = sampleRateHz,
-            // P3 has no PS wire/engine path, so persisted arm intent is
-            // deliberately NOT applied here (no sanitize hook) — the forced
-            // disarm keeps the snapshot honest; intent survives untouched and
-            // is applied on the next P1/P2 connect.
+            // P3 always starts disarmed. An optional external provider path is
+            // capability-gated later, but it still requires an explicit
+            // operator arm in this server session. Persisted intent is never
+            // applied automatically here.
             PsEnabled = false,
             ZoomLevel = Math.Min(s.ZoomLevel, LegacyMaxDisplayZoomLevel),
             AttOffsetDb = 0,

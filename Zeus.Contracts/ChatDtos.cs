@@ -42,6 +42,8 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Text.Json.Serialization;
+
 namespace Zeus.Contracts;
 
 // ── ZeusChat — operator-to-operator chat over a Cloudflare relay ───────────
@@ -187,7 +189,7 @@ public sealed record ChatFriendsDto(
 
 /// <summary>
 /// One ephemeral friend-to-friend PTT signalling event. <paramref name="Type"/>
-/// is "offer"|"answer"|"key"|"end". The relay stamps
+/// is "offer"|"answer"|"candidate"|"key"|"end". The relay stamps
 /// <paramref name="From"/> from the authenticated connection and delivers the
 /// event only to <paramref name="To"/>; no audio or signalling is persisted.
 /// </summary>
@@ -197,10 +199,63 @@ public sealed record ChatPttSignal(
     string To,
     string SessionId,
     string? Sdp = null,
-    string? Room = null)
+    string? Room = null,
+    string? OverId = null,
+    long? SourceEpoch = null,
+    ChatPttIceCandidate? Ice = null)
 {
     /// <summary>Maximum accepted WebRTC SDP length, mirrored by the relay.</summary>
     public const int MaxSdpLength = 64_000;
+    public const int MaxCandidateLength = 2_048;
+    public const int MaxSdpMidLength = 64;
+    public const int MaxUsernameFragmentLength = 256;
+}
+
+/// <summary>
+/// Sanitized Trickle ICE candidate. An empty <paramref name="Candidate"/> is
+/// the end-of-candidates marker for one ICE generation; null is the legacy
+/// all-transports-complete marker.
+/// </summary>
+public sealed record ChatPttIceCandidate(
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    string? Candidate,
+    string? SdpMid = null,
+    int? SdpMLineIndex = null,
+    string? UsernameFragment = null);
+
+/// <summary>
+/// One relay-stamped, metadata-only TDoA control event. <paramref name="Type"/>
+/// is "request"|"ack"|"result"|"cancel". Capture IQ is referenced by
+/// <paramref name="BlobKey"/> and is never embedded in this JSON contract.
+/// </summary>
+public sealed record ChatTdoaSignal(
+    string Type,
+    string From,
+    string To,
+    string RequestId,
+    long? FrequencyHz = null,
+    int? SampleCount = null,
+    long? DeadlineUnixMs = null,
+    string? PropagationModel = null,
+    bool? Accepted = null,
+    string? Reason = null,
+    string? BlobKey = null,
+    int? ByteCount = null,
+    string? Sha256 = null,
+    double? LatitudeDeg = null,
+    double? LongitudeDeg = null,
+    double? AltitudeMeters = null,
+    string? ReferenceTimeTaiNanoseconds = null,
+    double? SampleRateHz = null,
+    double? GroupDelayNanoseconds = null,
+    double? ClockUncertaintyNanoseconds = null,
+    bool? ClockLocked = null,
+    long? SourceEpoch = null)
+{
+    public const int MinSampleCount = 4_096;
+    public const int MaxSampleCount = 131_072;
+    public const int MaxReasonLength = 256;
+    public const int MaxBlobBytes = 1_048_576;
 }
 
 // ── REST request/response shapes ──────────────────────────────────────────
@@ -271,7 +326,43 @@ public sealed record ChatPttRequest(
     string To,
     string SessionId,
     string? Sdp = null,
-    string? Room = null);
+    string? Room = null,
+    string? OverId = null,
+    ChatPttIceCandidate? Ice = null);
+
+public sealed record ChatTdoaRequestSignalRequest(
+    string To,
+    string RequestId,
+    long FrequencyHz,
+    int SampleCount,
+    long DeadlineUnixMs,
+    string PropagationModel = "groundwave");
+
+public sealed record ChatTdoaAckSignalRequest(
+    string To,
+    string RequestId,
+    bool Accepted,
+    string? Reason = null);
+
+public sealed record ChatTdoaResultSignalRequest(
+    string To,
+    string RequestId,
+    string BlobKey,
+    int ByteCount,
+    string Sha256,
+    double LatitudeDeg,
+    double LongitudeDeg,
+    double AltitudeMeters,
+    string ReferenceTimeTaiNanoseconds,
+    double SampleRateHz,
+    double GroupDelayNanoseconds,
+    double ClockUncertaintyNanoseconds,
+    bool ClockLocked);
+
+public sealed record ChatTdoaCancelSignalRequest(
+    string To,
+    string RequestId,
+    string? Reason = null);
 
 /// <summary>Send a direct message to <paramref name="To"/>.
 /// <paramref name="Attachment"/> is an optional inline photo — when present the

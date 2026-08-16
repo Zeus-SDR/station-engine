@@ -25,7 +25,12 @@ public static class RadioTuningEndpoints
                     error = "hz is outside the native radio range and enabled transverter profiles",
                 });
             }
-            log.LogInformation("api.vfo receiver={Receiver} hz={Hz}", req.Receiver, req.Hz);
+            // Debug, not Information: this fires once per wheel/drag tune tick.
+            // At Information it floods the log inside the synchronous request
+            // path during a scroll, inflating each /api/vfo handler's duration
+            // and worsening the ThreadPool pressure that starves frame/audio
+            // delivery (see Program.RaiseThreadPoolFloor).
+            log.LogDebug("api.vfo receiver={Receiver} hz={Hz}", req.Receiver, req.Hz);
             return Results.Ok(r.SetReceiverVfo(req.Receiver, req.Hz));
         });
 
@@ -199,7 +204,9 @@ public static class RadioTuningEndpoints
                 log.LogInformation("api.radio.lo rejected hz={Hz}", req.Hz);
                 return Results.BadRequest(new { error = "hz is outside the native radio range and enabled transverter profiles" });
             }
-            log.LogInformation("api.radio.lo hz={Hz}", req.Hz);
+            // Debug, not Information: a ruler/pure-pan drag posts this once per
+            // frame — see the api.vfo note above.
+            log.LogDebug("api.radio.lo hz={Hz}", req.Hz);
             return Results.Ok(r.SetRadioLo(req.Hz));
         });
 

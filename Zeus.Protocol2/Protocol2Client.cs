@@ -79,6 +79,7 @@ public readonly record struct Protocol2TxIqDiagnostics(
 /// </summary>
 public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 {
+    private const int SharedSendTimeoutMs = 10;
     private const int BufLen = 1444;
     private const int DiscoverySamplesPerPacket = 238;
 
@@ -212,9 +213,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
     private Socket? _sock;
+    // One gate for every datagram written through the shared P2 socket. Besides
+    // preserving packet boundaries, this makes Poll(write) + SendTo atomic with
+    // respect to the command, TX-IQ, and speaker sender threads.
+    private readonly object _udpSendGate = new();
     private Action<byte[]>? _cmdHighPrioritySinkForTesting;
     private Action<int, byte[]>? _commandSinkForTesting;
+    private Action<int, byte[]>? _speakerAudioSinkForTesting;
     private IPEndPoint? _radioEndpoint;
+    private IPEndPoint? _speakerAudioEndpoint;
     private CancellationTokenSource? _rxCts;
     private Task? _rxTask;
     private Task? _keepaliveTask;
@@ -625,6 +632,55 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     internal void SetCommandSinkForTesting(Action<int, byte[]>? sink) =>
         _commandSinkForTesting = sink;
 
+    // Socketless capture of radio-speaker audio. Production sends through the
+    // same bound P2 socket as commands and TX IQ so Orion firmware sees one PC
+    // source port for the entire session (issue #1457).
+    internal void SetSpeakerAudioSinkForTesting(Action<int, byte[]>? sink) =>
+        _speakerAudioSinkForTesting = sink;
+
+    internal int SendSpeakerAudio(ReadOnlySpan<byte> packet)
+    {
+        const int speakerAudioPort = 1028;
+        const int speakerPacketBytes = 260;
+
+        if (packet.Length != speakerPacketBytes)
+            throw new ArgumentException($"Speaker audio packets must be exactly {speakerPacketBytes} bytes.", nameof(packet));
+
+        var testSink = _speakerAudioSinkForTesting;
+        if (testSink is not null)
+        {
+            testSink(speakerAudioPort, packet.ToArray());
+            return packet.Length;
+        }
+
+        var socket = _sock;
+        var speakerEndpoint = _speakerAudioEndpoint;
+        if (socket is null || speakerEndpoint is null) return 0;
+
+        return SendDatagram(packet, speakerEndpoint, requireImmediate: true);
+    }
+
+    private int SendDatagram(
+        ReadOnlySpan<byte> packet,
+        IPEndPoint endpoint,
+        bool requireImmediate = false)
+    {
+        lock (_udpSendGate)
+        {
+            var socket = _sock ?? throw new ObjectDisposedException(nameof(Protocol2Client));
+            // The RX loop deliberately uses a blocking ReceiveFrom. Do not make
+            // the whole shared socket non-blocking just for speaker egress.
+            // High-rate speaker/TX-IQ writers require immediate readiness;
+            // sparse critical commands may wait up to the bounded SendTimeout.
+            // With all Zeus sends serialized by this gate, another sender
+            // cannot consume the available buffer between Poll and the write.
+            if (requireImmediate && !socket.Poll(0, SelectMode.SelectWrite))
+                throw new SocketException((int)SocketError.WouldBlock);
+
+            return socket.SendTo(packet, SocketFlags.None, endpoint);
+        }
+    }
+
     private bool CanSendCmdHighPriority =>
         _rxTask is not null
         || _cmdHighPrioritySinkForTesting is not null
@@ -808,6 +864,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Already connected.");
 
         _radioEndpoint = new IPEndPoint(radioEndpoint.Address, 1024);
+        _speakerAudioEndpoint = new IPEndPoint(radioEndpoint.Address, 1028);
         var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         DisableUdpConnReset(sock);
         var localBind = FindLocalAddressForSubnet(radioEndpoint.Address) ?? IPAddress.Any;
@@ -844,6 +901,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // guarantee). See ComputeInQueueCapacity for the matching DSP-side cushion.
         try { sock.ReceiveBufferSize = 4 << 20; }
         catch (SocketException) { sock.ReceiveBufferSize = 1 << 20; }
+        // RX deliberately remains blocking on its dedicated thread, but no
+        // synchronous UDP writer may pin a command/TX-IQ/speaker thread during
+        // NIC loss or kernel-buffer pressure. Poll(write) normally turns a full
+        // buffer into WouldBlock before SendTo; this timeout is the bounded
+        // cross-platform guard for a readiness race after Poll.
+        sock.SendTimeout = SharedSendTimeoutMs;
         _sock = sock;
         _log.LogInformation(
             "p2.connect radio={Radio} localBind={Local} localPort={Port}",
@@ -2187,12 +2250,19 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                 fifoSamples += TxIqSamplesPerPacket;
                                 // ArrayPool may return a larger array; send exactly the
                                 // 1444-byte Protocol-2 payload, synchronously, before reuse.
-                                _sock!.SendTo(packet.AsSpan(0, BufLen), SocketFlags.None, ep);
+                                SendDatagram(packet.AsSpan(0, BufLen), ep, requireImmediate: true);
                                 rateCount++;
                                 Interlocked.Increment(ref _txIqPacketsSent);
                             }
                         }
                         catch (ObjectDisposedException) { break; }
+                        catch (SocketException ex) when (ex.SocketErrorCode is
+                            SocketError.WouldBlock or
+                            SocketError.NoBufferSpaceAvailable or
+                            SocketError.TimedOut)
+                        {
+                            Interlocked.Increment(ref _txIqSendFailures);
+                        }
                         catch (SocketException ex)
                         {
                             Interlocked.Increment(ref _txIqSendFailures);
@@ -2293,7 +2363,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         if (testSink is not null)
             testSink(destinationPort, packet);
         else
-            _sock!.SendTo(packet, new IPEndPoint(_radioEndpoint!.Address, destinationPort));
+            SendDatagram(packet, new IPEndPoint(_radioEndpoint!.Address, destinationPort));
     }
 
     internal static void ComposeWidebandGeneralConfig(
@@ -5053,6 +5123,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         try { StopAsync(CancellationToken.None).GetAwaiter().GetResult(); } catch { }
         _sock?.Dispose();
         _sock = null;
+        _speakerAudioEndpoint = null;
         _rxCts?.Dispose();
         _rxCts = null;
     }
@@ -5062,6 +5133,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         try { await StopAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
         _sock?.Dispose();
         _sock = null;
+        _speakerAudioEndpoint = null;
         _rxCts?.Dispose();
         _rxCts = null;
     }

@@ -127,6 +127,9 @@ public partial class Program
             : BuildProductLanHttpsUrls(
                 options.ProductLanHttpsPort,
                 LanCertificate.GetLanIps());
+        // A database import is staged by the live API and applied here before
+        // DI constructs any store or opens either Station-owned LiteDB.
+        UnifiedDatabaseBackup.ApplyPendingStationRestore();
         PrepareEnginePreferences();
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions

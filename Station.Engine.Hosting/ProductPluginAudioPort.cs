@@ -50,11 +50,16 @@ public sealed class ProductPluginAudioPort : IDisposable
     private ProductPluginTxAudioSink? _txSink;
     private ProductPluginMonitorAudioSink? _monitorSink;
     private Action<bool>? _txActiveSink;
+    private Func<long, bool, bool>? _txSpeechBypassSink;
     private TxService? _subscribedTx;
     private long _droppedCaptureBlocks;
     private long _droppedInjectionBlocks;
     private long _invalidInjectionBlocks;
     private bool _disposed;
+    private long _keyGeneration;
+
+    internal Action? KeyReservedForTest { get; set; }
+    internal Action? KeyActionEnteredForTest { get; set; }
 
     public ProductPluginAudioPort(ILogger<ProductPluginAudioPort> log)
     {
@@ -87,6 +92,12 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     public void ConfigureTxActiveSink(Action<bool>? sink) =>
         Interlocked.Exchange(ref _txActiveSink, sink);
+
+    /// <summary>Configure the engine-owned switch that bypasses speech-only TX
+    /// processing for an injection lease that explicitly requests linear audio.
+    /// The default attachment never raises this switch.</summary>
+    public void ConfigureTxSpeechBypassSink(Func<long, bool, bool>? sink) =>
+        Interlocked.Exchange(ref _txSpeechBypassSink, sink);
 
     public bool TryCreateCaptureAttachment(
         ProductPluginCaptureAttachRequest request,
@@ -166,6 +177,17 @@ public sealed class ProductPluginAudioPort : IDisposable
             error = "injection destination must be local-monitor or tx";
             return false;
         }
+        if (request.DriveCapPct is < 0 or > 100)
+        {
+            error = "driveCapPct must be between 0 and 100";
+            return false;
+        }
+        if (destination == ProductPluginInjectionDestination.LocalMonitor
+            && request.DriveCapPct is not null)
+        {
+            error = "driveCapPct is only valid for the tx destination";
+            return false;
+        }
 
         lock (_gate)
         {
@@ -180,13 +202,22 @@ public sealed class ProductPluginAudioPort : IDisposable
 
             var session = new InjectionSession(
                 Guid.NewGuid().ToString("N"), request.Name, request.Version,
-                AudioRingOwner.Create(), destination);
+                AudioRingOwner.Create(), destination,
+                request.BypassSpeechProcessing,
+                request.ReplayLastBlockOnUnderflow,
+                request.DriveCapPct);
             AddPendingLocked(session);
             if (destination == ProductPluginInjectionDestination.LocalMonitor)
                 Volatile.Write(ref _localMonitorInjection, session);
             else
                 Volatile.Write(ref _txInjection, session);
-            response = new ProductPluginAudioAttachResponse(session.LeaseId, session.Owner.Endpoint);
+            response = new ProductPluginAudioAttachResponse(
+                session.LeaseId,
+                session.Owner.Endpoint,
+                new ProductPluginAppliedInjectionOptions(
+                    session.BypassSpeechProcessing,
+                    session.ReplayLastBlockOnUnderflow,
+                    session.DriveCapPct));
             error = null;
             return true;
         }
@@ -216,7 +247,21 @@ public sealed class ProductPluginAudioPort : IDisposable
             while (!context.RequestAborted.IsCancellationRequested)
             {
                 if (session is InjectionSession injection)
+                {
+                    // Ending this loop detaches the session, which destroys the
+                    // lease. That is right for a source that opted OUT of
+                    // underflow replay (a picture transmit: a gap ruins the
+                    // frame, so the run is over and the operator restarts it).
+                    // It is wrong for a replay-tolerant source: its documented
+                    // recovery is to re-arm THIS lease and key again, and
+                    // destroying the lease is the "transmits once then stops"
+                    // field failure DigitalStationKeyingRecoveryTests pins.
+                    // Either way the revoke has already dropped key and arm and
+                    // released RF, and PumpInjection stays silent until the
+                    // plugin explicitly re-arms.
+                    if (injection.IsRevoked && !injection.ReplayLastBlockOnUnderflow) break;
                     PumpInjection(injection, force: false);
+                }
 
                 var now = Stopwatch.GetTimestamp();
                 if (now >= nextHeartbeat)
@@ -263,7 +308,7 @@ public sealed class ProductPluginAudioPort : IDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(tx);
-        TxService? release = null;
+        KeyRelease? release = null;
         lock (_gate)
         {
             if (!TryGetLeasedInjectionLocked(request.LeaseId, out var session))
@@ -288,6 +333,10 @@ public sealed class ProductPluginAudioPort : IDisposable
                 }
                 session.PluginId = request.PluginId;
                 session.Armed = true;
+                // An explicit re-arm is the recovery from a revoke: clear the
+                // latch so delivery resumes for this lease.
+                session.ClearRevoked();
+                session.ConsecutiveUnderflows = 0;
                 if (session.Destination == ProductPluginInjectionDestination.LocalMonitor)
                     session.NextDeliveryTicks = Stopwatch.GetTimestamp();
             }
@@ -305,11 +354,7 @@ public sealed class ProductPluginAudioPort : IDisposable
             response = CurrentStateLocked();
             error = null;
         }
-        if (release is not null)
-        {
-            NotifyTxActive(false);
-            ReleaseProductKey(release);
-        }
+        CompleteRelease(release);
         return true;
     }
 
@@ -321,9 +366,11 @@ public sealed class ProductPluginAudioPort : IDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(tx);
+        InjectionSession session;
+        long generation;
         lock (_gate)
         {
-            if (!TryGetLeasedInjectionLocked(request.LeaseId, out var session)
+            if (!TryGetLeasedInjectionLocked(request.LeaseId, out session)
                 || session.Destination != ProductPluginInjectionDestination.Tx)
             {
                 response = CurrentStateLocked();
@@ -353,23 +400,74 @@ public sealed class ProductPluginAudioPort : IDisposable
             SubscribeToTxLocked(tx);
             _keyedSession = session;
             session.Keyed = true;
+            generation = ++_keyGeneration;
+            session.KeyGeneration = generation;
             session.ExpectedSequence = 0;
             session.HasPendingBlock = false;
             session.NextDeliveryTicks = Stopwatch.GetTimestamp() + BlockTicks;
-            if (!tx.TrySetMox(true, MoxSource.ProductPlugin, out error)
-                || tx.MoxOwner != MoxSource.ProductPlugin)
-            {
-                _keyedSession = null;
-                session.Keyed = false;
-                response = CurrentStateLocked();
-                error ??= "the transmit safety interlock refused the product key";
-                return false;
-            }
-            NotifyTxActive(true);
-            response = CurrentStateLocked();
-            error = null;
-            return true;
         }
+        KeyReservedForTest?.Invoke();
+
+        bool moxGranted = false;
+        string? requestError = null;
+        bool transitionAdmitted = tx.TryRunWithTransmitIdle(
+            () =>
+            {
+                KeyActionEnteredForTest?.Invoke();
+                if (!OwnsKeyGeneration(session, generation))
+                {
+                    requestError = "the product key request was preempted before keying";
+                    return;
+                }
+
+                tx.SetProductPluginDriveCap(generation, session.DriveCapPct);
+                if (session.BypassSpeechProcessing
+                    && !TryNotifyTxSpeechBypass(generation, bypass: true))
+                {
+                    requestError = "the requested linear TX audio bypass could not be applied";
+                    return;
+                }
+                if (!OwnsKeyGeneration(session, generation))
+                {
+                    requestError = "the product key request was preempted before keying";
+                    return;
+                }
+
+                moxGranted = tx.TrySetProductPluginMox(generation, out requestError)
+                    && tx.MoxOwner == MoxSource.ProductPlugin;
+                if (!moxGranted)
+                    requestError ??= "the transmit safety interlock refused the product key";
+            },
+            out var transitionError);
+
+        bool granted;
+        lock (_gate)
+        {
+            granted = transitionAdmitted
+                && moxGranted
+                && ReferenceEquals(_keyedSession, session)
+                && session.Keyed
+                && session.KeyGeneration == generation;
+            if (!granted
+                && ReferenceEquals(_keyedSession, session)
+                && session.KeyGeneration == generation)
+                _ = ClearKeyLocked(session, disarm: false);
+            response = CurrentStateLocked();
+        }
+
+        if (!granted)
+        {
+            if (moxGranted)
+                ReleaseProductKey(tx, generation);
+            tx.ClearProductPluginDriveCap(generation);
+            TryNotifyTxSpeechBypass(generation, bypass: false);
+            error = requestError ?? transitionError ?? "the transmit safety interlock refused the product key";
+            return false;
+        }
+
+        NotifyTxActive(true);
+        error = null;
+        return true;
     }
 
     public bool TryReleaseKey(
@@ -380,7 +478,7 @@ public sealed class ProductPluginAudioPort : IDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(tx);
-        TxService? release;
+        KeyRelease? release;
         lock (_gate)
         {
             if (!TryGetLeasedInjectionLocked(request.LeaseId, out var session)
@@ -395,11 +493,7 @@ public sealed class ProductPluginAudioPort : IDisposable
             response = CurrentStateLocked();
             error = null;
         }
-        if (release is not null)
-        {
-            NotifyTxActive(false);
-            ReleaseProductKey(release);
-        }
+        CompleteRelease(release);
         return true;
     }
 
@@ -453,7 +547,7 @@ public sealed class ProductPluginAudioPort : IDisposable
     public void Dispose()
     {
         Session[] sessions;
-        TxService? release = null;
+        KeyRelease? release = null;
         lock (_gate)
         {
             if (_disposed) return;
@@ -467,11 +561,7 @@ public sealed class ProductPluginAudioPort : IDisposable
             _txInjection = null;
             UnsubscribeFromTxLocked();
         }
-        if (release is not null)
-        {
-            NotifyTxActive(false);
-            ReleaseProductKey(release);
-        }
+        CompleteRelease(release);
         foreach (var session in sessions) session.RequestDispose();
     }
 
@@ -515,6 +605,9 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     private void PumpInjection(InjectionSession session, bool force)
     {
+        // A revoked session stays leased so the plugin can recover, but it
+        // delivers nothing until it explicitly re-arms.
+        if (session.IsRevoked) return;
         if (!session.TryAddRef()) return;
         try
         {
@@ -532,8 +625,8 @@ public sealed class ProductPluginAudioPort : IDisposable
 
             // Frames written while the destination is not eligible are
             // discarded, never queued across an arm/key boundary.
-            if (!armed
-                || (session.Destination == ProductPluginInjectionDestination.Tx && !keyed))
+            if (session.Destination == ProductPluginInjectionDestination.Tx
+                && (!armed || !keyed))
             {
                 if (session.Owner.TryReadOutput(session.Scratch, out _, out _))
                     Interlocked.Increment(ref _droppedInjectionBlocks);
@@ -569,6 +662,11 @@ public sealed class ProductPluginAudioPort : IDisposable
             if (!session.HasPendingBlock)
             {
                 if (!keyed) return;
+                if (!session.ReplayLastBlockOnUnderflow)
+                {
+                    RevokeSession(session, "tx injection underflow (replay disabled)");
+                    return;
+                }
                 var underflows = session.ConsecutiveUnderflows + 1;
                 session.ConsecutiveUnderflows = underflows;
                 if (underflows > MaxToleratedUnderflowBlocks)
@@ -607,8 +705,10 @@ public sealed class ProductPluginAudioPort : IDisposable
                     && ReferenceEquals(current, session)
                     && session.IsLeased;
                 var stillEligible = session.Armed
-                    && (session.Destination == ProductPluginInjectionDestination.LocalMonitor
-                        || (ReferenceEquals(_keyedSession, session) && session.Keyed));
+                    && ReferenceEquals(_keyedSession, session)
+                    && session.Keyed;
+                if (session.Destination == ProductPluginInjectionDestination.LocalMonitor)
+                    stillEligible = true;
                 if (!stillLeased || !stillEligible)
                 {
                     session.HasPendingBlock = false;
@@ -659,25 +759,22 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     private void RevokeSession(InjectionSession session, string reason)
     {
-        TxService? release;
+        KeyRelease? release;
         lock (_gate)
         {
             if (!_sessions.TryGetValue(session.LeaseId, out var current)
                 || !ReferenceEquals(current, session)) return;
             release = ClearKeyAndArmLocked(session);
+            session.Revoke();
         }
-        if (release is not null)
-        {
-            NotifyTxActive(false);
-            ReleaseProductKey(release);
-        }
+        CompleteRelease(release);
         _log.LogWarning("product-plugin injection revoked session={SessionId} reason={Reason}",
             session.Owner.Endpoint.SessionId, reason);
     }
 
     private void Detach(Session session, string reason)
     {
-        TxService? release = null;
+        KeyRelease? release = null;
         lock (_gate)
         {
             if (!_sessions.TryGetValue(session.LeaseId, out var current)
@@ -687,11 +784,7 @@ public sealed class ProductPluginAudioPort : IDisposable
             if (session is InjectionSession injection)
                 release = ClearKeyAndArmLocked(injection);
         }
-        if (release is not null)
-        {
-            NotifyTxActive(false);
-            ReleaseProductKey(release);
-        }
+        CompleteRelease(release);
         session.RequestDispose();
         _log.LogInformation(
             "product-plugin audio detached kind={Kind} name={ProductName} session={SessionId} reason={Reason}",
@@ -794,35 +887,36 @@ public sealed class ProductPluginAudioPort : IDisposable
     private void OnHigherPrecedenceTransmitRequested(MoxSource source)
     {
         if (source == MoxSource.ProductPlugin) return;
-        TxService? release;
+        KeyRelease? release;
         lock (_gate)
         {
             if (_keyedSession is null) return;
             release = ClearKeyLocked(_keyedSession, disarm: false);
         }
         NotifyTxActive(false);
-        if (release is not null) ReleaseProductKey(release);
+        CompleteRelease(release, notifyInactive: false);
     }
 
     private void OnTxActiveChanged(bool active)
     {
         if (active) return;
+        KeyRelease? release;
         lock (_gate)
         {
             if (_keyedSession is null) return;
-            ClearKeyLocked(_keyedSession, disarm: false);
+            release = ClearKeyLocked(_keyedSession, disarm: false);
         }
-        NotifyTxActive(false);
+        CompleteRelease(release);
     }
 
-    private TxService? ClearKeyAndArmLocked(InjectionSession session)
+    private KeyRelease? ClearKeyAndArmLocked(InjectionSession session)
     {
         session.Armed = false;
         session.PluginId = null;
         return ClearKeyLocked(session, disarm: true);
     }
 
-    private TxService? ClearKeyLocked(InjectionSession session, bool disarm)
+    private KeyRelease? ClearKeyLocked(InjectionSession session, bool disarm)
     {
         if (disarm)
         {
@@ -840,12 +934,31 @@ public sealed class ProductPluginAudioPort : IDisposable
         }
         _keyedSession = null;
         session.Keyed = false;
-        return _subscribedTx;
+        return _subscribedTx is null
+            ? null
+            : new KeyRelease(_subscribedTx, session.KeyGeneration);
     }
 
-    private static void ReleaseProductKey(TxService tx)
+    private bool OwnsKeyGeneration(InjectionSession session, long generation)
     {
-        tx.TryReleaseMoxImmediately(MoxSource.ProductPlugin, out _);
+        lock (_gate)
+            return ReferenceEquals(_keyedSession, session)
+                && session.Keyed
+                && session.KeyGeneration == generation;
+    }
+
+    private void CompleteRelease(KeyRelease? release, bool notifyInactive = true)
+    {
+        if (release is null) return;
+        if (notifyInactive) NotifyTxActive(false);
+        ReleaseProductKey(release.Tx, release.Generation);
+        TryNotifyTxSpeechBypass(release.Generation, bypass: false);
+        release.Tx.ClearProductPluginDriveCap(release.Generation);
+    }
+
+    private static void ReleaseProductKey(TxService tx, long generation)
+    {
+        tx.TryReleaseProductPluginMox(generation, out _);
     }
 
     private void NotifyTxActive(bool active)
@@ -858,6 +971,22 @@ public sealed class ProductPluginAudioPort : IDisposable
         {
             _log.LogWarning(ex,
                 "product-plugin TX audio-state subscriber failed active={Active}", active);
+        }
+    }
+
+    private bool TryNotifyTxSpeechBypass(long generation, bool bypass)
+    {
+        try
+        {
+            var sink = Volatile.Read(ref _txSpeechBypassSink);
+            if (sink is null) return !bypass;
+            return sink(generation, bypass);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "product-plugin TX speech-bypass subscriber failed bypass={Bypass}", bypass);
+            return !bypass;
         }
     }
 
@@ -915,6 +1044,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         private int _leased;
         private int _references = 1;
         private int _disposeRequested;
+        private int _revoked;
 
         public string LeaseId { get; } = leaseId;
         public string Name { get; } = name;
@@ -923,7 +1053,20 @@ public sealed class ProductPluginAudioPort : IDisposable
         public abstract string Kind { get; }
         public Timer? PendingTimer { get; set; }
         public bool IsLeased => Volatile.Read(ref _leased) != 0;
+        public bool IsRevoked => Volatile.Read(ref _revoked) != 0;
         public bool TryLease() => Interlocked.CompareExchange(ref _leased, 1, 0) == 0;
+        public void Revoke()
+        {
+            Volatile.Write(ref _revoked, 1);
+        }
+
+        /// <summary>Clear the revoke latch when the plugin explicitly re-arms.
+        /// A revoke stops delivery but must NOT end the lease: the client's
+        /// documented recovery is to re-arm this same lease and key again.</summary>
+        public void ClearRevoked()
+        {
+            Volatile.Write(ref _revoked, 0);
+        }
 
         public bool TryAddRef()
         {
@@ -976,15 +1119,22 @@ public sealed class ProductPluginAudioPort : IDisposable
         string name,
         string version,
         AudioRingOwner owner,
-        ProductPluginInjectionDestination destination) : Session(leaseId, name, version, owner)
+        ProductPluginInjectionDestination destination,
+        bool bypassSpeechProcessing,
+        bool replayLastBlockOnUnderflow,
+        int? driveCapPct) : Session(leaseId, name, version, owner)
     {
         public override string Kind => Destination == ProductPluginInjectionDestination.Tx
             ? "tx" : "local-monitor";
         public ProductPluginInjectionDestination Destination { get; } = destination;
+        public bool BypassSpeechProcessing { get; } = bypassSpeechProcessing;
+        public bool ReplayLastBlockOnUnderflow { get; } = replayLastBlockOnUnderflow;
+        public int? DriveCapPct { get; } = driveCapPct;
         public float[] Scratch { get; } = new float[AudioRingProtocol.MaxSamplesPerBlock];
         public string? PluginId;
         public bool Armed;
         public bool Keyed;
+        public long KeyGeneration;
         public long ExpectedSequence;
         public int PendingCount;
         public bool HasPendingBlock;
@@ -994,6 +1144,7 @@ public sealed class ProductPluginAudioPort : IDisposable
     }
 
     private sealed record PendingExpiration(ProductPluginAudioPort Port, Session Session);
+    private sealed record KeyRelease(TxService Tx, long Generation);
 }
 
 internal enum ProductPluginCaptureSource
@@ -1017,9 +1168,20 @@ public sealed record ProductPluginCaptureAttachRequest(
 public sealed record ProductPluginInjectionAttachRequest(
     string Name,
     string Version,
-    string Destination);
+    string Destination,
+    bool BypassSpeechProcessing = false,
+    bool ReplayLastBlockOnUnderflow = true,
+    int? DriveCapPct = null);
 
-public sealed record ProductPluginAudioAttachResponse(string LeaseId, AudioRingEndpoint Ring);
+public sealed record ProductPluginAppliedInjectionOptions(
+    bool BypassSpeechProcessing,
+    bool ReplayLastBlockOnUnderflow,
+    int? DriveCapPct);
+
+public sealed record ProductPluginAudioAttachResponse(
+    string LeaseId,
+    AudioRingEndpoint Ring,
+    ProductPluginAppliedInjectionOptions? AppliedInjectionOptions = null);
 
 public sealed record ProductPluginArmRequest(string LeaseId, string PluginId, bool Armed);
 
