@@ -188,6 +188,7 @@ public static class StationEngineEndpoints
         endpoints.MapRadioTuningEndpoints();
         endpoints.MapReceiverLoEndpoint();
         endpoints.MapCtunEndpoint();
+        endpoints.MapFullDuplexMultiRxEndpoint();
         endpoints.MapModeEndpoint();
         endpoints.MapFilterEndpoints();
         endpoints.MapRadioDspControlEndpoints();

@@ -2568,19 +2568,26 @@ public class DspPipelineService : BackgroundService,
 
     private void ApplyVisibleDdcZoom(IDspEngine engine, StateDto state)
     {
+        // RX1 and each secondary now gate independently — they no longer share
+        // one zoom value, so an unchanged RX1 zoom can no longer short-circuit
+        // the whole function the way it used to (a secondary-only zoom change
+        // would otherwise be silently dropped).
         int zoom = DdcZoomLevel(state.ZoomLevel);
-        if (zoom == _appliedZoomLevel) return;
-
-        engine.SetZoom(Volatile.Read(ref _channelId), zoom);
+        if (zoom != _appliedZoomLevel)
+        {
+            engine.SetZoom(Volatile.Read(ref _channelId), zoom);
+            _appliedZoomLevel = zoom;
+        }
         for (int receiverIndex = 1; receiverIndex < MaxReceivers; receiverIndex++)
         {
             var rx = _secondaryRx[receiverIndex];
             int channelId = Volatile.Read(ref rx.ChannelId);
             if (channelId < 0) continue;
-            engine.SetZoom(channelId, zoom);
-            rx.AppliedZoom = zoom;
+            int rxZoom = DdcZoomLevel(RadioService.ReceiverZoomLevel(state, receiverIndex));
+            if (rx.AppliedZoom == rxZoom) continue;
+            engine.SetZoom(channelId, rxZoom);
+            rx.AppliedZoom = rxZoom;
         }
-        _appliedZoomLevel = zoom;
     }
 
     internal static bool IsWidebandDetailIqStale(long nowMs, long lastIqMs) =>
@@ -6603,7 +6610,7 @@ public class DspPipelineService : BackgroundService,
             engine.SetRxFilterPhase(channelId, s.RxFilterPhase);
             rx.AppliedFilterPhase = s.RxFilterPhase;
         }
-        int zoom = DdcZoomLevel(s.ZoomLevel);
+        int zoom = DdcZoomLevel(RadioService.ReceiverZoomLevel(s, rxIndex));
         if (rx.AppliedZoom != zoom)
         {
             engine.SetZoom(channelId, zoom);
@@ -9008,12 +9015,34 @@ public class DspPipelineService : BackgroundService,
         // don't broadcast it. The VST RX seam still fires on the drained RX
         // so RX-side plugins keep running even while monitor is on.
         bool txMonitorOn = engine.IsTxMonitorOn;
+        // Read once, up front: everything below that decides which receiver's
+        // audio survives this tick (RX1, each secondary, and the publish
+        // branch) needs to agree on the same keyed/post-TX-drain snapshot.
+        bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick();
+        int txReceiverIndex = state.TxReceiverIndex;
+        // Operator gate ("DUP" on the transport bar, default off). Disabled
+        // reduces every "!fullDuplexMultiRxEnabled || ri == txReceiverIndex"
+        // check below to unconditionally true, so the exclusion below applies
+        // to every receiver during suppression — byte-identical to the MOX
+        // behaviour before full-duplex multi-RX audio existed. Enabled narrows
+        // it to just the TX-selected receiver.
+        bool fullDuplexMultiRxEnabled = state.FullDuplexMultiRxEnabled;
         int audioSampleCount = engine.ReadAudio(channel, audioBuf);
         // Per-RX mute (Thetis chkMUT): RX1 stays the audio clock-master so the
         // mix/output timing is unchanged, but its samples are zeroed so only the
         // other (unmuted) receivers are heard. TX monitor overrides RX audio
         // below, so muting an RX never silences the monitor.
-        if (IsReceiverMuted(state, 0) && audioSampleCount > 0)
+        //
+        // Full-duplex multi-RX: while keyed (or draining post-TX) AND the DUP
+        // gate is on, only the receiver actually selected to transmit
+        // (TxReceiverIndex) is excluded here — every OTHER receiver keeps
+        // flowing through the mix below so the operator keeps hearing them
+        // during MOX, same as the panadapter/waterfall already do for
+        // secondaries. With DUP off, every receiver is excluded during
+        // suppression, matching the original MOX behaviour.
+        bool rx1Muted = IsReceiverMuted(state, 0)
+            || (suppressRxAudioForTx && (!fullDuplexMultiRxEnabled || txReceiverIndex == 0));
+        if (rx1Muted && audioSampleCount > 0)
             audioBuf.AsSpan(0, audioSampleCount).Clear();
 
         // Secondary-receiver audio. Per-receiver mute is the sole audibility
@@ -9052,8 +9081,14 @@ public class DspPipelineService : BackgroundService,
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
-            // affect the additive MixRxAudioN bus.
-            if (IsReceiverMuted(state, ri)) continue;
+            // affect the additive MixRxAudioN bus. With DUP on, the TX-selected
+            // receiver gets the same treatment while keyed/draining (see
+            // rx1Muted above) so it alone drops out of the mix and every other
+            // secondary stays audible; with DUP off, every secondary drops out
+            // during suppression, same as rx1Muted above.
+            if (IsReceiverMuted(state, ri)
+                || (suppressRxAudioForTx && (!fullDuplexMultiRxEnabled || ri == txReceiverIndex)))
+                continue;
             _mixSlices[mixSliceCount++] = new RxAudioSlice(sec.AudioBuf, n);
         }
 
@@ -9078,12 +9113,13 @@ public class DspPipelineService : BackgroundService,
             externalRxCount = _externalRxAudioSource.Read(_kiwiMixBuf.AsSpan(0, want));
         }
 
-        // RX1's own samples were already zeroed above when it's muted; tell the
-        // mixer to drop RX1 from the bus too. With nothing audible the mixer
-        // returns silence.
+        // RX1's own samples were already zeroed above when it's muted (or it's
+        // the TX-selected receiver, keyed); tell the mixer to drop RX1 from the
+        // bus too. With nothing audible from any receiver the mixer returns
+        // silence — but any OTHER live secondary still sums in normally.
         audioSampleCount = MixRxAudioN(
             audioBuf, audioSampleCount, _mixSlices.AsSpan(0, mixSliceCount),
-            rx1Muted: IsReceiverMuted(state, 0));
+            rx1Muted: rx1Muted);
 
         // Operator RX master mute, read ONCE this tick so every branch below agrees.
         // While muted, real RX audio (and CW sidetone) is published normally and the
@@ -9092,21 +9128,31 @@ public class DspPipelineService : BackgroundService,
         // do NOT mix it into the RX frame here and instead route it, recorder-only,
         // through the mute-exempt lane after the RX-publish block (see below).
         bool rxAudioMuted = _rxAudioMute?.IsMuted ?? false;
-        bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick();
         bool externalRxPreserved = suppressRxAudioForTx && externalRxCount > 0;
         // Keep Kiwi outside the local-radio DSP/plugin/fade lane. That lane can
         // be nonlinear and stateful, so subtracting raw Kiwi afterward cannot
         // recover its contribution. Seed a silent output-sized local block when
         // Kiwi is the only available clock source; Kiwi is added immediately
         // before the final limiter below.
+        //
+        // Deliberately keyed off the raw suppressRxAudioForTx flag rather than
+        // the per-receiver TX exclusion above: Kiwi plus a live non-TX local
+        // secondary during MOX is a narrow combination, and this preserves the
+        // existing "prefer Kiwi, drop the whole local mix" behaviour for it
+        // unchanged. The common (non-Kiwi) multi-RX case is unaffected — this
+        // call is a no-op whenever externalRxCount == 0.
         audioSampleCount = PrepareLocalRxForExternalOutput(
             audioBuf,
             audioSampleCount,
             externalRxCount,
             suppressRxAudioForTx);
-        // The suppression latch and post-TX drain apply to the local radio only.
-        // With Kiwi samples present, publish them through the ordinary RX path.
-        bool suppressPublishedRxAudio = suppressRxAudioForTx && !externalRxPreserved;
+        // Other (non-TX) receivers keep contributing to the mix above, so the
+        // bus can still carry live audio even while suppressRxAudioForTx is
+        // set. Only fall back to the fully-synthesized suppressed/sidetone
+        // block when nothing audible survived the TX-receiver exclusion.
+        bool otherReceiversLive = audioSampleCount > 0;
+        bool suppressPublishedRxAudio =
+            suppressRxAudioForTx && !otherReceiversLive && !externalRxPreserved;
 
         if (audioSampleCount > 0)
         {
@@ -9118,10 +9164,15 @@ public class DspPipelineService : BackgroundService,
             // not reintroduce an abrupt edge after this early demod-stage ramp.
             if (_rxFadeOutPending)
             {
-                if (externalRxPreserved)
+                if (externalRxPreserved || otherReceiversLive)
                 {
                     // Consume the local-radio fade edge without applying it to
-                    // the independent Kiwi receive samples.
+                    // the independent Kiwi receive samples, or (multi-RX full
+                    // duplex) to another receiver's audio that never went
+                    // silent. The TX-selected receiver's own contribution was
+                    // already dropped from the mix above with a hard cut —
+                    // same as an ordinary per-RX mute, which never fades
+                    // either — so no separate fade is needed on this bus.
                     _rxFadeOutPending = false;
                 }
                 else
@@ -9266,7 +9317,13 @@ public class DspPipelineService : BackgroundService,
                 // processed local block first, then apply its post-TX fade.
                 LimitRxAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
                 int postTxFadeRemaining = Volatile.Read(ref _rxPostTxFadeInSamplesRemaining);
-                if (postTxFadeRemaining > 0 && !externalRxPreserved)
+                // Same reasoning as the fade-out above: only ramp the resuming
+                // TX-selected receiver's own audio back in when it's the sole
+                // contributor to the bus. If another receiver was live the
+                // whole time (or Kiwi is preserved), leave the counter armed
+                // rather than ramping their already-continuous audio — it
+                // applies on a later tick once the TX receiver is heard alone.
+                if (postTxFadeRemaining > 0 && !externalRxPreserved && !otherReceiversLive)
                 {
                     int next = ApplyRxPostTxFadeIn(
                         audioBuf.AsSpan(0, audioSampleCount),
@@ -9305,11 +9362,20 @@ public class DspPipelineService : BackgroundService,
                 _productPluginAudio?.PublishRxAudio(
                     0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
                 RxAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
-                if (externalRxPreserved)
+                if (externalRxPreserved || (suppressRxAudioForTx && otherReceiversLive))
                 {
-                    // Advance the local-radio post-TX drain without fading or
-                    // delaying the Kiwi. When the drain completes, retain the
-                    // newly armed fade for the first local-radio RX samples.
+                    // Advance the local-radio post-TX drain here too: normal
+                    // RX audio published while suppressRxAudioForTx is still
+                    // set means either Kiwi was preserved, or (multi-RX full
+                    // duplex) another receiver's live audio carried the bus
+                    // while the TX-selected receiver stayed excluded. Either
+                    // way the drain clock must keep ticking down so the TX
+                    // receiver's own audio (and its post-TX fade-in) resumes
+                    // once its settle window elapses — otherwise, as long as
+                    // any other receiver keeps producing audio blocks (which
+                    // is continuous, independent of squelch), the counter
+                    // would never reach zero and the TX receiver would stay
+                    // excluded from the mix for the rest of the session.
                     MarkTxSuppressedAudioBlockPublished();
                 }
             }

@@ -271,6 +271,7 @@ public sealed class RadioService : IDisposable
         public bool Muted;       // per-RX audio mute (RXOutputGain=0 equivalent)
         public bool SplitEnabled;
         public long TxVfoHz;
+        public int ZoomLevel = 1; // independent DDC display zoom for this slice
     }
     private readonly ExtraReceiver[] _extraReceivers = CreateExtraReceivers();
     // Current Zeus ordinary Protocol-1 ingest decodes one DDC stream and fans it
@@ -864,6 +865,7 @@ public sealed class RadioService : IDisposable
             TxVfo: rsSnap?.TxVfo ?? TxVfo.A,
             CwPitchHz: CwOffset.CwPitchHz,
             CtunEnabled: rsSnap?.CtunEnabled ?? false,
+            FullDuplexMultiRxEnabled: rsSnap?.FullDuplexMultiRxEnabled ?? false,
             PreampOn: rsSnap?.PreampOn ?? false,
             RogerBeepEnabled: rsSnap?.RogerBeepEnabled ?? false,
             SplitEnabled: false,
@@ -1981,7 +1983,8 @@ public sealed class RadioService : IDisposable
         int? filterLowHz = null,
         int? filterHighHz = null,
         double? afGainDb = null,
-        string? filterPresetName = null)
+        string? filterPresetName = null,
+        int? zoomLevel = null)
     {
         // RX1 (0) and RX2 (1) live on the flat StateDto fields, but the uniform
         // numeric model means /api/receivers/{index} must drive every receiver.
@@ -2016,6 +2019,15 @@ public sealed class RadioService : IDisposable
                 Mutate(s => WithReceiverAdcSource(s, index, a));
                 if (index == 0) ApplyPrimaryAttenuatorToActiveClient(EffectiveAttenDb);
             }
+            // RX1's zoom stays on the legacy global StateDto.ZoomLevel (SetZoom /
+            // POST /api/rx/zoom) — a zoomLevel here is a no-op for index 0. RX2
+            // gets its own independent zoom, stored in Receivers[1] like AdcSource.
+            if (index == 1 && zoomLevel is int rx2Zoom)
+            {
+                int clamped = Math.Clamp(
+                    rx2Zoom, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
+                Mutate(s => WithReceiverZoom(s, index, clamped));
+            }
             return Snapshot();
         }
         if (index < 2 || index >= _extraReceivers.Length)
@@ -2040,6 +2052,8 @@ public sealed class RadioService : IDisposable
             if (filterHighHz is int fh) e.FilterHighHz = fh;
             if (filterPresetName is string fp) e.FilterPresetName = fp;
             if (afGainDb is double af) e.AfGainDb = Math.Clamp(af, -50.0, 20.0);
+            if (zoomLevel is int z)
+                e.ZoomLevel = Math.Clamp(z, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
             if (enabled is bool en)
             {
                 e.Enabled = en;
@@ -2744,6 +2758,19 @@ public sealed class RadioService : IDisposable
             // on the dial they're transmitting on.
             SetRadioLoUnchecked(CwOffset.EffectiveLoHz(mode, vfo));
         }
+        return Snapshot();
+    }
+
+    /// <summary>Enable or disable full-duplex multi-RX audio ("DUP" on the
+    /// transport bar). Pure software gate — DspPipelineService reads it each
+    /// tick to decide whether MOX excludes only the TX-selected receiver from
+    /// the RX audio mix (true) or every receiver as before (false, default).
+    /// No hardware effect. Persisted via FlushState.</summary>
+    public StateDto SetFullDuplexMultiRxEnabled(bool enabled)
+    {
+        Mutate(s => s.FullDuplexMultiRxEnabled == enabled
+            ? s
+            : s with { FullDuplexMultiRxEnabled = enabled });
         return Snapshot();
     }
 
@@ -6139,7 +6166,10 @@ public sealed class RadioService : IDisposable
         FilterLowHz: s.FilterLowHz, FilterHighHz: s.FilterHighHz,
         FilterPresetName: s.FilterPresetName,
         AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
-        Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled, TxVfoHz: s.SplitTxHz);
+        Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled, TxVfoHz: s.SplitTxHz,
+        // Read-only mirror of the legacy global zoom — RX1 is still SET only via
+        // StateDto.ZoomLevel / SetZoom, never through this projection.
+        ZoomLevel: s.ZoomLevel);
 
     private static StateDto WithReceiverAdcSource(StateDto s, int index, byte adcSource)
     {
@@ -6162,6 +6192,44 @@ public sealed class RadioService : IDisposable
         }
         if (!replaced) list.Add(next);
         return s with { Receivers = list };
+    }
+
+    // RX2's independent zoom, stored in Receivers[1] like AdcSource (see
+    // WithReceiverAdcSource above). RX1 never routes here — its zoom stays on
+    // the legacy global StateDto.ZoomLevel.
+    private static StateDto WithReceiverZoom(StateDto s, int index, int zoomLevel)
+    {
+        if (index != 1)
+            throw new ArgumentOutOfRangeException(nameof(index), index, "only RX2 zoom is stored in StateDto.Receivers");
+        var next = s.Rx2() with { ZoomLevel = zoomLevel };
+        var src = s.Receivers;
+        if (src is null)
+            return s with { Receivers = new[] { next } };
+
+        var list = new List<ReceiverDto>(src.Count);
+        bool replaced = false;
+        foreach (var r in src)
+        {
+            if (r.Index == index) { list.Add(next); replaced = true; }
+            else list.Add(r);
+        }
+        if (!replaced) list.Add(next);
+        return s with { Receivers = list };
+    }
+
+    // The zoom level RX2+ receiver `index` last had applied — falls back to
+    // 1x before the array is seeded. Used by DspPipelineService to drive each
+    // secondary channel's independent SetZoom instead of the global
+    // StateDto.ZoomLevel every receiver used to share.
+    internal static int ReceiverZoomLevel(StateDto s, int index)
+    {
+        if (s.Receivers is { } receivers)
+        {
+            for (int i = 0; i < receivers.Count; i++)
+                if (receivers[i].Index == index)
+                    return receivers[i].ZoomLevel;
+        }
+        return 1;
     }
 
     internal static byte ReceiverAdcSource(StateDto s, int index)
@@ -6195,7 +6263,7 @@ public sealed class RadioService : IDisposable
                 FilterPresetName: s.FilterPresetName,
                 AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
                 Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
-                TxVfoHz: s.SplitTxHz),
+                TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
             // in the array itself (the flat VFO-B fields are gone). Carry the
             // existing tuning forward and overlay the flat RX2 control fields
@@ -6227,7 +6295,7 @@ public sealed class RadioService : IDisposable
                 FilterPresetName: e.FilterPresetName,
                 AfGainDb: e.AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: e.Muted, SplitEnabled: e.SplitEnabled,
-                TxVfoHz: e.TxVfoHz));
+                TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel));
         }
         // Non-hardware KiwiSDR slice (reserved index KiwiReceiverIndex). Appended
         // out of the contiguous DDC run — it is a remote receiver, not a DDC, so
@@ -6327,6 +6395,7 @@ public sealed class RadioService : IDisposable
                 Rx2AfGainDb = rx2Snap.AfGainDb,
                 TxVfo = snap.TxVfo,
                 CtunEnabled = snap.CtunEnabled,
+                FullDuplexMultiRxEnabled = snap.FullDuplexMultiRxEnabled,
                 Notches = notches.Select(n => new RadioStateNotchEntry
                 {
                     CenterHz = n.CenterHz,

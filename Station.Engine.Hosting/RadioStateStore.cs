@@ -226,6 +226,9 @@ public sealed class RadioStateEntry
     // CTUN (click-tune / centred-tuning) toggle. See StateDto.CtunEnabled.
     // Persisted so the operator's preference survives a restart.
     public bool CtunEnabled { get; set; }
+    // Full-duplex multi-RX audio ("DUP"). See StateDto.FullDuplexMultiRxEnabled.
+    // Default false matches legacy rows and the pre-toggle MOX behaviour.
+    public bool FullDuplexMultiRxEnabled { get; set; }
     // Per-mode-family RX filter memory (abs values, always positive)
     public int SsbFilterLoAbs { get; set; } = 150;
     public int SsbFilterHiAbs { get; set; } = 2850;

@@ -235,4 +235,20 @@ public static class RadioTuningEndpoints
 
         return endpoints;
     }
+
+    public static IEndpointRouteBuilder MapFullDuplexMultiRxEndpoint(
+        this IEndpointRouteBuilder endpoints)
+    {
+        var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
+
+        // Toggle full-duplex multi-RX audio ("DUP"). See
+        // StateDto.FullDuplexMultiRxEnabled for what this gates.
+        endpoints.MapPost("/api/radio/full-duplex-multi-rx", (FullDuplexMultiRxSetRequest req, RadioService r) =>
+        {
+            log.LogInformation("api.radio.fullDuplexMultiRx enabled={Enabled}", req.Enabled);
+            return r.SetFullDuplexMultiRxEnabled(req.Enabled);
+        });
+
+        return endpoints;
+    }
 }

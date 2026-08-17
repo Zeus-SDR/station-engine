@@ -64,8 +64,12 @@ public static class RadioConnectionEndpoints
         // client owns the radio; the UI normally disables Connect for those.
         // This is outward-facing and deliberate: the Connect panel gates it
         // behind an explicit confirmation because the stop can interrupt an
-        // active transmission. P2 only continues after stable Idle proves the
-        // old stream is abandoned; a live controller makes the attempt fail.
+        // active transmission. P2 sends the stop and reconnects unconditionally
+        // (maintainer decision, 2026-08-16) — an earlier revision required the
+        // radio to prove stable Idle first, but that made an appliance's own
+        // still-alive controller (e.g. a G2's on-board Zeus Link kiosk) win the
+        // race back almost every time, leaving the operator unable to take the
+        // radio over at all. See docs/lessons/p2-second-master-relay-chatter.md.
         endpoints.MapPost("/api/radios/reclaim", async (
             ReclaimRadioRequest req,
             RadioReclaimService reclaim,
@@ -151,34 +155,17 @@ public static class RadioConnectionEndpoints
                         ct: ctx.RequestAborted)
                     .ConfigureAwait(false);
 
-                var stableIdle = await WaitForStableP2IdleAsync(
-                    cancellationToken => p2Connection.ProbeAsync(ipEndpoint, cancellationToken),
-                    TimeSpan.FromMilliseconds(250),
-                    samples: 3,
-                    cancellationToken: ctx.RequestAborted).ConfigureAwait(false);
-                var finalProbe = stableIdle
-                    ? await p2Connection.ProbeAsync(ipEndpoint, ctx.RequestAborted).ConfigureAwait(false)
-                    : null;
-                if (finalProbe is null || finalProbe.Busy)
-                {
-                    log.LogWarning(
-                        "api.radios.reclaim P2 radio {Ip} did not remain Idle; refusing second-master connect",
-                        ipEndpoint.Address);
-                    return Results.Json(
-                        new
-                        {
-                            error =
-                                "The radio stream stopped, but exclusive control could not be confirmed. " +
-                                "The other controller may still be active; disconnect it there before trying again.",
-                            busy = true,
-                            reclaimable = false,
-                        },
-                        statusCode: StatusCodes.Status409Conflict);
-                }
+                // Best-effort probe for board kind / firmware only. Reclaim
+                // already committed to the takeover by sending the stop, so this
+                // does not re-block on Busy — fails OPEN, same as the ordinary
+                // connect probe: a radio that doesn't answer (or still shows
+                // Busy because another controller resumed) is not blocked.
+                var finalProbe = await p2Connection.ProbeAsync(ipEndpoint, ctx.RequestAborted)
+                    .ConfigureAwait(false);
 
                 var boardKind = req.BoardId is byte rawBoardId
                     ? MapBoardByteP2(rawBoardId)
-                    : finalProbe.BoardKind;
+                    : finalProbe?.BoardKind ?? HpsdrBoardKind.Unknown;
                 var rateKhz = ResolveP2RateKhz(req.SampleRate);
                 rateKhz = await dsp.ConnectP2WithLifecycleGateHeldAsync(
                     ipEndpoint,
@@ -186,7 +173,7 @@ public static class RadioConnectionEndpoints
                     numAdc: 2,
                     ct: ctx.RequestAborted,
                     boardKind: boardKind,
-                    firmware: finalProbe.Firmware,
+                    firmware: finalProbe?.Firmware,
                     sampleRateExplicit: true).ConfigureAwait(false);
                 return Results.Ok(new
                 {
@@ -504,28 +491,6 @@ public static class RadioConnectionEndpoints
         1_536_000 => 1536,   // P2 only (ANAN G2)
         _ => 192,
     };
-
-    internal static async Task<bool> WaitForStableP2IdleAsync(
-        Func<CancellationToken, Task<Protocol2ConnectionProbe?>> probe,
-        TimeSpan interval,
-        int samples,
-        CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(probe);
-        if (samples < 1) throw new ArgumentOutOfRangeException(nameof(samples));
-
-        for (var sample = 0; sample < samples; sample++)
-        {
-            var result = await probe(cancellationToken).ConfigureAwait(false);
-            // Reclaim is deliberately fail-closed: unlike an ordinary connect,
-            // silence cannot prove that the incumbent stream was released.
-            if (result is null || result.Busy) return false;
-            if (sample + 1 < samples && interval > TimeSpan.Zero)
-                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
-        }
-
-        return true;
-    }
 
     private static RadioInfo MapP1(P1Radio radio) => new(
         MacAddress: radio.Mac.ToString(),

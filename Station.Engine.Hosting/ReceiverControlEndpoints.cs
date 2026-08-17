@@ -66,7 +66,8 @@ public static class ReceiverControlEndpoints
                 filterLowHz: req.FilterLowHz,
                 filterHighHz: req.FilterHighHz,
                 afGainDb: req.AfGainDb,
-                filterPresetName: req.FilterPresetName));
+                filterPresetName: req.FilterPresetName,
+                zoomLevel: req.ZoomLevel));
         });
 
         endpoints.MapPost("/api/receivers/{index:int}/mute", (

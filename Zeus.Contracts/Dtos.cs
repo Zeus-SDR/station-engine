@@ -1049,7 +1049,14 @@ public sealed record ReceiverDto(
     // TxReceiverIndex chooses the receiver whose mode/filter context is used,
     // then these fields optionally place that receiver's carrier elsewhere.
     bool SplitEnabled = false,
-    long TxVfoHz = 0);
+    long TxVfoHz = 0,
+    // Per-receiver DDC display zoom (SyntheticDspEngine.MinZoomLevel..
+    // MaxZoomLevel). RX1 (index 0) mirrors the legacy global StateDto.ZoomLevel
+    // here for read symmetry but is still SET only via StateDto.ZoomLevel/
+    // SetZoom; RX2+ are independently settable via ReceiverSetRequest.ZoomLevel
+    // and applied per-channel in DspPipelineService. Defaulted to 1x so
+    // pre-zoom wire frames deserialize unchanged.
+    int ZoomLevel = 1);
 
 public sealed record StateDto(
     ConnectionStatus Status,
@@ -1435,6 +1442,21 @@ public sealed record StateDto(
     // restart).
     int TxReceiverIndex = 0,
 
+    // Full-duplex multi-RX audio (operator toggle, "DUP" on the transport bar).
+    // When true, MOX only excludes the TX-selected receiver (TxReceiverIndex)
+    // from the RX audio mix — every other enabled, unmuted receiver keeps
+    // streaming audio through the whole keyed interval and the post-TX drain
+    // window (DspPipelineService). When false (default), MOX suppresses RX
+    // audio for every receiver exactly as it always has. Off by default: many
+    // boards share one antenna behind a T/R relay, so a receiver other than
+    // the one transmitting may hear nothing useful (or the station's own TX
+    // bleed-through) while keyed — the operator opts in on hardware that
+    // genuinely supports it. Unrelated to the Protocol-1 wire duplex bit
+    // (ControlFrame C4[2], always 1) and to the existing "display-duplex"
+    // waterfall continuity during TX, both of which stay unconditional.
+    // Persisted in zeus-prefs.db.
+    bool FullDuplexMultiRxEnabled = false,
+
     // ---- Diversity combiner (Thetis DiversityForm / WDSP xdivEXT) ----
     // Two phase-synchronous ADC streams combined with a per-source complex
     // rotation (gain magnitude + phase) to null an interferer or peak a signal.
@@ -1501,9 +1523,9 @@ public sealed record ConnectRequest(
     // behaviour. Issue #171.
     byte? BoardId = null,
     // Protocol 1 compatibility takeover. Protocol 2 never bypasses its Busy
-    // guard: the P2 reclaim endpoint sends run=0 and proves stable Idle before
-    // reconnecting normally, because the protocol cannot terminate a live
-    // controller process on another host. Default false = guard enforced.
+    // guard on /api/connect/p2 — that route always probes first; the P2
+    // takeover path is /api/radios/reclaim instead, which sends run=0 and
+    // reconnects directly. Default false = guard enforced.
     bool Force = false);
 
 public sealed record VfoSetRequest(long Hz, int Receiver = 0);
@@ -1585,7 +1607,12 @@ public sealed record ReceiverSetRequest(
     // from. Optimistic-only round-trip so the RX3+ passband shows the preset
     // label the operator picked, exactly as RX2 carries FilterPresetNameB. The
     // cuts in FilterLowHz/FilterHighHz remain authoritative for the DSP.
-    string? FilterPresetName = null);
+    string? FilterPresetName = null,
+    // Independent per-receiver DDC display zoom (RX2+ only — a no-op for
+    // index 0, which stays on the legacy global StateDto.ZoomLevel via
+    // POST /api/rx/zoom). Clamped to SyntheticDspEngine.MinZoomLevel..
+    // MaxZoomLevel by RadioService.SetReceiver.
+    int? ZoomLevel = null);
 
 /// <summary>Body of <c>POST /api/kiwi</c> — configure the KiwiSDR slice
 /// receiver. Every field is optional; only supplied fields change.
@@ -1797,6 +1824,11 @@ public sealed record RadioLoSetRequest(long Hz);
 /// enabled, panadapter clicks move only the dial and leave the hardware NCO
 /// frozen so the operator can tune off-centre; see <see cref="StateDto.CtunEnabled"/>.</summary>
 public sealed record CtunSetRequest(bool Enabled);
+
+/// <summary>Enable or disable full-duplex multi-RX audio ("DUP"): whether MOX
+/// excludes only the TX-selected receiver from the RX audio mix, or every
+/// receiver as before. See <see cref="StateDto.FullDuplexMultiRxEnabled"/>.</summary>
+public sealed record FullDuplexMultiRxSetRequest(bool Enabled);
 
 public sealed record ModeSetRequest(RxMode Mode, int Receiver = 0);
 

@@ -21,10 +21,14 @@ namespace Zeus.Server;
 /// (status byte 0x03) — i.e. one currently streaming to another client.
 ///
 /// <para>Neither HPSDR protocol authenticates the host: the radio streams to
-/// whoever last commanded it to run. To clear an abandoned Busy stream we send
-/// it a <em>stop</em> command before connecting normally. A stop does not kill a
-/// controller process on another host, so the endpoint verifies stable Idle and
-/// refuses the takeover if a live controller resumes its keepalive.</para>
+/// whoever last commanded it to run. To take a busy radio over we send it a
+/// <em>stop</em> command, which drops the previous owner, before connecting
+/// normally. This is gated behind an explicit operator confirmation in the
+/// Connect panel — it can kick another operator off a live, possibly
+/// transmitting, radio. A stop cannot kill a controller process on another
+/// host, so a live controller can resume its own keepalive and reacquire the
+/// radio after Zeus connects; the operator is expected to stop the other
+/// controller if that happens.</para>
 ///
 /// <list type="bullet">
 ///   <item>Protocol 1 — Metis start/stop command <c>EF FE 04 00</c> to UDP
