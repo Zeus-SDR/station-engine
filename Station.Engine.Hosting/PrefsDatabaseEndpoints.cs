@@ -28,6 +28,9 @@ public static class PrefsDatabaseEndpoints
         this IEndpointRouteBuilder app)
     {
         ArgumentNullException.ThrowIfNull(app);
+        var downloadsDirectory =
+            app.ServiceProvider.GetService<OperatorDownloadsDirectory>()
+            ?? new OperatorDownloadsDirectory();
 
         // Compatibility inventory: Zeus now exposes one canonical database to
         // the operator. Keep the route shape while older frontends roll forward.
@@ -130,9 +133,11 @@ public static class PrefsDatabaseEndpoints
             .WithMetadata(new Microsoft.AspNetCore.Mvc.RequestSizeLimitAttribute(
                 UploadRequestBodyLimitBytes));
 
-        // Download the one operator-facing Zeus backup. The versioned container
-        // captures both authoritative settings stores and deliberately
-        // excludes PureSignal's ps_settings collection.
+        // Download the one operator-facing Zeus backup. This remains the live
+        // remote-LAN appliance path: the SPA falls back to it when a local
+        // server-side save is forbidden or the engine predates that route.
+        // The versioned container captures both authoritative settings stores
+        // and deliberately excludes PureSignal's ps_settings collection.
         // The ".zeusdb" extension (#64) avoids collisions with ham-radio
         // logbook apps that register ".db" in the Windows shell.
         //
@@ -167,7 +172,38 @@ public static class PrefsDatabaseEndpoints
             }
         });
 
+        app.MapPost("/api/prefs/databases/export-file", (HttpContext ctx) =>
+            ExportFile(ctx, downloadsDirectory));
+
         return app;
+    }
+
+    internal static IResult ExportFile(
+        HttpContext ctx,
+        OperatorDownloadsDirectory downloadsDirectory)
+    {
+        if (LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
+                ctx, "export the Zeus settings database") is { } rejected)
+            return rejected;
+        if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
+                ctx, "export the Zeus settings database") is { } hostRejected)
+            return hostRejected;
+        try
+        {
+            var bytes = UnifiedDatabaseBackup.BuildContainer();
+            var saved = downloadsDirectory.SaveBackup(bytes);
+            return Results.Ok(new
+            {
+                path = saved.Path,
+                fileName = saved.FileName,
+                directory = saved.Directory,
+                sizeBytes = saved.SizeBytes,
+            });
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
 
     private static PrefsDatabasesDto CanonicalDatabaseDto()
