@@ -84,6 +84,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<PaSettingsStore>();
         services.AddSingleton<FilterPresetStore>();
         services.AddSingleton<PreferredRadioStore>();
+        services.AddSingleton<SMeterCalibrationStore>();
         services.AddSingleton(sp => new PsSettingsStore(
             sp.GetRequiredService<ILogger<PsSettingsStore>>(),
             PrefsDbPath.EngineGet()));
@@ -123,6 +124,7 @@ public static class StationEngineHostingExtensions
         // and a standalone engine on the same machine, with no migration.
         services.AddSingleton<ThemeSettingsStore>();
         services.AddSingleton<DisplaySettingsStore>();
+        services.AddSingleton<OperatorSettingsStore>();
         services.AddSingleton<ToolbarSettingsStore>();
         services.AddSingleton<NrUiPrefsStore>();
         services.AddSingleton<BottomPinStore>();
@@ -142,6 +144,12 @@ public static class StationEngineHostingExtensions
         // the ack stamp above so wizard completion follows the operator
         // between hosts on the same machine (and rides database backups).
         services.AddSingleton<OnboardingStateStore>();
+        // Active contest staging belongs to the API origin used by the SPA.
+        // In Zeus Link that is the standalone engine, so keep it in the
+        // engine-owned preferences database and persist each QSO separately.
+        services.AddSingleton(sp => new ContestLogStore(
+            sp.GetRequiredService<ILogger<ContestLogStore>>(),
+            PrefsDbPath.EngineGet()));
 
         services.AddSingleton<TxIqRing>();
         services.AddSingleton<ITxIqSource>(sp => sp.GetRequiredService<TxIqRing>());

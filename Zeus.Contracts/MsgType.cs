@@ -149,6 +149,14 @@ public enum MsgType : byte
     // noise powers. NaN fields / zero confidence mean unavailable.
     RxSignalQuality = 0x3F,
 
+    // Server → client (VFO state edge). Broadcast whenever a receiver's dial
+    // (VfoHz) or display centre (RadioLoHz) moves, from any source — front
+    // panel, CAT/TCI, band button, typed entry, web UI. Lets the frontend
+    // track a HARDWARE tune immediately instead of waiting for the 1 Hz state
+    // poll (dial) and the display-frame echo (pan). See VfoStateFrame.cs.
+    // Payload: [type:1][receiver:u8][vfoHz:i64 LE][radioLoHz:i64 LE] = 18 bytes.
+    VfoState = 0x26,
+
     // 0x1A — reserved (previously VstHostEvent on the drifted plugin-host
     // branch). Left as a gap rather than reassigned to avoid colliding with
     // any zeus-web build that hasn't been refreshed yet.

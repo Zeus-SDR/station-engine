@@ -88,6 +88,23 @@ public static class TxControlEndpoints
             return Results.Ok(new { micGainDb = snap.MicGainDb });
         });
 
+        endpoints.MapGet("/api/tx/am-profile", (RadioService r) =>
+            Results.Ok(r.GetAmTxProfile()));
+
+        endpoints.MapPost("/api/tx/am-profile", (AmTxProfileSetRequest req, RadioService r) =>
+        {
+            if (req.AmTxProfile is null)
+                return Results.BadRequest(new { error = "amTxProfile required" });
+            r.SetAmTxProfile(req.AmTxProfile);
+            return Results.Ok(r.Snapshot());
+        });
+
+        endpoints.MapPost("/api/tx/am-profile/capture-current", (RadioService r) =>
+        {
+            r.CaptureCurrentAmTxProfile();
+            return Results.Ok(r.Snapshot());
+        });
+
         // Leveler max-gain ceiling in dB. Operator band is 0..20 dB (Thetis parity,
         // setup.designer.cs): 0 disables the headroom entirely (unity-cap Leveler);
         // Thetis's stock default is 15 (radio.cs:2979). Anything outside is a

@@ -241,7 +241,7 @@ public static class RadioTuningEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
-        // Toggle full-duplex multi-RX audio ("DUP"). See
+        // Toggle full-duplex RX audio ("DUP"). See
         // StateDto.FullDuplexMultiRxEnabled for what this gates.
         endpoints.MapPost("/api/radio/full-duplex-multi-rx", (FullDuplexMultiRxSetRequest req, RadioService r) =>
         {

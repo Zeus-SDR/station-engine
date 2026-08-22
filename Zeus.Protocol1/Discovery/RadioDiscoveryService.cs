@@ -55,8 +55,8 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
     private const int HpsdrPort = 1024;
     private const int DiscoveryPacketLength = 63;
     private const int ReceiveBufferSize = 2048;
-    private const int MacOsSendAttempts = 3;
-    private static readonly TimeSpan SendGap = TimeSpan.FromMilliseconds(50);
+    internal const int SendAttempts = 3;
+    internal static readonly TimeSpan SendGap = TimeSpan.FromMilliseconds(50);
 
     private readonly ILogger<RadioDiscoveryService> _log;
 
@@ -113,7 +113,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         ReadOnlyMemory<byte> packet,
         CancellationToken ct)
     {
-        for (var attempt = 0; attempt < MacOsSendAttempts; attempt++)
+        for (var attempt = 0; attempt < SendAttempts; attempt++)
         {
             foreach (var socket in sockets)
             {
@@ -132,7 +132,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                 }
             }
 
-            if (attempt < MacOsSendAttempts - 1)
+            if (attempt < SendAttempts - 1)
             {
                 try
                 {
@@ -341,7 +341,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         return new IPAddress(bcastBytes);
     }
 
-    private static byte[] BuildDiscoveryPacket()
+    internal static byte[] BuildDiscoveryPacket()
     {
         var buf = new byte[DiscoveryPacketLength];
         buf[0] = 0xEF;

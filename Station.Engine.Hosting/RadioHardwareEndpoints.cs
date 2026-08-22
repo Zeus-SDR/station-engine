@@ -202,24 +202,28 @@ public static class RadioHardwareEndpoints
         // would deadlock with the RadioService recompute subscription fired on Save.
         // The GET uses the effective board's defaults to fill missing rows so the
         // panel opens with model-appropriate seeds on first load. Optional
-        // ?board= override lets the radio-selector preview defaults for a board
-        // other than the effective one without persisting the preference — the
-        // operator's saved per-band calibration still wins over the preview.
-        endpoints.MapGet("/api/pa-settings", (string? board, PaSettingsStore store, RadioService radio) =>
+        // ?board= and ?variant= overrides let the radio-selector preview
+        // defaults without persisting the preference — the operator's saved
+        // per-band calibration still wins over the preview.
+        endpoints.MapGet("/api/pa-settings", (string? board, string? variant, PaSettingsStore store, RadioService radio) =>
         {
             var preview = ParseBoardKind(board);
             var effective = preview ?? radio.EffectiveBoardKind;
-            return Results.Ok(store.GetAll(effective));
+            var effectiveVariant = ParseOrionMkIIVariant(variant)
+                ?? radio.EffectiveOrionMkIIVariant;
+            return Results.Ok(store.GetAll(effective, effectiveVariant));
         });
 
         // Pure board defaults — "Reset to defaults" button in the PA panel. Skips
         // the pa_bands collection entirely and returns piHPSDR/Thetis seed values
         // for the requested board (or the effective board if none specified).
-        endpoints.MapGet("/api/pa-settings/defaults", (string? board, PaSettingsStore store, RadioService radio) =>
+        endpoints.MapGet("/api/pa-settings/defaults", (string? board, string? variant, PaSettingsStore store, RadioService radio) =>
         {
             var preview = ParseBoardKind(board);
             var target = preview ?? radio.EffectiveBoardKind;
-            return Results.Ok(store.GetDefaults(target));
+            var targetVariant = ParseOrionMkIIVariant(variant)
+                ?? radio.EffectiveOrionMkIIVariant;
+            return Results.Ok(store.GetDefaults(target, targetVariant));
         });
 
         endpoints.MapPut("/api/pa-settings", (PaSettingsSetRequest req, PaSettingsStore store, RadioService radio) =>
@@ -229,7 +233,9 @@ public static class RadioHardwareEndpoints
             if (req.Global.PaMaxPowerWatts < 0)
                 return Results.BadRequest(new { error = "paMaxPowerWatts must be >= 0" });
             store.Save(new PaSettingsDto(req.Global, req.Bands));
-            return Results.Ok(store.GetAll(radio.EffectiveBoardKind));
+            return Results.Ok(store.GetAll(
+                radio.EffectiveBoardKind,
+                radio.EffectiveOrionMkIIVariant));
         });
 
         return endpoints;
@@ -241,8 +247,18 @@ public static class RadioHardwareEndpoints
         if (string.IsNullOrWhiteSpace(raw)) return null;
         if (string.Equals(raw, "Auto", StringComparison.OrdinalIgnoreCase)) return null;
         return Enum.TryParse<HpsdrBoardKind>(raw, ignoreCase: true, out var kind)
-            ? kind
-            : null;
+            && Enum.IsDefined(kind)
+                ? kind
+                : null;
+    }
+
+    private static OrionMkIIVariant? ParseOrionMkIIVariant(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        return Enum.TryParse<OrionMkIIVariant>(raw, ignoreCase: true, out var variant)
+            && Enum.IsDefined(variant)
+                ? variant
+                : null;
     }
 
     // The aux-input strings the connected board's Alex / filter board exposes

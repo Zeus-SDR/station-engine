@@ -27,6 +27,12 @@ internal sealed class GatedWebSocketAudioSink : IRxAudioSink
 
     public void Publish(in AudioFrame frame)
     {
+        // Count before the demand gate, mirroring WebSocketAudioSink's
+        // pre-mute placement: rx.audio.broadcast frames/s reports what the
+        // DSP produced for the websocket lane, so a desktop-mode log does
+        // not read frames/s=0 while the gated stream is actively serving a
+        // requester.
+        _hub.RecordRxAudioFrame();
         if (!_hub.AudioStreamRequested) return;
         _hub.Broadcast(in frame);
     }

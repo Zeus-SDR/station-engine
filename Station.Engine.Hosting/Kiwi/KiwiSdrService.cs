@@ -296,8 +296,14 @@ public sealed class KiwiSdrService : BackgroundService,
             radio.Disconnected += onDisconnect;
             radio.P2Disconnected += onDisconnect;
             radio.StateChanged += onState;
-            lock (_sync) { _radioConnected = radio.IsConnected; }
-            ApplySquelchConfig(radio.Snapshot().Squelch);
+            // Read the radio's state BEFORE taking _sync: RadioService.Snapshot()
+            // calls back into GetReceiver() under ITS lock, so touching the radio
+            // while holding _sync is a lock-order inversion (ABBA deadlock,
+            // wedged the linux-x64 CI leg for a day and can wedge engine start).
+            bool radioConnected = radio.IsConnected;
+            var squelch = radio.Snapshot().Squelch;
+            lock (_sync) { _radioConnected = radioConnected; }
+            ApplySquelchConfig(squelch);
         }
         else
         {

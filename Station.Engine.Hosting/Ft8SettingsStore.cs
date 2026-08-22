@@ -208,7 +208,7 @@ public sealed class Ft8SettingsEntry
     public bool AutoCq { get; set; }
     public int DefaultTxSlot { get; set; }
     public int DefaultTxOffsetHz { get; set; } = 1500;
-    public bool Rr73InsteadOfRrr { get; set; }
+    public bool Rr73InsteadOfRrr { get; set; } = true;
     public bool SkipGrid { get; set; }
     public int CallerMaxRetries { get; set; }
     public string? CqMessage { get; set; } = "CQ";

@@ -134,10 +134,10 @@ internal static class BoardCapabilitiesTable
         HasSteppedAttenuationRx2: false, // single-RX: RX2 doesn't exist
         SupportsPathIllustrator: true,
         MaxPowerWatts: 10,
-        // Hermes-class boards carry the Alex/filter RX-antenna relays (C3[7:5])
-        // and the full EXT1/EXT2/XVTR/BYPASS aux set — antenna slice (#804). No
-        // TX-antenna relay (P1, ANT1-hardwired on transmit); single RX → no RX2
-        // antenna path.
+        // Hermes-class boards carry the Alex TX-antenna relays (C4[1:0]), RX-
+        // antenna relays (C3[7:5]), and the full EXT1/EXT2/XVTR/BYPASS aux set —
+        // antenna slice (#804). Single RX → no RX2 antenna path.
+        HasTxAntennaRelays: true,
         HasRxAntennaRelays: true,
         RxAuxInputs: RxAuxInputs.All,
         // Hermes-class codec board: radio mic jack selectable. No line-in / XLR
@@ -157,6 +157,7 @@ internal static class BoardCapabilitiesTable
         HasSteppedAttenuationRx2: false,
         SupportsPathIllustrator: true,
         MaxPowerWatts: 30,
+        HasTxAntennaRelays: true,
         HasRxAntennaRelays: true,
         RxAuxInputs: RxAuxInputs.All,
         // ANAN-10E (HermesII): codec + analog line-in jack (issue #667 fix is

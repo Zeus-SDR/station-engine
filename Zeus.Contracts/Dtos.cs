@@ -957,6 +957,19 @@ public sealed record TxPhaseRotatorAsymmetry(
     double CurrentCornerHz,
     double AutoStep);
 
+/// <summary>Dedicated AM/SAM transmit chain selected automatically by the DSP
+/// pipeline without overwriting the ordinary voice-mode settings.</summary>
+public sealed record AmTxProfile
+{
+    public int CarrierLevelPercent { get; init; } = 100;
+    public int MicGainDb { get; init; }
+    public double LevelerMaxGainDb { get; init; } = 8.0;
+    public TxLevelingConfig TxLeveling { get; init; } = new();
+    public CfcConfig Cfc { get; init; } = CfcConfig.Default;
+    public TxPhaseRotatorConfig TxPhaseRotator { get; init; } = new();
+    public int TxFilterHighHz { get; init; } = 4000;
+}
+
 // A notch filter (MNF) — a band the operator paints, or Signal Intelligence
 // auto-detects, to remove EMF/birdies from the RX audio via WDSP's notch
 // database (nbp.c). CenterHz/WidthHz are ABSOLUTE RF in Hz (WDSP repositions
@@ -1493,7 +1506,10 @@ public sealed record StateDto(
     // RX1's per-receiver split projection. RX2+ carry the same fields directly
     // on ReceiverDto. Session-only: a process always starts in simplex.
     bool SplitEnabled = false,
-    long SplitTxHz = 0);
+    long SplitTxHz = 0,
+
+    // Null from an older state producer resolves to the safe AM defaults.
+    AmTxProfile? AmTxProfile = null);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both
@@ -1657,9 +1673,11 @@ public sealed record KiwiConfigDto(
 /// <see cref="CwTuneOffsetHz"/>, <see cref="DigiTuneOffsetHz"/>) decide what a
 /// click does.</para>
 /// <para><see cref="Bands"/> holds band keys (e.g. "20m"); empty means "all
-/// bands". <see cref="Modes"/> holds mode-group keys (CW / PHONE / DIGITAL /
-/// FM / AM); empty means "all modes". These are intentionally string lists so
-/// new bands/modes don't need a wire-format change.</para></summary>
+/// bands". <see cref="Modes"/> holds mode-group keys (CW / PHONE / LSB / USB /
+/// DIGITAL / FM / AM); empty means "all modes". PHONE is the broad voice
+/// filter and also matches LSB and USB, while LSB and USB narrow to one
+/// sideband. These are intentionally string lists so new bands/modes don't
+/// need a wire-format change.</para></summary>
 public sealed record SpotsSettings(
     bool Enabled = true,
     bool PotaEnabled = true,
@@ -2112,6 +2130,8 @@ public enum CwKeyerMode : byte
 
 public sealed record MicGainSetRequest(int Db);
 
+public sealed record AmTxProfileSetRequest(AmTxProfile AmTxProfile);
+
 // Leveler max-gain ceiling in dB. Server clamps to [0, 20]; outside that is
 // 400. Frontend POSTs this whenever the slider moves and on WS reconnect so
 // the operator's preferred ceiling is re-applied after a server restart
@@ -2556,7 +2576,15 @@ public sealed record DisplaySettingsDto(
     // deterministic wideband signal detector alongside the spectrum analyzer
     // and the overlay is available to display clients. Default off — this is
     // an opt-in operator aid layered on the wideband display.
-    bool WidebandSignalMarkersEnabled = false);
+    bool WidebandSignalMarkersEnabled = false,
+    string? WaterfallColormap = null,
+    double? WaterfallScrollSpeed = null,
+    bool? BandOverlayEnabled = null,
+    bool? BandEdgeAlertEnabled = null,
+    bool? ChatRosterOverlayEnabled = null,
+    int? SpotLabelFontPx = null,
+    string? GlobeRenderer = null,
+    string? GlobeCustomImageryJson = null);
 
 public sealed record DisplaySettingsSetRequest(
     string Mode,
@@ -2578,7 +2606,15 @@ public sealed record DisplaySettingsSetRequest(
     double? DisplayMaxFrameRateHz = null,
     int? DisplayDecimation = null,
     int? WaterfallUpdatePeriod = null,
-    bool? WidebandSignalMarkersEnabled = null);
+    bool? WidebandSignalMarkersEnabled = null,
+    string? WaterfallColormap = null,
+    double? WaterfallScrollSpeed = null,
+    bool? BandOverlayEnabled = null,
+    bool? BandEdgeAlertEnabled = null,
+    bool? ChatRosterOverlayEnabled = null,
+    int? SpotLabelFontPx = null,
+    string? GlobeRenderer = null,
+    string? GlobeCustomImageryJson = null);
 
 // One detected wideband signal, as reported by the engine's deterministic
 // wideband signal detector. Frequencies are absolute Hz in the wideband ADC

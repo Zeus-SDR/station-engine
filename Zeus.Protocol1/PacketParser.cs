@@ -44,6 +44,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using Zeus.Contracts;
 
 namespace Zeus.Protocol1;
 
@@ -62,9 +63,9 @@ namespace Zeus.Protocol1;
 public readonly record struct TelemetryReading(byte C0Address, ushort Ain0, ushort Ain1);
 
 /// <summary>
-/// Per-packet ADC overload flags extracted from the echoed C&amp;C word
-/// (C1[0] = ADC0, C2[0] = ADC1). OR-accumulated across both USB frames of
-/// one EP6 packet so a single set frame is enough to report overload.
+/// Per-packet ADC overload flags extracted from the address-dependent echoed
+/// C&amp;C word. OR-accumulated across both USB frames of one EP6 packet so a
+/// single set frame is enough to report overload.
 /// </summary>
 public readonly record struct AdcOverloadStatus(bool Adc0, bool Adc1)
 {
@@ -120,22 +121,18 @@ internal static class PacketParser
     }
 
     /// <summary>
-    /// Extract the CW key-down state from a parsed EP6 packet — C0[2] of each
-    /// USB frame OR'd together. This is the gateware's *shaped keyer output*
-    /// (HL2 response slot: <c>{3'b000, resp_addr[1:0], cw_key_status, 1'b0,
-    /// ptt_resp}</c>, so <c>cw_key_status = C0[2]</c>), which toggles per
-    /// dit/dah — NOT the level-held <c>ptt_resp</c> at C0[0] that
-    /// <see cref="ExtractHardwarePtt"/> reads. Used to drive the local CW
-    /// sidetone so it follows individual elements instead of staying on for
-    /// the whole keyed period + hang time. HL2 protocol doc: "C0[2] follows
-    /// the signal at the tip, and a shaped CW signal is generated." (zeus-cl2)
+    /// Extract the CW key-down state from a parsed EP6 packet. Hermes-Lite 2
+    /// reports its shaped keyer output in C0[2]. Legacy Hermes-class boards
+    /// instead report raw dot and dash inputs in C0[2] and C0[1], respectively,
+    /// so either input means key down on those boards.
     /// </summary>
-    public static bool ExtractCwKeyDown(ReadOnlySpan<byte> packet)
+    public static bool ExtractCwKeyDown(ReadOnlySpan<byte> packet, HpsdrBoardKind board)
     {
         if (packet.Length < PacketLength) return false;
         byte c0Frame0 = packet[MetisHeaderLength + 3];
         byte c0Frame1 = packet[MetisHeaderLength + UsbFrameLength + 3];
-        return ((c0Frame0 | c0Frame1) & 0x04) != 0;
+        byte keyMask = board == HpsdrBoardKind.HermesLite2 ? (byte)0x04 : (byte)0x06;
+        return ((c0Frame0 | c0Frame1) & keyMask) != 0;
     }
 
     /// <summary>
@@ -154,6 +151,14 @@ internal static class PacketParser
     /// Scale a signed int24 sample to a double in [-1.0, +1.0].
     /// </summary>
     public static double ScaleInt24(int sample) => sample * Int24Scale;
+
+    private static byte DecodeAdcOverloadBits(int responseAddress, ReadOnlySpan<byte> usb) =>
+        responseAddress switch
+        {
+            0 => (byte)(usb[4] & 0x01),
+            4 => (byte)((usb[4] & 0x01) | ((usb[5] & 0x01) << 1)),
+            _ => 0,
+        };
 
     /// <summary>
     /// Parse an EP6 RX IQ packet.
@@ -269,8 +274,7 @@ internal static class PacketParser
                 else telemetry1 = reading;
             }
 
-            adcOverloadBits |= (byte)(usb[4] & 0x01);        // C1[0] → bit 0 (ADC0)
-            adcOverloadBits |= (byte)((usb[5] & 0x01) << 1); // C2[0] → bit 1 (ADC1)
+            adcOverloadBits |= DecodeAdcOverloadBits(addr, usb);
 
             ReadOnlySpan<byte> payload = usb[UsbHeaderLength..];
             for (int g = 0; g < ComplexSamplesPerUsbFrame; g++)
@@ -431,8 +435,7 @@ internal static class PacketParser
                 if (frame == 0) telemetry0 = reading;
                 else telemetry1 = reading;
             }
-            adcOverloadBits |= (byte)(usb[4] & 0x01);
-            adcOverloadBits |= (byte)((usb[5] & 0x01) << 1);
+            adcOverloadBits |= DecodeAdcOverloadBits(addr, usb);
 
             ReadOnlySpan<byte> payload = usb[UsbHeaderLength..];
             for (int g = 0; g < Hl2Ps4DdcSamplesPerUsbFrame; g++)
@@ -581,8 +584,7 @@ internal static class PacketParser
                 if (frame == 0) telemetry0 = reading;
                 else telemetry1 = reading;
             }
-            adcOverloadBits |= (byte)(usb[4] & 0x01);
-            adcOverloadBits |= (byte)((usb[5] & 0x01) << 1);
+            adcOverloadBits |= DecodeAdcOverloadBits(addr, usb);
 
             ReadOnlySpan<byte> payload = usb[UsbHeaderLength..];
             for (int g = 0; g < TwoDdcSamplesPerUsbFrame; g++)

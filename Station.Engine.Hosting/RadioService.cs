@@ -614,6 +614,8 @@ public sealed class RadioService : IDisposable
         // in later. Reverse stays an explicit operator polarity choice.
         var persistedTxPhaseRotator = NormalizeTxPhaseRotator(
             _dspSettingsStore.GetTxPhaseRotator() ?? new TxPhaseRotatorConfig());
+        var persistedAmTxProfile = NormalizeAmTxProfile(
+            _dspSettingsStore.GetAmTxProfile() ?? new AmTxProfile());
         // SSB bandpass "rectangularity" (issue #871). Null on a fresh install
         // falls back to BandpassWindow.Normal, which resolves to the WDSP
         // open-time tap count (nc = max(2048, dsp_size)), so first-connect audio
@@ -851,15 +853,14 @@ public sealed class RadioService : IDisposable
             TxMoxTailDelayMs: Volatile.Read(ref _txMoxTailDelayMs),
             TxPostTxRxMuteDelayMs: Volatile.Read(ref _txPostTxRxMuteDelayMs),
             TxTimeoutSec: Volatile.Read(ref _txTimeoutSec),
-            // Hardware NCO — persisted in RadioStateStore so a restart resumes
-            // on the same physical centre. RadioLoHz snaps to VfoHz on legacy
-            // rows (RadioLoHz==0 — e.g. rows written by the old CTUN-off
-            // branch) so the panadapter centre is never zero on a fresh
-            // hydration. CTUN behaviour (frozen NCO, dial roams) is now
-            // unconditional — see docs/prd/panfall_behavior.md.
-            RadioLoHz: (rsSnap?.RadioLoHz ?? 0L) != 0L
-                ? rsSnap!.RadioLoHz
-                : (rsSnap?.VfoHz ?? 14_200_000),
+            // Preserve a persisted frozen NCO only when CTUN is enabled.
+            // CTUN-off always starts with the radio following the dial, even
+            // when an earlier ruler pan persisted an offset RadioLoHz.
+            RadioLoHz: (rsSnap?.CtunEnabled ?? false) && rsSnap.RadioLoHz != 0L
+                ? rsSnap.RadioLoHz
+                : CwOffset.EffectiveLoHz(
+                    rsSnap?.Mode ?? RxMode.USB,
+                    rsSnap?.VfoHz ?? 14_200_000),
             Rx2Enabled: rsSnap?.Rx2Enabled ?? false,
             Rx2AudioMode: rsSnap?.Rx2AudioMode ?? Zeus.Contracts.Rx2AudioMode.Both,
             TxVfo: rsSnap?.TxVfo ?? TxVfo.A,
@@ -872,7 +873,11 @@ public sealed class RadioService : IDisposable
             SplitTxHz: 0);
         _currentMode = (int)_state.Mode;
 
-        _state = _state with { TxPhaseRotator = persistedTxPhaseRotator };
+        _state = _state with
+        {
+            TxPhaseRotator = persistedTxPhaseRotator,
+            AmTxProfile = persistedAmTxProfile,
+        };
 
         // Seed the canonical Receivers[] so RX2's hydrated tuning is the live
         // source of truth from the very first snapshot. RX1 (index 0) is rebuilt
@@ -1509,6 +1514,17 @@ public sealed class RadioService : IDisposable
             // Board-gated effects only: on non-PS P1 boards this stores a
             // state-tracking flag with zero wire impact.
             client.SetPsEnabled(false);
+            // Angelia and the other legacy P1 gateware reset internal_CW off
+            // and only latch it from C&C address 0x0F. Seed both CW registers
+            // before StartAsync so a cold connection in CW mode does not
+            // depend on another client having primed the radio first.
+            var connectCwState = Snapshot();
+            client.SetCwKeyerConfig(
+                Volatile.Read(ref _cwKeyerWpm),
+                (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
+                Volatile.Read(ref _cwWeight),
+                Volatile.Read(ref _cwPaddleReverse) != 0);
+            client.SetCwKeyerEnabled(IsCwMode(RadioFrequencyResolver.TxMode(connectCwState)));
             int restoredHz = ResolveConnectSampleRateHz(client.BoardKind, hpsdrRate.SampleRateHz(), protocol2: false);
             if (restoredHz != hpsdrRate.SampleRateHz())
             {
@@ -1580,15 +1596,6 @@ public sealed class RadioService : IDisposable
             // compelling reason to ship bare HL2 without N2ADR emerges.
             if (ConnectedBoardKind == HpsdrBoardKind.HermesLite2)
                 client.SetHasN2adr(true);
-            // Push the persisted CW keyer config into the fresh client so the
-            // on-board iambic keyer matches the operator's panel before the
-            // first key-down. Default mode straight makes this a no-op until
-            // iambic is opted into. See zeus-bks.
-            client.SetCwKeyerConfig(
-                Volatile.Read(ref _cwKeyerWpm),
-                (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
-                Volatile.Read(ref _cwWeight),
-                Volatile.Read(ref _cwPaddleReverse) != 0);
             // Replay PA settings into the fresh client — drive byte, OC masks,
             // and (for P2 downstream) PA-enable. Without this the client sits
             // at the protocol defaults (drive=0, OC=0) until something else
@@ -2111,11 +2118,13 @@ public sealed class RadioService : IDisposable
                 ? next with { TxReceiverIndex = 0, TxVfo = TxVfo.A }
                 : next;
         });
-        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+        var snap = Snapshot();
+        PushCwKeyerEnabledToP1(snap);
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
         {
             RecomputePaAndPush();
         }
-        return Snapshot();
+        return snap;
     }
 
     public StateDto SetTxVfo(TxVfo txVfo)
@@ -2154,6 +2163,7 @@ public sealed class RadioService : IDisposable
                 };
         });
         var snap = Snapshot();
+        PushCwKeyerEnabledToP1(snap);
         if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
         {
             RecomputePaAndPush();
@@ -2761,10 +2771,10 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
-    /// <summary>Enable or disable full-duplex multi-RX audio ("DUP" on the
+    /// <summary>Enable or disable full-duplex RX audio ("DUP" on the
     /// transport bar). Pure software gate — DspPipelineService reads it each
-    /// tick to decide whether MOX excludes only the TX-selected receiver from
-    /// the RX audio mix (true) or every receiver as before (false, default).
+    /// tick to decide whether every unmuted receiver remains in the audio mix
+    /// through MOX (true) or every receiver is muted (false, default).
     /// No hardware effect. Persisted via FlushState.</summary>
     public StateDto SetFullDuplexMultiRxEnabled(bool enabled)
     {
@@ -3040,6 +3050,12 @@ public sealed class RadioService : IDisposable
 
             var txFam = TxFamilyFilterFor(mode);
             var (txLo, txHi) = SignedFilterForMode(mode, txFam.LoAbs, txFam.HiAbs);
+            if (mode is RxMode.AM or RxMode.SAM)
+            {
+                int amHigh = NormalizeAmTxProfile(s.AmTxProfile).TxFilterHighHz;
+                txLo = -amHigh;
+                txHi = amHigh;
+            }
 
             // RX2 is untouched on an RX1 mode change — ProjectReceivers carries
             // Receivers[1] forward (nextVfoB == rx2.VfoHz here).
@@ -3069,12 +3085,78 @@ public sealed class RadioService : IDisposable
             // Entering/leaving CW toggles the P2 internal keyer (TxSpecific
             // byte-5 CW-select). Re-push so a paddle keys the radio the moment
             // the operator is in CW, and the bit clears on the way back to
-            // SSB/AM/FM. P1's keyer is mode-agnostic (always-on in CW via the
-            // 0x0B rotation) so this is a no-op there. Issue #1032.
+            // SSB/AM/FM. Issue #1032.
             PushCwToP2();
         }
+        PushCwKeyerEnabledToP1();
 
         return Snapshot();
+    }
+
+    public AmTxProfile GetAmTxProfile() =>
+        Snapshot().AmTxProfile ?? new AmTxProfile();
+
+    public StateDto SetAmTxProfile(AmTxProfile profile)
+    {
+        var clean = NormalizeAmTxProfile(profile);
+        _dspSettingsStore.SetAmTxProfile(clean);
+        Mutate(s =>
+        {
+            if (RadioFrequencyResolver.TxReceiver(s).Mode is RxMode.AM or RxMode.SAM)
+            {
+                return s with
+                {
+                    AmTxProfile = clean,
+                    TxFilterLowHz = -clean.TxFilterHighHz,
+                    TxFilterHighHz = clean.TxFilterHighHz,
+                };
+            }
+            return s with { AmTxProfile = clean };
+        });
+        return Snapshot();
+    }
+
+    public StateDto CaptureCurrentAmTxProfile()
+    {
+        var s = Snapshot();
+        var captured = NormalizeAmTxProfile(new AmTxProfile
+        {
+            CarrierLevelPercent = s.AmTxProfile?.CarrierLevelPercent ?? 100,
+            MicGainDb = s.MicGainDb,
+            LevelerMaxGainDb = s.LevelerMaxGainDb,
+            TxLeveling = s.TxLeveling ?? new TxLevelingConfig(),
+            Cfc = s.Cfc ?? CfcConfig.Default,
+            TxPhaseRotator = s.TxPhaseRotator ?? new TxPhaseRotatorConfig(),
+            TxFilterHighHz = Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz)),
+        });
+        return SetAmTxProfile(captured);
+    }
+
+    internal static AmTxProfile NormalizeAmTxProfile(AmTxProfile? profile)
+    {
+        profile ??= new AmTxProfile();
+        double leveler = double.IsFinite(profile.LevelerMaxGainDb)
+            ? Math.Clamp(profile.LevelerMaxGainDb, 0.0, 20.0)
+            : 8.0;
+        var leveling = profile.TxLeveling ?? new TxLevelingConfig();
+        leveling = leveling with
+        {
+            AlcMaxGainDb = double.IsFinite(leveling.AlcMaxGainDb) ? Math.Clamp(leveling.AlcMaxGainDb, 0.0, 120.0) : 3.0,
+            AlcDecayMs = Math.Clamp(leveling.AlcDecayMs, 1, 50),
+            LevelerDecayMs = Math.Clamp(leveling.LevelerDecayMs, 1, 5000),
+            CompressorGainDb = double.IsFinite(leveling.CompressorGainDb) ? Math.Clamp(leveling.CompressorGainDb, 0.0, 20.0) : 0.0,
+        };
+        var cfc = profile.Cfc is { Bands.Length: 10 } ? profile.Cfc : CfcConfig.Default;
+        return profile with
+        {
+            CarrierLevelPercent = Math.Clamp(profile.CarrierLevelPercent, 0, 125),
+            MicGainDb = Math.Clamp(profile.MicGainDb, -40, 10),
+            LevelerMaxGainDb = leveler,
+            TxLeveling = leveling,
+            Cfc = cfc,
+            TxPhaseRotator = NormalizeTxPhaseRotator(profile.TxPhaseRotator ?? new TxPhaseRotatorConfig()),
+            TxFilterHighHz = Math.Clamp(Math.Abs(profile.TxFilterHighHz), MinFilterWidthHz, MaxFilterEdgeHz),
+        };
     }
 
     public StateDto SetFilter(int lowHz, int highHz, string? presetName = null)
@@ -3182,13 +3264,34 @@ public sealed class RadioService : IDisposable
     {
         if (highHz < lowHz) (lowHz, highHz) = (highHz, lowHz);
         (lowHz, highHz) = ClampMinFilterWidth(lowHz, highHz);
+        AmTxProfile? updatedAmProfile = null;
         Mutate(s =>
         {
             int loAbs = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
             int hiAbs = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
+            var txMode = RadioFrequencyResolver.TxReceiver(s).Mode;
+            if (txMode is RxMode.AM or RxMode.SAM)
+            {
+                // AM/SAM always use the dedicated symmetric profile. Route the
+                // ordinary TX-filter endpoint here too so every UI/CAT writer
+                // edits the value that is actually on air instead of a hidden
+                // global field that the AM overlay ignores.
+                updatedAmProfile = NormalizeAmTxProfile(s.AmTxProfile) with
+                {
+                    TxFilterHighHz = Math.Clamp(hiAbs, MinFilterWidthHz, MaxFilterEdgeHz),
+                };
+                return s with
+                {
+                    AmTxProfile = updatedAmProfile,
+                    TxFilterLowHz = -updatedAmProfile.TxFilterHighHz,
+                    TxFilterHighHz = updatedAmProfile.TxFilterHighHz,
+                };
+            }
             StoreTxFamilyFilter(s.Mode, loAbs, hiAbs);
             return s with { TxFilterLowHz = lowHz, TxFilterHighHz = highHz };
         });
+        if (updatedAmProfile is not null)
+            _dspSettingsStore.SetAmTxProfile(updatedAmProfile);
         FlushState();
         return Snapshot();
     }
@@ -4410,7 +4513,17 @@ public sealed class RadioService : IDisposable
         Volatile.Write(ref _cwWeight, weight);
         Volatile.Write(ref _cwPaddleReverse, paddleReverse ? 1 : 0);
         ActiveClient?.SetCwKeyerConfig(wpm, mode, weight, paddleReverse);
+        PushCwKeyerEnabledToP1();
         PushCwToP2();
+    }
+
+    private static bool IsCwMode(RxMode mode) => mode is RxMode.CWU or RxMode.CWL;
+
+    private void PushCwKeyerEnabledToP1(StateDto? state = null)
+    {
+        var effectiveState = state ?? Snapshot();
+        ActiveClient?.SetCwKeyerEnabled(
+            IsCwMode(RadioFrequencyResolver.TxMode(effectiveState)));
     }
 
     // 1 while a host-driven CW source (CwEngine / MoxSource.Cwx — keyboard,

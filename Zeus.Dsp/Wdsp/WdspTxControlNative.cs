@@ -5,6 +5,7 @@ namespace Zeus.Dsp.Wdsp;
 internal interface IWdspTxControlNative
 {
     void SetTXAMode(int channel, int mode);
+    void SetTXAAMCarrierLevel(int channel, double carrierLevel);
     void SetTXACompressorRun(int channel, int run);
     void SetTXACFCOMPRun(int channel, int run);
     void SetTXACFCOMPprofile(int channel, int nfreqs, double[] f, double[] g, double[] e);
@@ -27,6 +28,9 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 {
     public void SetTXAMode(int channel, int mode) =>
         NativeMethods.SetTXAMode(channel, mode);
+
+    public void SetTXAAMCarrierLevel(int channel, double carrierLevel) =>
+        NativeMethods.SetTXAAMCarrierLevel(channel, carrierLevel);
 
     public void SetTXACompressorRun(int channel, int run) =>
         NativeMethods.SetTXACompressorRun(channel, run);

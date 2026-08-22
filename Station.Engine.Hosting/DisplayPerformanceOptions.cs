@@ -23,24 +23,85 @@ public readonly record struct DisplayHardwareProfile(
     Architecture ProcessArchitecture,
     Architecture OSArchitecture,
     int ProcessorCount,
-    bool IsLinuxOs)
+    bool IsLinuxOs,
+    string? DeviceTreeModel)
 {
-    public static DisplayHardwareProfile Current() => new(
-        RuntimeInformation.ProcessArchitecture,
-        RuntimeInformation.OSArchitecture,
-        Environment.ProcessorCount,
-        OperatingSystem.IsLinux());
+    private const string DeviceTreeModelPath = "/proc/device-tree/model";
 
-    // Pi-class means the boards the low-power profile targets (Pi 4/5, the
-    // G2's internal CM4/CM5) — all Linux. Small arm64 macOS/Windows hosts
-    // must NOT auto-degrade; they can still opt in with an explicit
-    // low-power profile. A Linux guest VM with few cores is indistinguishable
-    // from a Pi by these signals and is treated as one — ZEUS_DISPLAY_PROFILE
-    // =normal opts it back out.
-    public bool IsPiClass =>
+    private static readonly string[] KnownSbcModelMarkers =
+    [
+        "raspberry pi",
+        "radxa",
+        "rockchip",
+        "rk3588",
+        "rk356",
+        "orange pi",
+        "banana pi",
+        "odroid",
+        "khadas",
+        "pine64",
+        "allwinner",
+        "amlogic",
+        "libre computer",
+    ];
+
+    public static DisplayHardwareProfile Current()
+    {
+        var probe = new DisplayHardwareProfile(
+            RuntimeInformation.ProcessArchitecture,
+            RuntimeInformation.OSArchitecture,
+            Environment.ProcessorCount,
+            OperatingSystem.IsLinux(),
+            DeviceTreeModel: null);
+
+        return probe.IsLinuxArm64
+            ? probe with { DeviceTreeModel = ReadDeviceTreeModel() }
+            : probe;
+    }
+
+    // The single authority for "is this a Linux arm64 host" — the device-tree
+    // read gate, the Pi-class test, and the startup diagnostics log must never
+    // diverge on this predicate.
+    public bool IsLinuxArm64 =>
         IsLinuxOs &&
-        (ProcessArchitecture == Architecture.Arm64 || OSArchitecture == Architecture.Arm64) &&
-        ProcessorCount <= 4;
+        (ProcessArchitecture == Architecture.Arm64 || OSArchitecture == Architecture.Arm64);
+
+    // Pi-class means Linux arm64 boards targeted by the low-power profile.
+    // Core count catches Pi 4/5 and Pi CM4/CM5 systems; the device-tree model
+    // catches many-core SBC swaps such as the Radxa CM5 / RK3588 class that
+    // core count misses. Ampere/Graviton servers and VMs have no matching
+    // device-tree model. A Linux arm64 VM with <=4 vCPUs is still treated as a
+    // Pi, unchanged from today; ZEUS_DISPLAY_PROFILE=normal opts anything out.
+    public bool IsPiClass =>
+        IsLinuxArm64 &&
+        (ProcessorCount <= 4 || IsKnownSbcModel(DeviceTreeModel));
+
+    public static bool IsKnownSbcModel(string? model)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return false;
+
+        return KnownSbcModelMarkers.Any(marker =>
+            model.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? ReadDeviceTreeModel()
+    {
+        try
+        {
+            var model = SanitizeDeviceTreeModel(File.ReadAllText(DeviceTreeModelPath));
+            return model.Length == 0 ? null : model;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    // The device-tree model payload is NUL-terminated and may carry stray
+    // whitespace around the NUL; strip every NUL before trimming so the
+    // logged value is clean text.
+    public static string SanitizeDeviceTreeModel(string raw) =>
+        raw.Replace("\0", string.Empty).Trim();
 }
 
 public static class DisplayPerformanceOptions
@@ -68,6 +129,16 @@ public static class DisplayPerformanceOptions
         environment ??= Environment.GetEnvironmentVariable;
         var hw = hardware ?? DisplayHardwareProfile.Current();
 
+        // Force the WebGL waterfall/panadapter independently of frame rate. On a
+        // host whose WebKit build ships no functional WebGPU backend (the G2
+        // appliance's WebKitGTK), the frontend would otherwise attempt WebGPU at
+        // >= 30 fps, surface an "unavailable" notice, and fall back with degraded
+        // colouring. This lets the appliance run a clean 30 fps (LowPower=false)
+        // AND pin WebGL, instead of dropping below 30 just to get PreferWebgl.
+        var forceWebgl =
+            IsTruthy(environment("ZEUS_PREFER_WEBGL")) ||
+            IsTruthy(configuration?["Zeus:Display:PreferWebgl"]);
+
         if (TryParseFrameRate(environment("ZEUS_DISPLAY_MAX_FPS"), out var envFps) ||
             TryParseFrameRate(configuration?["Zeus:Display:MaxFps"], out envFps) ||
             TryParseFrameRate(configuration?["Zeus:Display:FrameRateHz"], out envFps))
@@ -76,7 +147,7 @@ public static class DisplayPerformanceOptions
                 Profile: Math.Abs(envFps - DefaultFrameRateHz) < 0.0001 ? "normal" : "custom",
                 MaxFrameRateHz: envFps,
                 LowPower: envFps < DefaultFrameRateHz,
-                PreferWebglWaterfall: envFps < DefaultFrameRateHz,
+                PreferWebglWaterfall: forceWebgl || envFps < DefaultFrameRateHz,
                 RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
                 PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
                 DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration));
@@ -112,7 +183,7 @@ public static class DisplayPerformanceOptions
             Profile: "normal",
             MaxFrameRateHz: DefaultFrameRateHz,
             LowPower: false,
-            PreferWebglWaterfall: false,
+            PreferWebglWaterfall: forceWebgl,
             RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
             PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
             DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration));

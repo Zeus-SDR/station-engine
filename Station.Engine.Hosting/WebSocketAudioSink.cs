@@ -30,6 +30,7 @@ internal sealed class WebSocketAudioSink : IRxAudioSink
 
     public void Publish(in AudioFrame frame)
     {
+        _hub.RecordRxAudioFrame();
         if (_muteState.IsMuted) return;
         _hub.Broadcast(in frame);
     }

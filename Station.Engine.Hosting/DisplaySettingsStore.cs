@@ -151,7 +151,15 @@ public sealed class DisplaySettingsStore : IDisposable
                     WidebandDisplayEnabled: false,
                     DisplayMaxFrameRateHz: _defaultDisplayMaxFrameRateHz,
                     DisplayDecimation: DisplayPerformanceOptions.DefaultDisplayDecimation,
-                    WaterfallUpdatePeriod: DisplayPerformanceOptions.DefaultWaterfallUpdatePeriod);
+                    WaterfallUpdatePeriod: DisplayPerformanceOptions.DefaultWaterfallUpdatePeriod,
+                    WaterfallColormap: null,
+                    WaterfallScrollSpeed: null,
+                    BandOverlayEnabled: null,
+                    BandEdgeAlertEnabled: null,
+                    ChatRosterOverlayEnabled: null,
+                    SpotLabelFontPx: null,
+                    GlobeRenderer: null,
+                    GlobeCustomImageryJson: null);
             }
             var hasTxWfRange = TryNormalizeTxWaterfallRange(
                 e.WfTxDbMin,
@@ -183,7 +191,15 @@ public sealed class DisplaySettingsStore : IDisposable
                     _defaultDisplayMaxFrameRateHz),
                 DisplayDecimation: DisplayPerformanceOptions.NormalizeDisplayDecimation(e.DisplayDecimation),
                 WaterfallUpdatePeriod: DisplayPerformanceOptions.NormalizeWaterfallUpdatePeriod(e.WaterfallUpdatePeriod),
-                WidebandSignalMarkersEnabled: e.WidebandSignalMarkersEnabled);
+                WidebandSignalMarkersEnabled: e.WidebandSignalMarkersEnabled,
+                WaterfallColormap: e.WaterfallColormap,
+                WaterfallScrollSpeed: e.WaterfallScrollSpeed,
+                BandOverlayEnabled: e.BandOverlayEnabled,
+                BandEdgeAlertEnabled: e.BandEdgeAlertEnabled,
+                ChatRosterOverlayEnabled: e.ChatRosterOverlayEnabled,
+                SpotLabelFontPx: e.SpotLabelFontPx,
+                GlobeRenderer: e.GlobeRenderer,
+                GlobeCustomImageryJson: e.GlobeCustomImageryJson);
         }
     }
 
@@ -209,7 +225,15 @@ public sealed class DisplaySettingsStore : IDisposable
         double? displayMaxFrameRateHz = null,
         int? displayDecimation = null,
         int? waterfallUpdatePeriod = null,
-        bool? widebandSignalMarkersEnabled = null)
+        bool? widebandSignalMarkersEnabled = null,
+        string? waterfallColormap = null,
+        double? waterfallScrollSpeed = null,
+        bool? bandOverlayEnabled = null,
+        bool? bandEdgeAlertEnabled = null,
+        bool? chatRosterOverlayEnabled = null,
+        int? spotLabelFontPx = null,
+        string? globeRenderer = null,
+        string? globeCustomImageryJson = null)
     {
         lock (_sync)
         {
@@ -246,6 +270,25 @@ public sealed class DisplaySettingsStore : IDisposable
                 e.DisplayDecimation = DisplayPerformanceOptions.NormalizeDisplayDecimation(displayDecimation);
             if (waterfallUpdatePeriod.HasValue)
                 e.WaterfallUpdatePeriod = DisplayPerformanceOptions.NormalizeWaterfallUpdatePeriod(waterfallUpdatePeriod);
+            if (waterfallColormap is "blue" or "multicolor" or "viridis" or "inferno")
+                e.WaterfallColormap = waterfallColormap;
+            if (waterfallScrollSpeed.HasValue && double.IsFinite(waterfallScrollSpeed.Value))
+                e.WaterfallScrollSpeed = Math.Clamp(waterfallScrollSpeed.Value, 0.25, 2.5);
+            if (bandOverlayEnabled.HasValue) e.BandOverlayEnabled = bandOverlayEnabled;
+            if (bandEdgeAlertEnabled.HasValue) e.BandEdgeAlertEnabled = bandEdgeAlertEnabled;
+            if (chatRosterOverlayEnabled.HasValue) e.ChatRosterOverlayEnabled = chatRosterOverlayEnabled;
+            if (spotLabelFontPx.HasValue) e.SpotLabelFontPx = Math.Clamp(spotLabelFontPx.Value, 10, 18);
+            if (globeRenderer is "auto" or "rich" or "simple") e.GlobeRenderer = globeRenderer;
+            if (globeCustomImageryJson is not null)
+            {
+                if (globeCustomImageryJson.Length == 0)
+                    e.GlobeCustomImageryJson = null;
+                else
+                {
+                    using var _ = System.Text.Json.JsonDocument.Parse(globeCustomImageryJson);
+                    e.GlobeCustomImageryJson = globeCustomImageryJson;
+                }
+            }
             e.UpdatedUtc = DateTime.UtcNow;
             if (e.Id == 0) _docs.Insert(e);
             else _docs.Update(e);
@@ -374,5 +417,13 @@ public sealed class DisplaySettingsEntry
     // Waterfall row decimation, expressed like Thetis: scroll/update one row
     // every N generated display frames. 1 preserves the current Zeus behavior.
     public int? WaterfallUpdatePeriod { get; set; }
+    public string? WaterfallColormap { get; set; }
+    public double? WaterfallScrollSpeed { get; set; }
+    public bool? BandOverlayEnabled { get; set; }
+    public bool? BandEdgeAlertEnabled { get; set; }
+    public bool? ChatRosterOverlayEnabled { get; set; }
+    public int? SpotLabelFontPx { get; set; }
+    public string? GlobeRenderer { get; set; }
+    public string? GlobeCustomImageryJson { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

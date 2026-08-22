@@ -158,6 +158,9 @@ public sealed class StreamingHub
     private long _micUplinkLastBytes;
     private long _micUplinkLastSamples;
     private readonly System.Threading.Timer _dropLogTimer;
+    private readonly RxAudioMuteState? _rxAudioMuteState;
+    private long _rxAudioFramesObserved;
+    private long _lastLoggedRxAudioFrames;
 
     // Aggregate count of connected clients that have asked for the RX audio
     // stream (MsgType.AudioStreamRequest). GatedWebSocketAudioSink reads this
@@ -208,14 +211,54 @@ public sealed class StreamingHub
     public StreamingHub(
         ILogger<StreamingHub> log,
         IProductStreamSource? productStreamSource = null,
-        IClientDiagnosticSink? clientDiagnosticSink = null)
+        IClientDiagnosticSink? clientDiagnosticSink = null,
+        RxAudioMuteState? rxAudioMuteState = null)
     {
         _log = log;
         _productStreamSource = productStreamSource ?? NullProductStreamSource.Instance;
         _clientDiagnosticSink = clientDiagnosticSink ?? NullClientDiagnosticSink.Instance;
+        _rxAudioMuteState = rxAudioMuteState;
         _productStreamSource.FrameAvailable += BroadcastProductFrame;
-        _dropLogTimer = new System.Threading.Timer(_ => LogDropsIfAny(), null, 1000, 1000);
+        _dropLogTimer = new System.Threading.Timer(
+            _ =>
+            {
+                LogDropsIfAny();
+                LogRxAudioBroadcastDiagnostics();
+            },
+            null,
+            1000,
+            1000);
     }
+
+    private void LogRxAudioBroadcastDiagnostics()
+    {
+        long frames = Interlocked.Read(ref _rxAudioFramesObserved);
+        long frameDelta = frames - Interlocked.Read(ref _lastLoggedRxAudioFrames);
+        int connected = ClientCount;
+        if (connected == 0 && frameDelta == 0) return;
+
+        int recipients = AudioRecipientCount;
+        bool muted = _rxAudioMuteState?.IsMuted == true;
+        bool sending = frameDelta > 0 && recipients > 0 && !muted;
+        _log.LogInformation(
+            "rx.audio.broadcast frames/s={Frames} recipients={Recipients} muted={Muted} sending={Sending}",
+            frameDelta,
+            recipients,
+            muted ? "true" : "false",
+            sending ? "true" : "false");
+        Interlocked.Exchange(ref _lastLoggedRxAudioFrames, frames);
+    }
+
+    /// <summary>Test-only: run one diagnostics tick deterministically. Pair
+    /// with <see cref="StopDiagnosticsTimerForTest"/> so the constructor's
+    /// 1 Hz timer cannot interleave an extra log entry on a slow host.</summary>
+    internal void LogRxAudioBroadcastDiagnosticsForTest() =>
+        LogRxAudioBroadcastDiagnostics();
+
+    /// <summary>Test-only: park the 1 Hz drop/diagnostics timer so unit tests
+    /// asserting on logged entries are deterministic.</summary>
+    internal void StopDiagnosticsTimerForTest() =>
+        _dropLogTimer.Change(Timeout.Infinite, Timeout.Infinite);
 
     private void LogDropsIfAny()
     {
@@ -243,6 +286,23 @@ public sealed class StreamingHub
     }
 
     public int ClientCount => _clients.Count;
+
+    internal int AudioRecipientCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var client in _clients.Values)
+            {
+                if (client is ClientSession { SuppressAudio: true }) continue;
+                count++;
+            }
+            return count;
+        }
+    }
+
+    internal void RecordRxAudioFrame() =>
+        Interlocked.Increment(ref _rxAudioFramesObserved);
 
     /// <summary>
     /// Read-only websocket-hub health for the diagnostics v2 surface: connected
@@ -919,6 +979,19 @@ public sealed class StreamingHub
 
         var payload = new byte[MoxStateFrame.ByteLength];
         var writer = new FixedBufferWriter(payload, MoxStateFrame.ByteLength);
+        frame.Serialize(writer);
+        foreach (var client in _clients.Values)
+        {
+            if (!client.TryEnqueue(payload)) System.Threading.Interlocked.Increment(ref _dropsOther);
+        }
+    }
+
+    public void Broadcast(in VfoStateFrame frame)
+    {
+        if (_clients.IsEmpty) return;
+
+        var payload = new byte[VfoStateFrame.ByteLength];
+        var writer = new FixedBufferWriter(payload, VfoStateFrame.ByteLength);
         frame.Serialize(writer);
         foreach (var client in _clients.Values)
         {

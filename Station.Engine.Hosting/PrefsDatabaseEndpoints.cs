@@ -19,6 +19,11 @@ namespace Zeus.Server;
 /// </summary>
 public static class PrefsDatabaseEndpoints
 {
+    // UnifiedDatabaseBackup accepts at most 120 MiB of backup payload. Leave
+    // one MiB for multipart framing so Kestrel does not reject a Zeus-produced
+    // backup before this endpoint can return its own operator-facing error.
+    internal const long UploadRequestBodyLimitBytes = 121L * 1024 * 1024;
+
     public static IEndpointRouteBuilder MapPrefsDatabaseEndpoints(
         this IEndpointRouteBuilder app)
     {
@@ -70,7 +75,7 @@ public static class PrefsDatabaseEndpoints
 
         app.MapPost("/api/prefs/databases/import", (HttpContext ctx, ImportDatabaseRequest req) =>
         {
-            if (LocalRequestGuard.RejectIfNotLocalSameOrigin(
+            if (LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
                     ctx, "import the Zeus settings database") is { } rejected)
                 return rejected;
             if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
@@ -90,11 +95,11 @@ public static class PrefsDatabaseEndpoints
 
         // File-picker import: the webview can't hand the server a filesystem
         // path, so the chosen backup is uploaded as multipart. The route is
-        // still explicitly restricted to the local same-origin app before the
+        // still explicitly restricted to a local allowed app before the
         // multipart body is read.
         app.MapPost("/api/prefs/databases/upload", async (HttpContext ctx) =>
         {
-            if (LocalRequestGuard.RejectIfNotLocalSameOrigin(
+            if (LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
                     ctx, "import the Zeus settings database") is { } rejected)
                 return rejected;
             if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
@@ -109,6 +114,8 @@ public static class PrefsDatabaseEndpoints
                 var file = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
                 if (file is null || file.Length == 0)
                     return Results.BadRequest(new { error = "No file uploaded." });
+                if (file.Length > UnifiedDatabaseBackup.MaximumBackupBytes)
+                    return Results.BadRequest(new { error = "That Zeus database backup is too large." });
 
                 await using var stream = file.OpenReadStream();
                 UnifiedDatabaseBackup.StageImport(stream);
@@ -118,7 +125,10 @@ public static class PrefsDatabaseEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
-        }).DisableAntiforgery();
+        })
+            .DisableAntiforgery()
+            .WithMetadata(new Microsoft.AspNetCore.Mvc.RequestSizeLimitAttribute(
+                UploadRequestBodyLimitBytes));
 
         // Download the one operator-facing Zeus backup. The versioned container
         // captures both authoritative settings stores and deliberately
@@ -135,8 +145,14 @@ public static class PrefsDatabaseEndpoints
         // used to open the last-viewed logbook instead of anything Zeus. The
         // ".zeusdb" extension keeps a Zeus-specific identity so no other app
         // silently claims it.
-        app.MapGet("/api/prefs/databases/export", (string? relativePath) =>
+        app.MapGet("/api/prefs/databases/export", (HttpContext ctx, string? relativePath) =>
         {
+            if (LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
+                    ctx, "export the Zeus settings database") is { } rejected)
+                return rejected;
+            if (LocalRequestGuard.RejectIfNotLiteralLocalHost(
+                    ctx, "export the Zeus settings database") is { } hostRejected)
+                return hostRejected;
             try
             {
                 // relativePath is intentionally ignored as a compatibility

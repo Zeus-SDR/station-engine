@@ -63,6 +63,14 @@ communicating over the loopback station protocol documented below. It is not
 part of this repository and is not covered by this license. ASIO SDK-derived
 source and binaries do not enter that product.
 
+## Trademarks
+
+**ZeusSDR™** and **Zeus™** are trademarks of the Zeus project maintainers. The
+engine's GPL licences cover its source code; they grant no right to use those
+names, logos, or branding for a modified or derivative product. This is the
+ordinary separation of copyright from trademark, not an added GPL restriction.
+See [`TRADEMARK.md`](TRADEMARK.md) for the full policy.
+
 ## Requirements
 
 - .NET 10 SDK

@@ -3061,6 +3061,20 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setTxMode mode={Mode}", mapped);
     }
 
+    public void SetTxAmCarrierLevel(double carrierLevel)
+    {
+        if (_disposed != 0) return;
+        if (!double.IsFinite(carrierLevel))
+            throw new ArgumentOutOfRangeException(nameof(carrierLevel));
+        double clamped = Math.Clamp(carrierLevel, 0.0, 0.5 * Math.Sqrt(1.25));
+        lock (_txaLock)
+        {
+            if (_txaChannelId is not int txa) return;
+            _txControlNative.SetTXAAMCarrierLevel(txa, clamped);
+        }
+        _log.LogInformation("wdsp.setTxAmCarrierLevel level={Level:F3}", clamped);
+    }
+
     public void SetTxDigitalBypass(bool bypass)
     {
         if (_disposed != 0) return;
@@ -4588,6 +4602,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 fmin: 0.0,
                 fmax: 0.0,
                 max_w: maxW);
+            // SetAnalyzer resets ring/IQ state but preserves pixel averaging;
+            // purge the old frequency mapping as Thetis does after reconfigure
+            // (clsSpectrumProcessor.cs:1007).
+            NativeMethods.ResetPixelBuffers(disp);
         });
     }
 

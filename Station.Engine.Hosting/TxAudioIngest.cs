@@ -1183,7 +1183,13 @@ public sealed class TxAudioIngest : IDisposable
                 // FreeDV modem signal (in place, same count, internally
                 // buffered). WDSP's USB TXA then SSB-modulates the modem audio.
                 // No-op unless FreeDV is the active mode.
-                if (_productAudio.Active)
+                // A linear product-plugin source (Recorder/SSTV) must bypass
+                // the out-of-process Audio Suite as well as the in-engine TX
+                // plugin seam and WDSP speech stages. Voice Keyer leaves this
+                // flag clear and continues through the operator's TX chain.
+                if (_productAudio.Active
+                    && (source != MicBlockSource.ProductPlugin
+                        || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
                     _productAudio.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
                 if (_audioModem.Active)
                     _audioModem.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));

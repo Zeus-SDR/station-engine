@@ -56,8 +56,8 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
     private const int HpsdrPort = 1024;
     private const int DiscoveryPacketLength = 60;
     private const int ReceiveBufferSize = 2048;
-    private const int SendAttempts = 3;
-    private static readonly TimeSpan SendGap = TimeSpan.FromMilliseconds(50);
+    internal const int SendAttempts = 3;
+    internal static readonly TimeSpan SendGap = TimeSpan.FromMilliseconds(50);
 
     private readonly ILogger<RadioDiscoveryService> _log;
 
@@ -445,7 +445,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         return new IPAddress(bcastBytes);
     }
 
-    private static byte[] BuildDiscoveryPacket()
+    internal static byte[] BuildDiscoveryPacket()
     {
         var buf = new byte[DiscoveryPacketLength];
         buf[4] = 0x02;

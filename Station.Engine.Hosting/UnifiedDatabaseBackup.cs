@@ -6,6 +6,7 @@
 
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text.Json;
 using LiteDB;
 using JsonSerializer = System.Text.Json.JsonSerializer;
@@ -24,16 +25,21 @@ internal static class UnifiedDatabaseBackup
     internal const int CurrentVersion = 1;
     internal const string PendingRestoreDirectoryEnvironmentVariable =
         "ZEUS_PENDING_DATABASE_RESTORE_PATH";
+    internal const string ProductPreferencesPathEnvironmentVariable =
+        "ZEUS_PRODUCT_PREFS_PATH";
+    internal const string ProductDataDirectoryEnvironmentVariable =
+        "ZEUS_PRODUCT_DATA_DIR";
 
     private const string ManifestEntryName = "manifest.json";
     private const string PendingDirectoryName = ".pending-database-restore";
     private const string RollbackDirectoryName = ".rollback";
     private const string RollbackManifestName = "rollback.json";
     private const string PureSignalCollection = "ps_settings";
-    // Stay below ASP.NET Core's default multipart body ceiling even when ZIP
-    // compression provides little benefit.
+    // Bound both individual snapshots and the complete container even when ZIP
+    // compression provides little benefit. The upload route is sized from the
+    // complete-container limit below.
     private const long MaximumEntryBytes = 96L * 1024 * 1024;
-    private const long MaximumBackupBytes = 120L * 1024 * 1024;
+    internal const long MaximumBackupBytes = 120L * 1024 * 1024;
 
     private static readonly HashSet<string> LegacyProductPreferenceAnchors =
         new(StringComparer.Ordinal)
@@ -103,7 +109,9 @@ internal static class UnifiedDatabaseBackup
 
     internal static byte[] BuildContainer() => BuildContainer(DiscoverStores());
 
-    internal static byte[] BuildContainer(IReadOnlyList<StoreSpec> stores)
+    internal static byte[] BuildContainer(
+        IReadOnlyList<StoreSpec> stores,
+        Action<StoreSpec, string>? liteDatabaseSnapshotObserver = null)
     {
         ArgumentNullException.ThrowIfNull(stores);
         using var output = new MemoryStream();
@@ -119,15 +127,18 @@ internal static class UnifiedDatabaseBackup
                     continue;
 
                 var bytes = store.Kind == "litedb"
-                    ? SnapshotLiteDatabase(fullPath)
+                    ? SnapshotLiteDatabase(
+                        fullPath,
+                        store.StationOwned,
+                        snapshotPath => liteDatabaseSnapshotObserver?.Invoke(store, snapshotPath))
                     : File.ReadAllBytes(fullPath);
                 if (bytes.LongLength > MaximumEntryBytes)
                     throw new InvalidOperationException(
-                        $"The '{store.Key}' database is too large to export safely.");
+                        $"The '{store.Key}' store is too large to export safely.");
                 totalBytes = checked(totalBytes + bytes.LongLength);
                 if (totalBytes > MaximumBackupBytes)
                     throw new InvalidOperationException(
-                        "The Zeus settings database is too large to export safely.");
+                        $"The Zeus settings database became too large while adding the '{store.Key}' store.");
 
                 var archivePath = $"data/{store.Key}{(store.Kind == "litedb" ? ".db" : ".json")}";
                 var zipEntry = archive.CreateEntry(archivePath, CompressionLevel.Optimal);
@@ -189,16 +200,23 @@ internal static class UnifiedDatabaseBackup
     }
 
     /// <summary>
-    /// Applies the two Station-owned files that together form the single
-    /// operator-facing settings database. This runs before either file is
-    /// opened by a store.
+    /// Applies every Station-owned file in the operator-facing settings
+    /// database. Product-owned entries stay staged for ZeusProduct to consume
+    /// before it opens its own stores.
     /// </summary>
-    internal static void ApplyPendingStationRestore()
+    internal static void ApplyPendingStationRestore(TimeSpan? restoreLockTimeout = null)
     {
         var pendingDirectory = PendingDirectory();
-        using var restoreLock = TryAcquireRestoreLock(pendingDirectory);
+        using var restoreLock = TryAcquireRestoreLock(
+            pendingDirectory,
+            restoreLockTimeout ?? TimeSpan.FromSeconds(30));
         if (restoreLock is null)
+        {
+            // File + stderr: windowed builds swallow the console.
+            ReportRestoreDiagnostic(
+                "database.restore station skipped: timed out waiting for the restore lock; restore remains pending for the next start.");
             return;
+        }
         if (!RecoverInterruptedRestore(pendingDirectory))
             return;
         var manifestPath = Path.Combine(pendingDirectory, ManifestEntryName);
@@ -212,7 +230,8 @@ internal static class UnifiedDatabaseBackup
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"database.restore pending manifest invalid: {ex.Message}");
+            ReportRestoreDiagnostic(
+                $"database.restore pending manifest invalid: {ex.Message}");
             return;
         }
 
@@ -225,6 +244,7 @@ internal static class UnifiedDatabaseBackup
             .Where(entry => !destinations.TryGetValue(entry.Key, out var store) || !store.StationOwned)
             .ToList();
         var prepared = new List<PreparedEntry>();
+        var stagedPaths = new List<string>();
         try
         {
             // Validate and fully prepare every replacement before changing any
@@ -233,6 +253,19 @@ internal static class UnifiedDatabaseBackup
             foreach (var (entry, store) in applicable)
             {
                 var stagedPath = SafePendingEntryPath(pendingDirectory, entry.ArchivePath);
+                stagedPaths.Add(stagedPath);
+                if (!File.Exists(stagedPath))
+                {
+                    // Crash-after-apply deletes staged files before the manifest
+                    // shrinks, and the prepared transform usually changes the
+                    // destination bytes, so a hash mismatch here is expected.
+                    // Nothing is recoverable without the staged bytes — skip
+                    // instead of wedging every subsequent boot.
+                    if (!DestinationMatches(entry, store))
+                        Console.Error.WriteLine(
+                            $"database.restore staged entry '{entry.Key}' is missing; keeping the current local file.");
+                    continue;
+                }
                 prepared.Add(new PreparedEntry(
                     entry,
                     store,
@@ -244,10 +277,7 @@ internal static class UnifiedDatabaseBackup
             {
                 CreateRollback(pendingDirectory, prepared);
                 foreach (var item in prepared)
-                {
-                    DeleteIfExists(item.Store.Path + "-log");
-                    File.Move(item.PreparedPath, item.Store.Path, overwrite: true);
-                }
+                    ReplacePreparedEntryWithRetry(item.PreparedPath, item.Store.Path);
 
                 var rollbackDirectory = Path.Combine(pendingDirectory, RollbackDirectoryName);
                 // Removing the rollback marker is the commit point. If cleanup
@@ -255,15 +285,32 @@ internal static class UnifiedDatabaseBackup
                 // safe to apply again on the next start.
                 DeleteIfExists(Path.Combine(rollbackDirectory, RollbackManifestName));
                 TryDeleteDirectory(rollbackDirectory);
-                foreach (var item in prepared)
-                    TryDelete(item.StagedPath);
             }
+
+            if (remaining.Count == 0)
+                DeleteIfExists(manifestPath);
+            else
+                WriteManifestAtomically(manifestPath, manifest with { Entries = remaining });
+
+            foreach (var stagedPath in stagedPaths)
+                TryDelete(stagedPath);
+            if (remaining.Count == 0)
+                TryDeleteDirectory(pendingDirectory);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"database.restore could not apply settings: {ex.Message}");
+            ReportRestoreDiagnostic(
+                $"database.restore could not apply settings: {ex.Message}");
             if (!RecoverInterruptedRestore(pendingDirectory))
-                Console.Error.WriteLine("database.restore rollback remains pending for the next start.");
+            {
+                ReportRestoreDiagnostic(
+                    "database.restore rollback remains pending for the next start.");
+            }
+            else
+            {
+                ReportRestoreDiagnostic(
+                    "database.restore rollback completed; restore remains pending for the next start.");
+            }
             return;
         }
         finally
@@ -275,15 +322,6 @@ internal static class UnifiedDatabaseBackup
             }
         }
 
-        if (remaining.Count == 0)
-        {
-            TryDelete(manifestPath);
-            TryDeleteDirectory(pendingDirectory);
-            return;
-        }
-
-        var updated = manifest with { Entries = remaining };
-        WriteManifestAtomically(manifestPath, updated);
     }
 
     internal static IReadOnlyList<StoreSpec> DiscoverStores()
@@ -292,34 +330,83 @@ internal static class UnifiedDatabaseBackup
         [
             new("preferences", "litedb", PrefsDbPath.Get(), StationOwned: true),
             new("station-engine", "litedb", PrefsDbPath.EngineGet(), StationOwned: true),
+            new("link-product", "litedb", ProductPreferencesPath(), StationOwned: false),
+            new("logbook", "litedb", PrefsDbPath.LogbookPath(), StationOwned: true),
+            new("link-logbook", "litedb", ProductLogbookPath(), StationOwned: false),
+            new("audio-suite", "file", ProductPreferencesPath() + ".audio-suite.json", StationOwned: false),
+            new("audio-suite-quarantine", "file",
+                ProductPreferencesPath() + ".audio-suite.json.plugin-quarantine.json",
+                StationOwned: false),
         ];
     }
 
-    private static byte[] SnapshotLiteDatabase(string sourcePath)
+    private static string ProductPreferencesPath()
+    {
+        var configured = Environment.GetEnvironmentVariable(
+            ProductPreferencesPathEnvironmentVariable);
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured;
+        var local = Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData,
+            Environment.SpecialFolderOption.Create);
+        return Path.Combine(local, "Zeus", "zeus-link-product.db");
+    }
+
+    private static string ProductLogbookPath()
+    {
+        var configured = Environment.GetEnvironmentVariable(
+            ProductDataDirectoryEnvironmentVariable);
+        var dataDirectory = !string.IsNullOrWhiteSpace(configured)
+            ? configured
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ZeusProduct");
+        return Path.Combine(dataDirectory, "logbook", "zeus-logbook.db");
+    }
+
+    private static byte[] SnapshotLiteDatabase(
+        string sourcePath,
+        bool stationOwned,
+        Action<string>? snapshotObserver = null)
     {
         var tempPath = Path.Combine(
             Path.GetTempPath(), $"zeus-database-snapshot-{Guid.NewGuid():N}.db");
         try
         {
-            // Shared mode coordinates with both local stores and a live Link
-            // product process. Checkpoint before copying so the ZIP never
-            // depends on an omitted LiteDB transaction sidecar.
-            using (var lease = Zeus.Data.SharedLiteDatabase.Acquire(sourcePath))
+            if (stationOwned)
             {
+                // Station-owned stores share this process's lease registry, so
+                // they can be checkpointed before the stable byte copy.
+                using var lease = Zeus.Data.SharedLiteDatabase.Acquire(sourcePath);
                 lease.Database.Checkpoint();
-                using var source = new FileStream(
-                    sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var destination = new FileStream(
-                    tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                source.CopyTo(destination);
+                CopySnapshotFile(sourcePath, tempPath);
+            }
+            else
+            {
+                // Product stores may belong to a different live process. Never
+                // open or checkpoint that process's authoritative file: copy
+                // the database and transaction sidecar, then open only the copy.
+                CopySnapshotFile(sourcePath, tempPath);
+                if (File.Exists(sourcePath + "-log"))
+                    CopySnapshotFile(sourcePath + "-log", tempPath + "-log");
             }
 
-            using (var snapshot = new LiteDatabase(tempPath))
+            snapshotObserver?.Invoke(tempPath);
+            try
             {
-                // PureSignal calibration and arm-related persistence never
-                // leave the machine through this backup surface.
-                snapshot.DropCollection(PureSignalCollection);
-                snapshot.Checkpoint();
+                SanitizeSnapshotCopy(tempPath);
+            }
+            catch (Exception ex) when (!stationOwned && ex is LiteException or IOException)
+            {
+                // The db and -log copies are taken independently; a foreign
+                // checkpoint landing between them can tear the pair. One
+                // bounded recopy converges on a consistent snapshot.
+                TryDelete(tempPath);
+                TryDelete(tempPath + "-log");
+                CopySnapshotFile(sourcePath, tempPath);
+                if (File.Exists(sourcePath + "-log"))
+                    CopySnapshotFile(sourcePath + "-log", tempPath + "-log");
+                SanitizeSnapshotCopy(tempPath);
             }
             return File.ReadAllBytes(tempPath);
         }
@@ -328,6 +415,24 @@ internal static class UnifiedDatabaseBackup
             TryDelete(tempPath);
             TryDelete(tempPath + "-log");
         }
+    }
+
+    private static void SanitizeSnapshotCopy(string tempPath)
+    {
+        using var snapshot = new LiteDatabase(tempPath);
+        // PureSignal calibration and arm-related persistence never
+        // leave the machine through this backup surface.
+        snapshot.DropCollection(PureSignalCollection);
+        snapshot.Checkpoint();
+    }
+
+    private static void CopySnapshotFile(string sourcePath, string destinationPath)
+    {
+        using var source = new FileStream(
+            sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var destination = new FileStream(
+            destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        source.CopyTo(destination);
     }
 
     private static void StageContainer(string path)
@@ -391,6 +496,12 @@ internal static class UnifiedDatabaseBackup
                     SanitizeAndValidateLiteDatabase(outputPath);
                 else if (entry.Kind == "json")
                     ValidateJson(outputPath);
+                else if (entry.Kind == "file")
+                {
+                    // Opaque product-owned state. Integrity and size were
+                    // already checked above; the owning product validates it
+                    // when it opens the restored file.
+                }
                 else
                     throw new InvalidOperationException(
                         $"The '{entry.Key}' entry has an unsupported kind.");
@@ -416,7 +527,9 @@ internal static class UnifiedDatabaseBackup
             WriteManifestAtomically(
                 Path.Combine(temporaryDirectory, ManifestEntryName),
                 manifest with { Entries = stagedEntries });
-            using var restoreLock = TryAcquireRestoreLock(pendingDirectory)
+            using var restoreLock = TryAcquireRestoreLock(
+                pendingDirectory,
+                TimeSpan.FromSeconds(30))
                 ?? throw new InvalidOperationException(
                     "Zeus is currently applying another database restore; try the import again.");
             RejectIfRollbackPending(pendingDirectory);
@@ -452,7 +565,9 @@ internal static class UnifiedDatabaseBackup
                 Path.Combine(temporaryDirectory, "data", "station-engine.db"), engineBytes);
             WriteManifestAtomically(
                 Path.Combine(temporaryDirectory, ManifestEntryName), manifest);
-            using var restoreLock = TryAcquireRestoreLock(pendingDirectory)
+            using var restoreLock = TryAcquireRestoreLock(
+                pendingDirectory,
+                TimeSpan.FromSeconds(30))
                 ?? throw new InvalidOperationException(
                     "Zeus is currently applying another database restore; try the import again.");
             RejectIfRollbackPending(pendingDirectory);
@@ -481,7 +596,9 @@ internal static class UnifiedDatabaseBackup
         {
             var currentEnginePath = PrefsDbPath.EngineGet();
             if (File.Exists(currentEnginePath))
-                File.WriteAllBytes(temporaryPath, SnapshotLiteDatabase(currentEnginePath));
+                File.WriteAllBytes(
+                    temporaryPath,
+                    SnapshotLiteDatabase(currentEnginePath, stationOwned: true));
             else
             {
                 using var empty = new LiteDatabase(temporaryPath);
@@ -561,9 +678,14 @@ internal static class UnifiedDatabaseBackup
                 SanitizeAndValidateLiteDatabase(temporaryPath);
                 PreserveLocalPureSignal(store.Path, temporaryPath);
             }
-            else
+            else if (entry.Kind == "json")
             {
                 ValidateJson(temporaryPath);
+            }
+            else if (entry.Kind != "file")
+            {
+                throw new InvalidOperationException(
+                    "Staged database entry has an unsupported kind.");
             }
 
             return temporaryPath;
@@ -574,6 +696,18 @@ internal static class UnifiedDatabaseBackup
             TryDelete(temporaryPath + "-log");
             throw;
         }
+    }
+
+    private static bool DestinationMatches(BackupEntry entry, StoreSpec store)
+    {
+        if (!File.Exists(store.Path))
+            return false;
+        var bytes = File.ReadAllBytes(store.Path);
+        return bytes.LongLength == entry.Length
+            && string.Equals(
+                Convert.ToHexString(SHA256.HashData(bytes)),
+                entry.Sha256,
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private static void CreateRollback(
@@ -644,10 +778,35 @@ internal static class UnifiedDatabaseBackup
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"database.restore rollback failed: {ex.Message}");
+            ReportRestoreDiagnostic($"database.restore rollback failed: {ex.Message}");
             return false;
         }
     }
+
+    internal static void ReplacePreparedEntryWithRetry(
+        string preparedPath,
+        string destinationPath,
+        Action<int>? beforeAttempt = null,
+        Action? waitBetweenAttempts = null)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                beforeAttempt?.Invoke(attempt);
+                DeleteIfExists(destinationPath + "-log");
+                File.Move(preparedPath, destinationPath, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (
+                attempt < 4 && ex is IOException or UnauthorizedAccessException)
+            {
+                (waitBetweenAttempts ?? WaitForTransientFileRelease)();
+            }
+        }
+    }
+
+    private static void WaitForTransientFileRelease() => Thread.Sleep(100);
 
     private static void RestoreOriginal(bool existed, string backupPath, string destinationPath)
     {
@@ -732,15 +891,32 @@ internal static class UnifiedDatabaseBackup
         {
             using var database = new LiteDatabase(path);
             var names = database.GetCollectionNames().ToHashSet(StringComparer.Ordinal);
-            // Historical single-file exports were the canonical product prefs
-            // with current engine collections merged into them. Requiring
-            // evidence from both families rejects station-engine.db, Link's
-            // product-only DB, logbooks, and other unrelated LiteDB files.
-            if (!names.Overlaps(LegacyProductPreferenceAnchors)
-                || !names.Overlaps(LegacyEnginePreferenceAnchors))
+            // Accept in two shapes only:
+            //  - any product anchor: every real pre-split single-file backup
+            //    and every product-family database carries at least one;
+            //  - prefs-resident engine anchors (display/theme/layout) with NO
+            //    engine-exclusive collection present: a fresh split-era
+            //    zeus-prefs.db whose operator has only touched those.
+            // A file whose recognized names are engine-exclusive (radio_state,
+            // dsp_settings, ...) is station-engine.db or a copy; staging it
+            // would replace zeus-prefs.db wholesale and silently revert every
+            // product setting, so those stay rejected on purpose. Names alone
+            // cannot separate the dual-homed layout collections, hence the
+            // engine-exclusive test rather than a simple family overlap.
+            var engineExclusive = EnginePrefsDbMigration.AllEngineOwnedCollectionNames()
+                .Except(new[] { "ui_layout", "ui_layouts_v2", "ui_saved_layouts", "cfc_presets" },
+                    StringComparer.Ordinal)
+                .ToHashSet(StringComparer.Ordinal);
+            var prefsResidentAnchors = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "display_settings", "theme_settings", "ui_layout", "ui_layouts_v2",
+            };
+            var acceptable = names.Overlaps(LegacyProductPreferenceAnchors)
+                || (names.Overlaps(prefsResidentAnchors) && !names.Overlaps(engineExclusive));
+            if (!acceptable)
             {
                 throw new InvalidOperationException(
-                    "That LiteDB file is not a complete Zeus settings database.");
+                    "That LiteDB file is not a Zeus settings database.");
             }
         }
         catch (InvalidOperationException)
@@ -802,8 +978,19 @@ internal static class UnifiedDatabaseBackup
             PendingRestoreDirectoryEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(configured))
             return Path.GetFullPath(configured);
-        var directory = Path.GetDirectoryName(Path.GetFullPath(PrefsDbPath.Get()))
+        var activeDirectory = Path.GetDirectoryName(Path.GetFullPath(PrefsDbPath.Get()))
             ?? PrefsDbPath.DataDir;
+        // Leaf-name check on purpose: ZEUS_PREFS_PATH relocates the prefs file
+        // without moving DataDir, so an exact-path comparison against
+        // DataDir/profiles misses relocated (and test) profile layouts. A data
+        // root literally named "profiles" would be misclassified, but that is
+        // a contrived layout and the env override above is the escape hatch.
+        var directory = string.Equals(
+            Path.GetFileName(activeDirectory),
+            "profiles",
+            StringComparison.OrdinalIgnoreCase)
+            ? Path.GetDirectoryName(activeDirectory) ?? PrefsDbPath.DataDir
+            : activeDirectory;
         return Path.Combine(directory, PendingDirectoryName);
     }
 
@@ -841,13 +1028,16 @@ internal static class UnifiedDatabaseBackup
         }
     }
 
-    private static FileStream? TryAcquireRestoreLock(string pendingDirectory)
+    private static FileStream? TryAcquireRestoreLock(
+        string pendingDirectory,
+        TimeSpan timeout)
     {
         var parent = Path.GetDirectoryName(Path.GetFullPath(pendingDirectory))
             ?? PrefsDbPath.DataDir;
         Directory.CreateDirectory(parent);
         var lockPath = Path.Combine(parent, ".database-restore.lock");
-        for (var attempt = 0; attempt < 50; attempt++)
+        var wait = Stopwatch.StartNew();
+        while (true)
         {
             try
             {
@@ -857,16 +1047,14 @@ internal static class UnifiedDatabaseBackup
                     FileAccess.ReadWrite,
                     FileShare.None);
             }
-            catch (IOException) when (attempt < 49)
-            {
-                Thread.Sleep(100);
-            }
             catch (IOException)
             {
-                return null;
+                if (wait.Elapsed >= timeout)
+                    return null;
+                var remaining = timeout - wait.Elapsed;
+                Thread.Sleep((int)Math.Min(100, Math.Max(1, remaining.TotalMilliseconds)));
             }
         }
-        return null;
     }
 
     private static void WriteManifestAtomically(string path, BackupManifest manifest)
@@ -926,5 +1114,24 @@ internal static class UnifiedDatabaseBackup
     {
         try { if (Directory.Exists(path)) Directory.Delete(path, recursive: true); }
         catch { }
+    }
+
+    private static void ReportRestoreDiagnostic(string message)
+    {
+        try { Console.Error.WriteLine(message); } catch { }
+        AppendRestoreDiagnostic(message);
+    }
+
+    private static void AppendRestoreDiagnostic(string message)
+    {
+        try
+        {
+            using var sink = new Diagnostics.DiagnosticLogFileSink(PrefsDbPath.AppLogPath());
+            sink.Append($"{DateTime.Now:HH:mm:ss.fff} ERROR DatabaseRestore {message}");
+        }
+        catch
+        {
+            // Restore diagnostics are best-effort and must never block startup.
+        }
     }
 }

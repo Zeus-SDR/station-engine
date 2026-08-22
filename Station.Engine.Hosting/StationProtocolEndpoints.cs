@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Net;
 using System.Text.Json;
 using Station.AudioRing;
+using Zeus.Contracts;
 using Zeus.Dsp.Wdsp;
 
 namespace Zeus.Server;
@@ -245,6 +246,29 @@ public static class StationProtocolEndpoints
                 : Results.Conflict(new { error });
         });
 
+        // Loopback seam that lets a product plugin engage the operator-facing TX
+        // Monitor. The recorder uses it for over-air playback so a transmitted
+        // recording is heard through the same processed on-air preview path as
+        // live mic. Clear meter-only so the monitor is AUDIBLE (matching the
+        // Audio Suite "Preview" toggle exactly), and report the state BEFORE the
+        // change so the caller restores it when the transmission ends. RF-safe:
+        // TX Monitor is a receive-side demod of the transmit IQ and never alters
+        // what is transmitted.
+        endpoints.MapPost("/api/station/tx-monitor", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context))
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var radio = context.RequestServices.GetService<RadioService>();
+            if (radio is null) return Results.NotFound();
+            var request = await ReadRequestAsync<StationTxMonitorRequest>(context).ConfigureAwait(false);
+            if (request is null) return Results.BadRequest(new { error = "tx-monitor request is required" });
+            var pipe = context.RequestServices.GetService<DspPipelineService>();
+            bool previousEnabled = radio.Snapshot().TxMonitorEnabled;
+            pipe?.SetTxMonitorMeterOnly(false);
+            var state = radio.SetTxMonitor(new TxMonitorSetRequest(request.Enabled));
+            return Results.Ok(new { previousEnabled, enabled = state.TxMonitorEnabled });
+        });
+
         return endpoints;
     }
 
@@ -302,3 +326,6 @@ public static class StationProtocolEndpoints
         }
     }
 }
+
+/// <summary>Loopback TX-monitor toggle request body (product plugin → engine).</summary>
+internal sealed record StationTxMonitorRequest(bool Enabled);

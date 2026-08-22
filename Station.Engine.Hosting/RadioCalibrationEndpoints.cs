@@ -2,7 +2,9 @@
 
 namespace Zeus.Server;
 
-/// <summary>Maps radio frequency-calibration routes.</summary>
+using System.Text.Json;
+
+/// <summary>Maps radio frequency and S-meter calibration routes.</summary>
 public static class RadioCalibrationEndpoints
 {
     public static IEndpointRouteBuilder MapRadioCalibrationEndpoints(
@@ -85,8 +87,86 @@ public static class RadioCalibrationEndpoints
             });
         });
 
+        endpoints.MapGet("/api/radio/smeter-calibration", (
+            RadioService radio,
+            SMeterCalibrationStore store) =>
+            Results.Ok(SMeterCalibrationSnapshot(radio, store)));
+
+        endpoints.MapPost("/api/radio/smeter-calibration", (
+            JsonElement request,
+            RadioService radio,
+            SMeterCalibrationStore store) =>
+        {
+            if (request.ValueKind != JsonValueKind.Object
+                || !request.TryGetProperty("offsetDb", out JsonElement value)
+                || value.ValueKind != JsonValueKind.Number
+                || !value.TryGetDouble(out double requested)
+                || !double.IsFinite(requested))
+            {
+                return Results.BadRequest(new
+                {
+                    error = "offsetDb must be a finite real number",
+                });
+            }
+
+            var board = radio.EffectiveBoardKind;
+            var variant = radio.EffectiveOrionMkIIVariant;
+            double applied = store.Set(board, variant, requested);
+            return Results.Ok(SMeterCalibrationSnapshot(
+                board,
+                variant,
+                applied));
+        });
+
+        endpoints.MapPost("/api/radio/smeter-calibration/reset", (
+            RadioService radio,
+            SMeterCalibrationStore store) =>
+        {
+            var board = radio.EffectiveBoardKind;
+            var variant = radio.EffectiveOrionMkIIVariant;
+            double applied = store.Set(board, variant, 0.0);
+            return Results.Ok(SMeterCalibrationSnapshot(
+                board,
+                variant,
+                applied));
+        });
+
         return endpoints;
+    }
+
+    private static SMeterCalibrationDto SMeterCalibrationSnapshot(
+        RadioService radio,
+        SMeterCalibrationStore store)
+    {
+        var board = radio.EffectiveBoardKind;
+        var variant = radio.EffectiveOrionMkIIVariant;
+        return SMeterCalibrationSnapshot(
+            board,
+            variant,
+            store.Get(board, variant));
+    }
+
+    private static SMeterCalibrationDto SMeterCalibrationSnapshot(
+        Zeus.Contracts.HpsdrBoardKind board,
+        Zeus.Contracts.OrionMkIIVariant variant,
+        double offsetDb)
+    {
+        return new SMeterCalibrationDto(
+            offsetDb,
+            board,
+            variant,
+            SMeterCalibrationStore.MinOffsetDb,
+            SMeterCalibrationStore.MaxOffsetDb,
+            SMeterCalibrationStore.StepDb);
     }
 }
 
 internal sealed record FrequencyCalibrationSetRequest(double Ppm);
+
+internal sealed record SMeterCalibrationDto(
+    double OffsetDb,
+    Zeus.Contracts.HpsdrBoardKind BoardKind,
+    Zeus.Contracts.OrionMkIIVariant Variant,
+    double MinDb,
+    double MaxDb,
+    double StepDb);

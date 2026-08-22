@@ -72,8 +72,17 @@ internal static class EnginePrefsDbMigration
             "radio_speaker_settings",
             "radio_state",
             "rf_filter_settings",
+            "serial_ptt_settings",
+            "smeter_calibration",
             StationFavoriteStore.CollectionName,
+            "transverter_settings",
             "tx_fidelity_policy",
+            "cfc_presets",
+            "hf_auto_config",
+            "spe_taurus_config",
+            "ui_layout",
+            "ui_layouts_v2",
+            "ui_saved_layouts",
         ]);
 
     /// <summary>

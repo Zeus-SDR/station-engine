@@ -74,6 +74,11 @@ public class DspPipelineService : BackgroundService,
     private static readonly TimeSpan TickPeriod = TimeSpan.FromMilliseconds(1000.0 / 30.0);
 
     private readonly RadioService _radio;
+    private readonly SMeterCalibrationStore? _sMeterCalibrationStore;
+    private readonly object _sMeterCalibrationSync = new();
+    private HpsdrBoardKind _cachedSMeterBoard;
+    private OrionMkIIVariant _cachedSMeterVariant;
+    private double _operatorSMeterOffsetDb;
     private readonly StreamingHub _hub;
     private readonly IRxAudioSink[] _audioSinks;
     private readonly TxIqRing? _txIqRing;
@@ -1134,15 +1139,57 @@ public class DspPipelineService : BackgroundService,
     // from the magnitudes via the single source of truth (SignedFilterForMode)
     // is idempotent for well-formed state, so this never overrides an operator's
     // deliberate width edit.
-    private static (int low, int high) SignedTxFilterFor(StateDto s, RxMode txEngineMode)
+    internal sealed record EffectiveTxAudioProfile(
+        int MicGainDb,
+        double LevelerMaxGainDb,
+        TxLevelingConfig TxLeveling,
+        CfcConfig Cfc,
+        TxPhaseRotatorConfig TxPhaseRotator,
+        int FilterLowHz,
+        int FilterHighHz,
+        double CarrierCoefficient);
+
+    internal static EffectiveTxAudioProfile ResolveEffectiveTxAudioProfile(
+        StateDto s,
+        RxMode txEngineMode)
     {
+        var txMode = RadioFrequencyResolver.TxReceiver(s).Mode;
+        var am = RadioService.NormalizeAmTxProfile(s.AmTxProfile);
+        if (txMode is RxMode.AM or RxMode.SAM)
+        {
+            int high = am.TxFilterHighHz;
+            return new(
+                am.MicGainDb,
+                am.LevelerMaxGainDb,
+                am.TxLeveling,
+                am.Cfc,
+                am.TxPhaseRotator,
+                -high,
+                high,
+                0.5 * Math.Sqrt(am.CarrierLevelPercent / 100.0));
+        }
         int loAbs = Math.Min(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
         int hiAbs = Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
         // EffectiveEngineMode is a no-op for every mode except FreeDv, where the
         // TX bandpass must follow the same band-convention sideband as the RX/TXA
         // demod so the transmitted OFDM carriers land on the band's shared
         // orientation (LSB < 10 MHz, USB ≥). See RadioService.EffectiveEngineMode.
-        return RadioService.SignedFilterForMode(txEngineMode, loAbs, hiAbs);
+        var (low, highNormal) = RadioService.SignedFilterForMode(txEngineMode, loAbs, hiAbs);
+        return new(
+            s.MicGainDb,
+            s.LevelerMaxGainDb,
+            s.TxLeveling ?? new TxLevelingConfig(),
+            s.Cfc ?? CfcConfig.Default,
+            s.TxPhaseRotator ?? new TxPhaseRotatorConfig(),
+            low,
+            highNormal,
+            0.5 * Math.Sqrt(am.CarrierLevelPercent / 100.0));
+    }
+
+    private static (int low, int high) SignedTxFilterFor(StateDto s, RxMode txEngineMode)
+    {
+        var effective = ResolveEffectiveTxAudioProfile(s, txEngineMode);
+        return (effective.FilterLowHz, effective.FilterHighHz);
     }
 
     internal static bool IsDigitalTxZeusMode(RxMode mode) =>
@@ -1258,6 +1305,7 @@ public class DspPipelineService : BackgroundService,
     // Same NaN-first-apply sentinel for the Leveler ceiling so a channel-open
     // with the persisted value matching the 8 dB default still re-pushes it.
     private double _appliedTxLevelerMaxGainDb = double.NaN;
+    private double _appliedTxAmCarrierLevel = double.NaN;
     private NrConfig _appliedNr = new();
     // Diversity-combiner latch. Null seed so the first state push always applies
     // (mirrors _appliedNr's change-detect). Global, not per-channel.
@@ -1394,6 +1442,17 @@ public class DspPipelineService : BackgroundService,
     private long _fastAttackLastLoHz = long.MinValue;
     private long _fastAttackLoChangedAt;
     private volatile bool _fastAttackActive;
+    // Last VfoState pushed to clients (RX0). Broadcast a VfoStateFrame whenever
+    // the dial or the display centre moves so the frontend tracks a HARDWARE
+    // tune immediately, instead of waiting for the 1 Hz state poll (dial) and
+    // the display-frame echo (pan). State-handler thread only. long.MinValue =
+    // nothing pushed yet (suppresses a spurious edge on the connect snapshot).
+    private long _lastPushedVfoHz = long.MinValue;
+    private long _lastPushedRadioLoHz = long.MinValue;
+    // Same, for RX2 / VFO B (Receiver: 1). Reset to the sentinel whenever RX2 is
+    // disabled so re-enabling it pushes a fresh edge.
+    private long _lastPushedRx2VfoHz = long.MinValue;
+    private long _lastPushedRx2LoHz = long.MinValue;
     private const int FastAttackRestoreMs = 250;
     private static readonly long FastAttackRestoreTicks =
         (long)(FastAttackRestoreMs / 1000.0 * Stopwatch.Frequency);
@@ -1443,11 +1502,16 @@ public class DspPipelineService : BackgroundService,
     internal const int DefaultRxPostTxMuteBlocks = 6; // ~200 ms at the 30 Hz audio cadence
     private volatile bool _rxFadeOutPending;        // first RX block after MOX↑
     private volatile bool _rxAudioSuppressedForTx;  // publish silence/sidetone instead of RX while TX is keyed
-    // Latch key-down display/PS policy so an emergency mid-TX disarm cannot
-    // change the matching key-up cleanup. P2 keeps RX display analyzers intact;
-    // P1 PS retains its established TX-domain reset until P1 has independent
-    // receive and transmit tuning frames.
-    private bool _stopRxForPureSignalForCurrentTx;
+    private volatile bool _fullDuplexRxActiveForCurrentTx;
+    private volatile bool _localRxAudioContinuousForCurrentTx;
+    // Set on the MOX edge; consumed by the first suppressed tick, which latches
+    // the operator's DUP choice without taking the radio-state lock.
+    private volatile bool _fullDuplexLatchPendingForCurrentTx;
+    // Latch key-down policy so UI/PS changes cannot alter the matching keyed
+    // interval and key-up cleanup. P2 keeps RX display analyzers intact; P1 PS
+    // retains its established TX-domain reset until P1 has independent receive
+    // and transmit tuning frames.
+    private volatile bool _stopRxForPureSignalForCurrentTx;
     private bool _resetDisplayPixelsForCurrentTx;
     private bool _p2DisplayDuplexForCurrentTx;
     private int _rxPostTxMuteBlocksRemaining;       // RXA transition-drain blocks after MOX↓
@@ -1716,9 +1780,16 @@ public class DspPipelineService : BackgroundService,
         IExternalRadioSidecar? externalRadioSidecar = null,
         IConfiguration? configuration = null,
         IProductTxAudioPort? productAudio = null,
-        ProductPluginAudioPort? productPluginAudio = null)
+        ProductPluginAudioPort? productPluginAudio = null,
+        SMeterCalibrationStore? sMeterCalibrationStore = null)
     {
         _radio = radio;
+        _sMeterCalibrationStore = sMeterCalibrationStore;
+        if (_sMeterCalibrationStore is not null)
+        {
+            _sMeterCalibrationStore.Changed += OnSMeterCalibrationChanged;
+            RefreshOperatorSMeterOffset(force: true);
+        }
         _hub = hub;
         _txIqRing = txIqRing;
         _audioModem = audioModem ?? new NullAudioModemPort();
@@ -1739,7 +1810,10 @@ public class DspPipelineService : BackgroundService,
         _log = loggerFactory.CreateLogger<DspPipelineService>();
         _externalDspProvider = new ExternalDspEngineProviderLoader(configuration, _log);
         _txTurnaround = new TxTurnaroundTelemetry(_log);
-        var displayPerformance = DisplayPerformanceOptions.Resolve(configuration);
+        var displayHardware = DisplayHardwareProfile.Current();
+        var displayPerformance = DisplayPerformanceOptions.Resolve(
+            configuration,
+            hardware: displayHardware);
         _rxAnalyzerFftSize = displayPerformance.RxAnalyzerFftSize;
         // WDSP's AGC threshold→max-gain conversion needs the FFT size of the
         // analyzer the noise floor is measured from (wcpAGC.c:482) — give the
@@ -1758,7 +1832,20 @@ public class DspPipelineService : BackgroundService,
         _snrPowerBuf = new float[RxSnrSpectrumInfo.MaxPixelCount];
         _diagWfSnapshot = new float[_panadapterWidth];
         var loggedDisplayPerformanceProfile = !DisplayPerformanceOptions.IsStock(displayPerformance);
-        if (loggedDisplayPerformanceProfile)
+        if (displayHardware.IsLinuxArm64)
+        {
+            var profile = string.Equals(displayPerformance.Profile, "auto->low-power", StringComparison.Ordinal)
+                ? "auto->low-power (Pi-class detected)"
+                : displayPerformance.Profile;
+            _log.LogInformation(
+                "dsp.pipeline performance profile={Profile} deviceTreeModel={DeviceTreeModel} maxFps={MaxFps:F1} rxFft={RxFft} width={Width}",
+                profile,
+                displayHardware.DeviceTreeModel ?? "unreadable",
+                displayPerformance.MaxFrameRateHz,
+                displayPerformance.RxAnalyzerFftSize,
+                displayPerformance.PanadapterWidth);
+        }
+        else if (loggedDisplayPerformanceProfile)
         {
             var profile = string.Equals(displayPerformance.Profile, "auto->low-power", StringComparison.Ordinal)
                 ? "auto->low-power (Pi-class detected)"
@@ -1801,6 +1888,38 @@ public class DspPipelineService : BackgroundService,
             EngineChanged += LoadNr3ModelInto;
             _nr3ModelStore.Changed += _ => ReloadNr3ModelToCurrentEngine();
         }
+    }
+
+    private void OnSMeterCalibrationChanged() =>
+        RefreshOperatorSMeterOffset(force: true);
+
+    private double OperatorSMeterOffsetDb() =>
+        RefreshOperatorSMeterOffset(force: false);
+
+    private double RefreshOperatorSMeterOffset(bool force)
+    {
+        if (_sMeterCalibrationStore is null) return 0.0;
+
+        HpsdrBoardKind board = _radio.EffectiveBoardKind;
+        OrionMkIIVariant variant = _radio.EffectiveOrionMkIIVariant;
+        lock (_sMeterCalibrationSync)
+        {
+            if (!force && board == _cachedSMeterBoard && variant == _cachedSMeterVariant)
+                return _operatorSMeterOffsetDb;
+
+            double offset = _sMeterCalibrationStore.Get(board, variant);
+            _cachedSMeterBoard = board;
+            _cachedSMeterVariant = variant;
+            _operatorSMeterOffsetDb = offset;
+            return _operatorSMeterOffsetDb;
+        }
+    }
+
+    public override void Dispose()
+    {
+        if (_sMeterCalibrationStore is not null)
+            _sMeterCalibrationStore.Changed -= OnSMeterCalibrationChanged;
+        base.Dispose();
     }
 
     // Operator-installed RNNoise (NR3) model store. Optional so test
@@ -2115,6 +2234,17 @@ public class DspPipelineService : BackgroundService,
     }
 
     private uint NextDisplaySeq() => unchecked((uint)Interlocked.Increment(ref _seq));
+
+    // Capture-time stamp for DisplayFrame/AudioFrame.TsUnixMs. Both fields are
+    // double on the wire, but ToUnixTimeMilliseconds() truncates to a whole
+    // millisecond, discarding the sub-ms precision UtcNow actually carries. The
+    // WebGPU spectrum surfaces derive per-row depth and the row-cadence estimate
+    // from these stamps, so the ±0.5 ms rounding shows up as a ~2% row-spacing
+    // shimmer and biases the measured period a few percent high. Keep the full
+    // fractional resolution; every consumer already treats it as a real number,
+    // and the diagnostic (long) casts still truncate to ms as before.
+    private static double UnixTimeMillisecondsHighRes() =>
+        (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).TotalMilliseconds;
 
     private readonly record struct DisplayFramePlan(int Decimation, bool IncludeWaterfall);
 
@@ -2717,7 +2847,7 @@ public class DspPipelineService : BackgroundService,
             if (displayPlan.IncludeWaterfall)
                 bodyFlags |= DisplayBodyFlags.WfValid;
 
-            double nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            double nowMs = UnixTimeMillisecondsHighRes();
             var frame = new DisplayFrame(
                 Seq: NextDisplaySeq(),
                 TsUnixMs: nowMs,
@@ -2871,7 +3001,7 @@ public class DspPipelineService : BackgroundService,
         if (!displayPlan.IncludeWaterfall)
             bodyFlags &= ~DisplayBodyFlags.WfValid;
 
-        double nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        double nowMs = UnixTimeMillisecondsHighRes();
         var frame = new DisplayFrame(
             Seq: NextDisplaySeq(),
             TsUnixMs: nowMs,
@@ -3003,8 +3133,20 @@ public class DspPipelineService : BackgroundService,
         bool txMonitorMeterOnly = false) =>
         (!txMonitorOn || txMonitorMeterOnly) && !txAudioSuppressed;
 
-    private bool ShouldSuppressRxAudioForCurrentTick() =>
-        _rxAudioSuppressedForTx || Volatile.Read(ref _rxPostTxMuteBlocksRemaining) > 0;
+    private bool ShouldSuppressRxAudioForCurrentTick(out bool activelyKeyed)
+    {
+        // This volatile acquire pairs with SetMox(true)'s final suppression
+        // write, publishing the per-transmission DUP and PureSignal decision.
+        activelyKeyed = _rxAudioSuppressedForTx;
+        int postTxMuteBlocksRemaining = Volatile.Read(ref _rxPostTxMuteBlocksRemaining);
+        if (!activelyKeyed && postTxMuteBlocksRemaining <= 0)
+        {
+            _fullDuplexRxActiveForCurrentTx = false;
+            if (Volatile.Read(ref _rxPostTxFadeInSamplesRemaining) <= 0)
+                _localRxAudioContinuousForCurrentTx = false;
+        }
+        return activelyKeyed || postTxMuteBlocksRemaining > 0;
+    }
 
     internal bool ShouldSuppressRxDisplayForCurrentTick()
     {
@@ -3038,7 +3180,10 @@ public class DspPipelineService : BackgroundService,
                 continue;
 
             if (next == 0)
+            {
                 Volatile.Write(ref _rxPostTxFadeInSamplesRemaining, RxPostTxFadeInSamples);
+                _fullDuplexRxActiveForCurrentTx = false;
+            }
             return;
         }
     }
@@ -3171,11 +3316,22 @@ public class DspPipelineService : BackgroundService,
             Volatile.Write(ref _rxPostTxMuteBlocksRemaining, 0);
             Volatile.Write(ref _rxPostTxFadeInSamplesRemaining, 0);
             Volatile.Write(ref _rxPostTxDisplayFramesRemaining, 0);
-            _rxAudioSuppressedForTx = true;
-            _rxFadeOutPending = true;
             _p2DisplayDuplexForCurrentTx = _radio.IsProtocol2Active;
             _stopRxForPureSignalForCurrentTx = _appliedPsEnabled;
+            // The operator's DUP choice is latched by the first suppressed tick
+            // rather than read here. SetMox runs on the caller's thread (see the
+            // note above) and RadioService.Snapshot takes the radio-state lock,
+            // so reading it here would put a cross-service lock acquisition on
+            // the MOX edge. The tick already holds a projected StateDto and can
+            // latch without any lock at all.
+            _fullDuplexRxActiveForCurrentTx = false;
+            _localRxAudioContinuousForCurrentTx = false;
+            _fullDuplexLatchPendingForCurrentTx = true;
             _resetDisplayPixelsForCurrentTx = _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx;
+            _rxFadeOutPending = true;
+            // Publish every per-transmission decision above before the RX sink
+            // thread observes keyed audio suppression.
+            _rxAudioSuppressedForTx = true;
             lock (_engineLock)
             {
                 _engine?.SetMox(true, _stopRxForPureSignalForCurrentTx);
@@ -5350,6 +5506,7 @@ public class DspPipelineService : BackgroundService,
             txReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
         bool rxFreeDvMode = s.Mode == RxMode.FreeDv;
         bool txFreeDvMode = txReceiver.Mode == RxMode.FreeDv;
+        var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, txEngineMode);
         bool txDigitalBypass = IsDigitalTxZeusMode(txReceiver.Mode);
         // Forward VFO changes to the P2 client when it's active. RadioService
         // does this for P1 via ActiveClient?.SetVfoAHz() inside SetVfo, but
@@ -5412,6 +5569,51 @@ public class DspPipelineService : BackgroundService,
                 _engine?.SetRxDisplayFastAttack(_channelId, fast: true);
                 _fastAttackActive = true;
             }
+        }
+
+        // Realtime VFO push (RX0): the moment the dial or display centre moves —
+        // from ANY source, including the front-panel encoder whose tune never
+        // touches the web UI — tell the frontend over the socket so it can move
+        // the dial readout and glide the pan without waiting for the 1 Hz state
+        // poll and the display-frame echo. Edge-gated to real moves; the first
+        // callback after construction only records the sentinel. Both dial and
+        // centre travel so the frontend can place the pan (RadioLoHz, CW/CTUN-
+        // correct) and the readout (VfoHz) each correctly.
+        if (_lastPushedVfoHz == long.MinValue)
+        {
+            _lastPushedVfoHz = s.VfoHz;
+            _lastPushedRadioLoHz = s.RadioLoHz;
+        }
+        else if (s.VfoHz != _lastPushedVfoHz || s.RadioLoHz != _lastPushedRadioLoHz)
+        {
+            _lastPushedVfoHz = s.VfoHz;
+            _lastPushedRadioLoHz = s.RadioLoHz;
+            _hub.Broadcast(new VfoStateFrame(Receiver: 0, VfoHz: s.VfoHz, RadioLoHz: s.RadioLoHz));
+        }
+
+        // Same push for RX2 / VFO B when it is enabled: its dial is
+        // Receivers[1].VfoHz, its display centre the CTUN-frozen DDC centre
+        // _secondaryRx[1].LoHz (kept current by UpdateRxLo(1, s) above).
+        if (SecondaryReceiverEnabled(1, s))
+        {
+            long rx2Vfo = SecondaryRxParams(s, 1).vfoHz;
+            long rx2Lo = _secondaryRx[1].LoHz;
+            if (_lastPushedRx2VfoHz == long.MinValue)
+            {
+                _lastPushedRx2VfoHz = rx2Vfo;
+                _lastPushedRx2LoHz = rx2Lo;
+            }
+            else if (rx2Vfo != _lastPushedRx2VfoHz || rx2Lo != _lastPushedRx2LoHz)
+            {
+                _lastPushedRx2VfoHz = rx2Vfo;
+                _lastPushedRx2LoHz = rx2Lo;
+                _hub.Broadcast(new VfoStateFrame(Receiver: 1, VfoHz: rx2Vfo, RadioLoHz: rx2Lo));
+            }
+        }
+        else if (_lastPushedRx2VfoHz != long.MinValue)
+        {
+            _lastPushedRx2VfoHz = long.MinValue;
+            _lastPushedRx2LoHz = long.MinValue;
         }
 
         var engine = _engine;
@@ -5613,7 +5815,8 @@ public class DspPipelineService : BackgroundService,
         // TX mic gain: dB → linear (10^(db/20)) at the engine seam. Conversion
         // matches the historical /api/mic-gain inline (Math.Pow(10.0, db/20.0));
         // moved here so the operator-friendly dB is what gets stored and broadcast.
-        double micLinear = Math.Pow(10.0, s.MicGainDb / 20.0);
+        int effectiveMicGainDb = effectiveTxAudio.MicGainDb;
+        double micLinear = Math.Pow(10.0, effectiveMicGainDb / 20.0);
         if (micLinear != _appliedTxMicGainLinear)
         {
             engine.SetTxPanelGain(micLinear);
@@ -5621,7 +5824,9 @@ public class DspPipelineService : BackgroundService,
         }
         // FreeDV: raise the Leveler makeup ceiling so the low-level OFDM is driven
         // to a usable (but headroom-safe) level. Operator's value restored on exit.
-        double levelerMax = txFreeDvMode ? FreeDvLevelerMaxGainDb : s.LevelerMaxGainDb;
+        double levelerMax = txFreeDvMode
+            ? FreeDvLevelerMaxGainDb
+            : effectiveTxAudio.LevelerMaxGainDb;
         if (levelerMax != _appliedTxLevelerMaxGainDb)
         {
             engine.SetTxLevelerMaxGain(levelerMax);
@@ -5662,17 +5867,23 @@ public class DspPipelineService : BackgroundService,
         }
         var txLeveling = txFreeDvMode
             ? FreeDvTxLevelingProfile
-            : (s.TxLeveling ?? new TxLevelingConfig());
+            : effectiveTxAudio.TxLeveling;
         if (!txLeveling.Equals(_appliedTxLeveling))
         {
             engine.SetTxLeveling(channel, txLeveling);
             _appliedTxLeveling = txLeveling;
         }
-        var txPhaseRotator = s.TxPhaseRotator ?? new TxPhaseRotatorConfig();
+        var txPhaseRotator = effectiveTxAudio.TxPhaseRotator;
         if (!txPhaseRotator.Equals(_appliedTxPhaseRotator))
         {
             engine.SetTxPhaseRotator(channel, txPhaseRotator);
             _appliedTxPhaseRotator = txPhaseRotator;
+        }
+        double amCarrierLevel = effectiveTxAudio.CarrierCoefficient;
+        if (amCarrierLevel != _appliedTxAmCarrierLevel)
+        {
+            engine.SetTxAmCarrierLevel(amCarrierLevel);
+            _appliedTxAmCarrierLevel = amCarrierLevel;
         }
         ApplyVisibleDdcZoom(engine, s);
 
@@ -5859,7 +6070,7 @@ public class DspPipelineService : BackgroundService,
         // falls back to CfcConfig.Default → engine sees a clean OFF profile.
         // Digital TX mode gates the CFC master run flag at the engine seam; the
         // operator's profile still lands so leaving the mode restores instantly.
-        var cfc = s.Cfc ?? CfcConfig.Default;
+        var cfc = effectiveTxAudio.Cfc;
         if (resync || !CfcConfigsEqual(cfc, _appliedCfc))
         {
             engine.SetCfcConfig(cfc);
@@ -6203,14 +6414,19 @@ public class DspPipelineService : BackgroundService,
             s.Agc ?? new AgcConfig(AgcMode.Med),
             effectiveAgc);
         var squelch = s.Squelch ?? new SquelchConfig();
-        var txLeveling = s.TxLeveling ?? new TxLevelingConfig();
-        var txPhaseRotator = s.TxPhaseRotator ?? new TxPhaseRotatorConfig();
         // FreeDV resolves to the band-convention sideband (LSB < 10 MHz, USB ≥);
         // every other mode passes through as itself. See RadioService.EffectiveEngineMode.
         var openEngineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz);
         var openTxReceiver = RadioFrequencyResolver.TxReceiver(s);
         var openTxEngineMode = RadioService.EffectiveEngineMode(
             openTxReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
+        bool openTxFreeDvMode = openTxReceiver.Mode == RxMode.FreeDv;
+        var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, openTxEngineMode);
+        var txLeveling = openTxFreeDvMode
+            ? FreeDvTxLevelingProfile
+            : effectiveTxAudio.TxLeveling;
+        var txPhaseRotator = effectiveTxAudio.TxPhaseRotator;
+        var cfc = effectiveTxAudio.Cfc;
         engine.SetMode(channelId, openEngineMode);
         // Sync TXA modulator with RX mode at engine-open time so the first
         // key-down lands with the correct sideband (no-op on Synthetic / pre-
@@ -6246,9 +6462,15 @@ public class DspPipelineService : BackgroundService,
         // values differ. The engine's TXA reopen path resets PanelGain1=1.0 and
         // LevelerTop=8.0 internally; without this re-push, a relaunch would
         // ignore the just-hydrated StateDto values.
-        double micLinearInit = Math.Pow(10.0, s.MicGainDb / 20.0);
+        int micGainDb = effectiveTxAudio.MicGainDb;
+        double micLinearInit = Math.Pow(10.0, micGainDb / 20.0);
         engine.SetTxPanelGain(micLinearInit);
-        engine.SetTxLevelerMaxGain(s.LevelerMaxGainDb);
+        double levelerMax = openTxFreeDvMode
+            ? FreeDvLevelerMaxGainDb
+            : effectiveTxAudio.LevelerMaxGainDb;
+        engine.SetTxLevelerMaxGain(levelerMax);
+        double carrierLevel = effectiveTxAudio.CarrierCoefficient;
+        engine.SetTxAmCarrierLevel(carrierLevel);
         engine.SetNoiseReduction(channelId, nr);
         // Force-apply AGC mode/custom params on a fresh engine so the operator's
         // persisted choice survives a reconnect. The engine's channel-open path
@@ -6270,6 +6492,7 @@ public class DspPipelineService : BackgroundService,
         // Auto Tune-locked setting survives reconnect. Reverse is part of the
         // same config but remains operator-controlled.
         engine.SetTxPhaseRotator(channelId, txPhaseRotator);
+        engine.SetCfcConfig(cfc);
         // Manual notches: feed the LO first (notch positioning reference), then
         // re-apply the operator's notch set onto the fresh engine. A reconnect
         // builds a brand-new engine whose notch DB is empty; RadioService holds
@@ -6298,12 +6521,14 @@ public class DspPipelineService : BackgroundService,
         for (int i = 1; i < MaxReceivers; i++)
             _secondaryRx[i].AppliedAfGainDb = double.NaN;
         _appliedTxMicGainLinear = micLinearInit;
-        _appliedTxLevelerMaxGainDb = s.LevelerMaxGainDb;
+        _appliedTxLevelerMaxGainDb = levelerMax;
+        _appliedTxAmCarrierLevel = carrierLevel;
         _appliedNr = nr;
         _appliedAgc = agc;
         _appliedSquelch = squelch;
         _appliedTxLeveling = txLeveling;
         _appliedTxPhaseRotator = txPhaseRotator;
+        _appliedCfc = cfc;
         _appliedRxBandpassWindow = s.RxFilterWindow;
         _appliedTxBandpassWindow = s.TxFilterWindow;
         _appliedRxFilterPhase = s.RxFilterPhase;
@@ -8585,7 +8810,7 @@ public class DspPipelineService : BackgroundService,
         // Audio path uses nowMs too (it runs even when no clients are connected,
         // for in-process RxAudioAvailable subscribers like TCI). Hoisted above
         // the display gate to keep one timestamp call per tick.
-        double nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        double nowMs = UnixTimeMillisecondsHighRes();
         long holdNowMs = Environment.TickCount64;
         bool pan = false, wf = false;
         bool psFbPanUsed = false, psFbWfUsed = false;
@@ -9018,30 +9243,39 @@ public class DspPipelineService : BackgroundService,
         // Read once, up front: everything below that decides which receiver's
         // audio survives this tick (RX1, each secondary, and the publish
         // branch) needs to agree on the same keyed/post-TX-drain snapshot.
-        bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick();
-        int txReceiverIndex = state.TxReceiverIndex;
-        // Operator gate ("DUP" on the transport bar, default off). Disabled
-        // reduces every "!fullDuplexMultiRxEnabled || ri == txReceiverIndex"
-        // check below to unconditionally true, so the exclusion below applies
-        // to every receiver during suppression — byte-identical to the MOX
-        // behaviour before full-duplex multi-RX audio existed. Enabled narrows
-        // it to just the TX-selected receiver.
-        bool fullDuplexMultiRxEnabled = state.FullDuplexMultiRxEnabled;
+        bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick(out bool activelyKeyed);
+        // The operator's DUP choice and the PureSignal guard are latched on the
+        // first suppressed tick of a transmission. A mid-transmission toggle
+        // applies on the next transmission, keeping this TX and its drain window
+        // on one stable policy. Latching here rather than in SetMox keeps the
+        // radio-state lock off the MOX edge: this tick already has a projected
+        // StateDto, so no cross-service call is needed.
+        if (_fullDuplexLatchPendingForCurrentTx && suppressRxAudioForTx)
+        {
+            bool latched =
+                state.FullDuplexMultiRxEnabled && !_stopRxForPureSignalForCurrentTx;
+            _fullDuplexRxActiveForCurrentTx = latched;
+            _localRxAudioContinuousForCurrentTx = latched;
+            _fullDuplexLatchPendingForCurrentTx = false;
+        }
+        bool fullDuplexRxActive = _fullDuplexRxActiveForCurrentTx;
+        bool localRxAudioContinuous = _localRxAudioContinuousForCurrentTx;
+        // A full-duplex receiver may resume after a transient keyed starvation,
+        // but once continuity is lost the post-TX drain must finish before local
+        // RX resumes. Continuous full-duplex audio bypasses that artificial gap.
+        bool allowLocalRxDuringSuppression =
+            fullDuplexRxActive && (activelyKeyed || localRxAudioContinuous);
         int audioSampleCount = engine.ReadAudio(channel, audioBuf);
         // Per-RX mute (Thetis chkMUT): RX1 stays the audio clock-master so the
         // mix/output timing is unchanged, but its samples are zeroed so only the
         // other (unmuted) receivers are heard. TX monitor overrides RX audio
         // below, so muting an RX never silences the monitor.
         //
-        // Full-duplex multi-RX: while keyed (or draining post-TX) AND the DUP
-        // gate is on, only the receiver actually selected to transmit
-        // (TxReceiverIndex) is excluded here — every OTHER receiver keeps
-        // flowing through the mix below so the operator keeps hearing them
-        // during MOX, same as the panadapter/waterfall already do for
-        // secondaries. With DUP off, every receiver is excluded during
-        // suppression, matching the original MOX behaviour.
+        // Full duplex: while keyed (or draining post-TX), DUP keeps every
+        // unmuted receiver flowing through the mix. With DUP off, or while
+        // PureSignal owns RXA for feedback, TX suppression excludes them all.
         bool rx1Muted = IsReceiverMuted(state, 0)
-            || (suppressRxAudioForTx && (!fullDuplexMultiRxEnabled || txReceiverIndex == 0));
+            || (suppressRxAudioForTx && !allowLocalRxDuringSuppression);
         if (rx1Muted && audioSampleCount > 0)
             audioBuf.AsSpan(0, audioSampleCount).Clear();
 
@@ -9081,13 +9315,11 @@ public class DspPipelineService : BackgroundService,
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
-            // affect the additive MixRxAudioN bus. With DUP on, the TX-selected
-            // receiver gets the same treatment while keyed/draining (see
-            // rx1Muted above) so it alone drops out of the mix and every other
-            // secondary stays audible; with DUP off, every secondary drops out
-            // during suppression, same as rx1Muted above.
+            // affect the additive MixRxAudioN bus. With DUP on, every unmuted
+            // secondary remains audible while keyed/draining; with DUP off,
+            // every secondary drops out during suppression, same as RX1 above.
             if (IsReceiverMuted(state, ri)
-                || (suppressRxAudioForTx && (!fullDuplexMultiRxEnabled || ri == txReceiverIndex)))
+                || (suppressRxAudioForTx && !allowLocalRxDuringSuppression))
                 continue;
             _mixSlices[mixSliceCount++] = new RxAudioSlice(sec.AudioBuf, n);
         }
@@ -9113,10 +9345,9 @@ public class DspPipelineService : BackgroundService,
             externalRxCount = _externalRxAudioSource.Read(_kiwiMixBuf.AsSpan(0, want));
         }
 
-        // RX1's own samples were already zeroed above when it's muted (or it's
-        // the TX-selected receiver, keyed); tell the mixer to drop RX1 from the
-        // bus too. With nothing audible from any receiver the mixer returns
-        // silence — but any OTHER live secondary still sums in normally.
+        // RX1's own samples were already zeroed above when it is muted or TX
+        // suppression is active without DUP; tell the mixer to drop RX1 from
+        // the bus too. Every live, unmuted secondary still sums in normally.
         audioSampleCount = MixRxAudioN(
             audioBuf, audioSampleCount, _mixSlices.AsSpan(0, mixSliceCount),
             rx1Muted: rx1Muted);
@@ -9129,6 +9360,13 @@ public class DspPipelineService : BackgroundService,
         // through the mute-exempt lane after the RX-publish block (see below).
         bool rxAudioMuted = _rxAudioMute?.IsMuted ?? false;
         bool externalRxPreserved = suppressRxAudioForTx && externalRxCount > 0;
+        bool liveLocalRxAudioBeforeExternalRouting = audioSampleCount > 0;
+        if (suppressRxAudioForTx && localRxAudioContinuous &&
+            (!liveLocalRxAudioBeforeExternalRouting || externalRxPreserved))
+        {
+            localRxAudioContinuous = false;
+            _localRxAudioContinuousForCurrentTx = false;
+        }
         // Keep Kiwi outside the local-radio DSP/plugin/fade lane. That lane can
         // be nonlinear and stateful, so subtracting raw Kiwi afterward cannot
         // recover its contribution. Seed a silent output-sized local block when
@@ -9136,23 +9374,21 @@ public class DspPipelineService : BackgroundService,
         // before the final limiter below.
         //
         // Deliberately keyed off the raw suppressRxAudioForTx flag rather than
-        // the per-receiver TX exclusion above: Kiwi plus a live non-TX local
-        // secondary during MOX is a narrow combination, and this preserves the
-        // existing "prefer Kiwi, drop the whole local mix" behaviour for it
-        // unchanged. The common (non-Kiwi) multi-RX case is unaffected — this
-        // call is a no-op whenever externalRxCount == 0.
+        // the latched DUP allowance above. This preserves the existing
+        // "prefer Kiwi, drop the whole local mix" behaviour while TX/drain is
+        // active. The common non-Kiwi case is unaffected because this is a
+        // no-op whenever externalRxCount == 0.
         audioSampleCount = PrepareLocalRxForExternalOutput(
             audioBuf,
             audioSampleCount,
             externalRxCount,
             suppressRxAudioForTx);
-        // Other (non-TX) receivers keep contributing to the mix above, so the
-        // bus can still carry live audio even while suppressRxAudioForTx is
-        // set. Only fall back to the fully-synthesized suppressed/sidetone
-        // block when nothing audible survived the TX-receiver exclusion.
-        bool otherReceiversLive = audioSampleCount > 0;
+        // With DUP active, the bus can carry live local audio even while the
+        // keyed/post-TX suppression clock is running. Only fall back to the
+        // synthesized suppressed/sidetone block when no local audio is present.
+        bool liveLocalRxAudio = audioSampleCount > 0;
         bool suppressPublishedRxAudio =
-            suppressRxAudioForTx && !otherReceiversLive && !externalRxPreserved;
+            suppressRxAudioForTx && !liveLocalRxAudio && !externalRxPreserved;
 
         if (audioSampleCount > 0)
         {
@@ -9164,15 +9400,11 @@ public class DspPipelineService : BackgroundService,
             // not reintroduce an abrupt edge after this early demod-stage ramp.
             if (_rxFadeOutPending)
             {
-                if (externalRxPreserved || otherReceiversLive)
+                if (externalRxPreserved || localRxAudioContinuous)
                 {
                     // Consume the local-radio fade edge without applying it to
-                    // the independent Kiwi receive samples, or (multi-RX full
-                    // duplex) to another receiver's audio that never went
-                    // silent. The TX-selected receiver's own contribution was
-                    // already dropped from the mix above with a hard cut —
-                    // same as an ordinary per-RX mute, which never fades
-                    // either — so no separate fade is needed on this bus.
+                    // independent Kiwi samples or local RX audio that has
+                    // remained continuous since key-down.
                     _rxFadeOutPending = false;
                 }
                 else
@@ -9317,13 +9549,15 @@ public class DspPipelineService : BackgroundService,
                 // processed local block first, then apply its post-TX fade.
                 LimitRxAudioBuffer(audioBuf.AsSpan(0, audioSampleCount));
                 int postTxFadeRemaining = Volatile.Read(ref _rxPostTxFadeInSamplesRemaining);
-                // Same reasoning as the fade-out above: only ramp the resuming
-                // TX-selected receiver's own audio back in when it's the sole
-                // contributor to the bus. If another receiver was live the
-                // whole time (or Kiwi is preserved), leave the counter armed
-                // rather than ramping their already-continuous audio — it
-                // applies on a later tick once the TX receiver is heard alone.
-                if (postTxFadeRemaining > 0 && !externalRxPreserved && !otherReceiversLive)
+                // Local audio that remained continuous through TX and drain
+                // must not receive a second fade. If it starved or Kiwi
+                // preempted it, retain the raised-cosine soft resume.
+                if (postTxFadeRemaining > 0 && localRxAudioContinuous)
+                {
+                    Volatile.Write(ref _rxPostTxFadeInSamplesRemaining, 0);
+                    _localRxAudioContinuousForCurrentTx = false;
+                }
+                else if (postTxFadeRemaining > 0)
                 {
                     int next = ApplyRxPostTxFadeIn(
                         audioBuf.AsSpan(0, audioSampleCount),
@@ -9362,20 +9596,14 @@ public class DspPipelineService : BackgroundService,
                 _productPluginAudio?.PublishRxAudio(
                     0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
                 RxAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
-                if (externalRxPreserved || (suppressRxAudioForTx && otherReceiversLive))
+                if (externalRxPreserved || (suppressRxAudioForTx && liveLocalRxAudio))
                 {
                     // Advance the local-radio post-TX drain here too: normal
                     // RX audio published while suppressRxAudioForTx is still
-                    // set means either Kiwi was preserved, or (multi-RX full
-                    // duplex) another receiver's live audio carried the bus
-                    // while the TX-selected receiver stayed excluded. Either
-                    // way the drain clock must keep ticking down so the TX
-                    // receiver's own audio (and its post-TX fade-in) resumes
-                    // once its settle window elapses — otherwise, as long as
-                    // any other receiver keeps producing audio blocks (which
-                    // is continuous, independent of squelch), the counter
-                    // would never reach zero and the TX receiver would stay
-                    // excluded from the mix for the rest of the session.
+                    // set means either Kiwi was preserved or DUP carried live
+                    // local audio. The drain clock must keep ticking so the
+                    // suppression state reaches zero after MOX-off even on a
+                    // single-receiver full-duplex station.
                     MarkTxSuppressedAudioBlockPublished();
                 }
             }
@@ -9545,11 +9773,15 @@ public class DspPipelineService : BackgroundService,
             _rxMeterTickMod = 0;
             double transverterMeterCorrectionDb =
                 _radio.TransverterMeterCorrectionDb(state.VfoHz);
-            double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
+            double operatorSMeterOffsetDb = OperatorSMeterOffsetDb();
+            double baseRxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
                 _radio.EffectiveBoardKind,
                 _radio.EffectiveOrionMkIIVariant)
                 + transverterMeterCorrectionDb
                 + RxAttenuatorMeterOffsetDb(state);
+            double rxCalOffsetDb = AddOperatorSMeterOffset(
+                baseRxCalOffsetDb,
+                operatorSMeterOffsetDb);
 
             // Prefer WDSP's S-meter when it is ticking. The native production-
             // sequence regression proves S_AV escapes its -400 startup sentinel
@@ -9569,7 +9801,10 @@ public class DspPipelineService : BackgroundService,
                 double rms = double.IsFinite(rxAudioRmsForMeter) ? rxAudioRmsForMeter : 0.0;
                 dbm = AudioRmsToFallbackDbm(
                     rms,
-                    RxFallbackMeterCorrectionDb(state, transverterMeterCorrectionDb));
+                    RxFallbackMeterCorrectionDb(
+                        state,
+                        transverterMeterCorrectionDb,
+                        operatorSMeterOffsetDb));
             }
             if (!double.IsFinite(dbm)) dbm = -160.0;
             _hub.Broadcast(new RxMeterFrame((float)dbm));
@@ -9692,7 +9927,8 @@ public class DspPipelineService : BackgroundService,
         var state = _radio.Snapshot();
         long? receiverVfoHz = Protocol3MeterReceiverVfoHz(state, channel);
         byte? receiverAdcSource = Protocol3MeterReceiverAdcSource(state, channel);
-        double rxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
+        double operatorSMeterOffsetDb = OperatorSMeterOffsetDb();
+        double baseRxCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
             _radio.EffectiveBoardKind,
             _radio.EffectiveOrionMkIIVariant)
             + (receiverVfoHz is long vfoHz
@@ -9701,6 +9937,9 @@ public class DspPipelineService : BackgroundService,
             + (receiverAdcSource is byte adcSource
                 ? RxAttenuatorMeterOffsetDb(state, adcSource)
                 : 0.0);
+        double rxCalOffsetDb = AddOperatorSMeterOffset(
+            baseRxCalOffsetDb,
+            operatorSMeterOffsetDb);
         double dbm = ApplyRxMeterCalibration(dbfsRaw, rxCalOffsetDb);
         if (!double.IsFinite(dbm)) dbm = -160.0;
         float adcPk = (float)(double.IsFinite(adcHeadroomDb) ? -adcHeadroomDb : -200.0);
@@ -10025,8 +10264,16 @@ public class DspPipelineService : BackgroundService,
 
     internal static double RxFallbackMeterCorrectionDb(
         StateDto state,
-        double transverterMeterCorrectionDb) =>
-        transverterMeterCorrectionDb + RxAttenuatorMeterOffsetDb(state);
+        double transverterMeterCorrectionDb,
+        double operatorOffsetDb = 0.0) =>
+        AddOperatorSMeterOffset(
+            transverterMeterCorrectionDb + RxAttenuatorMeterOffsetDb(state),
+            operatorOffsetDb);
+
+    internal static double AddOperatorSMeterOffset(
+        double existingCalibrationDb,
+        double operatorOffsetDb) =>
+        existingCalibrationDb + operatorOffsetDb;
 
     internal static double RxAttenuatorMeterOffsetDb(StateDto state, byte meteredAdcSource) =>
         (meteredAdcSource == PrimaryReceiverAdcSource(state))

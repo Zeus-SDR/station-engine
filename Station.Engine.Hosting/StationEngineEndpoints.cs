@@ -205,6 +205,11 @@ public static class StationEngineEndpoints
         endpoints.MapSpectralZoomEndpoint();
         endpoints.MapWorkspaceZoomEndpoint();
         endpoints.MapOperatorUiSettingsEndpoints();
+        endpoints.MapOperatorSettingsEndpoints();
+        // The attached SPA sends the same waterfall render-state beacon as the
+        // full host. Without the shared route Zeus Link logs a 404 after every
+        // waterfall mount even though the WebGL fallback itself is healthy.
+        endpoints.MapWaterfallDiagnosticEndpoint();
         // Same field gap as the operator UI prefs: the SPA's Zeus Digital
         // settings tab reads/writes /api/ft8/settings (+ autocq-ack) against
         // the engine in attach mode, and the standalone host mapped neither.
@@ -214,6 +219,7 @@ public static class StationEngineEndpoints
         // whether it is talking to the engine (attach) or the full host.
         endpoints.MapOnboardingEndpoints();
         endpoints.MapWorkspaceLayoutEndpoints();
+        endpoints.MapContestLogEndpoints();
         endpoints.MapBandPlanEndpoints();
         endpoints.MapStationFavoriteEndpoints();
         endpoints.MapPaSettingsEndpoints();

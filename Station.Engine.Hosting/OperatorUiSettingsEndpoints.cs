@@ -36,16 +36,31 @@ public static class OperatorUiSettingsEndpoints
         {
             if (string.IsNullOrWhiteSpace(req.Mode) || string.IsNullOrWhiteSpace(req.Fit))
                 return Results.BadRequest(new { error = "mode and fit required" });
-            store.SaveMode(req.Mode, req.Fit, req.RxTraceColor,
-                req.DbMin, req.DbMax, req.TxDbMin, req.TxDbMax,
-                req.WfDbMin, req.WfDbMax, req.WfTxDbMin, req.WfTxDbMax,
-                req.TxDisplayCalOffsetDb, req.TxDisplayFftSize,
-                req.TxDisplayWindow, req.TxDisplayAvgTauMs,
-                req.WidebandDisplayEnabled,
-                req.DisplayMaxFrameRateHz,
-                req.DisplayDecimation,
-                req.WaterfallUpdatePeriod,
-                req.WidebandSignalMarkersEnabled);
+            try
+            {
+                store.SaveMode(req.Mode, req.Fit, req.RxTraceColor,
+                    req.DbMin, req.DbMax, req.TxDbMin, req.TxDbMax,
+                    req.WfDbMin, req.WfDbMax, req.WfTxDbMin, req.WfTxDbMax,
+                    req.TxDisplayCalOffsetDb, req.TxDisplayFftSize,
+                    req.TxDisplayWindow, req.TxDisplayAvgTauMs,
+                    req.WidebandDisplayEnabled,
+                    req.DisplayMaxFrameRateHz,
+                    req.DisplayDecimation,
+                    req.WaterfallUpdatePeriod,
+                    req.WidebandSignalMarkersEnabled,
+                    req.WaterfallColormap,
+                    req.WaterfallScrollSpeed,
+                    req.BandOverlayEnabled,
+                    req.BandEdgeAlertEnabled,
+                    req.ChatRosterOverlayEnabled,
+                    req.SpotLabelFontPx,
+                    req.GlobeRenderer,
+                    req.GlobeCustomImageryJson);
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
             var saved = store.Get();
             dsp.ApplyDisplaySettings(saved);
             return Results.Ok(saved);

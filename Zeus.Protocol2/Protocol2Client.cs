@@ -53,6 +53,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Zeus.Contracts;
+using Zeus.Protocol2.Discovery;
 
 namespace Zeus.Protocol2;
 
@@ -82,6 +83,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private const int SharedSendTimeoutMs = 10;
     private const int BufLen = 1444;
     private const int DiscoverySamplesPerPacket = 238;
+    private const int DiscoveryPort = 1024;
+    private const int ReachabilityReplyBufferSize = 2048;
+    // One parallel wave keeps multi-adapter disambiguation bounded by one
+    // short wait rather than multiplying latency by the candidate count.
+    private const int ReachabilityProbeTimeoutMs = 300;
 
     // Hi-priority status packet (radio → host on UDP 1025). Thetis treats it
     // as a 60-byte payload (network.c:683-756 reads up through byte 55), but
@@ -213,6 +219,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
     private Socket? _sock;
+    private string _boundNicDisplay = "(none)";
+    private string _rejectedBindNicDisplays = "(none)";
     // One gate for every datagram written through the shared P2 socket. Besides
     // preserving packet boundaries, this makes Poll(write) + SendTo atomic with
     // respect to the command, TX-IQ, and speaker sender threads.
@@ -858,16 +866,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public long HiPriPacketCount => Interlocked.Read(ref _hiPriPackets);
     private long _hiPriPackets;
 
-    public Task ConnectAsync(IPEndPoint radioEndpoint, CancellationToken ct)
+    public async Task ConnectAsync(IPEndPoint radioEndpoint, CancellationToken ct)
     {
         if (_sock is not null)
             throw new InvalidOperationException("Already connected.");
 
-        _radioEndpoint = new IPEndPoint(radioEndpoint.Address, 1024);
-        _speakerAudioEndpoint = new IPEndPoint(radioEndpoint.Address, 1028);
         var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        DisableUdpConnReset(sock);
-        var localBind = FindLocalAddressForSubnet(radioEndpoint.Address) ?? IPAddress.Any;
+        LocalAddressSelection bindSelection;
+        IPAddress localBind;
+        int reachabilityProbed;
         // Matched port convention — PC binds 1025, radio sends back with source
         // ports 1025/1026/1027/1035.. which we demux by fromaddr.
         //
@@ -884,15 +891,33 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         int localPort = 1025;
         try
         {
-            sock.Bind(new IPEndPoint(localBind, 1025));
+            DisableUdpConnReset(sock);
+            // Hermes gateware latches the stream destination IP/MAC/port from our
+            // packet source while run=0 (docs/references/firmware/hermes/P2-gateware/
+            // Hermes_Protocol_2_v10.7/Ethernet/network.v). Source-address and egress-
+            // interface agreement is therefore load-bearing for returned DDC IQ.
+            (bindSelection, reachabilityProbed) = await SelectLocalAddressForRemoteAsync(
+                radioEndpoint.Address,
+                ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            localBind = bindSelection.Address ?? IPAddress.Any;
+            try
+            {
+                sock.Bind(new IPEndPoint(localBind, 1025));
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                sock.Bind(new IPEndPoint(localBind, 0));
+                localPort = ((IPEndPoint)sock.LocalEndPoint!).Port;
+                _log.LogInformation(
+                    "p2.connect local UDP 1025 in use (co-located radio app?) — bound ephemeral port {Port}",
+                    localPort);
+            }
         }
-        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+        catch
         {
-            sock.Bind(new IPEndPoint(localBind, 0));
-            localPort = ((IPEndPoint)sock.LocalEndPoint!).Port;
-            _log.LogInformation(
-                "p2.connect local UDP 1025 in use (co-located radio app?) — bound ephemeral port {Port}",
-                localPort);
+            sock.Dispose();
+            throw;
         }
         // 4 MiB RX socket buffer. At 1536 kHz a single DDC pushes ~9.3 MB/s, and
         // with several DDCs streaming concurrently the kernel buffer must absorb
@@ -907,12 +932,29 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // buffer into WouldBlock before SendTo; this timeout is the bounded
         // cross-platform guard for a readiness race after Poll.
         sock.SendTimeout = SharedSendTimeoutMs;
-        _sock = sock;
+        if (Interlocked.CompareExchange(ref _sock, sock, null) is not null)
+        {
+            sock.Dispose();
+            throw new InvalidOperationException("Already connected.");
+        }
+        _radioEndpoint = new IPEndPoint(radioEndpoint.Address, 1024);
+        _speakerAudioEndpoint = new IPEndPoint(radioEndpoint.Address, 1028);
+        _boundNicDisplay = bindSelection.NicDisplay;
+        _rejectedBindNicDisplays = FormatNicDisplays(bindSelection.RejectedNicDisplays);
         _log.LogInformation(
-            "p2.connect radio={Radio} localBind={Local} localPort={Port}",
+            "p2.connect radio={Radio} localBind={Local} localPort={Port} subnetCandidates={CandidateCount} " +
+            "reachabilityProbed={ReachabilityProbed} reachabilityRouteDisagree={ReachabilityRouteDisagree} " +
+            "boundNic={BoundNic} rejectedNics={RejectedNics} selectionRule={SelectionRule} routeMatches={RouteMatches}",
             radioEndpoint.Address,
             localBind.Equals(IPAddress.Any) ? "ANY (no subnet match)" : localBind.ToString(),
-            localPort);
+            localPort,
+            bindSelection.SubnetMatchCount,
+            reachabilityProbed,
+            bindSelection.ReachabilityDisagreesWithRoute,
+            _boundNicDisplay,
+            _rejectedBindNicDisplays,
+            bindSelection.RuleName,
+            bindSelection.MatchesRouteProbe);
         if (NetworkAddressSelection.IsLinkLocal(radioEndpoint.Address))
         {
             _log.LogWarning(
@@ -920,7 +962,6 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 "connection is functional but this topology is drop-prone; a switch with a DHCP router is recommended",
                 radioEndpoint.Address);
         }
-        return Task.CompletedTask;
     }
 
     public Task StartAsync(int sampleRateKhz, CancellationToken ct)
@@ -2498,26 +2539,322 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         return true;
     }
 
-    // Returns the local IPv4 address of the first NIC whose subnet contains radioIp.
-    // Returns null when no subnet match is found (single-NIC host, radio behind a
-    // router, etc.) — the caller falls back to IPAddress.Any in that case.
-    internal static IPAddress? FindLocalAddressForSubnet(IPAddress radioIp)
+    private async Task<(LocalAddressSelection Selection, int ProbedCandidateCount)> SelectLocalAddressForRemoteAsync(
+        IPAddress radioIp,
+        CancellationToken ct)
     {
-        return NetworkAddressSelection.FindLocalAddressForSubnet(radioIp, EnumerateLocalIpv4Addresses());
+        var candidates = EnumerateLocalIpv4Addresses().ToArray();
+        var routeProbeAddress = ProbeLocalAddressForRemote(radioIp, DiscoveryPort);
+        var matches = NetworkAddressSelection.FindSubnetMatches(radioIp, candidates);
+        var reachability = default(ReachabilityProbeResult);
+
+        // With zero or one subnet match there is nothing to disambiguate. Keep
+        // ordinary single-NIC LAN hosts on precisely the existing path: no
+        // discovery packet, no added latency, and no change in selection.
+        if (NetworkAddressSelection.ShouldProbeReachability(matches.Count))
+        {
+            reachability = await ProbeReachabilityAsync(
+                radioIp,
+                matches,
+                routeProbeAddress,
+                ct).ConfigureAwait(false);
+        }
+
+        return (
+            NetworkAddressSelection.SelectLocalAddressForSubnet(
+                radioIp,
+                candidates,
+                routeProbeAddress,
+                reachability.Address),
+            reachability.ProbedCandidateCount);
     }
 
-    private static IEnumerable<LocalIpv4Address> EnumerateLocalIpv4Addresses()
+    private async Task<ReachabilityProbeResult> ProbeReachabilityAsync(
+        IPAddress radioIp,
+        IReadOnlyList<LocalIpv4Address> matches,
+        IPAddress? routeProbeAddress,
+        CancellationToken ct)
     {
-        foreach (var iface in NetworkInterface.GetAllNetworkInterfaces())
+        var orderedCandidates = NetworkAddressSelection.GetReachabilityProbeCandidates(matches, int.MaxValue);
+        var candidates = orderedCandidates
+            .Take(NetworkAddressSelection.MaxReachabilityProbeCandidates)
+            .ToArray();
+        if (candidates.Length <= 1) return default;
+
+        var droppedCandidates = orderedCandidates.Skip(candidates.Length).ToArray();
+        var droppedCandidateCount = droppedCandidates.Length;
+        if (droppedCandidateCount > 0)
         {
-            if (iface.OperationalStatus != OperationalStatus.Up) continue;
-            if (iface.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-            foreach (var ua in iface.GetIPProperties().UnicastAddresses)
+            _log.LogWarning(
+                "p2.reachability.probe truncated subnetCandidates={CandidateCount} probedCandidates={ProbedCount} " +
+                "droppedCandidates={DroppedCount} droppedNics={DroppedNics}",
+                matches.Count,
+                candidates.Length,
+                droppedCandidateCount,
+                FormatNicDisplays(droppedCandidates
+                    .Select(LocalAddressSelection.DisplayNic)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray()));
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ReachabilityProbeTimeoutMs);
+        var packet = RadioDiscoveryService.BuildDiscoveryPacket();
+        var replies = await Task.WhenAll(candidates
+            .Select(candidate => ProbeCandidateReachabilityAsync(
+                radioIp,
+                candidate,
+                packet,
+                timeout.Token)))
+            .ConfigureAwait(false);
+        var responders = replies.OfType<IPAddress>().ToArray();
+        var reachableAddress = NetworkAddressSelection.SelectReachableAddress(
+            candidates,
+            responders,
+            routeProbeAddress);
+        if (reachableAddress is null)
+        {
+            _log.LogWarning(
+                "p2.reachability.probe no responders candidateCount={CandidateCount} probedNics={ProbedNics}; " +
+                "falling back to route answer",
+                candidates.Length,
+                FormatNicDisplays(candidates
+                    .Select(LocalAddressSelection.DisplayNic)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray()));
+        }
+
+        return new ReachabilityProbeResult(reachableAddress, candidates.Length);
+    }
+
+    private static async Task<IPAddress?> ProbeCandidateReachabilityAsync(
+        IPAddress radioIp,
+        LocalIpv4Address candidate,
+        ReadOnlyMemory<byte> packet,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            DisableUdpConnReset(socket);
+            socket.Bind(new IPEndPoint(candidate.Address, 0));
+            var radioEndpoint = new IPEndPoint(radioIp, DiscoveryPort);
+            // Reuse discovery's retry count and gap: a freshly selected source
+            // address has a cold ARP path, so the first UDP datagram may vanish.
+            for (var attempt = 0; attempt < RadioDiscoveryService.SendAttempts; attempt++)
             {
-                if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                var mask = ua.IPv4Mask;
+                try
+                {
+                    await socket.SendToAsync(
+                        packet,
+                        SocketFlags.None,
+                        radioEndpoint,
+                        ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return null;
+                }
+                catch (Exception)
+                {
+                    // A failed attempt does not prevent the remaining ARP-warmup
+                    // retransmissions or the established fallback ranking.
+                }
+
+                if (attempt < RadioDiscoveryService.SendAttempts - 1)
+                {
+                    try
+                    {
+                        await Task.Delay(RadioDiscoveryService.SendGap, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            var reply = new byte[ReachabilityReplyBufferSize];
+            EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+            while (!ct.IsCancellationRequested)
+            {
+                var received = await socket.ReceiveFromAsync(
+                    reply,
+                    SocketFlags.None,
+                    any,
+                    ct).ConfigureAwait(false);
+                if (received.RemoteEndPoint is not IPEndPoint source ||
+                    !source.Address.Equals(radioIp))
+                {
+                    continue;
+                }
+
+                if (ReplyParser.TryParse(
+                    reply.AsSpan(0, received.ReceivedBytes),
+                    source.Address,
+                    out _))
+                {
+                    return candidate.Address;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Reachability is evidence, never a gate. Any per-NIC failure,
+            // timeout, or cancellation falls through to route/physical ranking.
+        }
+
+        return null;
+    }
+
+    private readonly record struct ReachabilityProbeResult(
+        IPAddress? Address,
+        int ProbedCandidateCount);
+
+    // Deliberately mirrored in Protocol1Client. UDP Connect sends no traffic;
+    // it asks the kernel to resolve the route and assign the source address.
+    // Any platform or routing failure degrades to the established ranking.
+    private IPAddress? ProbeLocalAddressForRemote(IPAddress radioIp, int port)
+    {
+        try
+        {
+            if (radioIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                _log.LogDebug("p2.route.probe unusable radio={Radio} reason=non-ipv4-radio", radioIp);
+                return null;
+            }
+            using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            probe.Connect(new IPEndPoint(radioIp, port));
+            var local = (probe.LocalEndPoint as IPEndPoint)?.Address;
+            if (local is null)
+            {
+                _log.LogDebug("p2.route.probe unusable radio={Radio} reason=no-local-endpoint", radioIp);
+                return null;
+            }
+            if (local.AddressFamily != AddressFamily.InterNetwork)
+            {
+                _log.LogDebug("p2.route.probe unusable radio={Radio} reason=non-ipv4-local", radioIp);
+                return null;
+            }
+            if (local.Equals(IPAddress.Any))
+            {
+                _log.LogDebug("p2.route.probe unusable radio={Radio} reason=any-local", radioIp);
+                return null;
+            }
+            return local;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "p2.route.probe failed radio={Radio}", radioIp);
+            return null;
+        }
+    }
+
+    private static string FormatNicDisplays(IReadOnlyList<string> displays) =>
+        displays.Count == 0 ? "(none)" : string.Join(",", displays);
+
+    private IEnumerable<LocalIpv4Address> EnumerateLocalIpv4Addresses()
+        => SelectLocalIpv4Addresses(SnapshotNetworkInterfaces());
+
+    private IEnumerable<NicSnapshot> SnapshotNetworkInterfaces()
+    {
+        NetworkInterface[] nics;
+        try
+        {
+            nics = NetworkInterface.GetAllNetworkInterfaces();
+        }
+        catch (Exception ex)
+        {
+            // Losing the whole enumeration leaves no subnet candidates, which the
+            // caller cannot tell apart from "no NIC is on the radio's subnet" — it
+            // silently degrades to an IPAddress.Any bind. Leave a breadcrumb.
+            _log.LogDebug(ex, "p2.nic.enumerate failed");
+            return Array.Empty<NicSnapshot>();
+        }
+
+        var snapshots = new List<NicSnapshot>(nics.Length);
+        foreach (var nic in nics)
+        {
+            try
+            {
+                var properties = nic.GetIPProperties();
+
+                int? ipv4InterfaceIndex = null;
+                try
+                {
+                    ipv4InterfaceIndex = properties.GetIPv4Properties()?.Index;
+                }
+                catch (Exception ex)
+                {
+                    // Interfaces without IPv4 properties remain valid candidates;
+                    // diagnostics use an explicit unknown-index placeholder.
+                    _log.LogDebug(ex, "p2.nic.ipv4props unavailable nic={Nic}", SafeNicDescription(nic));
+                }
+
+                // Materialised inside the same guard as GetIPProperties: on a NIC
+                // that disappears mid-enumeration (hot-unplugged USB dongle, a
+                // filter driver in a bad state) address access can throw too, and
+                // an escape here would fail the whole connect instead of skipping
+                // one adapter.
+                var addresses = new List<(IPAddress Address, IPAddress? Mask)>();
+                foreach (var uni in properties.UnicastAddresses)
+                    addresses.Add((uni.Address, uni.IPv4Mask));
+
+                snapshots.Add(new NicSnapshot(
+                    nic.Name,
+                    nic.NetworkInterfaceType,
+                    nic.OperationalStatus,
+                    addresses,
+                    SafeNicDescription(nic),
+                    ipv4InterfaceIndex,
+                    nic.Id));
+            }
+            catch (Exception ex)
+            {
+                // A skipped NIC vanishes from candidacy, and a radio-facing NIC
+                // that vanishes reproduces exactly the rx-silence symptom this
+                // selection exists to prevent. Never drop one silently.
+                _log.LogDebug(ex, "p2.nic.skip nic={Nic}", SafeNicDescription(nic));
+            }
+        }
+
+        return snapshots;
+    }
+
+    // Description access is itself part of the failing surface we are reporting
+    // on, so it must never throw out of a diagnostic path.
+    private static string SafeNicDescription(NetworkInterface nic)
+    {
+        try { return nic.Description; }
+        catch (Exception) { return "(unknown adapter)"; }
+    }
+
+    // Pure projection mirrored from Protocol1Client: tunnel-typed NICs plus
+    // macOS utun and Linux/Pi tun, wg, and ppp NICs reported as Unknown are
+    // tagged behind physical NICs.
+    internal static IEnumerable<LocalIpv4Address> SelectLocalIpv4Addresses(IEnumerable<NicSnapshot> nics)
+    {
+        var snapshotIndex = 0;
+        foreach (var nic in nics)
+        {
+            snapshotIndex++;
+            if (nic.Status != OperationalStatus.Up) continue;
+            if (nic.Type == NetworkInterfaceType.Loopback) continue;
+            var isTunnel = NetworkAddressSelection.IsTunnelInterface(nic.Name, nic.Type);
+            var identity = string.IsNullOrWhiteSpace(nic.Identity)
+                ? $"snapshot-{snapshotIndex}"
+                : nic.Identity;
+            foreach (var (address, mask) in nic.UnicastAddresses)
+            {
+                if (address.AddressFamily != AddressFamily.InterNetwork) continue;
                 if (mask is null || mask.Equals(IPAddress.Any)) continue;
-                yield return new LocalIpv4Address(ua.Address, mask);
+                yield return new LocalIpv4Address(
+                    address,
+                    mask,
+                    isTunnel,
+                    identity,
+                    nic.Description,
+                    nic.Ipv4InterfaceIndex);
             }
         }
     }
@@ -4642,9 +4979,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                     return;
                 case RxSilenceRecoveryAction.Exhausted:
                     _log.LogWarning(
-                        "p2.rx.recover failed attempts={Max} silenceMs={Silence} - the radio may still be sending to a previous session because its stream destination stayed locked while the radio was running; secondary network causes include direct-connect/link-local addressing, an isolated switch, DHCP renewal, NIC power management, firewall filtering, or WiFi/Ethernet route selection",
+                        "p2.rx.recover failed attempts={Max} silenceMs={Silence} - the radio may still be sending to a previous session because its stream destination stayed locked while the radio was running; secondary network causes include direct-connect/link-local addressing, an isolated switch, DHCP renewal, NIC power management, firewall filtering, or WiFi/Ethernet route selection; boundNic={BoundNic} rejectedNics={RejectedNics}",
                         decision.MaxAttempts,
-                        decision.SilenceMs);
+                        decision.SilenceMs,
+                        _boundNicDisplay,
+                        _rejectedBindNicDisplays);
                     SignalDisconnected("rx-silence");
                     return;
             }

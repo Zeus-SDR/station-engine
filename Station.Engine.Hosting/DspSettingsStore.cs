@@ -676,6 +676,49 @@ public sealed class DspSettingsStore : IDisposable
         e.CfcBand10Freq = c.Bands[9].FreqHz; e.CfcBand10Comp = c.Bands[9].CompLevelDb; e.CfcBand10Post = c.Bands[9].PostGainDb;
     }
 
+    public AmTxProfile? GetAmTxProfile(string profileId = "default")
+    {
+        var json = _entries.FindOne(x => x.ProfileId == profileId)?.AmTxProfileJson;
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<AmTxProfile>(json);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            _log.LogWarning(ex, "Ignoring invalid AM TX profile for {ProfileId}", profileId);
+            return null;
+        }
+    }
+
+    public void SetAmTxProfile(AmTxProfile profile, string profileId = "default")
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        var existing = _entries.FindOne(x => x.ProfileId == profileId);
+        if (existing is null)
+        {
+            var nrSeed = new NrConfig();
+            existing = new DspSettingsEntry
+            {
+                ProfileId = profileId,
+                NrMode = nrSeed.NrMode,
+                AnfEnabled = nrSeed.AnfEnabled,
+                SnbEnabled = nrSeed.SnbEnabled,
+                NbpNotchesEnabled = nrSeed.NbpNotchesEnabled,
+                NbMode = nrSeed.NbMode,
+                NbThreshold = nrSeed.NbThreshold,
+            };
+            existing.AmTxProfileJson = System.Text.Json.JsonSerializer.Serialize(profile);
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _entries.Insert(existing);
+            return;
+        }
+
+        existing.AmTxProfileJson = System.Text.Json.JsonSerializer.Serialize(profile);
+        existing.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(existing);
+    }
+
     // Keep this in lock-step with RadioService.IsSupportedNrMode — the store
     // must persist every mode RadioService treats as supported, or the live
     // selection (e.g. NR3 / Rnnr) is silently dropped to Off on the next read.
@@ -794,5 +837,6 @@ public sealed class DspSettingsEntry
     public BandpassWindow? TxFilterWindow { get; set; }
     public FilterPhaseMode? RxFilterPhase { get; set; }
     public FilterPhaseMode? TxFilterPhase { get; set; }
+    public string? AmTxProfileJson { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

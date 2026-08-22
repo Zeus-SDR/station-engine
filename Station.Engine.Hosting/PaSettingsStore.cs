@@ -43,9 +43,16 @@ public sealed class PaSettingsStore : IDisposable
     // Dedup key for the cross-board PA-gain substitution warning (issue #1180).
     // PaBandEntry rows are not board-scoped, so a value stored under one board
     // family's semantics survives a session into another board family — fired
-    // once per (band, board) pair on read so the operator sees the substitution
-    // in the log without flooding it on every recompute.
-    private readonly HashSet<(string Band, HpsdrBoardKind Board)> _crossBoardWarned = new();
+    // once per (band, board, variant) tuple on read so the operator sees the
+    // substitution in the log without flooding it on every recompute.
+    private readonly HashSet<(string Band, HpsdrBoardKind Board, OrionMkIIVariant Variant)> _crossBoardWarned = new();
+    // Non-positive dB gain is a separate legacy-Unknown contamination class
+    // from an out-of-range cross-board value. Keep its warning distinct.
+    private readonly HashSet<(string Band, HpsdrBoardKind Board, OrionMkIIVariant Variant)> _nonPositiveGainWarned = new();
+    // A legacy/non-connected session can persist PaMaxPowerWatts=0 in the
+    // board-agnostic global row. Warn once per resolved board when read repair
+    // substitutes that board/variant's calibrated full-scale target.
+    private readonly HashSet<(HpsdrBoardKind Board, OrionMkIIVariant Variant)> _maxPowerWarned = new();
 
     public event Action? Changed;
 
@@ -89,7 +96,9 @@ public sealed class PaSettingsStore : IDisposable
                 ? new PaGlobalSettingsDto(
                     PaEnabled: true,
                     PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant))
-                : new PaGlobalSettingsDto(g.PaEnabled, g.PaMaxPowerWatts);
+                : new PaGlobalSettingsDto(
+                    g.PaEnabled,
+                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant));
 
             var existing = _bands.FindAll().ToDictionary(e => e.Band, e => e);
             var bands = BandUtils.HfBands
@@ -169,15 +178,51 @@ public sealed class PaSettingsStore : IDisposable
         // dB forward gain. The PA Settings panel clamps non-HL2 input to
         // 0..70 dB (see docs/lessons/hl2-drive-model.md), so any persisted
         // value > 70 on a dB board is necessarily cross-board contamination.
-        double upper = board == HpsdrBoardKind.HermesLite2 ? 100.0 : 70.0;
+        bool isHl2 = board == HpsdrBoardKind.HermesLite2;
+        double upper = isHl2 ? 100.0 : 70.0;
+        if (!isHl2 && stored <= 0.0)
+        {
+            var seededGain = PaDefaults.GetPaGainDb(board, band, variant);
+            // Every supported non-HL2 board has a positive gain-table seed.
+            // If a future board is missing one, preserve the stored value
+            // rather than claiming that another non-positive value repaired it.
+            if (seededGain <= 0.0) return stored;
+            if (_nonPositiveGainWarned.Add((band, board, variant)))
+            {
+                _log.LogWarning(
+                    "pa.gain.nonpositive_substituted band={Band} board={Board} variant={Variant} stored={Stored:F2} -> using per-board default {Fallback:F2}. The non-positive dB gain was persisted before a supported board was resolved; the value in pa_bands is unchanged.",
+                    band, board, variant, stored, seededGain);
+            }
+            return seededGain;
+        }
         if (stored >= 0.0 && stored <= upper) return stored;
 
         var fallback = PaDefaults.GetPaGainDb(board, band, variant);
-        if (_crossBoardWarned.Add((band, board)))
+        if (fallback <= 0.0) return stored;
+        if (_crossBoardWarned.Add((band, board, variant)))
         {
             _log.LogWarning(
                 "pa.gain.cross_board_substituted band={Band} board={Board} variant={Variant} stored={Stored:F2} validUpper={Upper:F1} -> using per-board default {Fallback:F2}. The value in pa_bands was persisted under a different board's semantics (likely HL2 ↔ Hermes/ANAN/Orion). Open PA Settings and press \"Reset to defaults\" then APPLY to overwrite the row.",
                 band, board, variant, stored, upper, fallback);
+        }
+        return fallback;
+    }
+
+    private int ResolveMaxPowerWattsForBoard(
+        int stored,
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant)
+    {
+        // Unknown/unsupported hardware deliberately retains the raw-byte
+        // fallback represented by a non-positive value.
+        if (stored > 0 || board == HpsdrBoardKind.Unknown) return stored;
+
+        var fallback = PaDefaults.GetMaxPowerWatts(board, variant);
+        if (_maxPowerWarned.Add((board, variant)))
+        {
+            _log.LogWarning(
+                "pa.max_power.nonpositive_substituted board={Board} variant={Variant} stored={Stored} -> using per-board default {Fallback}. The value in pa_globals is unchanged; open PA Settings and press APPLY to persist a positive value.",
+                board, variant, stored, fallback);
         }
         return fallback;
     }
@@ -205,7 +250,9 @@ public sealed class PaSettingsStore : IDisposable
                 ? new PaGlobalSettingsDto(
                     PaEnabled: true,
                     PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant))
-                : new PaGlobalSettingsDto(g.PaEnabled, g.PaMaxPowerWatts);
+                : new PaGlobalSettingsDto(
+                    g.PaEnabled,
+                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant));
         }
     }
 

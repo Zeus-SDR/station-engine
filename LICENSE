@@ -7,6 +7,8 @@ Most of the first-party engine source is licensed under the GNU General Public
 License, version 2 or (at your option) any later version (GPL-2.0-or-later). The
 full text of version 2 is provided alongside this file in LICENSE.GPL-2.0, and
 those files individually remain available under GPL-2.0-or-later.
+These licences cover source code and convey no trademark rights in the Zeus or
+ZeusSDR names, logos, or branding.
 
 The SPE Expert 1.5K Taurus amplifier support under
 Station.Engine.Hosting/SpeTaurus/ is licensed under the GNU General Public

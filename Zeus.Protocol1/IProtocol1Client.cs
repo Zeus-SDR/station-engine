@@ -208,15 +208,15 @@ public interface IProtocol1Client : IDisposable
     bool HardwarePtt { get; }
 
     /// <summary>
-    /// Edge-triggered CW key-down from the gateware's shaped keyer output
-    /// (C0[2] / cw_key_status) — toggles per dit/dah, distinct from the
-    /// held <see cref="HardwarePttChanged"/> (C0[0] / ptt_resp). Drives the
-    /// local CW sidetone. Fires on the RX thread; handlers must not block.
-    /// (zeus-cl2)
+    /// Edge-triggered CW key-down. Hermes-Lite 2 supplies its shaped keyer
+    /// output in C0[2]; legacy Hermes-class boards supply raw dot/dash in
+    /// C0[2:1]. Distinct from <see cref="HardwarePttChanged"/> at C0[0].
+    /// Drives the local CW sidetone. Fires on the RX thread; handlers must not
+    /// block.
     /// </summary>
     event Action<bool>? CwKeyDownChanged;
 
-    /// <summary>Latest CW key-down level (C0[2]). Volatile; any thread.</summary>
+    /// <summary>Latest board-decoded CW key-down level. Volatile; any thread.</summary>
     bool CwKeyDown { get; }
 
     /// <summary>
@@ -382,6 +382,13 @@ public interface IProtocol1Client : IDisposable
     /// straight mode. See zeus-bks.
     /// </summary>
     void SetCwKeyerConfig(int wpm, CwKeyerMode mode, int weight, bool paddleReverse);
+
+    /// <summary>
+    /// Enable the Protocol-1 firmware CW generator through C&amp;C register
+    /// 0x0F (wire C0=0x1E, C1[0]). RadioService keeps this true only while
+    /// the effective transmit mode is CWL or CWU.
+    /// </summary>
+    void SetCwKeyerEnabled(bool enabled);
 
     /// <summary>
     /// Set the TX audio front-end (external-audio-jacks re-port). Global

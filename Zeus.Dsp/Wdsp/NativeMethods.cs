@@ -699,6 +699,10 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int SetChannelState(int channel, int state, int dmp);
 
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAAMCarrierLevel(int channel, double c_level);
+
     // fexchange2 (iobuffs.h:91) — TX-side frame exchange. Iin carries mono mic
     // samples, Qin stays silent, Iout/Qout receive modulated I/Q for the P1 EP2
     // outbound packer. INREAL/OUTREAL are `float` (wdsp.h:7-8) — NOT `double`

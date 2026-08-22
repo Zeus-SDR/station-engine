@@ -49,6 +49,7 @@ public sealed record QrzLoginRequest(string Username, string Password);
 public sealed record QrzLookupRequest(string Callsign);
 
 public sealed record QrzSetApiKeyRequest(string? ApiKey);
+public sealed record QrzRememberedUsernameRequest(string Username);
 
 public sealed record QrzStation(
     string Callsign,
@@ -92,7 +93,8 @@ public sealed record QrzStatus(
     QrzStation? Home,
     string? Error,
     bool HasStoredCredentials = false,
-    bool HasApiKey = false);
+    bool HasApiKey = false,
+    string? RememberedUsername = null);
 
 // ── Point-to-point propagation (DE → DX) ──────────────────────────────────
 // Sourced from the HamClock sidecar's ITU-R P.533-14 engine (with a built-in

@@ -37,7 +37,8 @@ public static class EngineAppControlEndpoints
             "/api/app/restart",
             (HttpContext ctx, IHostApplicationLifetime lifetime, ILoggerFactory loggerFactory) =>
             {
-                var rejection = RejectDisallowedRequest(ctx, "restart");
+                var rejection = LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
+                    ctx, "restart Zeus");
                 if (rejection is not null)
                     return rejection;
 
@@ -49,7 +50,8 @@ public static class EngineAppControlEndpoints
             "/shutdown",
             (HttpContext ctx, IHostApplicationLifetime lifetime, ILoggerFactory loggerFactory) =>
             {
-                var rejection = RejectDisallowedRequest(ctx, "shut down");
+                var rejection = LocalRequestGuard.RejectIfNotLocalAllowedBrowserOrigin(
+                    ctx, "shut down Zeus");
                 if (rejection is not null)
                     return rejection;
 
@@ -64,33 +66,6 @@ public static class EngineAppControlEndpoints
             });
 
         return endpoints;
-    }
-
-    private static IResult? RejectDisallowedRequest(HttpContext ctx, string action)
-    {
-        // Guard: loopback requests only, and when an Origin header is present
-        // it must be an allowed browser origin. This admits the launcher
-        // request (loopback, no Origin) and the product SPA on another loopback
-        // port while rejecting tunneled or foreign-browser requests.
-        if (!LocalRequestGuard.IsLocalRequest(ctx))
-        {
-            return Results.Json(
-                new { error = $"Open Zeus on the machine running the engine to {action} Zeus." },
-                statusCode: StatusCodes.Status403Forbidden);
-        }
-
-        var origins = ctx.Request.Headers.Origin;
-        if (origins.Count > 1
-            || (origins.Count == 1
-                && (origins[0] is not { } origin
-                    || !StationEngineEndpoints.IsBrowserOriginAllowed(origin))))
-        {
-            return Results.Json(
-                new { error = $"Zeus can only {action} from an allowed local app origin." },
-                statusCode: StatusCodes.Status403Forbidden);
-        }
-
-        return null;
     }
 
     private static ILogger Log(ILoggerFactory loggerFactory) =>

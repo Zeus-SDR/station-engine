@@ -179,6 +179,11 @@ internal static class ControlFrame
         //   keyer_reverse = cmd_data[22]    → C2[6]
         // Wire encoding lives in WriteCwKeyerConfigPayload. See zeus-bks.
         CwKeyerConfig = 0x16,
+        // Firmware CW generator enable. Gateware command address 0x0F maps to
+        // wire byte 0x1E; C1[0] latches internal_CW. The legacy Hermes/
+        // Angelia/Orion gateware resets this latch off, so the parameter frame
+        // above cannot make a paddle key the transmitter by itself.
+        CwControl = 0x1e,
         // Orion MkII / ANAN-8000DLE transverter T/R relay enable. Thetis
         // networkproto1.c case 16 emits C0=0x24 and places xvtr_enable in
         // C2[0]. This register stays in the normal rotation even when false,
@@ -311,10 +316,10 @@ internal static class ControlFrame
         // TX antenna relay select — Config-frame C4[1:0] (external-port parity
         // audit, GAP-P1-1). Thetis networkproto1.c:463-468 case 0: ANT3 → 0b10,
         // ANT2 → 0b01, ANT1 → 0b00. The HpsdrAntenna enum value (Ant1=0/Ant2=1/
-        // Ant3=2) IS the 2-bit wire selector. Honoured ONLY on P1 boards with
-        // full Alex TX relays (P1BoardHasTxAntennaRelays — ANAN-100D/200D); every
-        // other P1 board is ANT1-hardwired on transmit and the encoder clamps to
-        // 0. Default Ant1 → C4[1:0]=0, byte-identical to before this audit.
+        // Ant3=2) IS the 2-bit wire selector. Honoured only on P1 boards with
+        // Alex TX relays (P1BoardHasTxAntennaRelays); relay-less P1 boards are
+        // clamped to 0. Default Ant1 → C4[1:0]=0, byte-identical to before this
+        // audit.
         HpsdrAntenna TxAntenna = HpsdrAntenna.Ant1,
         // HL2 user GPIO (external-ports plan, Phase 5; re-ported in the external-
         // port parity audit). The 4-bit user_dig_out mask lands in C3[3:0] of the
@@ -354,7 +359,8 @@ internal static class ControlFrame
         // Trailing defaults preserve every older positional construction and
         // today's byte-identical wire form.
         int CwKeyerWeight = 50,
-        bool CwKeyerPaddleReverse = false);
+        bool CwKeyerPaddleReverse = false,
+        bool CwKeyerEnabled = false);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -440,6 +446,16 @@ internal static class ControlFrame
 
             case CcRegister.CwKeyerConfig:
                 WriteCwKeyerConfigPayload(cc[1..], in state);
+                break;
+
+            case CcRegister.CwControl:
+                // Thetis networkproto1.c case 13: C0=0x1E and C1=cw_enable.
+                // Zeus generates sidetone locally and does not expose the
+                // adjacent hardware sidetone-level / RF-delay fields.
+                cc[1] = state.CwKeyerEnabled ? (byte)0x01 : (byte)0x00;
+                cc[2] = 0;
+                cc[3] = 0;
+                cc[4] = 0;
                 break;
 
             case CcRegister.XvtrControl:
@@ -780,11 +796,11 @@ internal static class ControlFrame
         c4 |= (byte)((s.NumReceiversMinusOne & 0x07) << 3);
         // TX antenna relay select C4[1:0] (external-port parity audit, GAP-P1-1).
         // Thetis networkproto1.c:463-468 case 0: ANT3 → 0b10, ANT2 → 0b01, ANT1 →
-        // 0b00. Only emitted on P1 boards with full Alex TX relays (ANAN-100D/
-        // 200D); EncodeTxAntennaC4Bits clamps every other board to ANT1 so a stale
-        // per-band ANT2/3 (band rows are board-agnostic) can never reroute the
-        // transmitter on a board that is ANT1-hardwired on transmit. Default Ant1
-        // → 0 → byte-identical to before this audit.
+        // 0b00. Only emitted on P1 boards with Alex TX relays;
+        // EncodeTxAntennaC4Bits clamps every other board to ANT1 so a stale per-
+        // band ANT2/3 (band rows are board-agnostic) can never reroute the
+        // transmitter on a relay-less board. Default Ant1 → 0 → byte-identical
+        // to before this audit.
         c4 |= EncodeTrxAntennaC4Bits(
             s.RxAntenna,
             s.TxAntenna,
@@ -900,14 +916,13 @@ internal static class ControlFrame
     /// C4[1:0] math, shared by the wire path (WriteConfigPayload) and the
     /// external-port encoder seam so the two are byte-identical by construction.
     ///
-    /// WIRE-LAYER CLAMP: a P1 board WITHOUT full Alex TX relays
-    /// (<see cref="P1BoardHasTxAntennaRelays"/> false — every board except
-    /// ANAN-100D/200D) is forced to ANT1 here, so a stale per-band ANT2/3 can
-    /// never reroute the transmitter on a board that is ANT1-hardwired on
-    /// transmit. This is the wire layer of the same UI-gate / REST-409 / wire-
-    /// clamp defence the RX-antenna path uses; it holds even if an upstream layer
-    /// is bypassed. Relay-capable boards emit the raw selection — byte-identical
-    /// to before this audit at the default-ANT1, so the goldens stay green.
+    /// WIRE-LAYER CLAMP: a P1 board without Alex TX relays is forced to ANT1
+    /// here, so a stale per-band ANT2/3 can never reroute the transmitter on a
+    /// relay-less board. This is the wire layer of the same UI-gate / REST-409 /
+    /// wire-clamp defence the RX-antenna path uses; it holds even if an upstream
+    /// layer is bypassed. Relay-capable boards emit the raw selection — byte-
+    /// identical to before this audit at the default-ANT1, so the goldens stay
+    /// green.
     /// </summary>
     internal static byte EncodeTxAntennaC4Bits(HpsdrAntenna txAntenna, HpsdrBoardKind board)
     {
@@ -937,16 +952,19 @@ internal static class ControlFrame
     /// <summary>
     /// Whether a Protocol-1 board has switchable full-Alex TX-antenna relays
     /// (ANT1/2/3 on Config-frame C4[1:0]). Mirrors the P1 subset of
-    /// <c>BoardCapabilities.HasTxAntennaRelays</c>: the full-Alex dual-ADC ANAN
-    /// boards (ANAN-100D / ANAN-200D = <see cref="HpsdrBoardKind.Angelia"/> /
-    /// <see cref="HpsdrBoardKind.Orion"/>). Hermes / Metis / ANAN-10 / ANAN-10E
-    /// (no full Alex), ANAN-G2E (ANT1-hardwired on TX) and Hermes-Lite 2 (single
-    /// jack) are ANT1-only on transmit. Kept local to the protocol assembly so the
-    /// wire-layer clamp needs no reference to Station.Engine.Hosting; it MUST stay in
-    /// step with the BoardCapabilitiesTable HasTxAntennaRelays entries for P1.
+    /// <c>BoardCapabilities.HasTxAntennaRelays</c>: the Hermes / Metis / ANAN-10 /
+    /// ANAN-10E and dual-ADC ANAN-100D / ANAN-200D families. ANAN-G2E
+    /// (ANT1-hardwired on TX) and Hermes-Lite 2 (single jack) are ANT1-only on
+    /// transmit. Kept local to the protocol assembly so the wire-layer clamp
+    /// needs no reference to Station.Engine.Hosting; it MUST stay in step with
+    /// the BoardCapabilitiesTable HasTxAntennaRelays entries for P1.
     /// </summary>
     internal static bool P1BoardHasTxAntennaRelays(HpsdrBoardKind board) =>
-        board is HpsdrBoardKind.Angelia or HpsdrBoardKind.Orion;
+        board is HpsdrBoardKind.Metis
+            or HpsdrBoardKind.Hermes
+            or HpsdrBoardKind.HermesII
+            or HpsdrBoardKind.Angelia
+            or HpsdrBoardKind.Orion;
 
     /// <summary>
     /// Build a complete 1032-byte Metis data frame with two USB frames carrying

@@ -128,6 +128,11 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // Previous P2 PttIn level, for edge detection on the level-sampled P2
     // telemetry stream. Owned by the P2 RX thread only.
     private bool _p2PrevPtt;
+    // Previous P2 FPGA-keyer sidetone-active level (hi-priority status byte 0
+    // bit 7). Edge-detected the same way as _p2PrevPtt — it toggles per
+    // dit/dah while the internal keyer runs — so the host monitor sidetone
+    // tracks the gateware's shaped key-down. Owned by the P2 RX thread only.
+    private bool _p2PrevSidetone;
     // Single-shot timer used to debounce falling edges. Created lazily and
     // re-armed via Change(); the underlying System.Threading.Timer is thread
     // safe so cancellation from the RX thread and fire-and-handle on the
@@ -323,7 +328,12 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // on for the whole keyed period including inter-element gaps + hang time.
     // Gated to CW modes so an SSB mic-PTT press doesn't inject a 600 Hz tone.
     // (zeus-cl2)
-    private void OnCwKeyDownChanged(bool down)
+    private void OnCwKeyDownChanged(bool down) => DriveSidetone(down);
+
+    // Toggle the host CW monitor tone off a shaped key-down edge, gated to CW
+    // modes so an SSB mic-PTT press never injects a 600 Hz tone. Shared by the
+    // P1 CwKeyDownChanged (C0[2]) path and the P2 hi-priority sidetone bit.
+    private void DriveSidetone(bool down)
     {
         if (_sidetone is null) return;
         if (!IsCwMode(_radio.CurrentMode)) return;
@@ -337,7 +347,7 @@ public sealed class ExternalPttService : IHostedService, IDisposable
 
     private void OnP2Connected(Zeus.Protocol2.Protocol2Client client)
     {
-        lock (_sync) { _p2Client = client; _owned = false; _hwHigh = false; _p2PrevPtt = false; }
+        lock (_sync) { _p2Client = client; _owned = false; _hwHigh = false; _p2PrevPtt = false; _p2PrevSidetone = false; }
         client.TelemetryReceived += OnP2Telemetry;
     }
 
@@ -350,10 +360,14 @@ public sealed class ExternalPttService : IHostedService, IDisposable
             _p2Client = null;
             _owned = false;
             _p2PrevPtt = false;
+            _p2PrevSidetone = false;
             ++_moxOpSeq;
             _moxWorkPending = false;
         }
         if (client is not null) client.TelemetryReceived -= OnP2Telemetry;
+        // Release any monitor tone left keyed by an in-flight element so a
+        // disconnect mid-dah can't wedge the sidetone on.
+        _sidetone?.Up();
         _hangTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         ClearHardwareLevel();
     }
@@ -363,6 +377,21 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // PttIn level. Runs on the Protocol2Client RX thread.
     private void OnP2Telemetry(Zeus.Protocol2.P2TelemetryReading reading)
     {
+        // The P2 FPGA internal keyer shapes CW locally and reports its
+        // key-down envelope in the hi-priority status (byte 0 bit 7). It
+        // toggles per dit/dah independently of the held PTT-IN line, so drive
+        // the host monitor sidetone off THIS bit — the P2 analog of the P1
+        // CwKeyDownChanged (C0[2]) path — BEFORE the PttIn edge gate below,
+        // which would otherwise swallow every element that doesn't also move
+        // PTT. Without this the internal keyer transmits fine but the operator
+        // hears no local sidetone through Zeus's audio bus (#1524).
+        bool sidetone = reading.SidetoneActive;
+        if (sidetone != _p2PrevSidetone)
+        {
+            _p2PrevSidetone = sidetone;
+            DriveSidetone(sidetone);
+        }
+
         bool ptt = reading.PttIn;
         if (ptt == _p2PrevPtt) return; // no edge
         _p2PrevPtt = ptt;

@@ -106,6 +106,38 @@ internal static class LocalRequestGuard
         return null;
     }
 
+    /// <summary>
+    /// Local privileged-request gate for the split Zeus Link topology. The
+    /// request itself must originate on this machine; a browser Origin, when
+    /// present, must be one of the origins accepted by the station engine's
+    /// CORS policy. This admits a product SPA on a different loopback port
+    /// without admitting a browser running on another LAN host.
+    /// </summary>
+    public static IResult? RejectIfNotLocalAllowedBrowserOrigin(
+        HttpContext ctx,
+        string action)
+    {
+        if (!IsLocalRequest(ctx))
+        {
+            return Results.Json(
+                new { error = $"Open Zeus on the machine running the engine to {action}." },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        var origins = ctx.Request.Headers.Origin;
+        if (origins.Count > 1
+            || (origins.Count == 1
+                && (origins[0] is not { } origin
+                    || !StationEngineEndpoints.IsBrowserOriginAllowed(origin))))
+        {
+            return Results.Json(
+                new { error = $"Zeus can only {action} from an allowed local app origin." },
+                statusCode: StatusCodes.Status403Forbidden);
+        }
+
+        return null;
+    }
+
     public static IResult? RejectIfNotLiteralLocalHost(HttpContext ctx, string action)
     {
         var host = ctx.Request.Host.Host;

@@ -328,6 +328,11 @@ public interface IDspEngine : IDisposable
     /// TXA is open.</summary>
     void SetTxMode(RxMode mode);
 
+    /// <summary>Set WDSP's AM carrier coefficient. The hosting layer derives
+    /// this from Thetis-compatible carrier percent as 0.5*sqrt(percent/100).
+    /// Implementations without an AM modulator may no-op.</summary>
+    void SetTxAmCarrierLevel(double carrierLevel) { }
+
     /// <summary>Zeus-level digital TX mode is active (DIGU/DIGL/FreeDV): gate
     /// the TX CFC master + phase rotator run flags off while preserving
     /// operator-configured settings. No-op for Synthetic and when no TXA is

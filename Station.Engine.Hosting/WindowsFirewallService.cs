@@ -113,6 +113,26 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Message: status.Message);
         }
 
+        // Querying an existing rule does not require administrator rights, so probe
+        // first: if the inbound allow rule already exists for this exact program path
+        // there is nothing to change, and re-adding it would needlessly trigger the
+        // Windows UAC elevation prompt on every launch. Short-circuit before touching
+        // netsh add / runas.
+        var probe = await _runner.ProbeAsync(RuleName, status.ProgramPath, ct);
+        if (probe.Exists && probe.MatchesProgram)
+        {
+            _log.LogInformation(
+                "windows.firewall.rule already present path={ProgramPath}; skipping apply", status.ProgramPath);
+            return new(
+                Supported: true,
+                Applied: true,
+                ElevationAttempted: false,
+                ElevationCanceled: false,
+                RuleName,
+                ProgramPath: status.ProgramPath,
+                Message: "Windows Firewall rule already present.");
+        }
+
         var direct = await _runner.ApplyAsync(RuleName, status.ProgramPath, elevated: false, ct);
         if (direct.ExitCode == 0)
         {
@@ -180,6 +200,11 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
 
 internal interface IWindowsFirewallCommandRunner
 {
+    Task<FirewallRuleProbe> ProbeAsync(
+        string ruleName,
+        string programPath,
+        CancellationToken ct);
+
     Task<FirewallCommandResult> ApplyAsync(
         string ruleName,
         string programPath,
@@ -189,9 +214,39 @@ internal interface IWindowsFirewallCommandRunner
 
 internal sealed record FirewallCommandResult(int ExitCode, string Output, bool Canceled = false);
 
+// Result of a non-elevated query for an existing inbound allow rule. MatchesProgram
+// is only meaningful when Exists is true.
+internal sealed record FirewallRuleProbe(bool Exists, bool MatchesProgram);
+
 internal sealed class ProcessWindowsFirewallCommandRunner : IWindowsFirewallCommandRunner
 {
     private const int ErrorCancelled = 1223;
+
+    public async Task<FirewallRuleProbe> ProbeAsync(
+        string ruleName,
+        string programPath,
+        CancellationToken ct)
+    {
+        // "show rule" is a read-only query and does not require elevation. netsh
+        // returns a non-zero exit code ("No rules match the specified criteria")
+        // when the rule is absent.
+        var result = await RunNetshAsync(
+            [
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=" + ruleName,
+                "verbose",
+            ],
+            ct);
+
+        if (result.ExitCode != 0)
+            return new(Exists: false, MatchesProgram: false);
+
+        var matchesProgram = result.Output.Contains(programPath, StringComparison.OrdinalIgnoreCase);
+        return new(Exists: true, MatchesProgram: matchesProgram);
+    }
 
     public async Task<FirewallCommandResult> ApplyAsync(
         string ruleName,

@@ -62,6 +62,11 @@ public sealed class Protocol1Client : IProtocol1Client
     private const int ConsecutiveTimeoutsBeforeGiveUp = 10;
     private const int RxSinkStallTimeoutMs = 2000;
     private const int TxLivenessPollMs = 100;
+    private const int DiscoveryPort = 1024;
+    private const int ReachabilityReplyBufferSize = 2048;
+    // One parallel wave keeps multi-adapter disambiguation bounded by one
+    // short wait rather than multiplying latency by the candidate count.
+    private const int ReachabilityProbeTimeoutMs = 300;
     // HL2's TX DAC runs at a fixed 48 kHz regardless of the RX sample rate;
     // each EP2 packet carries 126 IQ pairs so the target TX packet rate is
     // 381 pkt/s. Earlier attempts at using a PeriodicTimer fell to whatever
@@ -187,6 +192,7 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _cwKeyerMode; // CwKeyerMode as int for Interlocked
     private int _cwKeyerWeight = 50;
     private int _cwKeyerPaddleReverse;
+    private int _cwKeyerEnabled;
     // TX audio front-end (external-audio-jacks re-port). mic_boost / mic_linein
     // ride the 0x12 frame on codec boards; mic_trs / mic_bias / line_in_gain
     // ride the 0x14 frame on HL2 (read-modify-write — see ControlFrame). All
@@ -262,6 +268,8 @@ public sealed class Protocol1Client : IProtocol1Client
 
     private Socket? _socket;
     private IPEndPoint? _remote;
+    private string _boundNicDisplay = "(none)";
+    private string _rejectedBindNicDisplays = "(none)";
     private Thread? _rxThread;
     private Task? _txTask;
     private CancellationTokenSource? _loopCts;
@@ -345,10 +353,9 @@ public sealed class Protocol1Client : IProtocol1Client
     public event Action<TelemetryReading>? TelemetryReceived;
     public event Action<AdcOverloadStatus>? AdcOverloadObserved;
     public event Action<bool>? HardwarePttChanged;
-    /// <summary>Fires on the edge of the gateware's shaped CW keyer output
-    /// (C0[2] / cw_key_status), i.e. per dit/dah — distinct from
-    /// <see cref="HardwarePttChanged"/> (C0[0] / ptt_resp), which is held for
-    /// the whole keyed period. Drives the local sidetone. (zeus-cl2)</summary>
+    /// <summary>Fires on the edge of the board-decoded CW key state: HL2's
+    /// shaped output or legacy Hermes-class raw dot/dash inputs. Distinct from
+    /// <see cref="HardwarePttChanged"/> at C0[0]. Drives the local sidetone.</summary>
     public event Action<bool>? CwKeyDownChanged;
 
     // 0/1; Volatile so the property read on any thread sees the latest value
@@ -584,7 +591,7 @@ public sealed class Protocol1Client : IProtocol1Client
             // Mirror the standard-path hardware-PTT level update so an
             // external key released during PS+TX still propagates the edge.
             UpdateHardwarePtt(PacketParser.ExtractHardwarePtt(packet));
-            UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(packet));
+            UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(packet, BoardKind));
 
             // DDC0 → IqFrame channel — keeps panadapter / audio alive during PS+TX.
             // Use a fresh rented buffer the channel can own; the ddc0 rental is
@@ -787,7 +794,7 @@ public sealed class Protocol1Client : IProtocol1Client
             catch (Exception ex) { _log.LogWarning(ex, "AdcOverloadObserved handler threw"); }
 
             UpdateHardwarePtt(PacketParser.ExtractHardwarePtt(packet));
-            UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(packet));
+            UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(packet, BoardKind));
 
             var rented = ArrayPool<double>.Shared.Rent(2 * samples);
             new ReadOnlySpan<double>(ddc0, 0, 2 * samples)
@@ -928,7 +935,7 @@ public sealed class Protocol1Client : IProtocol1Client
         set => Interlocked.Exchange(ref _enableHl2BandVolts, value ? 1 : 0);
     }
 
-    public Task ConnectAsync(IPEndPoint radioEndpoint, CancellationToken ct)
+    public async Task ConnectAsync(IPEndPoint radioEndpoint, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_socket is not null) throw new InvalidOperationException("Already connected.");
@@ -945,10 +952,17 @@ public sealed class Protocol1Client : IProtocol1Client
         try { sock.ReceiveBufferSize = 4 << 20; }
         catch (SocketException) { sock.ReceiveBufferSize = 1 << 20; }
         IPAddress localBind;
+        LocalAddressSelection bindSelection;
+        int reachabilityProbed;
         try
         {
             DisableUdpConnReset(sock);
-            localBind = LocalAddressForRemote(radioEndpoint.Address);
+            (bindSelection, reachabilityProbed) = await SelectLocalAddressForRemoteAsync(
+                radioEndpoint.Address,
+                radioEndpoint.Port,
+                ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            localBind = bindSelection.Address ?? IPAddress.Any;
             sock.Bind(new IPEndPoint(localBind, 0));
         }
         catch
@@ -957,13 +971,28 @@ public sealed class Protocol1Client : IProtocol1Client
             throw;
         }
 
-        _socket = sock;
+        if (Interlocked.CompareExchange(ref _socket, sock, null) is not null)
+        {
+            sock.Dispose();
+            throw new InvalidOperationException("Already connected.");
+        }
         _remote = radioEndpoint;
+        _boundNicDisplay = bindSelection.NicDisplay;
+        _rejectedBindNicDisplays = FormatNicDisplays(bindSelection.RejectedNicDisplays);
         _log.LogInformation(
-            "p1.connect radio={Radio} localBind={LocalBind} local={Local}",
+            "p1.connect radio={Radio} localBind={LocalBind} local={Local} subnetCandidates={CandidateCount} " +
+            "reachabilityProbed={ReachabilityProbed} reachabilityRouteDisagree={ReachabilityRouteDisagree} " +
+            "boundNic={BoundNic} rejectedNics={RejectedNics} selectionRule={SelectionRule} routeMatches={RouteMatches}",
             radioEndpoint.Address,
             localBind.Equals(IPAddress.Any) ? "ANY (no subnet match)" : localBind.ToString(),
-            sock.LocalEndPoint);
+            sock.LocalEndPoint,
+            bindSelection.SubnetMatchCount,
+            reachabilityProbed,
+            bindSelection.ReachabilityDisagreesWithRoute,
+            _boundNicDisplay,
+            _rejectedBindNicDisplays,
+            bindSelection.RuleName,
+            bindSelection.MatchesRouteProbe);
         if (NetworkAddressSelection.IsLinkLocal(radioEndpoint.Address))
         {
             _log.LogWarning(
@@ -971,51 +1000,332 @@ public sealed class Protocol1Client : IProtocol1Client
                 "connection is functional but this topology is drop-prone; a switch with a DHCP router is recommended",
                 radioEndpoint.Address);
         }
-        return Task.CompletedTask;
     }
 
-    // Prefer the local IPv4 unicast whose subnet contains the radio. This
-    // subsumes the original link-local case (169.254.0.0/16 direct-connect /
-    // DHCP-less segment), where IPAddress.Any lets the OS pick the default-route
-    // interface and the radio streams IQ to an unreachable source address.
-    // Routers stay unchanged: no local subnet match means bind ANY.
-    private static IPAddress LocalAddressForRemote(IPAddress remote)
+    // Hermes P2 gateware latches the stream destination IP/MAC/port from our
+    // packet source while run=0 (docs/references/firmware/hermes/P2-gateware/
+    // Hermes_Protocol_2_v10.7/Ethernet/network.v). The same source/egress
+    // agreement is load-bearing for P1 radios that return IQ to the sender.
+    private async Task<(LocalAddressSelection Selection, int ProbedCandidateCount)> SelectLocalAddressForRemoteAsync(
+        IPAddress remote,
+        int remotePort,
+        CancellationToken ct)
     {
-        return NetworkAddressSelection.FindLocalAddressForSubnet(remote, EnumerateLocalIpv4Addresses())
-               ?? IPAddress.Any;
+        var candidates = EnumerateLocalIpv4Addresses().ToArray();
+        var routeProbeAddress = ProbeLocalAddressForRemote(remote, remotePort);
+        var matches = NetworkAddressSelection.FindSubnetMatches(remote, candidates);
+        var reachability = default(ReachabilityProbeResult);
+
+        // With zero or one subnet match there is nothing to disambiguate. Keep
+        // ordinary single-NIC LAN hosts on precisely the existing path: no
+        // discovery packet, no added latency, and no change in selection.
+        if (NetworkAddressSelection.ShouldProbeReachability(matches.Count))
+        {
+            reachability = await ProbeReachabilityAsync(
+                remote,
+                matches,
+                routeProbeAddress,
+                ct).ConfigureAwait(false);
+        }
+
+        return (
+            NetworkAddressSelection.SelectLocalAddressForSubnet(
+                remote,
+                candidates,
+                routeProbeAddress,
+                reachability.Address),
+            reachability.ProbedCandidateCount);
     }
 
-    private static IEnumerable<LocalIpv4Address> EnumerateLocalIpv4Addresses()
+    private async Task<ReachabilityProbeResult> ProbeReachabilityAsync(
+        IPAddress radioIp,
+        IReadOnlyList<LocalIpv4Address> matches,
+        IPAddress? routeProbeAddress,
+        CancellationToken ct)
+    {
+        var orderedCandidates = NetworkAddressSelection.GetReachabilityProbeCandidates(matches, int.MaxValue);
+        var candidates = orderedCandidates
+            .Take(NetworkAddressSelection.MaxReachabilityProbeCandidates)
+            .ToArray();
+        if (candidates.Length <= 1) return default;
+
+        var droppedCandidates = orderedCandidates.Skip(candidates.Length).ToArray();
+        var droppedCandidateCount = droppedCandidates.Length;
+        if (droppedCandidateCount > 0)
+        {
+            _log.LogWarning(
+                "p1.reachability.probe truncated subnetCandidates={CandidateCount} probedCandidates={ProbedCount} " +
+                "droppedCandidates={DroppedCount} droppedNics={DroppedNics}",
+                matches.Count,
+                candidates.Length,
+                droppedCandidateCount,
+                FormatNicDisplays(droppedCandidates
+                    .Select(LocalAddressSelection.DisplayNic)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray()));
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ReachabilityProbeTimeoutMs);
+        var packet = RadioDiscoveryService.BuildDiscoveryPacket();
+        var replies = await Task.WhenAll(candidates
+            .Select(candidate => ProbeCandidateReachabilityAsync(
+                radioIp,
+                candidate,
+                packet,
+                timeout.Token)))
+            .ConfigureAwait(false);
+        var responders = replies.OfType<IPAddress>().ToArray();
+        var reachableAddress = NetworkAddressSelection.SelectReachableAddress(
+            candidates,
+            responders,
+            routeProbeAddress);
+        if (reachableAddress is null)
+        {
+            _log.LogWarning(
+                "p1.reachability.probe no responders candidateCount={CandidateCount} probedNics={ProbedNics}; " +
+                "falling back to route answer",
+                candidates.Length,
+                FormatNicDisplays(candidates
+                    .Select(LocalAddressSelection.DisplayNic)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray()));
+        }
+
+        return new ReachabilityProbeResult(reachableAddress, candidates.Length);
+    }
+
+    private static async Task<IPAddress?> ProbeCandidateReachabilityAsync(
+        IPAddress radioIp,
+        LocalIpv4Address candidate,
+        ReadOnlyMemory<byte> packet,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            DisableUdpConnReset(socket);
+            socket.Bind(new IPEndPoint(candidate.Address, 0));
+            var radioEndpoint = new IPEndPoint(radioIp, DiscoveryPort);
+            // Reuse discovery's retry count and gap: a freshly selected source
+            // address has a cold ARP path, so the first UDP datagram may vanish.
+            for (var attempt = 0; attempt < RadioDiscoveryService.SendAttempts; attempt++)
+            {
+                try
+                {
+                    await socket.SendToAsync(
+                        packet,
+                        SocketFlags.None,
+                        radioEndpoint,
+                        ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return null;
+                }
+                catch (Exception)
+                {
+                    // A failed attempt does not prevent the remaining ARP-warmup
+                    // retransmissions or the established fallback ranking.
+                }
+
+                if (attempt < RadioDiscoveryService.SendAttempts - 1)
+                {
+                    try
+                    {
+                        await Task.Delay(RadioDiscoveryService.SendGap, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            var reply = new byte[ReachabilityReplyBufferSize];
+            EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+            while (!ct.IsCancellationRequested)
+            {
+                var received = await socket.ReceiveFromAsync(
+                    reply,
+                    SocketFlags.None,
+                    any,
+                    ct).ConfigureAwait(false);
+                if (received.RemoteEndPoint is not IPEndPoint source ||
+                    !source.Address.Equals(radioIp))
+                {
+                    continue;
+                }
+
+                if (ReplyParser.TryParse(
+                    reply.AsSpan(0, received.ReceivedBytes),
+                    source.Address,
+                    out _))
+                {
+                    return candidate.Address;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Reachability is evidence, never a gate. Any per-NIC failure,
+            // timeout, or cancellation falls through to route/physical ranking.
+        }
+
+        return null;
+    }
+
+    private readonly record struct ReachabilityProbeResult(
+        IPAddress? Address,
+        int ProbedCandidateCount);
+
+    // Deliberately mirrored in Protocol2Client. UDP Connect sends no traffic;
+    // it asks the kernel to resolve the route and assign the source address.
+    // Any platform or routing failure degrades to the established ranking.
+    private IPAddress? ProbeLocalAddressForRemote(IPAddress radioIp, int port)
+    {
+        try
+        {
+            if (radioIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                _log.LogDebug("p1.route.probe unusable radio={Radio} reason=non-ipv4-radio", radioIp);
+                return null;
+            }
+            using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            probe.Connect(new IPEndPoint(radioIp, port));
+            var local = (probe.LocalEndPoint as IPEndPoint)?.Address;
+            if (local is null)
+            {
+                _log.LogDebug("p1.route.probe unusable radio={Radio} reason=no-local-endpoint", radioIp);
+                return null;
+            }
+            if (local.AddressFamily != AddressFamily.InterNetwork)
+            {
+                _log.LogDebug("p1.route.probe unusable radio={Radio} reason=non-ipv4-local", radioIp);
+                return null;
+            }
+            if (local.Equals(IPAddress.Any))
+            {
+                _log.LogDebug("p1.route.probe unusable radio={Radio} reason=any-local", radioIp);
+                return null;
+            }
+            return local;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "p1.route.probe failed radio={Radio}", radioIp);
+            return null;
+        }
+    }
+
+    private static string FormatNicDisplays(IReadOnlyList<string> displays) =>
+        displays.Count == 0 ? "(none)" : string.Join(",", displays);
+
+    private IEnumerable<LocalIpv4Address> EnumerateLocalIpv4Addresses()
         => SelectLocalIpv4Addresses(SnapshotNetworkInterfaces());
 
-    private static IEnumerable<NicSnapshot> SnapshotNetworkInterfaces()
+    private IEnumerable<NicSnapshot> SnapshotNetworkInterfaces()
     {
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        NetworkInterface[] nics;
+        try
         {
-            var addresses = new List<(IPAddress Address, IPAddress? Mask)>();
-            foreach (var uni in nic.GetIPProperties().UnicastAddresses)
-                addresses.Add((uni.Address, uni.IPv4Mask));
-            yield return new NicSnapshot(nic.Name, nic.NetworkInterfaceType, nic.OperationalStatus, addresses);
+            nics = NetworkInterface.GetAllNetworkInterfaces();
         }
+        catch (Exception ex)
+        {
+            // Losing the whole enumeration leaves no subnet candidates, which the
+            // caller cannot tell apart from "no NIC is on the radio's subnet" — it
+            // silently degrades to an IPAddress.Any bind. Leave a breadcrumb.
+            _log.LogDebug(ex, "p1.nic.enumerate failed");
+            return Array.Empty<NicSnapshot>();
+        }
+
+        var snapshots = new List<NicSnapshot>(nics.Length);
+        foreach (var nic in nics)
+        {
+            try
+            {
+                var properties = nic.GetIPProperties();
+
+                int? ipv4InterfaceIndex = null;
+                try
+                {
+                    ipv4InterfaceIndex = properties.GetIPv4Properties()?.Index;
+                }
+                catch (Exception ex)
+                {
+                    // Interfaces without IPv4 properties remain valid candidates;
+                    // diagnostics use an explicit unknown-index placeholder.
+                    _log.LogDebug(ex, "p1.nic.ipv4props unavailable nic={Nic}", SafeNicDescription(nic));
+                }
+
+                // Materialised inside the same guard as GetIPProperties: on a NIC
+                // that disappears mid-enumeration (hot-unplugged USB dongle, a
+                // filter driver in a bad state) address access can throw too, and
+                // an escape here would fail the whole connect instead of skipping
+                // one adapter.
+                var addresses = new List<(IPAddress Address, IPAddress? Mask)>();
+                foreach (var uni in properties.UnicastAddresses)
+                    addresses.Add((uni.Address, uni.IPv4Mask));
+
+                snapshots.Add(new NicSnapshot(
+                    nic.Name,
+                    nic.NetworkInterfaceType,
+                    nic.OperationalStatus,
+                    addresses,
+                    SafeNicDescription(nic),
+                    ipv4InterfaceIndex,
+                    nic.Id));
+            }
+            catch (Exception ex)
+            {
+                // A skipped NIC vanishes from candidacy, and a radio-facing NIC
+                // that vanishes reproduces exactly the rx-silence symptom this
+                // selection exists to prevent. Never drop one silently.
+                _log.LogDebug(ex, "p1.nic.skip nic={Nic}", SafeNicDescription(nic));
+            }
+        }
+
+        return snapshots;
+    }
+
+    // Description access is itself part of the failing surface we are reporting
+    // on, so it must never throw out of a diagnostic path.
+    private static string SafeNicDescription(NetworkInterface nic)
+    {
+        try { return nic.Description; }
+        catch (Exception) { return "(unknown adapter)"; }
     }
 
     // Pure projection of NIC snapshots into bind candidates, split out from the
     // live NetworkInterface enumeration so the tunnel tagging is unit-testable
-    // (see NetworkAddressSelectionTests). Tunnel-typed NICs and macOS utun NICs
-    // reported as Unknown are tagged IsTunnel so NetworkAddressSelection can rank
-    // them behind physical NICs; loopback and down interfaces are dropped as before.
+    // (see NetworkAddressSelectionTests). Tunnel-typed NICs plus macOS utun and
+    // Linux/Pi tun, wg, and ppp NICs reported as Unknown are tagged IsTunnel so
+    // NetworkAddressSelection can rank them behind physical NICs; loopback and
+    // down interfaces are dropped as before.
     internal static IEnumerable<LocalIpv4Address> SelectLocalIpv4Addresses(IEnumerable<NicSnapshot> nics)
     {
+        var snapshotIndex = 0;
         foreach (var nic in nics)
         {
+            snapshotIndex++;
             if (nic.Status != OperationalStatus.Up) continue;
             if (nic.Type == NetworkInterfaceType.Loopback) continue;
             var isTunnel = NetworkAddressSelection.IsTunnelInterface(nic.Name, nic.Type);
+            var identity = string.IsNullOrWhiteSpace(nic.Identity)
+                ? $"snapshot-{snapshotIndex}"
+                : nic.Identity;
             foreach (var (address, mask) in nic.UnicastAddresses)
             {
                 if (address.AddressFamily != AddressFamily.InterNetwork) continue;
                 if (mask is null || mask.Equals(IPAddress.Any)) continue;
-                yield return new LocalIpv4Address(address, mask, isTunnel);
+                yield return new LocalIpv4Address(
+                    address,
+                    mask,
+                    isTunnel,
+                    identity,
+                    nic.Description,
+                    nic.Ipv4InterfaceIndex);
             }
         }
     }
@@ -1735,8 +2045,10 @@ public sealed class Protocol1Client : IProtocol1Client
                 if (mode == StartWatchdogMode.RxRecovery)
                 {
                     _log.LogWarning(
-                        "p1.rx.recover failed attempts={Max} - no RX packets after start re-sends; firing Disconnected on next RX timeout",
-                        maxAttempts);
+                        "p1.rx.recover failed attempts={Max} - no RX packets after start re-sends; firing Disconnected on next RX timeout; boundNic={BoundNic} rejectedNics={RejectedNics}",
+                        maxAttempts,
+                        _boundNicDisplay,
+                        _rejectedBindNicDisplays);
                 }
                 else
                 {
@@ -1816,6 +2128,9 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _cwKeyerWeight, weight);
         Interlocked.Exchange(ref _cwKeyerPaddleReverse, paddleReverse ? 1 : 0);
     }
+
+    public void SetCwKeyerEnabled(bool enabled) =>
+        Interlocked.Exchange(ref _cwKeyerEnabled, enabled ? 1 : 0);
 
     /// <summary>
     /// Set the TX audio front-end (external-audio-jacks re-port). Global,
@@ -2054,6 +2369,7 @@ public sealed class Protocol1Client : IProtocol1Client
             CwKeyerMode: (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
             CwKeyerWeight: Volatile.Read(ref _cwKeyerWeight),
             CwKeyerPaddleReverse: Volatile.Read(ref _cwKeyerPaddleReverse) != 0,
+            CwKeyerEnabled: Volatile.Read(ref _cwKeyerEnabled) != 0,
             MicBoost: Volatile.Read(ref _micBoost) != 0,
             MicLineIn: Volatile.Read(ref _micLineIn) != 0,
             MicTrs: Volatile.Read(ref _micTrs) != 0,
@@ -2364,9 +2680,9 @@ public sealed class Protocol1Client : IProtocol1Client
                 // ExternalPttService can lift the host MOX when the operator
                 // keys the rear KEY jack or an external PTT line.
                 UpdateHardwarePtt(PacketParser.ExtractHardwarePtt(buffer.AsSpan(0, n)));
-                // CW key-down (C0[2], shaped keyer output) — drives the local
-                // sidetone per dit/dah, separate from the held PTT. (zeus-cl2)
-                UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(buffer.AsSpan(0, n)));
+                // Board-decoded CW key-down drives the local sidetone,
+                // separate from the held PTT.
+                UpdateCwKeyDown(PacketParser.ExtractCwKeyDown(buffer.AsSpan(0, n), BoardKind));
 
                 var rateHz = (HpsdrSampleRate)Volatile.Read(ref _rate) switch
                 {
@@ -2568,7 +2884,7 @@ public sealed class Protocol1Client : IProtocol1Client
         _lastSeenSequence = seq;
     }
 
-    // 4-phase rotation across the registers we currently own. Every phase
+    // Round-robin rotation across the registers we currently own. Every phase
     // pairs the frequency register (ensuring sub-3ms QSY latency) with one
     // of Config / DriveFilter / Attenuator / TxFreq in turn. Attenuator
     // needs a slot or HL2 firmware never sees gain changes. TxFreq is
@@ -2598,7 +2914,7 @@ public sealed class Protocol1Client : IProtocol1Client
     /// rotation. True only when PS is armed AND the board actually has a P1
     /// PS feedback path — HermesLite2 (mi0bot 4-DDC layout) or HermesC10
     /// (ANAN-G2E, classic Hermes v3.3 — the origin of that same layout).
-    /// Every other P1 board stays on the 5-phase rotation even with
+    /// Every other P1 board stays on the normal rotation even with
     /// PsEnabled set, so its wire traffic is byte-identical to a disarmed
     /// session (the 0x1c / RxFreq2-4 registers are never scheduled). Single
     /// source of the predicate for TxLoop and the rotation tests.
@@ -2690,12 +3006,13 @@ public sealed class Protocol1Client : IProtocol1Client
             };
         }
 
-        // Non-PS rotation is 5 phases. Phase 4 carries the CW keyer config
+        // Non-PS rotation is 6 phases. Phase 4 carries the CW keyer config
         // (0x0B) in the RX-only branch so the on-board iambic keyer speed/
-        // mode tracks the operator's CW panel — it's set before keying, so
-        // the MOX branch doesn't waste a slot on it. Adding one phase drops
-        // the RxFreq NCO refresh from 3-of-4 to 4-of-5 frames — negligible.
-        int p = phase % 5;
+        // mode tracks the operator's CW panel. Phase 5 carries the 0x0F
+        // internal-CW latch in both RX and TX so mode changes always clear or
+        // set it. Adding the latch phase leaves every existing register in the
+        // rotation and keeps TxFreq/RxFreq refreshed continuously.
+        int p = phase % 6;
         if (mox)
         {
             return p switch
@@ -2704,7 +3021,8 @@ public sealed class Protocol1Client : IProtocol1Client
                 1 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.DriveFilter),
                 2 => (ControlFrame.CcRegister.Attenuator, ControlFrame.CcRegister.TxFreq),
                 3 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.Config),
-                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.XvtrControl),
+                4 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.XvtrControl),
+                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.CwControl),
             };
         }
         return p switch
@@ -2713,7 +3031,8 @@ public sealed class Protocol1Client : IProtocol1Client
             1 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.DriveFilter),
             2 => (ControlFrame.CcRegister.Attenuator,    ControlFrame.CcRegister.RxFreq),
             3 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.TxFreq),
-            _ => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.XvtrControl),
+            4 => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.XvtrControl),
+            _ => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.CwControl),
         };
     }
 
@@ -2844,7 +3163,7 @@ public sealed class Protocol1Client : IProtocol1Client
                 // RxFreq3/RxFreq4 slots it needs are already there.
                 bool psArmed = PsArmedRotation(in state);
                 var (first, second) = PhaseRegisters(phase, state.Mox, psArmed);
-                phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 5);
+                phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 6);
                 bool pacedAudioSend = !state.Mox && _audioEgressPacer.Active;
                 ControlFrame.BuildDataPacket(buf, NextEp2Seq(), first, second, in state, _txIqSource, _rxAudioSource);
                 rateWindowPkts++;
