@@ -4,8 +4,8 @@
 // Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA), Christian Suarez (N9WAR), and contributors.
 //
 // Host-side CW keyer. WDSP's CWX module is not exported by the libwdsp
-// binaries we ship today (verified 2026-05-24: `nm -D libwdsp.so | grep -i
-// CWX` is empty on linux-x64 and osx-arm64), so we generate the IQ here
+// binaries we ship today (re-verified 2026-08-23: `nm -D libwdsp.so | grep -i
+// CWX` is empty on linux-x64, osx-arm64, and osx-x64), so we generate the IQ here
 // instead and push it straight into the protocol-1 TX ring. The shape we
 // produce — a single tone at the CW pitch with raised-cosine rise/fall —
 // is what piHPSDR's `transmitter_send_cw` ends up emitting on the wire

@@ -31,8 +31,11 @@ internal sealed record EngineRadioCapabilitiesSnapshot(
 
 internal sealed record EngineRadioCalibrationSnapshot(
     double BridgeVolt,
+    double ReverseBridgeVolt,
+    double SixMeterReverseBridgeVolt,
     double RefVoltage,
     int AdcCalOffset,
+    int ReverseAdcCalOffset,
     double MaxWatts);
 
 internal sealed record EngineRadioDiagnosticsSnapshot(
@@ -103,8 +106,11 @@ internal sealed record EngineRadioDiagnosticsSnapshot(
                 variant),
             Calibration: new EngineRadioCalibrationSnapshot(
                 calibration.BridgeVolt,
+                calibration.ReverseBridgeVolt,
+                calibration.SixMeterReverseBridgeVolt,
                 calibration.RefVoltage,
                 calibration.AdcCalOffset,
+                calibration.ReverseAdcCalOffset,
                 calibration.MaxWatts),
             Firmware: radio.ConnectedFirmware);
     }

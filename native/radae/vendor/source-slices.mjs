@@ -18,7 +18,13 @@ const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RADE_SOURCE_SPEC = path.join(moduleDirectory, "SOURCE-SLICES.json");
 export const RADE_BINDING_PATH = "native/radae/vendor/BINARY-SOURCE-BINDING.json";
 const REQUIRED_SLICES = new Set(["radae_c", "opus_dnn", "freedv_text"]);
-const REQUIRED_BINARY_RIDS = new Set(["linux-x64", "linux-arm64", "win-x64", "osx-arm64"]);
+const REQUIRED_BINARY_RIDS = new Set([
+  "linux-x64",
+  "linux-arm64",
+  "win-x64",
+  "osx-arm64",
+  "osx-x64",
+]);
 
 function normalizedPath(filePath) {
   return filePath.split(path.sep).join("/");
@@ -102,7 +108,7 @@ export function loadRadeSourceSpec(specPath = DEFAULT_RADE_SOURCE_SPEC) {
     binaryRids.size !== REQUIRED_BINARY_RIDS.size
     || [...REQUIRED_BINARY_RIDS].some((rid) => !binaryRids.has(rid))
   ) {
-    throw new Error("RADE source-slice spec must bind exactly linux-x64, linux-arm64, win-x64, and osx-arm64");
+    throw new Error("RADE source-slice spec must bind exactly linux-x64, linux-arm64, win-x64, osx-arm64, and osx-x64");
   }
 
   if (!Array.isArray(spec.buildInputs) || spec.buildInputs.length === 0) {

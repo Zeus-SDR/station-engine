@@ -56,6 +56,12 @@
       "path": "Zeus.Dsp/runtimes/osx-arm64/native/libzeus_rade.dylib",
       "sha256": "a593e230c3e6e8c3d98f71d5a447c6de244f16f6e5692bea1753ea23e2cfcda7",
       "toolchain": "macOS 14 runner with CMake and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+    },
+    {
+      "rid": "osx-x64",
+      "path": "Zeus.Dsp/runtimes/osx-x64/native/libzeus_rade.dylib",
+      "sha256": "c2d27aa979876bf33ba643e58a479ac5893cc71a5a9cc1c61b125acfa9f4188d",
+      "toolchain": "AppleClang 21.0.0 and CMake 4.3.2 on Apple Silicon with CMAKE_OSX_ARCHITECTURES=x86_64 and CMAKE_OSX_DEPLOYMENT_TARGET=12.0; Mach-O architecture, deployment target, and ABI exports verified locally on 2026-08-23"
     }
   ],
   "buildInputs": [

@@ -496,6 +496,9 @@ public sealed class TxMetersService : BackgroundService
                         _refAdcPeak = 0;
                     }
                     var cal = RadioCalibrations.For(_radio.ConnectedBoardKind, _radio.EffectiveOrionMkIIVariant);
+                    long hardwareTxHz = _radio.ToHardwareFrequencyHz(
+                        RadioFrequencyResolver.TxFrequencyHz(_radio.Snapshot()));
+                    bool sixMeters = BandUtils.FreqToBand(hardwareTxHz) == "6m";
                     // Watts use peak-hold (matches LP-100A peak-reading
                     // wattmeter). SWR uses the smoothed ADC pair instead:
                     // peak(FWD) vs peak(REF) are two uncorrelated transient
@@ -503,8 +506,8 @@ public sealed class TxMetersService : BackgroundService
                     // ratio — on HL2 both rails can saturate together during
                     // PA-on / LPF-relay transients, with REF clamping a few
                     // counts above FWD, which the trip logic reads as 9:1.
-                    var (fwdW, refW, _) = ComputeMeters(fwdAdc, refAdc, cal);
-                    var (_, _, swrVal) = ComputeMeters(fwdAdcSmoothed, refAdcSmoothed, cal);
+                    var (fwdW, refW, _) = ComputeMeters(fwdAdc, refAdc, cal, sixMeters);
+                    var (_, _, swrVal) = ComputeMeters(fwdAdcSmoothed, refAdcSmoothed, cal, sixMeters);
                     swr = swrVal;
                     // Stage meters are published by WdspDspEngine.ProcessTxBlock;
                     // may lag the first TX block by a few ticks at MOX-on, which
@@ -644,14 +647,16 @@ public sealed class TxMetersService : BackgroundService
         }
         _lastDiagLogAtUtc = nowUtc;
         _log.LogInformation(
-            "tx.meters.diag board={Board} cal=bridge{Bridge:F2}/ref{Ref:F1}/off{Off} " +
+            "tx.meters.diag board={Board} cal=fwdBridge{FwdBridge:F2}/refBridge{RefBridge:F2}/ref{Ref:F1}/fwdOff{FwdOff}/refOff{RefOff} " +
             "fwdSlot/s={FwdCount} refSlot/s={RefCount} paTempSlot/s={PaTempCount} " +
             "lastFwdAin1={LastFwdAin1} lastFwdAin0={LastFwdAin0} lastRefAin0={LastRefAin0} " +
             "fwdAdcSm={FwdSm:F0} refAdcSm={RefSm:F0} fwdAdcPk={FwdPk} refAdcPk={RefPk} " +
             "fwdAdcUsed={FwdUsed:F0} refAdcUsed={RefUsed:F0} " +
             "fwdW={FwdW:F2} refW={RefW:F2} swr={Swr:F2} " +
             "seenFwdRef={SeenFR} seenPaTemp={SeenPT} paTempAdc={PaTempAdc:F0}",
-            _radio.ConnectedBoardKind, cal.BridgeVolt, cal.RefVoltage, cal.AdcCalOffset,
+            _radio.ConnectedBoardKind,
+            cal.BridgeVolt, cal.ReverseBridgeVolt, cal.RefVoltage,
+            cal.AdcCalOffset, cal.ReverseAdcCalOffset,
             fwdCount, refCount, paTempCount,
             lastFwdAin1, lastFwdAin0, lastRefAin0,
             fwdAdcSmoothed, refAdcSmoothed, fwdAdcPeak, refAdcPeak,
@@ -762,12 +767,15 @@ public sealed class TxMetersService : BackgroundService
     /// pure function, no state.
     /// </summary>
     public static (double FwdWatts, double RefWatts, double Swr) ComputeMeters(
-        double fwdAdc, double refAdc, RadioCalibration cal)
+        double fwdAdc, double refAdc, RadioCalibration cal, bool sixMeters = false)
     {
         double fwdV = (fwdAdc - cal.AdcCalOffset) / 4095.0 * cal.RefVoltage;
-        double refV = (refAdc - cal.AdcCalOffset) / 4095.0 * cal.RefVoltage;
+        double refV = (refAdc - cal.ReverseAdcCalOffset) / 4095.0 * cal.RefVoltage;
         double fwdW = fwdV * fwdV / cal.BridgeVolt;
-        double refW = refV * refV / cal.BridgeVolt;
+        double reverseBridgeVolt = sixMeters
+            ? cal.SixMeterReverseBridgeVolt
+            : cal.ReverseBridgeVolt;
+        double refW = refV * refV / reverseBridgeVolt;
         if (fwdW < 0 || double.IsNaN(fwdW)) fwdW = 0;
         if (refW < 0 || double.IsNaN(refW)) refW = 0;
 

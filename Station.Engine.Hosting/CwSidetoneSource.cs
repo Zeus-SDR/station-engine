@@ -7,8 +7,9 @@ namespace Zeus.Server;
 
 /// <summary>
 /// Host-side sidetone generator for CW keying. WDSP exports no sidetone
-/// API in the libraries we ship (verified 2026-05-24: `nm -D libwdsp.so |
-/// grep -i sidetone` is empty across linux-x64, linux-arm64, osx-arm64), so
+/// API in the libraries we ship (re-verified 2026-08-23: `nm -D libwdsp.so |
+/// grep -i sidetone` is empty across linux-x64, linux-arm64, osx-arm64,
+/// osx-x64), so
 /// — like the carrier itself in <see cref="CwEngine"/> — we synthesise the
 /// monitor tone in C# and mix it into the RX audio buffer just before the
 /// pipeline publishes the block. Sinking through the existing RX audio bus

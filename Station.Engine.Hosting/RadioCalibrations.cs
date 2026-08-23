@@ -31,8 +31,8 @@ namespace Zeus.Server;
 /// through this helper rather than being special-cased inside
 /// <c>TxMetersService.ComputeMeters</c>.
 ///
-/// Constants come from Thetis <c>console.cs:25053-25118</c>
-/// (<c>computeAlexFwdPower</c>). Where Thetis distinguishes flavours that
+/// Constants come from Thetis <c>console.cs</c> <c>computeAlexFwdPower</c> and
+/// <c>computeRefPower</c>. Where Thetis distinguishes flavours that
 /// Zeus' single-byte board id collapses (the 0x0A wire-byte family —
 /// ANAN-G2 vs Apache OrionMkII vs ANAN-8000D etc.), the operator selects
 /// the variant via <see cref="OrionMkIIVariant"/> and the dispatch routes
@@ -76,10 +76,10 @@ internal static class RadioCalibrations
         // Board id 0x0A aliases six radios. Operator selects the variant
         // via PreferredRadioStore.GetOrionMkIIVariant(); default G2
         // preserves Zeus' pre-#218 behaviour. Sources:
-        //  - G2 / 7000DLE / G2-1K / ANVELINA / RedPitaya: bridge 0.12 /
-        //    ref 5.0 / offset 32 (Thetis console.cs:25079-25088).
-        //  - 8000DLE / Apache OrionMkII original: bridge 0.08 / ref 5.0 /
-        //    offset 18 (Thetis console.cs:25089-25093).
+        //  - G2 / 7000DLE / G2-1K / ANVELINA / RedPitaya: FWD bridge 0.12 /
+        //    offset 32; REF bridge 0.15 / offset 28.
+        //  - 8000DLE / Apache OrionMkII original: FWD bridge 0.08 / offset 18;
+        //    REF bridge 0.08 / offset 16. Both groups use a 5.0 V reference.
         HpsdrBoardKind.OrionMkII   => variant switch
         {
             OrionMkIIVariant.Anan8000DLE       => RadioCalibration.OrionMkIIAnan8000,
