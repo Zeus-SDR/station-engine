@@ -14,8 +14,9 @@ namespace Zeus.Server;
 
 // Persists the panadapter background mode (basic / beam-map / image), the
 // image-fit variant, and (optionally) a single user-supplied background
-// image stored as raw bytes. Lives in the same zeus-prefs.db as PA / band-
-// memory / layout — none of these values are sensitive.
+// image stored as raw bytes, plus the independent Bandwidth Filter mini-pan
+// background settings and image. Lives in the same zeus-prefs.db as PA /
+// band-memory / layout — none of these values are sensitive.
 //
 // Why server-side: the previous implementation stored panBackground +
 // backgroundImage in browser localStorage, which is per-origin and per-
@@ -25,6 +26,12 @@ namespace Zeus.Server;
 // pointed at the Zeus instance.
 public sealed class DisplaySettingsStore : IDisposable
 {
+    public const string DefaultFilterPanelBgColor = "#262A33";
+    public const int DefaultFilterPanelBgBrightness = 50;
+    public const int MaxCombinedImageBytes = 12 * 1024 * 1024;
+    public const string CombinedImageBudgetError =
+        "combined background images exceed the 12 MB storage budget: remove or shrink the other background image";
+
     // Defensive bounds for any persisted dB window. Mirrors DB_ABS_LIMIT /
     // MIN_SPAN_DB in zeus-web's display-settings-store.ts. A range outside
     // these bounds (or with span < MIN_SPAN_DB) would render the panadapter
@@ -159,7 +166,12 @@ public sealed class DisplaySettingsStore : IDisposable
                     ChatRosterOverlayEnabled: null,
                     SpotLabelFontPx: null,
                     GlobeRenderer: null,
-                    GlobeCustomImageryJson: null);
+                    GlobeCustomImageryJson: null,
+                    FilterPanelBgMode: "default",
+                    FilterPanelBgColor: DefaultFilterPanelBgColor,
+                    FilterPanelBgBrightness: DefaultFilterPanelBgBrightness,
+                    HasFilterPanelImage: false,
+                    FilterPanelImageMime: null);
             }
             var hasTxWfRange = TryNormalizeTxWaterfallRange(
                 e.WfTxDbMin,
@@ -199,7 +211,17 @@ public sealed class DisplaySettingsStore : IDisposable
                 ChatRosterOverlayEnabled: e.ChatRosterOverlayEnabled,
                 SpotLabelFontPx: e.SpotLabelFontPx,
                 GlobeRenderer: e.GlobeRenderer,
-                GlobeCustomImageryJson: e.GlobeCustomImageryJson);
+                GlobeCustomImageryJson: e.GlobeCustomImageryJson,
+                FilterPanelBgMode: NormalizeFilterPanelMode(e.FilterPanelBgMode),
+                FilterPanelBgColor: NormalizeFilterPanelColor(e.FilterPanelBgColor),
+                FilterPanelBgBrightness: Math.Clamp(
+                    e.FilterPanelBgBrightness ?? DefaultFilterPanelBgBrightness,
+                    0,
+                    100),
+                HasFilterPanelImage: e.FilterPanelImageBytes is { Length: > 0 },
+                FilterPanelImageMime: string.IsNullOrEmpty(e.FilterPanelImageMime)
+                    ? null
+                    : e.FilterPanelImageMime);
         }
     }
 
@@ -233,7 +255,10 @@ public sealed class DisplaySettingsStore : IDisposable
         bool? chatRosterOverlayEnabled = null,
         int? spotLabelFontPx = null,
         string? globeRenderer = null,
-        string? globeCustomImageryJson = null)
+        string? globeCustomImageryJson = null,
+        string? filterPanelBgMode = null,
+        string? filterPanelBgColor = null,
+        int? filterPanelBgBrightness = null)
     {
         lock (_sync)
         {
@@ -279,6 +304,12 @@ public sealed class DisplaySettingsStore : IDisposable
             if (chatRosterOverlayEnabled.HasValue) e.ChatRosterOverlayEnabled = chatRosterOverlayEnabled;
             if (spotLabelFontPx.HasValue) e.SpotLabelFontPx = Math.Clamp(spotLabelFontPx.Value, 10, 18);
             if (globeRenderer is "auto" or "rich" or "simple") e.GlobeRenderer = globeRenderer;
+            if (filterPanelBgMode is not null)
+                e.FilterPanelBgMode = NormalizeFilterPanelMode(filterPanelBgMode);
+            if (filterPanelBgColor is not null)
+                e.FilterPanelBgColor = NormalizeFilterPanelColor(filterPanelBgColor);
+            if (filterPanelBgBrightness.HasValue)
+                e.FilterPanelBgBrightness = Math.Clamp(filterPanelBgBrightness.Value, 0, 100);
             if (globeCustomImageryJson is not null)
             {
                 if (globeCustomImageryJson.Length == 0)
@@ -312,6 +343,7 @@ public sealed class DisplaySettingsStore : IDisposable
         lock (_sync)
         {
             var e = _docs.FindAll().FirstOrDefault() ?? new DisplaySettingsEntry();
+            EnsureCombinedImageBudget(bytes.Length, e.FilterPanelImageBytes?.Length ?? 0);
             e.ImageBytes = bytes;
             e.ImageMime = string.IsNullOrEmpty(mime) ? "application/octet-stream" : mime;
             e.UpdatedUtc = DateTime.UtcNow;
@@ -333,7 +365,54 @@ public sealed class DisplaySettingsStore : IDisposable
         }
     }
 
+    public (byte[] Bytes, string Mime)? GetFilterPanelImage()
+    {
+        lock (_sync)
+        {
+            var e = _docs.FindAll().FirstOrDefault();
+            if (e is null || e.FilterPanelImageBytes is null || e.FilterPanelImageBytes.Length == 0)
+                return null;
+            var mime = string.IsNullOrEmpty(e.FilterPanelImageMime)
+                ? "application/octet-stream"
+                : e.FilterPanelImageMime;
+            return (e.FilterPanelImageBytes, mime);
+        }
+    }
+
+    public void SaveFilterPanelImage(byte[] bytes, string mime)
+    {
+        lock (_sync)
+        {
+            var e = _docs.FindAll().FirstOrDefault() ?? new DisplaySettingsEntry();
+            EnsureCombinedImageBudget(bytes.Length, e.ImageBytes?.Length ?? 0);
+            e.FilterPanelImageBytes = bytes;
+            e.FilterPanelImageMime = string.IsNullOrEmpty(mime) ? "application/octet-stream" : mime;
+            e.UpdatedUtc = DateTime.UtcNow;
+            if (e.Id == 0) _docs.Insert(e);
+            else _docs.Update(e);
+        }
+    }
+
+    public void DeleteFilterPanelImage()
+    {
+        lock (_sync)
+        {
+            var e = _docs.FindAll().FirstOrDefault();
+            if (e is null) return;
+            e.FilterPanelImageBytes = null;
+            e.FilterPanelImageMime = null;
+            e.UpdatedUtc = DateTime.UtcNow;
+            _docs.Update(e);
+        }
+    }
+
     public void Dispose() => _dbLease.Dispose();
+
+    private static void EnsureCombinedImageBudget(int newImageBytes, int otherImageBytes)
+    {
+        if ((long)newImageBytes + otherImageBytes > MaxCombinedImageBytes)
+            throw new CombinedBackgroundImageStorageException();
+    }
 
     private static string NormalizeMode(string? raw) =>
         raw switch
@@ -347,6 +426,13 @@ public sealed class DisplaySettingsStore : IDisposable
         {
             "fit" or "fill" or "stretch" => raw,
             _ => "fill",
+        };
+
+    private static string NormalizeFilterPanelMode(string? raw) =>
+        raw switch
+        {
+            "default" or "color" or "image" => raw,
+            _ => "default",
         };
 
     // Matches the frontend's DEFAULT_RX_TRACE_COLOR in display-settings-store.ts
@@ -366,6 +452,27 @@ public sealed class DisplaySettingsStore : IDisposable
         return raw.ToUpperInvariant();
     }
 
+    private static string NormalizeFilterPanelColor(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return DefaultFilterPanelBgColor;
+        if (raw.Length != 7 || raw[0] != '#') return DefaultFilterPanelBgColor;
+        for (var i = 1; i < 7; i++)
+        {
+            var c = raw[i];
+            var ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!ok) return DefaultFilterPanelBgColor;
+        }
+        return raw.ToUpperInvariant();
+    }
+
+}
+
+public sealed class CombinedBackgroundImageStorageException : InvalidOperationException
+{
+    public CombinedBackgroundImageStorageException()
+        : base(DisplaySettingsStore.CombinedImageBudgetError)
+    {
+    }
 }
 
 public sealed class DisplaySettingsEntry
@@ -373,12 +480,17 @@ public sealed class DisplaySettingsEntry
     public int Id { get; set; }
     public string Mode { get; set; } = "basic";
     public string Fit { get; set; } = "fill";
-    // Inline byte[] keeps the doc self-contained; LiteDB handles BSON blobs
-    // up to 16 MB per document, which is well over any realistic background
-    // image. If we ever need bigger, swap to LiteFileStorage and store an
-    // id here instead.
+    // Both background image slots share this LiteDB document. Saves enforce a
+    // 12 MB combined budget, leaving at least 4 MB of BSON headroom for the
+    // remaining settings. If larger images are ever needed, move the blobs to
+    // LiteFileStorage and keep only ids here.
     public byte[]? ImageBytes { get; set; }
     public string? ImageMime { get; set; }
+    public string FilterPanelBgMode { get; set; } = "default";
+    public string FilterPanelBgColor { get; set; } = DisplaySettingsStore.DefaultFilterPanelBgColor;
+    public int? FilterPanelBgBrightness { get; set; }
+    public byte[]? FilterPanelImageBytes { get; set; }
+    public string? FilterPanelImageMime { get; set; }
     // Panadapter signal trace colour as #RRGGBB. Null on legacy rows written
     // before this field existed — Get() normalises null → DefaultRxTraceColor.
     public string? RxTraceColor { get; set; }

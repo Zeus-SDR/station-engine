@@ -67,6 +67,8 @@ extern void setBuffers_osctrl (OSCTRL a, double* in, double* out);
 
 extern void setSamplerate_osctrl (OSCTRL a, int rate);
 
+extern int setBandwidth_osctrl (OSCTRL a, double bandwidth);
+
 extern void setSize_osctrl (OSCTRL a, int size);
 
 #endif

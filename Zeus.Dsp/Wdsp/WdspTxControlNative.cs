@@ -7,6 +7,8 @@ internal interface IWdspTxControlNative
     void SetTXAMode(int channel, int mode);
     void SetTXAAMCarrierLevel(int channel, double carrierLevel);
     void SetTXACompressorRun(int channel, int run);
+    void SetTXAosctrlRun(int channel, int run);
+    void SetTXAosctrlBandwidth(int channel, double bandwidth);
     void SetTXACFCOMPRun(int channel, int run);
     void SetTXACFCOMPprofile(int channel, int nfreqs, double[] f, double[] g, double[] e);
     void SetTXACFCOMPPrecomp(int channel, double precomp);
@@ -34,6 +36,12 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXACompressorRun(int channel, int run) =>
         NativeMethods.SetTXACompressorRun(channel, run);
+
+    public void SetTXAosctrlRun(int channel, int run) =>
+        NativeMethods.SetTXAosctrlRun(channel, run);
+
+    public void SetTXAosctrlBandwidth(int channel, double bandwidth) =>
+        NativeMethods.SetTXAosctrlBandwidth(channel, bandwidth);
 
     public void SetTXACFCOMPRun(int channel, int run) =>
         NativeMethods.SetTXACFCOMPRun(channel, run);

@@ -97,10 +97,11 @@ public static class RadioDspControlEndpoints
         {
             var cfg = req.TxLeveling;
             log.LogInformation(
-                "api.tx.leveling alcMaxGainDb={Alc:F1} alcDecayMs={AlcDecay} levelerEnabled={Lvlr} levelerDecayMs={LvlrDecay} compEnabled={Comp} compGainDb={CompGain:F1}",
+                "api.tx.leveling alcMaxGainDb={Alc:F1} alcDecayMs={AlcDecay} levelerEnabled={Lvlr} levelerDecayMs={LvlrDecay} compEnabled={Comp} compGainDb={CompGain:F1} cessbEnabled={Cessb} cessbBandwidthHz={CessbBandwidth}",
                 cfg.AlcMaxGainDb, cfg.AlcDecayMs, cfg.LevelerEnabled, cfg.LevelerDecayMs,
-                cfg.CompressorEnabled, cfg.CompressorGainDb);
-            // Range validation (Thetis parity §6.1-6.3). RadioService also clamps,
+                cfg.CompressorEnabled, cfg.CompressorGainDb, cfg.CessbEnabled,
+                cfg.CessbBandwidthHz);
+            // Range validation (Thetis parity §6.1-6.3 + CESSB). RadioService also clamps,
             // but a 400 lets a misbehaving client know its value was rejected.
             if (double.IsNaN(cfg.AlcMaxGainDb) || cfg.AlcMaxGainDb < 0.0 || cfg.AlcMaxGainDb > 120.0)
                 return Results.BadRequest(new { error = "alcMaxGainDb must be 0..120 dB" });
@@ -110,6 +111,8 @@ public static class RadioDspControlEndpoints
                 return Results.BadRequest(new { error = "levelerDecayMs must be 1..5000" });
             if (double.IsNaN(cfg.CompressorGainDb) || cfg.CompressorGainDb < 0.0 || cfg.CompressorGainDb > 20.0)
                 return Results.BadRequest(new { error = "compressorGainDb must be 0..20 dB" });
+            if (cfg.CessbBandwidthHz is not (3000 or 4000))
+                return Results.BadRequest(new { error = "cessbBandwidthHz must be 3000 or 4000 Hz" });
             return Results.Ok(r.SetTxLeveling(cfg));
         });
 

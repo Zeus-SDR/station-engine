@@ -193,6 +193,8 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _cwKeyerWeight = 50;
     private int _cwKeyerPaddleReverse;
     private int _cwKeyerEnabled;
+    private int _cwSidetoneLevel;   // firmware sidetone_level 0..100 (issue #1783)
+    private int _cwSidetoneFreqHz;  // firmware tone_freq in Hz, 12-bit (issue #1783)
     // TX audio front-end (external-audio-jacks re-port). mic_boost / mic_linein
     // ride the 0x12 frame on codec boards; mic_trs / mic_bias / line_in_gain
     // ride the 0x14 frame on HL2 (read-modify-write — see ControlFrame). All
@@ -2133,6 +2135,28 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _cwKeyerEnabled, enabled ? 1 : 0);
 
     /// <summary>
+    /// Set the firmware CW sidetone level (0..100) and pitch (Hz). Driven by
+    /// RadioService from the operator's persisted CW settings so the legacy
+    /// Hermes/Angelia/Orion gateware plays a zero-latency headphone sidetone
+    /// while the internal keyer is active. The level is emitted only while the
+    /// keyer is enabled (see <see cref="SnapshotState"/>) so non-CW frames stay
+    /// byte-identical. Issue #1783.
+    /// </summary>
+    public void SetCwSidetone(int level, int freqHz)
+    {
+        Interlocked.Exchange(ref _cwSidetoneLevel, Math.Clamp(level, 0, 100));
+        Interlocked.Exchange(ref _cwSidetoneFreqHz, Math.Clamp(freqHz, 0, 0x0FFF));
+    }
+
+    /// <inheritdoc/>
+    // Mirrors the SnapshotState gate that decides whether a nonzero
+    // sidetone_level rides the 0x1E frame: the FPGA only routes its headphone
+    // sidetone while the internal keyer is enabled and the level is nonzero
+    // (issue #1783).
+    public bool HardwareCwSidetoneActive =>
+        Volatile.Read(ref _cwKeyerEnabled) != 0 && Volatile.Read(ref _cwSidetoneLevel) > 0;
+
+    /// <summary>
     /// Set the TX audio front-end (external-audio-jacks re-port). Global,
     /// per-radio — not per-band. <paramref name="micBoost"/> /
     /// <paramref name="micLineIn"/> ride the 0x12 frame on Hermes-class codec
@@ -2370,6 +2394,14 @@ public sealed class Protocol1Client : IProtocol1Client
             CwKeyerWeight: Volatile.Read(ref _cwKeyerWeight),
             CwKeyerPaddleReverse: Volatile.Read(ref _cwKeyerPaddleReverse) != 0,
             CwKeyerEnabled: Volatile.Read(ref _cwKeyerEnabled) != 0,
+            // Only emit a nonzero hardware sidetone level while the internal
+            // keyer is enabled (CW mode); every other mode keeps the 0x1E frame
+            // byte-identical to the pre-#1783 wire. tone_freq is a harmless
+            // latch, so it is always published.
+            CwSidetoneLevel: Volatile.Read(ref _cwKeyerEnabled) != 0
+                ? (byte)Volatile.Read(ref _cwSidetoneLevel)
+                : (byte)0,
+            CwSidetoneFreqHz: Volatile.Read(ref _cwSidetoneFreqHz),
             MicBoost: Volatile.Read(ref _micBoost) != 0,
             MicLineIn: Volatile.Read(ref _micLineIn) != 0,
             MicTrs: Volatile.Read(ref _micTrs) != 0,
@@ -3006,13 +3038,15 @@ public sealed class Protocol1Client : IProtocol1Client
             };
         }
 
-        // Non-PS rotation is 6 phases. Phase 4 carries the CW keyer config
+        // Non-PS rotation is 7 phases. Phase 4 carries the CW keyer config
         // (0x0B) in the RX-only branch so the on-board iambic keyer speed/
         // mode tracks the operator's CW panel. Phase 5 carries the 0x0F
-        // internal-CW latch in both RX and TX so mode changes always clear or
-        // set it. Adding the latch phase leaves every existing register in the
-        // rotation and keeps TxFreq/RxFreq refreshed continuously.
-        int p = phase % 6;
+        // internal-CW latch + sidetone level in both RX and TX so mode changes
+        // always clear or set it. Phase 6 carries the 0x10 CW sidetone
+        // frequency (issue #1783) so the FPGA headphone sidetone plays at the
+        // operator's pitch. Adding these phases leaves every existing register
+        // in the rotation and keeps TxFreq/RxFreq refreshed continuously.
+        int p = phase % 7;
         if (mox)
         {
             return p switch
@@ -3022,7 +3056,8 @@ public sealed class Protocol1Client : IProtocol1Client
                 2 => (ControlFrame.CcRegister.Attenuator, ControlFrame.CcRegister.TxFreq),
                 3 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.Config),
                 4 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.XvtrControl),
-                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.CwControl),
+                5 => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.CwControl),
+                _ => (ControlFrame.CcRegister.TxFreq,     ControlFrame.CcRegister.CwSidetoneFreq),
             };
         }
         return p switch
@@ -3032,7 +3067,8 @@ public sealed class Protocol1Client : IProtocol1Client
             2 => (ControlFrame.CcRegister.Attenuator,    ControlFrame.CcRegister.RxFreq),
             3 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.TxFreq),
             4 => (ControlFrame.CcRegister.CwKeyerConfig, ControlFrame.CcRegister.XvtrControl),
-            _ => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.CwControl),
+            5 => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.CwControl),
+            _ => (ControlFrame.CcRegister.RxFreq,        ControlFrame.CcRegister.CwSidetoneFreq),
         };
     }
 
@@ -3163,7 +3199,7 @@ public sealed class Protocol1Client : IProtocol1Client
                 // RxFreq3/RxFreq4 slots it needs are already there.
                 bool psArmed = PsArmedRotation(in state);
                 var (first, second) = PhaseRegisters(phase, state.Mox, psArmed);
-                phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 6);
+                phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 7);
                 bool pacedAudioSend = !state.Mox && _audioEgressPacer.Active;
                 ControlFrame.BuildDataPacket(buf, NextEp2Seq(), first, second, in state, _txIqSource, _rxAudioSource);
                 rateWindowPkts++;

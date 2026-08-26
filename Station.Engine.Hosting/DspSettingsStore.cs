@@ -327,7 +327,11 @@ public sealed class DspSettingsStore : IDisposable
             LevelerEnabled: e.TxLevelerEnabled ?? def.LevelerEnabled,
             LevelerDecayMs: e.TxLevelerDecayMs ?? def.LevelerDecayMs,
             CompressorEnabled: e.TxCompressorEnabled ?? def.CompressorEnabled,
-            CompressorGainDb: e.TxCompressorGainDb ?? def.CompressorGainDb);
+            CompressorGainDb: e.TxCompressorGainDb ?? def.CompressorGainDb,
+            CessbEnabled: e.TxCessbEnabled ?? def.CessbEnabled,
+            CessbBandwidthHz: e.TxCessbBandwidthHz is 3000 or 4000
+                ? e.TxCessbBandwidthHz.Value
+                : def.CessbBandwidthHz);
     }
 
     public void SetTxLeveling(TxLevelingConfig config, string profileId = "default")
@@ -370,6 +374,8 @@ public sealed class DspSettingsStore : IDisposable
         e.TxLevelerDecayMs = c.LevelerDecayMs;
         e.TxCompressorEnabled = c.CompressorEnabled;
         e.TxCompressorGainDb = c.CompressorGainDb;
+        e.TxCessbEnabled = c.CessbEnabled;
+        e.TxCessbBandwidthHz = c.CessbBandwidthHz;
     }
 
     // TX phase rotator (Thetis DSP->CFC->PhaseRot parity). Persisted as
@@ -820,6 +826,8 @@ public sealed class DspSettingsEntry
     public int? TxLevelerDecayMs { get; set; }
     public bool? TxCompressorEnabled { get; set; }
     public double? TxCompressorGainDb { get; set; }
+    public bool? TxCessbEnabled { get; set; }
+    public int? TxCessbBandwidthHz { get; set; }
     // TX phase rotator (Thetis DSP->CFC->PhaseRot). TxPhaseRotatorSet null on
     // legacy rows → GetTxPhaseRotator() returns null → RadioService uses the
     // disabled defaults. Reverse is stored independently from Enabled.

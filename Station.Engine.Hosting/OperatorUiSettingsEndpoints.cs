@@ -55,7 +55,10 @@ public static class OperatorUiSettingsEndpoints
                     req.ChatRosterOverlayEnabled,
                     req.SpotLabelFontPx,
                     req.GlobeRenderer,
-                    req.GlobeCustomImageryJson);
+                    req.GlobeCustomImageryJson,
+                    req.FilterPanelBgMode,
+                    req.FilterPanelBgColor,
+                    req.FilterPanelBgBrightness);
             }
             catch (System.Text.Json.JsonException ex)
             {
@@ -97,13 +100,60 @@ public static class OperatorUiSettingsEndpoints
                 return Results.BadRequest(new { error = "image/* content-type required" });
             using var ms = new MemoryStream(capacity: (int)file.Length);
             await file.CopyToAsync(ms);
-            store.SaveImage(ms.ToArray(), mime);
+            try
+            {
+                store.SaveImage(ms.ToArray(), mime);
+            }
+            catch (CombinedBackgroundImageStorageException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
             return Results.Ok(store.Get());
         });
 
         endpoints.MapDelete("/api/display-settings/image", (DisplaySettingsStore store) =>
         {
             store.DeleteImage();
+            return Results.Ok(store.Get());
+        });
+
+        endpoints.MapGet("/api/display-settings/filter-image", (DisplaySettingsStore store) =>
+        {
+            var img = store.GetFilterPanelImage();
+            if (img is null) return Results.NotFound();
+            return Results.File(img.Value.Bytes, img.Value.Mime);
+        });
+
+        endpoints.MapPut("/api/display-settings/filter-image", async (HttpContext ctx, DisplaySettingsStore store) =>
+        {
+            if (!ctx.Request.HasFormContentType)
+                return Results.BadRequest(new { error = "multipart/form-data required" });
+            var form = await ctx.Request.ReadFormAsync();
+            var file = form.Files["file"] ?? form.Files.FirstOrDefault();
+            if (file is null || file.Length == 0)
+                return Results.BadRequest(new { error = "file field required" });
+            const long MaxBytes = 8 * 1024 * 1024;
+            if (file.Length > MaxBytes)
+                return Results.BadRequest(new { error = $"file too large (max {MaxBytes} bytes)" });
+            var mime = string.IsNullOrEmpty(file.ContentType) ? "application/octet-stream" : file.ContentType;
+            if (!mime.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+                return Results.BadRequest(new { error = "image/* content-type required" });
+            using var ms = new MemoryStream(capacity: (int)file.Length);
+            await file.CopyToAsync(ms);
+            try
+            {
+                store.SaveFilterPanelImage(ms.ToArray(), mime);
+            }
+            catch (CombinedBackgroundImageStorageException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            return Results.Ok(store.Get());
+        });
+
+        endpoints.MapDelete("/api/display-settings/filter-image", (DisplaySettingsStore store) =>
+        {
+            store.DeleteFilterPanelImage();
             return Results.Ok(store.Get());
         });
 

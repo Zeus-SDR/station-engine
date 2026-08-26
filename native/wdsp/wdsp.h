@@ -812,6 +812,7 @@ extern void xnobEXTF (int id, float *I, float *Q);
 //
 
 extern void SetTXAosctrlRun (int channel, int run);
+extern void SetTXAosctrlBandwidth (int channel, double bandwidth);
 
 //
 // Interfaces from patchpanel.c

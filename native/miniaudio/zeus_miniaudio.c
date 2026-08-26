@@ -28,9 +28,25 @@
 #define MA_NO_RESOURCE_MANAGER
 #define MA_NO_ENGINE
 #define MA_NO_NODE_GRAPH
+#if defined(__linux__)
+/* JACK stays out of the Linux build. miniaudio dlcloses libjack when it tears a
+ * context down, but on a PipeWire desktop libjack IS pipewire-jack, whose
+ * pw_thread_loop and registry listener outlive that unload; the next registry
+ * event then dispatches into an unmapped vtable and the process takes a SIGSEGV.
+ * Zeus has no JACK integration, so disabling the backend costs nothing.
+ * Linux-only is deliberate: upstream also enables JACK on Windows desktop, but
+ * WASAPI is first in miniaudio's default order and always succeeds there, so the
+ * JACK path is unreachable in practice — and gating here keeps the Windows
+ * binary byte-identical rather than churning it for no behavioural gain. */
+#define MA_NO_JACK
+#endif
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+
+#if defined(MA_LINUX) && defined(MA_HAS_JACK)
+#error "JACK must remain disabled on Linux: pipewire-jack's thread loop can outlive libjack after dlclose"
+#endif
 
 #include "zeus_miniaudio.h"
 

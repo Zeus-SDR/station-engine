@@ -31,6 +31,7 @@ project(wdsp
 
 option(WDSP_WITH_NR3 "Build with RNNoise (NR3) support — xiph/rnnoise vendored under native/rnnoise/" ON)
 option(WDSP_WITH_NR4 "Build with libspecbleach (NR4 / SBNR) support — vendored under native/libspecbleach/" ON)
+option(WDSP_BUILD_OSCTRL_TESTS "Build deterministic CESSB overshoot-controller tests" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
@@ -383,6 +384,26 @@ set_target_properties(wdsp PROPERTIES
 )
 if(WIN32)
     set_target_properties(wdsp PROPERTIES PREFIX "")
+endif()
+
+if(WDSP_BUILD_OSCTRL_TESTS)
+    enable_testing()
+    add_executable(wdsp_osctrl_tests
+        osctrl.c
+        tests/osctrl_tests.c
+    )
+    target_compile_definitions(wdsp_osctrl_tests PRIVATE WDSP_OSCTRL_CORE_TEST)
+    target_include_directories(wdsp_osctrl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # The native-library workflow builds Release, which normally defines
+    # NDEBUG and compiles every assert in this test harness away. Keep the
+    # assertions active so a passing CTest result represents real coverage.
+    if(MSVC)
+        target_compile_options(wdsp_osctrl_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(wdsp_osctrl_tests PRIVATE -UNDEBUG)
+        target_link_libraries(wdsp_osctrl_tests PRIVATE m)
+    endif()
+    add_test(NAME wdsp_osctrl_tests COMMAND wdsp_osctrl_tests)
 endif()
 
 message(STATUS "wdsp: build type = ${CMAKE_BUILD_TYPE}")

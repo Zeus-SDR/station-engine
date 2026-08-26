@@ -2104,7 +2104,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 : !HasAuthoritativeStatus(remote)
                     ? "Expert Amp Server status is not fresh protocol-native amplifier evidence."
                     : !IsExpectedTaurus(remote)
-                        ? "Expert Amp Server did not identify an SPE Expert 1.5K Taurus."
+                        ? PanelIdentityFailureReason(remote)
                         : null);
         return direct with
         {
@@ -2118,6 +2118,18 @@ internal sealed class ExpertAmpServerControl : IDisposable
             Error = connectionError,
             LastSampleUtc = contact,
         };
+    }
+
+    private static string PanelIdentityFailureReason(ExpertStatus status)
+    {
+        var model = string.IsNullOrWhiteSpace(status.ModelName)
+            ? "no model name"
+            : $"model \"{status.ModelName.Trim()}\"";
+        return ExpertAmpServerEvidence.CanUseDisplayIdentityFallback(status.ModelName)
+            ? "Expert Amp Server did not identify an SPE Expert 1.5K Taurus. It has fresh amplifier contact, but reported "
+                + $"{model} and Zeus has not yet seen the Taurus identity banner. Put the amplifier in STANDBY on its main screen so "
+                + $"{ExpertAmpServerEvidence.TaurusDisplayBanner} is visible."
+            : $"Expert Amp Server did not identify an SPE Expert 1.5K Taurus; it reported {model}.";
     }
 
     private SpeTaurusStatus RemoteUnavailable(

@@ -328,7 +328,38 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // on for the whole keyed period including inter-element gaps + hang time.
     // Gated to CW modes so an SSB mic-PTT press doesn't inject a 600 Hz tone.
     // (zeus-cl2)
-    private void OnCwKeyDownChanged(bool down) => DriveSidetone(down);
+    private void OnCwKeyDownChanged(bool down)
+    {
+        // Issue #1783: on boards whose FPGA now plays its own zero-latency
+        // headphone sidetone (internal keyer enabled + nonzero hardware
+        // sidetone_level, onboard codec present), suppress the host monitor
+        // tone for the hardware key so the operator doesn't hear each dit/dah
+        // twice — once instantly from the FPGA and once ~50-150 ms later from
+        // the host. Host-generated CW (CwEngine) is untouched: the FPGA keyer
+        // only fires on the physical key. Boards without the codec sidetone
+        // (Hermes-Lite 2) keep the host tone. Force the host tone off on every
+        // edge while the FPGA owns the monitor so a level change mid-key can't
+        // strand a host tone on.
+        if (HardwareSidetoneOwnsMonitor())
+        {
+            _sidetone?.Up();
+            return;
+        }
+        DriveSidetone(down);
+    }
+
+    // True while the connected P1 radio's FPGA is generating its own headphone
+    // sidetone (issue #1783), so the host must not also play one for the same
+    // hardware key. Gated on HasOnboardCodec because that is where the gateware
+    // routes the tone; HL2 (no stream codec) never gets an FPGA sidetone and
+    // must keep the host monitor tone.
+    private bool HardwareSidetoneOwnsMonitor()
+    {
+        IProtocol1Client? client;
+        lock (_sync) { client = _client; }
+        if (client is null || !client.HardwareCwSidetoneActive) return false;
+        return BoardCapabilitiesTable.For(_radio.ConnectedBoardKind).HasOnboardCodec;
+    }
 
     // Toggle the host CW monitor tone off a shaped key-down edge, gated to CW
     // modes so an SSB mic-PTT press never injects a 600 Hz tone. Shared by the
@@ -712,6 +743,8 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     internal void TestP2Telemetry(Zeus.Protocol2.P2TelemetryReading reading) => OnP2Telemetry(reading);
 
     internal void TestCwKeyDown(bool down) => OnCwKeyDownChanged(down);
+
+    internal void TestConnectP1(IProtocol1Client client) => OnConnected(client);
 
     internal void TestHangElapsed() => OnHangElapsed(null);
 

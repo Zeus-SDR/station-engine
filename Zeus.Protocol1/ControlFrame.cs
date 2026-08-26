@@ -115,7 +115,7 @@ internal static class ControlFrame
         // byte in C4. For HL2 the same address frame also carries the
         // puresignal_run bit in C2 bit 6 (mi0bot networkproto1.c:1102) and
         // the user_dig_out nibble in C3, plus an extended C4 attenuator
-        // range (0x40 | (60-Db)) — see WriteAttenuatorPayload.
+        // range (0x40 | (31-Db)) — see WriteAttenuatorPayload.
         Attenuator = 0x14,
         // HL2 AD9866 PGA stable-gain control. HL2-doc address 0x0e →
         // wire byte 0x1c.
@@ -179,11 +179,21 @@ internal static class ControlFrame
         //   keyer_reverse = cmd_data[22]    → C2[6]
         // Wire encoding lives in WriteCwKeyerConfigPayload. See zeus-bks.
         CwKeyerConfig = 0x16,
-        // Firmware CW generator enable. Gateware command address 0x0F maps to
-        // wire byte 0x1E; C1[0] latches internal_CW. The legacy Hermes/
+        // Firmware CW generator enable + hardware sidetone level. Gateware
+        // command address 0x0F maps to wire byte 0x1E; C1[0] latches
+        // internal_CW and C2 carries sidetone_level (0-100). The legacy Hermes/
         // Angelia/Orion gateware resets this latch off, so the parameter frame
         // above cannot make a paddle key the transmitter by itself.
         CwControl = 0x1e,
+        // Firmware CW hang time + sidetone frequency. Gateware command address
+        // 0x10 maps to wire byte 0x10 << 1 = 0x20. The Angelia/Hermes/Orion
+        // gateware decodes the 10-bit CW hang time and the 12-bit sidetone
+        // tone_freq here (anan-100d_angelia Angelia.v:2258-2264). Without it
+        // tone_freq stays at its reset value 0 Hz and the FPGA sidetone is
+        // silent (DC) even when sidetone_level is nonzero — so the on-board
+        // headphone sidetone never sounds. Wire encoding lives in the
+        // CwSidetoneFreq case of WriteCcBytes. Issue #1783.
+        CwSidetoneFreq = 0x20,
         // Orion MkII / ANAN-8000DLE transverter T/R relay enable. Thetis
         // networkproto1.c case 16 emits C0=0x24 and places xvtr_enable in
         // C2[0]. This register stays in the normal rotation even when false,
@@ -360,7 +370,16 @@ internal static class ControlFrame
         // today's byte-identical wire form.
         int CwKeyerWeight = 50,
         bool CwKeyerPaddleReverse = false,
-        bool CwKeyerEnabled = false);
+        bool CwKeyerEnabled = false,
+        // Firmware CW sidetone (issue #1783). Level 0..100 is written to the
+        // CwControl (0x1E) frame C2 = sidetone_level (Angelia.v:2255); the
+        // gateware routes the raised-cosine sidetone to the headphone codec
+        // only while the internal keyer is active AND sidetone_level != 0
+        // (Angelia.v:1209). FreqHz is the 12-bit tone_freq written to the
+        // CwSidetoneFreq (0x20) frame. Both default 0 so a non-CW snapshot
+        // emits byte-identical 0x1E / 0x20 payloads to the pre-fix wire.
+        byte CwSidetoneLevel = 0,
+        int CwSidetoneFreqHz = 0);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -449,13 +468,32 @@ internal static class ControlFrame
                 break;
 
             case CcRegister.CwControl:
-                // Thetis networkproto1.c case 13: C0=0x1E and C1=cw_enable.
-                // Zeus generates sidetone locally and does not expose the
-                // adjacent hardware sidetone-level / RF-delay fields.
+                // Gateware address 0x0F (Angelia.v:2252-2257): C1[0] = internal_CW,
+                // C2 = sidetone_level (0-100), C3 = RF_delay. Zeus carries the
+                // operator's hardware sidetone level in C2 so the FPGA routes the
+                // raised-cosine tone to the headphone codec (Angelia.v:1209) with
+                // no host-audio latency; RF_delay stays 0 because Zeus owns the
+                // key-to-RF timing host-side. Issue #1783.
                 cc[1] = state.CwKeyerEnabled ? (byte)0x01 : (byte)0x00;
-                cc[2] = 0;
+                cc[2] = state.CwSidetoneLevel;
                 cc[3] = 0;
                 cc[4] = 0;
+                break;
+
+            case CcRegister.CwSidetoneFreq:
+                // Gateware address 0x10 (Angelia.v:2258-2264): hang[9:2] = C1,
+                // hang[1:0] = C2[1:0], tone_freq[11:4] = C3, tone_freq[3:0] =
+                // C4[3:0]. Hang stays 0 — Zeus owns CW keying/QSK timing
+                // host-side — while tone_freq carries the operator's configured
+                // sidetone pitch so the FPGA sidetone is audible instead of the
+                // reset-default 0 Hz (silent DC). Issue #1783.
+                {
+                    int toneFreq = Math.Clamp(state.CwSidetoneFreqHz, 0, 0x0FFF);
+                    cc[1] = 0;                              // C1  hang[9:2]
+                    cc[2] = 0;                              // C2  hang[1:0]
+                    cc[3] = (byte)((toneFreq >> 4) & 0xFF); // C3  tone_freq[11:4]
+                    cc[4] = (byte)(toneFreq & 0x0F);        // C4  tone_freq[3:0]
+                }
                 break;
 
             case CcRegister.XvtrControl:
@@ -481,12 +519,12 @@ internal static class ControlFrame
     private static void WriteAttenuatorPayload(Span<byte> c14, in CcState s)
     {
         // Bare HPSDR (Hermes/Angelia/Orion/MkII): C4 = 0x20 | (Db & 0x1F).
-        // HL2: C4 = 0x40 | (60 - Db) — HL2 has no physical RX step attenuator,
+        // HL2: C4 = 0x40 | (31 - Db) — HL2 has no physical RX step attenuator,
         // so the UI "attenuate by N dB" maps to "reduce firmware RX gain by N
-        // from its max of 60" (HL2 gateware ad9866 rxgain register).
+        // from the 19 dB baseline at register 31" (HL2 gateware AD9866 RX gain).
         int db = s.Atten.ClampedDb;
         byte c4 = s.Board == HpsdrBoardKind.HermesLite2
-            ? (byte)(0x40 | Math.Clamp(60 - db, 0, 60))
+            ? (byte)(0x40 | Math.Clamp(31 - db, 0, 60))
             : (byte)(0x20 | (db & 0x1F));
 
         // HL2 PS auto-attenuate: during MOX with PS enabled, mi0bot

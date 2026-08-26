@@ -1524,6 +1524,10 @@ public sealed class RadioService : IDisposable
                 (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
                 Volatile.Read(ref _cwWeight),
                 Volatile.Read(ref _cwPaddleReverse) != 0);
+            int connectSidetoneHz;
+            double connectSidetoneGainDb;
+            lock (_sync) { connectSidetoneHz = _cwSidetoneHz; connectSidetoneGainDb = _cwSidetoneGainDb; }
+            client.SetCwSidetone(HardwareSidetoneLevel(connectSidetoneGainDb), connectSidetoneHz);
             client.SetCwKeyerEnabled(IsCwMode(RadioFrequencyResolver.TxMode(connectCwState)));
             int restoredHz = ResolveConnectSampleRateHz(client.BoardKind, hpsdrRate.SampleRateHz(), protocol2: false);
             if (restoredHz != hpsdrRate.SampleRateHz())
@@ -4513,8 +4517,21 @@ public sealed class RadioService : IDisposable
         Volatile.Write(ref _cwWeight, weight);
         Volatile.Write(ref _cwPaddleReverse, paddleReverse ? 1 : 0);
         ActiveClient?.SetCwKeyerConfig(wpm, mode, weight, paddleReverse);
+        ActiveClient?.SetCwSidetone(HardwareSidetoneLevel(sidetoneGainDb), sidetoneHz);
         PushCwKeyerEnabledToP1();
         PushCwToP2();
+    }
+
+    // Map the operator's host sidetone gain (dBFS, -60..0) to the legacy P1
+    // firmware sidetone_level (0..100). The FPGA multiplies its sine table by
+    // this level (anan-100d_angelia sidetone.v:97), so a linear-amplitude
+    // mapping keeps the hardware headphone sidetone tracking the same volume
+    // the host-generated sidetone uses. A muted (very low dB) setting rounds to
+    // 0 = hardware sidetone off. Issue #1783.
+    internal static int HardwareSidetoneLevel(double gainDb)
+    {
+        double linear = Math.Pow(10.0, Math.Clamp(gainDb, -60.0, 0.0) / 20.0);
+        return Math.Clamp((int)Math.Round(linear * 100.0), 0, 100);
     }
 
     private static bool IsCwMode(RxMode mode) => mode is RxMode.CWU or RxMode.CWL;
@@ -5572,8 +5589,9 @@ public sealed class RadioService : IDisposable
     }
 
     // TX leveling — ALC (max-gain/decay), Leveler (on/off/decay), Compressor
-    // (on/off/gain). Replace-style like SetSquelch; the engine apply happens in
-    // DspPipelineService via the _appliedTxLeveling latch. All ranges are
+    // (on/off/gain), and CESSB (on/off + 3/4 kHz bandwidth). Replace-style like
+    // SetSquelch; the engine apply happens in DspPipelineService via the
+    // _appliedTxLeveling latch. All ranges are
     // clamped here so a persisted/echoed value is always sane (Thetis parity:
     // AlcMaxGainDb 0..120, AlcDecayMs 1..50, LevelerDecayMs 1..5000,
     // CompressorGainDb 0..20). The Leveler max-gain stays on the separate
@@ -5587,6 +5605,7 @@ public sealed class RadioService : IDisposable
             AlcDecayMs = Math.Clamp(cfg.AlcDecayMs, 1, 50),
             LevelerDecayMs = Math.Clamp(cfg.LevelerDecayMs, 1, 5000),
             CompressorGainDb = Math.Clamp(cfg.CompressorGainDb, 0.0, 20.0),
+            CessbBandwidthHz = cfg.CessbBandwidthHz is 4000 ? 4000 : 3000,
         };
         Mutate(s => s with { TxLeveling = clamped });
         _dspSettingsStore.SetTxLeveling(clamped);

@@ -391,6 +391,23 @@ public interface IProtocol1Client : IDisposable
     void SetCwKeyerEnabled(bool enabled);
 
     /// <summary>
+    /// Set the firmware CW sidetone level (0..100) and pitch (Hz) for C&amp;C
+    /// registers 0x0F (C2 = sidetone_level) and 0x10 (tone_freq). Lets the
+    /// legacy Hermes/Angelia/Orion gateware play a zero-latency headphone
+    /// sidetone while the internal keyer is active. Issue #1783.
+    /// </summary>
+    void SetCwSidetone(int level, int freqHz);
+
+    /// <summary>
+    /// True while the internal keyer is enabled AND a nonzero hardware
+    /// sidetone level is being emitted (issue #1783) — i.e. the radio's FPGA
+    /// is producing its own zero-latency headphone sidetone. The host uses
+    /// this to suppress its duplicate monitor tone for the hardware key so the
+    /// operator does not hear the dit/dah twice.
+    /// </summary>
+    bool HardwareCwSidetoneActive { get; }
+
+    /// <summary>
     /// Set the TX audio front-end (external-audio-jacks re-port). Global
     /// per-radio. <paramref name="micBoost"/> / <paramref name="micLineIn"/>
     /// ride the 0x12 codec frame on Hermes-class boards; <paramref name="micTrs"/>

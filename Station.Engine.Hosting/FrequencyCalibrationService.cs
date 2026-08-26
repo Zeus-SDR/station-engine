@@ -4,7 +4,9 @@
 // Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
 //                         Christian Suarez (N9WAR), and contributors.
 
+using System.Globalization;
 using Zeus.Contracts;
+using Zeus.Dsp;
 
 namespace Zeus.Server;
 
@@ -74,11 +76,30 @@ public sealed class FrequencyCalibrationService
     private const int MeasureFrames = 7;
     private const int MinAgreeingFrames = 4;
 
+    // Rejected publications do not consume the seven frames needed for the
+    // measurement. Bound them separately so even a late CTUN override can
+    // restart a full cohort without allowing another client to fight the LO
+    // forever.
+    private const int MaxDiscardedFramePublications = 6;
+
     // How far apart per-frame measurements may sit and still be believed,
     // expressed in pixels of the configured zoom. A stable carrier lands on
     // the same bin every frame; ±2 pixels of spread is fading and windowing,
     // more than that is not one signal.
     private const double MaxFrameSpreadPixels = 2.0;
+
+    // Once the temporal median nominates a persistent bin, measure each frame
+    // only near that bin. This excludes stronger peaks that wander elsewhere,
+    // while leaving a wider window than MaxFrameSpreadPixels so scattered
+    // local noise still fails the independent 4-of-7 agreement check.
+    private const int NominatedPeakNeighborhoodPixels = 6;
+
+    // The persistent bin must also stand above the median of the temporally
+    // combined search spectrum. Without this independent discriminator, pure
+    // noise always nominates some bin and the bounded follow-up search can
+    // turn that nomination into a false 4-of-7 cluster. Three dB preserves the
+    // reported 3.7 dB weak-carrier case while rejecting flat temporal noise.
+    private const float MinTemporalPeakAboveMedianDb = 3.0f;
 
     private readonly RadioService _radio;
     private readonly DspPipelineService _pipeline;
@@ -139,7 +160,9 @@ public sealed class FrequencyCalibrationService
             double loOffsetHz = FrequencyCalibrationPlan.LoOffsetHz(referenceFrequencyHz);
             var (searchMinHz, searchMaxHz) = FrequencyCalibrationPlan.SearchBandHz(referenceFrequencyHz);
             int calZoom = FrequencyCalibrationPlan.ZoomForReference(
-                referenceFrequencyHz, startSnap.SampleRate, _radio.CurrentMaxDisplayZoomLevel);
+                referenceFrequencyHz,
+                startSnap.SampleRate,
+                Math.Min(_radio.CurrentMaxDisplayZoomLevel, SyntheticDspEngine.MaxZoomLevel));
 
             _log.LogInformation(
                 "freqcal.start ref={Ref}Hz loOffset={Off}Hz search={Min}..{Max}Hz zoom={Zoom} rate={Rate} origVfo={Vfo} origMode={Mode} origZoom={OrigZoom}",
@@ -162,17 +185,17 @@ public sealed class FrequencyCalibrationService
 
                 await Task.Delay(SettleMs, ct).ConfigureAwait(false);
 
-                var candidates = new List<FrameMeasurement>(MeasureFrames);
+                var frames = new List<CapturedFrame>(MeasureFrames);
                 var pixels = new float[_pipeline.ConfiguredPanadapterWidth];
                 float hzPerPixel = 0f;
-                float lastPeakDb = float.NegativeInfinity;
-                float lastMedianDb = float.NaN;
-                bool captured = false;
                 long lastSnapshotVersion = 0;
+                int captureAttempts = 0;
+                int discardedPublications = 0;
 
-                for (int frame = 0; frame < MeasureFrames; frame++)
+                while (frames.Count < MeasureFrames &&
+                       discardedPublications < MaxDiscardedFramePublications)
                 {
-                    if (frame > 0)
+                    if (captureAttempts++ > 0)
                         await Task.Delay(
                             FrequencyCalibrationPlan.MeasurementFrameGapMs,
                             ct).ConfigureAwait(false);
@@ -185,13 +208,44 @@ public sealed class FrequencyCalibrationService
                     // mid-retune frame, and the P2 wideband-detail path.
                     var capture = await TryCaptureWithRetryAsync(
                         pixels, lastSnapshotVersion, ct).ConfigureAwait(false);
-                    if (capture is null) continue;
+                    if (capture is null)
+                    {
+                        discardedPublications++;
+                        continue;
+                    }
                     (float frameHzPerPixel, long frameCenterHz, long snapshotVersion) = capture.Value;
-                    if (frameHzPerPixel <= 0f) continue;
+                    if (frameHzPerPixel <= 0f)
+                    {
+                        discardedPublications++;
+                        continue;
+                    }
 
-                    captured = true;
                     lastSnapshotVersion = snapshotVersion;
                     hzPerPixel = frameHzPerPixel;
+
+                    // CTUN filter-autopan runs in every connected frontend.
+                    // Its queued /api/radio/lo request can arrive after the
+                    // calibration retune and move the analyzer while leaving
+                    // WWV visibly on screen. Never search a self-consistent
+                    // but wrong frame cohort: reject the foreign centre,
+                    // reassert calibration's LO, and wait for a newer stamp.
+                    if (!FrequencyCalibrationPlan.IsExpectedCenter(
+                            frameCenterHz,
+                            commandedLoHz,
+                            frameHzPerPixel))
+                    {
+                        double centerToleranceHz = Math.Max(1.0, frameHzPerPixel * 2.0);
+                        _log.LogInformation(
+                            "freqcal.center-overridden ref={Ref}Hz expected={Expected} actual={Actual} toleranceHz={Tolerance:F2}; reasserting calibration LO",
+                            referenceFrequencyHz,
+                            commandedLoHz,
+                            frameCenterHz,
+                            centerToleranceHz);
+                        frames.Clear();
+                        _radio.SetRadioLo(commandedLoHz);
+                        discardedPublications++;
+                        continue;
+                    }
 
                     double centerIdx = pixels.Length / 2.0;
                     int searchMinIdx = (int)Math.Floor(centerIdx + searchMinHz / frameHzPerPixel);
@@ -207,32 +261,118 @@ public sealed class FrequencyCalibrationService
                         searchMinIdx = Math.Max(0, searchMinIdx);
                         searchMaxIdx = Math.Min(pixels.Length - 1, searchMaxIdx);
                     }
-                    if (searchMinIdx > searchMaxIdx) continue;
-
-                    int peakIndex = -1;
-                    float peakDb = float.NegativeInfinity;
-                    for (int i = searchMinIdx; i <= searchMaxIdx; i++)
+                    if (searchMinIdx > searchMaxIdx)
                     {
-                        if (pixels[i] > peakDb)
-                        {
-                            peakDb = pixels[i];
-                            peakIndex = i;
-                        }
+                        discardedPublications++;
+                        continue;
                     }
-                    if (peakIndex < 0) continue;
 
-                    float medianDb = FrequencyCalibrationPlan.Median(pixels);
-                    lastPeakDb = peakDb;
-                    lastMedianDb = medianDb;
-                    double refinedIdx = FrequencyCalibrationPlan.InterpolatePeakIndex(pixels, peakIndex);
-                    double measuredHz = FrequencyCalibrationPlan.PixelToHz(
-                        refinedIdx, frameCenterHz, frameHzPerPixel, pixels.Length);
-                    candidates.Add(new FrameMeasurement(
-                        measuredHz,
-                        peakDb));
+                    var capturedFrame = new CapturedFrame(
+                        pixels.ToArray(),
+                        frameHzPerPixel,
+                        frameCenterHz,
+                        searchMinIdx,
+                        searchMaxIdx);
+
+                    if (frames.Count > 0 && !HasSameGeometry(frames[0], capturedFrame))
+                    {
+                        _log.LogInformation(
+                            "freqcal.geometry-transition ref={Ref}Hz oldCenter={OldCenter} newCenter={NewCenter} oldHpp={OldHpp:F4} newHpp={NewHpp:F4}; restarting frame cohort",
+                            referenceFrequencyHz,
+                            frames[0].CenterHz,
+                            capturedFrame.CenterHz,
+                            frames[0].HzPerPixel,
+                            capturedFrame.HzPerPixel);
+                        frames.Clear();
+                        discardedPublications++;
+                    }
+
+                    frames.Add(capturedFrame);
                 }
 
-                if (!captured) return CalibrationResult.CaptureFailed;
+                if (frames.Count < MeasureFrames)
+                {
+                    _log.LogWarning(
+                        "freqcal.incomplete-frame-cohort ref={Ref}Hz captured={Captured}/{Required} discarded={Discarded}",
+                        referenceFrequencyHz,
+                        frames.Count,
+                        MeasureFrames,
+                        discardedPublications);
+                    return CalibrationResult.CaptureFailed;
+                }
+
+                // Nominate a persistent bin independently for every measured
+                // frame: the temporal median is built from the OTHER frames,
+                // then its narrow candidate is located in the excluded frame.
+                // A frame can never create the hypothesis used to measure it.
+                CapturedFrame firstFrame = frames[0];
+                bool geometryStable = frames.All(frame =>
+                    HasSameGeometry(firstFrame, frame));
+                if (!geometryStable)
+                {
+                    _log.LogWarning(
+                        "freqcal.geometry-changed ref={Ref}Hz frames={Frames}",
+                        referenceFrequencyHz,
+                        string.Join(';', frames.Select(frame =>
+                            $"center={frame.CenterHz},hpp={frame.HzPerPixel.ToString("F4", CultureInfo.InvariantCulture)},range={frame.SearchMinIndex}..{frame.SearchMaxIndex}")));
+                    return CalibrationResult.CaptureFailed;
+                }
+
+                var candidates = new List<FrameMeasurement>(frames.Count);
+                var nominations = new List<FrameNomination>(frames.Count);
+                for (int excludedFrame = 0; excludedFrame < frames.Count; excludedFrame++)
+                {
+                    CapturedFrame frame = frames[excludedFrame];
+                    float[][] nominationSpectra = frames
+                        .Where((_, index) => index != excludedFrame)
+                        .Select(other => other.Pixels)
+                        .ToArray();
+                    var nomination = FrequencyCalibrationPlan.TemporalMedianPeak(
+                        nominationSpectra,
+                        firstFrame.SearchMinIndex,
+                        firstFrame.SearchMaxIndex);
+                    float globalProminenceDb = nomination.PeakDb - nomination.MedianDb;
+                    float shoulderProminenceDb = nomination.PeakDb - nomination.ShoulderMedianDb;
+                    nominations.Add(new FrameNomination(
+                        excludedFrame,
+                        nomination.Index,
+                        nomination.PeakDb,
+                        nomination.MedianDb,
+                        globalProminenceDb,
+                        shoulderProminenceDb));
+                    if (nomination.Index < 0 ||
+                        globalProminenceDb < MinTemporalPeakAboveMedianDb ||
+                        shoulderProminenceDb < MinTemporalPeakAboveMedianDb)
+                    {
+                        continue;
+                    }
+
+                    int localMin = Math.Max(
+                        frame.SearchMinIndex,
+                        nomination.Index - NominatedPeakNeighborhoodPixels);
+                    int localMax = Math.Min(
+                        frame.SearchMaxIndex,
+                        nomination.Index + NominatedPeakNeighborhoodPixels);
+                    int peakIndex = FrequencyCalibrationPlan.PeakIndexInRange(
+                        frame.Pixels,
+                        localMin,
+                        localMax);
+                    if (peakIndex < 0) continue;
+
+                    double refinedIdx = FrequencyCalibrationPlan.InterpolatePeakIndex(
+                        frame.Pixels,
+                        peakIndex);
+                    double measuredHz = FrequencyCalibrationPlan.PixelToHz(
+                        refinedIdx,
+                        frame.CenterHz,
+                        frame.HzPerPixel,
+                        frame.Pixels.Length);
+                    candidates.Add(new FrameMeasurement(
+                        measuredHz,
+                        frame.Pixels[peakIndex],
+                        excludedFrame));
+                }
+
                 double maxSpreadHz = MaxFrameSpreadPixels * hzPerPixel;
                 // Frequency agreement across independent frames is the signal
                 // discriminator. Unlike the former per-frame 6 dB cut, this
@@ -242,12 +382,31 @@ public sealed class FrequencyCalibrationService
                     pool.Select(candidate => candidate.MeasuredHz).ToArray(),
                     maxSpreadHz);
                 if (stableIndices.Length < MinAgreeingFrames)
+                {
+                    float diagnosticPeakDb = FrequencyCalibrationPlan.Median(
+                        nominations.Select(nomination => nomination.PeakDb).ToArray());
+                    float diagnosticMedianDb = FrequencyCalibrationPlan.Median(
+                        nominations.Select(nomination => nomination.MedianDb).ToArray());
+                    _log.LogWarning(
+                        "freqcal.no-stable-carrier ref={Ref}Hz temporalPeakDb={PeakDb:F1} temporalMedianDb={MedianDb:F1} agreeing={Agreeing}/{Total} required={Required} maxSpreadHz={MaxSpread:F2} nominations={Nominations} framePeaksHz={FramePeaks}",
+                        referenceFrequencyHz,
+                        diagnosticPeakDb,
+                        diagnosticMedianDb,
+                        stableIndices.Length,
+                        MeasureFrames,
+                        MinAgreeingFrames,
+                        maxSpreadHz,
+                        string.Join(';', nominations.Select(nomination =>
+                            $"frame={nomination.ExcludedFrame},bin={nomination.Index},global={nomination.GlobalProminenceDb.ToString("F1", CultureInfo.InvariantCulture)},shoulder={nomination.ShoulderProminenceDb.ToString("F1", CultureInfo.InvariantCulture)}")),
+                        string.Join(',', pool.Select(candidate =>
+                            $"frame={candidate.FrameIndex}:{candidate.MeasuredHz.ToString("F2", CultureInfo.InvariantCulture)}")));
                     return CalibrationResult.NoSignal(
-                        lastPeakDb,
-                        lastMedianDb,
+                        diagnosticPeakDb,
+                        diagnosticMedianDb,
                         stableIndices.Length,
                         MeasureFrames,
                         MinAgreeingFrames);
+                }
 
                 var stable = stableIndices.Select(index => pool[index]).ToArray();
                 var measurements = stable.Select(candidate => candidate.MeasuredHz).ToArray();
@@ -340,9 +499,31 @@ public sealed class FrequencyCalibrationService
         return null;
     }
 
+    private static bool HasSameGeometry(CapturedFrame left, CapturedFrame right) =>
+        left.CenterHz == right.CenterHz &&
+        left.HzPerPixel == right.HzPerPixel &&
+        left.SearchMinIndex == right.SearchMinIndex &&
+        left.SearchMaxIndex == right.SearchMaxIndex;
+
     private sealed record FrameMeasurement(
         double MeasuredHz,
-        float PeakDb);
+        float PeakDb,
+        int FrameIndex);
+
+    private sealed record FrameNomination(
+        int ExcludedFrame,
+        int Index,
+        float PeakDb,
+        float MedianDb,
+        float GlobalProminenceDb,
+        float ShoulderProminenceDb);
+
+    private sealed record CapturedFrame(
+        float[] Pixels,
+        float HzPerPixel,
+        long CenterHz,
+        int SearchMinIndex,
+        int SearchMaxIndex);
 }
 
 /// <summary>

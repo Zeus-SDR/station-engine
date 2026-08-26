@@ -903,24 +903,33 @@ public sealed record SquelchConfig(
 }
 
 // Operator-facing TX leveling configuration (issue: DSP controls Thetis parity
-// §6.1-6.3). Bundles the three TXA dynamics stages the operator reaches for:
+// §6.1-6.3). Bundles the TXA dynamics stages the operator reaches for:
 // ALC (max-gain + decay — the ALC run state is ALWAYS on, never exposed; the
 // SSB modulator emits zero IQ if ALC is off, see NativeMethods.SetTXAALCSt),
-// the Leveler (operator on/off + decay), and the Compressor/CPDR (on/off +
-// gain). The Leveler MAX-GAIN ("top") is intentionally NOT carried here — it
-// stays on StateDto.LevelerMaxGainDb with its own /api/tx/leveler-max-gain
-// path. Ranges/defaults mirror Thetis verbatim (radio.cs / setup.designer.cs):
+// the Leveler (operator on/off + decay), the Compressor/CPDR (on/off + gain),
+// and CESSB (on/off + 3/4 kHz bandwidth). The Leveler MAX-GAIN ("top") is
+// intentionally NOT carried here — it stays on StateDto.LevelerMaxGainDb with
+// its own /api/tx/leveler-max-gain path. Existing dynamics ranges/defaults
+// mirror Thetis (radio.cs / setup.designer.cs):
 // AlcMaxGainDb 0..120 (default 3), AlcDecayMs 1..50 (default 10), LevelerEnabled
 // default on, LevelerDecayMs 1..5000 (default 100), CompressorEnabled default
-// off, CompressorGainDb 0..20 (default 0). Persisted globally via
-// DspSettingsStore — same pattern as Agc/Squelch.
+// off, CompressorGainDb 0..20 (default 0), CESSB off at 3000 Hz. Persisted
+// globally via DspSettingsStore — same pattern as Agc/Squelch.
 public sealed record TxLevelingConfig(
     double AlcMaxGainDb = 3.0,
     int AlcDecayMs = 10,
     bool LevelerEnabled = true,
     int LevelerDecayMs = 100,
     bool CompressorEnabled = false,
-    double CompressorGainDb = 0.0);
+    double CompressorGainDb = 0.0,
+    // Controlled-envelope SSB overshoot control. Thetis only runs CESSB when
+    // the speech compressor is running; the engine also suppresses it for
+    // digital/test-bypass audio and while PureSignal is armed. Default OFF is
+    // deliberate for fresh installs and legacy payloads that omit the field.
+    bool CessbEnabled = false,
+    // Zeus WDSP 2.0 extends Thetis's fixed 3 kHz controller with a 4 kHz
+    // profile. Legacy payloads use the conservative 3 kHz profile.
+    int CessbBandwidthHz = 3000);
 
 // Operator-facing TX phase rotator. WDSP implements this as a cascade of
 // first-order all-pass stages in the TXA audio path (Thetis DSP->CFC->PhaseRot).
@@ -1956,8 +1965,8 @@ public sealed record SquelchSetRequest(SquelchConfig Squelch);
 // TX leveling set request. Replace-style (the whole TxLevelingConfig is posted
 // on every change), matching SquelchSetRequest. The server clamps every range
 // (AlcMaxGainDb 0..120, AlcDecayMs 1..50, LevelerDecayMs 1..5000,
-// CompressorGainDb 0..20). The separate Leveler max-gain path
-// (/api/tx/leveler-max-gain) is untouched.
+// CompressorGainDb 0..20, CessbBandwidthHz 3000 or 4000). The separate
+// Leveler max-gain path (/api/tx/leveler-max-gain) is untouched.
 public sealed record TxLevelingSetRequest(TxLevelingConfig TxLeveling);
 
 // SSB bandpass "rectangularity" set request — issue #871. Single-field shape:
@@ -2540,7 +2549,9 @@ public sealed record RfFilterRuntimeSettings(
 // the current value up on next interaction. All fields persisted server-side
 // so the settings follow the operator across browsers / devices — Photino
 // desktop mode in particular binds the webview to a fresh random loopback
-// port on every launch, which orphans any per-origin localStorage value.
+// port on every launch, which orphans any per-origin localStorage value. The
+// FilterPanel* fields independently customize the Bandwidth Filter mini-pan;
+// its image bytes are fetched from /api/display-settings/filter-image.
 public sealed record DisplaySettingsDto(
     string Mode,
     string Fit,
@@ -2584,7 +2595,12 @@ public sealed record DisplaySettingsDto(
     bool? ChatRosterOverlayEnabled = null,
     int? SpotLabelFontPx = null,
     string? GlobeRenderer = null,
-    string? GlobeCustomImageryJson = null);
+    string? GlobeCustomImageryJson = null,
+    string FilterPanelBgMode = "default",
+    string FilterPanelBgColor = "#262A33",
+    int FilterPanelBgBrightness = 50,
+    bool HasFilterPanelImage = false,
+    string? FilterPanelImageMime = null);
 
 public sealed record DisplaySettingsSetRequest(
     string Mode,
@@ -2614,7 +2630,10 @@ public sealed record DisplaySettingsSetRequest(
     bool? ChatRosterOverlayEnabled = null,
     int? SpotLabelFontPx = null,
     string? GlobeRenderer = null,
-    string? GlobeCustomImageryJson = null);
+    string? GlobeCustomImageryJson = null,
+    string? FilterPanelBgMode = null,
+    string? FilterPanelBgColor = null,
+    int? FilterPanelBgBrightness = null);
 
 // One detected wideband signal, as reported by the engine's deterministic
 // wideband signal detector. Frequencies are absolute Hz in the wideband ADC
@@ -2881,7 +2900,8 @@ public sealed record TxStationProfilesResponse(IReadOnlyList<TxStationProfileDto
 //
 // EXCLUDED on purpose (not audio-shaping / global): drive %, tune drive,
 // pre-key delay, PureSignal, two-tone, TX monitor/preview, the named
-// CFC/filter preset libraries, installed VST3 registrations, CESSB(auto).
+// CFC/filter preset libraries and installed VST3 registrations. CESSB is
+// captured inside TxLevelingConfig with the other TXA dynamics stages.
 //
 // ProcessingMode is "native" or "vst" (lower-case) to keep Zeus.Contracts free
 // of any dependency on the server-side AudioProcessingMode enum — matching how

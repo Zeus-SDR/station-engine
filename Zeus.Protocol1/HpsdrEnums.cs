@@ -72,9 +72,9 @@ public enum HpsdrSampleRate : byte
 /// register CC0=0x14. The Db value is the same API across boards; ControlFrame
 /// maps it per-board:
 /// <list type="bullet">
-/// <item>HL2 (<see cref="HpsdrBoardKind.HermesLite2"/>) writes C4 = 0x40 | (60 − Db) — HL2 has no hardware
+/// <item>HL2 (<see cref="HpsdrBoardKind.HermesLite2"/>) writes C4 = 0x40 | (31 − Db) — HL2 has no hardware
 /// attenuator, so "attenuate by N dB" is expressed as "reduce firmware RX
-/// gain by N units from max".</item>
+/// gain by N units from its register-31 baseline".</item>
 /// <item>Standard HPSDR (ANAN / Hermes / Orion) writes C4 = 0x20 | (Db &amp; 0x1F).</item>
 /// </list>
 /// </summary>

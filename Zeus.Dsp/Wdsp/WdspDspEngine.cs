@@ -424,6 +424,14 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // configured compressor gain remains untouched. Seeded false to match the
     // TXA-open TxLevelingConfig default. Written/read under _txaLock.
     private bool _txCompressorEnabled;
+    // Operator's requested CESSB state. Effective native run additionally
+    // requires the speech compressor, a voice path, and PureSignal disarmed.
+    // Volatile because SetPsEnabled restores it while holding _psLock rather
+    // than _txaLock.
+    private volatile bool _txCessbEnabled;
+    private int _txCessbBandwidthHz = 3000;
+    // 0 unknown, 1 available, -1 missing (older bundled/system libwdsp).
+    private int _cessbBandwidthExportState;
     // Operator's Leveler on/off, last applied via SetTxLeveling. The TUN and
     // two-tone paths force the Leveler St=0 while keyed and restore it on
     // un-key; they read this so the restore lands on the operator's setting
@@ -525,7 +533,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // shared state inside calcc.c) and FeedPsFeedbackBlock. _psInfoBuf is
     // pinned once and reused on every GetPSInfo call.
     private readonly object _psLock = new();
-    private bool _psEnabled;
+    private volatile bool _psEnabled;
     private bool _psAuto = true;
     private bool _psSingle;
     private double _psHwPeak = 0.4072;   // P1 default; RadioService overrides at connect
@@ -686,6 +694,18 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     }
 
     internal int? TxMonitorChannelIdForTests => _monitorChannelId;
+
+    internal void SetCessbForTests(bool enabled, int bandwidthHz)
+    {
+        lock (_txaLock)
+        {
+            if (_txaChannelId is not int txa) return;
+            _txCessbEnabled = enabled;
+            _txCessbBandwidthHz = bandwidthHz is 4000 ? 4000 : 3000;
+            TrySetCessbBandwidth(txa, _txCessbBandwidthHz);
+            ApplyTxCompressorAndCessbRuns(txa);
+        }
+    }
 
     internal AgcMode? GetChannelAgcModeForTests(int channelId) =>
         _channels.TryGetValue(channelId, out var state) ? state.CurrentAgcMode : null;
@@ -2449,8 +2469,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // until they're wired to operator UI and tuned — enabling them
                 // with library-default parameters can mask or create distortion.
                 // ALC stays on (see SetTXAALCSt below; never 0). AMSQ is the mic
-                // noise gate and shouldn't shape SSB audio. CESSB (osctrl) is
-                // unconditionally ON — see SetTXAosctrlRun below.
+                // noise gate and shouldn't shape SSB audio. CESSB (osctrl)
+                // defaults OFF and is enabled only by persisted operator state.
                 // ALC run state — MUST stay ON (never 0). Disabling it silences the
                 // SSB modulator (NativeMethods.SetTXAALCSt warning). ApplyTxLeveling
                 // below sets the ALC max-gain/decay but deliberately never touches
@@ -2481,15 +2501,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 ApplyTxLevelingLocked(id, new TxLevelingConfig());
                 _txControlNative.SetTXACFCOMPRun(id, 0);
                 ApplyTxPhaseRotatorLocked(id, new TxPhaseRotatorConfig());
-                // CESSB / osctrl — ON at TXA open (established default, ~1-1.5 dB
-                // average voice-SSB power; bd zeus-5cg). PS isn't armed at open, so
-                // this is the correct non-PS state. It is then toggled OFF while PS
-                // is armed and back ON on disarm in SetPsEnabled — because osctrl
-                // (a non-linear lookahead peak divisor) standalone in front of the
-                // ALC makes the peak envelope non-stationary on voice and breaks PS
-                // voice-peak correction (Thetis/pi/desk keep it out of the PS path).
-                // #559.
-                NativeMethods.SetTXAosctrlRun(id, 1);
+                // ApplyTxLevelingLocked above also asserted the default-off
+                // CESSB state after configuring the compressor.
                 NativeMethods.SetTXAEQRun(id, 0);
                 NativeMethods.SetTXAAMSQRun(id, 0);
 
@@ -2602,7 +2615,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 }
 
                 _log.LogInformation(
-                    "wdsp.openTxChannel id={Id} rates={InRate}/{DspRate}/{OutRate} sizes={InSz}/{OutSz} cfir={Cfir} chain=[alc=1 lvlr=1 lvlrMax={LvlrMax:F1}dB cpdr=0 cfc=0 phrot=0 osctrl=1 eq=0 amsq=0] bp=150..2850 panelGain=1.0 txDisp={TxDisp}(pix={Pix} rxRate={RxRate} txRate={TxRate} zoom={Zoom})",
+                    "wdsp.openTxChannel id={Id} rates={InRate}/{DspRate}/{OutRate} sizes={InSz}/{OutSz} cfir={Cfir} chain=[alc=1 lvlr=1 lvlrMax={LvlrMax:F1}dB cpdr=0 cfc=0 phrot=0 osctrl=0 eq=0 amsq=0] bp=150..2850 panelGain=1.0 txDisp={TxDisp}(pix={Pix} rxRate={RxRate} txRate={TxRate} zoom={Zoom})",
                     id, _txaInputRateHz, _txaDspRateHz, _txaOutputRateHz,
                     _txaInSize, _txaOutSize, _txaCfirRun ? 1 : 0, DefaultLevelerMaxGainDb,
                     _txDispAlive ? "on" : "off", _txDispPixelWidth, _txDispRxSampleRateHz, _txaOutputRateHz, _txDispZoomLevel);
@@ -2823,9 +2836,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             ApplyTxLevelingLocked(txa, cfg);
         }
         _log.LogInformation(
-            "wdsp.setTxLeveling alcMaxGainDb={Alc:F1} alcDecayMs={AlcDecay} levelerEnabled={Lvlr} levelerDecayMs={LvlrDecay} compEnabled={Comp} compGainDb={CompGain:F1}",
+            "wdsp.setTxLeveling alcMaxGainDb={Alc:F1} alcDecayMs={AlcDecay} levelerEnabled={Lvlr} levelerDecayMs={LvlrDecay} compEnabled={Comp} compGainDb={CompGain:F1} cessbEnabled={Cessb} cessbBandwidthHz={CessbBandwidth}",
             cfg.AlcMaxGainDb, cfg.AlcDecayMs, cfg.LevelerEnabled, cfg.LevelerDecayMs,
-            cfg.CompressorEnabled, cfg.CompressorGainDb);
+            cfg.CompressorEnabled, cfg.CompressorGainDb, cfg.CessbEnabled,
+            cfg.CessbBandwidthHz);
     }
 
     // Shared apply for SetTxLeveling and the TXA-open init block so a fresh
@@ -2846,8 +2860,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 && !_txInjectedAudioBypass && cfg.LevelerEnabled) ? 1 : 0);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
         _txCompressorEnabled = cfg.CompressorEnabled;
-        ApplyTxCompressorRunLocked(txa);
         NativeMethods.SetTXACompressorGain(txa, cfg.CompressorGainDb);
+        _txCessbEnabled = cfg.CessbEnabled;
+        _txCessbBandwidthHz = cfg.CessbBandwidthHz is 4000 ? 4000 : 3000;
+        TrySetCessbBandwidth(txa, _txCessbBandwidthHz);
+        ApplyTxCompressorAndCessbRuns(txa);
         _txLevelerEnabled = cfg.LevelerEnabled;
     }
 
@@ -2949,11 +2966,59 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private void ApplyCfcMasterRunLocked(int txa, CfcConfig cfg) =>
         _txControlNative.SetTXACFCOMPRun(txa, EffectiveTxRun(cfg.Enabled));
 
-    // Caller holds _txaLock. Digital-mode bypass gates only the compressor run;
-    // the operator's compressor gain stays exactly as configured.
-    private void ApplyTxCompressorRunLocked(int txa) =>
-        RunNativeLifecycleCriticalSection(() =>
-            _txControlNative.SetTXACompressorRun(txa, EffectiveTxRun(_txCompressorEnabled)));
+    // Apply the coupled COMP -> CESSB topology in a transition-safe order.
+    // When bypassing, osctrl goes OFF before COMP so no block can see standalone
+    // CESSB. When enabling, COMP goes ON first and osctrl follows. Shape/gain
+    // settings remain untouched. Callers may hold either _txaLock or _psLock;
+    // taking _txaLock here makes the effective-state snapshot and ordered
+    // native writes atomic with respect to concurrent TX-settings changes.
+    private void ApplyTxCompressorAndCessbRuns(int txa)
+    {
+        lock (_txaLock)
+        {
+            int compressorRun = EffectiveTxRun(_txCompressorEnabled);
+            int cessbRun = compressorRun != 0 && _txCessbEnabled && !_psEnabled ? 1 : 0;
+            RunNativeLifecycleCriticalSection(() =>
+            {
+                if (cessbRun == 0)
+                {
+                    _txControlNative.SetTXAosctrlRun(txa, 0);
+                    _txControlNative.SetTXACompressorRun(txa, compressorRun);
+                }
+                else
+                {
+                    _txControlNative.SetTXACompressorRun(txa, 1);
+                    _txControlNative.SetTXAosctrlRun(txa, 1);
+                }
+            });
+        }
+    }
+
+    private void TrySetCessbBandwidth(int txa, int bandwidthHz)
+    {
+        // Every pre-feature libwdsp already creates osctrl at 3000 Hz. Avoid
+        // probing the optional export for that baseline so old binaries remain
+        // fully compatible. Once a successful 4 kHz write proves the export is
+        // present, a later change back to 3 kHz must be forwarded normally.
+        int availability = Volatile.Read(ref _cessbBandwidthExportState);
+        if (availability < 0 || (availability == 0 && bandwidthHz == 3000))
+            return;
+
+        try
+        {
+            _txControlNative.SetTXAosctrlBandwidth(txa, bandwidthHz);
+            Volatile.Write(ref _cessbBandwidthExportState, 1);
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            if (Interlocked.Exchange(ref _cessbBandwidthExportState, -1) >= 0)
+            {
+                _log.LogWarning(
+                    "wdsp.cessb.bandwidth.unavailable requestedHz={Bandwidth} reason=\"libwdsp does not export SetTXAosctrlBandwidth; using native 3000 Hz default\" detail={Message}",
+                    bandwidthHz, ex.Message);
+            }
+        }
+    }
 
     public void SetTxTune(bool on)
     {
@@ -3025,7 +3090,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             _txCurrentMode = mapped;
             ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
             ApplyCfcMasterRunLocked(txa, _cfcConfig);
-            ApplyTxCompressorRunLocked(txa);
+            ApplyTxCompressorAndCessbRuns(txa);
             // TXA bandpass is now operator-controlled — DspPipelineService
             // asserts SetTxFilter after SetTxMode using the per-mode-family
             // memory in RadioService. No auto-apply here.
@@ -3086,7 +3151,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
-                ApplyTxCompressorRunLocked(txa);
+                ApplyTxCompressorAndCessbRuns(txa);
             }
         }
         _log.LogInformation("wdsp.setTxDigitalBypass bypass={Bypass}", bypass);
@@ -3103,7 +3168,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
-                ApplyTxCompressorRunLocked(txa);
+                ApplyTxCompressorAndCessbRuns(txa);
                 _txControlNative.SetTXALevelerSt(
                     txa,
                     (_txLevelerEnabled && !_txLevelerForcedOff
@@ -3124,7 +3189,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
-                ApplyTxCompressorRunLocked(txa);
+                ApplyTxCompressorAndCessbRuns(txa);
                 _txControlNative.SetTXALevelerSt(
                     txa,
                     (_txLevelerEnabled && !_txLevelerForcedOff
@@ -3625,6 +3690,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (enabled)
             {
                 _psEnabled = true;
+                // Remove CESSB before calibration/correction starts. The
+                // effective-state helper keeps COMP running but switches
+                // osctrl off first, so PS never sees the non-linear envelope.
+                ApplyTxCompressorAndCessbRuns(id);
                 // Reset diagnostic counters so the first state transition
                 // and the first 100 pscc blocks log on every fresh arm.
                 _lastLoggedPsState = 255;
@@ -3644,18 +3713,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // becomes a no-op in that case and Tick keeps falling through
                 // to the existing TX/RX trace.
                 OpenPsFeedbackAnalyzer(id);
-                // CESSB/osctrl OFF while PS is armed (#559). osctrl is a
-                // non-linear lookahead peak divisor; standalone in front of the
-                // ALC it makes the peak envelope non-stationary on voice, so PS
-                // sees a moving target at the peaks → voice-peak splatter. Off
-                // here = the reference topology (Thetis/pi/desk keep it out of
-                // the PS path). Restored to the established default (ON) on disarm — so
-                // non-PS operators keep the ~1-1.5 dB average-power win.
-                RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXAosctrlRun(id, 0));
             }
             else
             {
-                _psEnabled = false;
                 // Tear down the PS-FB analyzer first so a stale GetPixels
                 // call from Tick doesn't race with WDSP cleaning up the slot.
                 ClosePsFeedbackAnalyzer();
@@ -3680,10 +3740,14 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 }
                 NativeMethods.SetPSRunCal(id, 0);
                 NativeMethods.SetPSControl(id, 1, 0, 0, 0);
-                // Restore CESSB/osctrl ON — the established default for non-PS voice
-                // SSB (~1-1.5 dB average power; bd zeus-5cg). Only held off
-                // while PS is armed (see the enable branch above).
-                RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXAosctrlRun(id, 1));
+                // Keep the CESSB interlock asserted until both native PS
+                // controls are down. Only then publish PS-off and restore the
+                // operator's effective COMP/CESSB topology.
+                _psEnabled = false;
+                // Restore the operator's effective CESSB state. A saved OFF,
+                // disabled compressor, or active digital/test bypass remains
+                // off after PureSignal disarms.
+                ApplyTxCompressorAndCessbRuns(id);
             }
         }
         _log.LogInformation("wdsp.setPsEnabled enabled={Enabled}", enabled);

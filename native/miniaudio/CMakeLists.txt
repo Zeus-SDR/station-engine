@@ -2,7 +2,7 @@
 #
 # Produces:
 #   macOS   : libminiaudio.dylib  (arm64, x86_64) — CoreAudio backend
-#   Linux   : libminiaudio.so     (x86_64, arm64) — ALSA + PulseAudio + JACK
+#   Linux   : libminiaudio.so     (x86_64, arm64) — ALSA + PulseAudio; JACK disabled (unsafe pipewire-jack unload)
 #   Windows : miniaudio.dll       (x64, arm64)    — WASAPI
 #
 # Source is vendored upstream `miniaudio.h` (David Reid / mackron, v0.11.25,
@@ -48,8 +48,9 @@ if(APPLE)
         ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${AUDIOUNIT_LIB} ${COREFOUNDATION_LIB}
     )
 elseif(UNIX)
-    # Linux: miniaudio loads ALSA / PulseAudio / JACK dynamically at runtime
-    # via dlopen; only -ldl + -lpthread + -lm are required at link time.
+    # Linux: miniaudio loads ALSA / PulseAudio dynamically at runtime. JACK is
+    # disabled because pipewire-jack's thread loop can outlive libjack dlclose.
+    # Only -ldl + -lpthread + -lm are required at link time.
     find_package(Threads REQUIRED)
     target_link_libraries(miniaudio PRIVATE Threads::Threads dl m)
 elseif(WIN32)

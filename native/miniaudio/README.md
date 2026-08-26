@@ -52,7 +52,8 @@ native/miniaudio/
 ```
 
 On macOS miniaudio targets CoreAudio (default backend); Linux uses ALSA +
-PulseAudio + JACK (compile-time); Windows uses WASAPI. Backend selection is
+PulseAudio, with JACK disabled because pipewire-jack's thread loop can outlive
+libjack after `dlclose`; Windows uses WASAPI. Backend selection is
 runtime-fallback within miniaudio — Zeus does not pin a backend.
 
 ## Why a wrapper C file rather than direct P/Invoke on miniaudio.h
@@ -66,7 +67,8 @@ the vendored upstream is a recompile, not a coordinated C#-side change.
 
 ## Trimmed features
 
-`zeus_miniaudio.c` defines `MA_NO_DECODING`, `MA_NO_ENCODING`,
-`MA_NO_GENERATION`, `MA_NO_RESOURCE_MANAGER`, and `MA_NO_ENGINE` before the
-`MINIAUDIO_IMPLEMENTATION` include. Zeus only uses raw device playback /
-capture; the file-decode and high-level engine layers stay out of the binary.
+`zeus_miniaudio.c` sets its `MA_NO_*` trims — decoding, encoding, generation,
+resource manager, engine, node graph, and (on Linux) JACK — before the
+`MINIAUDIO_IMPLEMENTATION` include; that define block is the authoritative
+list. Zeus only uses raw device playback / capture; the file-decode and
+high-level engine layers stay out of the binary.

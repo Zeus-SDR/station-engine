@@ -910,6 +910,10 @@ internal static partial class NativeMethods
 
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAosctrlBandwidth(int channel, double bandwidth);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAEQRun(int channel, int run);
 
     // TUN carrier generator (wdsp.h:586-589) injected post-DSP. Zeus uses

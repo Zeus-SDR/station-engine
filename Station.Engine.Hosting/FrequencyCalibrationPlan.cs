@@ -133,6 +133,19 @@ internal static class FrequencyCalibrationPlan
         centerHz + (pixelIndex - width / 2.0) * hzPerPixel;
 
     /// <summary>
+    /// Whether a stamped analyzer centre still belongs to calibration's LO.
+    /// Two pixels accommodates display-frequency rounding while remaining far
+    /// smaller than the 1 kHz DC guard and the multi-kHz CTUN autopan moves
+    /// this check is intended to reject.
+    /// </summary>
+    public static bool IsExpectedCenter(long actualCenterHz, long commandedCenterHz, double hzPerPixel)
+    {
+        if (!double.IsFinite(hzPerPixel) || hzPerPixel <= 0) return false;
+        double toleranceHz = Math.Max(1.0, hzPerPixel * 2.0);
+        return Math.Abs(actualCenterHz - commandedCenterHz) <= toleranceHz;
+    }
+
+    /// <summary>
     /// Fold a fresh measurement into the correction factor already in force.
     ///
     /// <para>The radio's NCO is programmed with <c>round(displayHz × factor)</c>
@@ -179,6 +192,96 @@ internal static class FrequencyCalibrationPlan
         Array.Sort(buf);
         int mid = buf.Length / 2;
         return (buf.Length % 2 == 0) ? (buf[mid - 1] + buf[mid]) / 2f : buf[mid];
+    }
+
+    /// <summary>
+    /// Find the spectral bin whose value persists across the captured frames.
+    /// Taking the median independently at every bin prevents a stronger noise
+    /// peak that moves from frame to frame from hiding a weaker fixed carrier.
+    /// </summary>
+    public static (int Index, float PeakDb, float MedianDb, float ShoulderMedianDb) TemporalMedianPeak(
+        IReadOnlyList<float[]> spectra,
+        int searchMinIndex,
+        int searchMaxIndex)
+    {
+        if (spectra.Count == 0)
+            return (-1, float.NegativeInfinity, float.NaN, float.NaN);
+
+        int width = spectra.Min(spectrum => spectrum.Length);
+        int min = Math.Max(0, searchMinIndex);
+        int max = Math.Min(width - 1, searchMaxIndex);
+        if (min > max)
+            return (-1, float.NegativeInfinity, float.NaN, float.NaN);
+
+        // Deliberately use the upper median for temporal consensus. Leave-one-
+        // out trains on six frames; the ordinary even-count median averages
+        // the third and fourth sorted values, which turns a 3-of-6 split into
+        // half a carrier and silently makes the service require 5 of 7 despite
+        // its explicit 4-of-7 contract. The upper median (sorted index N/2)
+        // lets three training frames nominate the held-out fourth carrier.
+        // This is temporal voting only; ordinary spatial/result medians retain
+        // their conventional even-count averaging semantics above.
+        var binValues = new float[spectra.Count];
+        var temporalSpectrum = new float[max - min + 1];
+        int peakIndex = -1;
+        float peakDb = float.NegativeInfinity;
+        for (int bin = min; bin <= max; bin++)
+        {
+            for (int frame = 0; frame < spectra.Count; frame++)
+                binValues[frame] = spectra[frame][bin];
+
+            binValues.AsSpan().Sort();
+            float medianDb = binValues[binValues.Length / 2];
+            temporalSpectrum[bin - min] = medianDb;
+            if (medianDb > peakDb)
+            {
+                peakDb = medianDb;
+                peakIndex = bin;
+            }
+        }
+
+        // A real reference carrier is narrow. Compare the nominated bin with
+        // its nearby shoulders, excluding the carrier's own main-lobe bins.
+        // This rejects a broad, static passband hump that can stand above the
+        // global search median but has no carrier-like local shape. A narrow
+        // fixed spur intentionally remains indistinguishable from a carrier.
+        const int shoulderRadiusPixels = 12;
+        const int carrierHalfWidthPixels = 2;
+        var shoulderValues = new List<float>(2 * shoulderRadiusPixels);
+        for (int offset = -shoulderRadiusPixels; offset <= shoulderRadiusPixels; offset++)
+        {
+            if (Math.Abs(offset) <= carrierHalfWidthPixels) continue;
+            int bin = peakIndex + offset;
+            if (bin < min || bin > max) continue;
+            shoulderValues.Add(temporalSpectrum[bin - min]);
+        }
+
+        float shoulderMedianDb = shoulderValues.Count > 0
+            ? Median(shoulderValues.ToArray())
+            : float.NaN;
+        return (peakIndex, peakDb, Median(temporalSpectrum), shoulderMedianDb);
+    }
+
+    /// <summary>Index of the strongest finite bin in an inclusive range.</summary>
+    public static int PeakIndexInRange(
+        ReadOnlySpan<float> spectrum,
+        int searchMinIndex,
+        int searchMaxIndex)
+    {
+        int min = Math.Max(0, searchMinIndex);
+        int max = Math.Min(spectrum.Length - 1, searchMaxIndex);
+        int peakIndex = -1;
+        float peakDb = float.NegativeInfinity;
+        for (int bin = min; bin <= max; bin++)
+        {
+            if (float.IsFinite(spectrum[bin]) && spectrum[bin] > peakDb)
+            {
+                peakDb = spectrum[bin];
+                peakIndex = bin;
+            }
+        }
+
+        return peakIndex;
     }
 
     /// <summary>
