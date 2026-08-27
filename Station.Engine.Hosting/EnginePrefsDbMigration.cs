@@ -83,6 +83,8 @@ internal static class EnginePrefsDbMigration
             "ui_layout",
             "ui_layouts_v2",
             "ui_saved_layouts",
+            "vna_calibrations",
+            "vna_sweeps",
         ]);
 
     /// <summary>

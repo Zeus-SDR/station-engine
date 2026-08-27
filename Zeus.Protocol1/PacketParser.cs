@@ -533,6 +533,28 @@ internal static class PacketParser
     public const int TwoDdcSamplesPerPacket = TwoDdcSamplesPerUsbFrame * 2;            // 72
 
     /// <summary>
+    /// Validate only the framing shared by every EP6 receiver-count geometry.
+    /// This deliberately does not identify a one-DDC packet as one- or two-DDC;
+    /// those layouts carry no discriminator in the packet itself.
+    /// </summary>
+    public static bool HasValidEp6Framing(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length != PacketLength) return false;
+        if (packet[0] != MetisMagic0 || packet[1] != MetisMagic1) return false;
+        if (packet[2] != MetisTypeDataFrame || packet[3] != MetisEp6) return false;
+
+        for (int frame = 0; frame < 2; frame++)
+        {
+            int frameStart = MetisHeaderLength + frame * UsbFrameLength;
+            if (packet[frameStart] != Sync
+                || packet[frameStart + 1] != Sync
+                || packet[frameStart + 2] != Sync)
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Decode the two interleaved DDC streams from a standard dual-receiver EP6
     /// packet (NumReceiversMinusOne=1). Each output buffer must have room for at
     /// least <c>2 × <see cref="TwoDdcSamplesPerPacket"/></c> doubles (interleaved
@@ -555,10 +577,7 @@ internal static class PacketParser
         telemetry1 = default;
         adcOverloadBits = 0;
 
-        if (packet.Length != PacketLength) return false;
-        if (packet[0] != MetisMagic0 || packet[1] != MetisMagic1) return false;
-        if (packet[2] != MetisTypeDataFrame) return false;
-        if (packet[3] != MetisEp6) return false;
+        if (!HasValidEp6Framing(packet)) return false;
 
         sequence = BinaryPrimitives.ReadUInt32BigEndian(packet[4..8]);
 

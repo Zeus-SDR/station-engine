@@ -92,6 +92,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     private readonly ILogger<SaturnSpeakerAudioSink> _log;
     private Action _promoteWorker;
     private readonly FloatSpscRing _ring = new(RingCapacity);
+    private readonly FloatSpscRing _cwSidetoneRing = new(RingCapacity);
     private readonly ManualResetEventSlim _wake = new(false);
     private readonly ManualResetEventSlim _idle = new(true);
     private readonly CancellationTokenSource _cts = new();
@@ -104,6 +105,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     private long _droppedPackets;
     private long _droppedSamples;
     private bool _wasEligible;
+    private bool _lastDrainWasMox;
 
     // #1148 pacing schedule (sender-thread-owned). _nextSendTicks is the
     // monotonic Stopwatch deadline for the next packet (0 = realign to "now" on
@@ -118,6 +120,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     // transport, no real time. Null/Stopwatch in production.
     private Func<long> _clock = Stopwatch.GetTimestamp;
     private Action<long>? _sentObserverForTest;
+    private Action? _beforeCwSidetoneWriteForTest;
 
     // #1148 sender-side telemetry (sender-thread-owned). Emitted at ~1 Hz so an
     // OFF-vs-ON radio-speaker capture can be correlated with p2.rxdiag /
@@ -137,6 +140,11 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     // single-bit flags, not data values; the worker re-snapshots radio/settings
     // state when it acts on them so there's nothing to atomicise.
     private volatile bool _drainRequested;
+    private int _moxDrainRequests;
+    private int _moxOffGeneration;
+
+    private const int DrainRxForMox = 1;
+    private const int DrainSidetoneForRx = 2;
 
     // Set first thing in Dispose so the cross-thread signallers stop touching
     // _wake before it is disposed. See SignalWake.
@@ -163,6 +171,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _radio.StateChanged += OnRadioStateChanged;
+        _radio.MoxChanged += OnMoxChanged;
         _settings.Changed += OnSettingsChanged;
         _muteState.Changed += OnMuteChanged;
         _worker = new Thread(WorkerLoop)
@@ -177,6 +186,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _radio.StateChanged -= OnRadioStateChanged;
+        _radio.MoxChanged -= OnMoxChanged;
         _settings.Changed -= OnSettingsChanged;
         _muteState.Changed -= OnMuteChanged;
         _cts.Cancel();
@@ -203,13 +213,11 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             return;
         }
 
-        // Mirror the P1 sink's MOX mute: while transmitting, don't carry the
-        // operator's TX-monitor / CW sidetone out to the radio's speaker jack.
-        // Ask the worker to drop the buffered tail (and the partial packet) so
-        // RX resumes clean on unkey instead of replaying the pre-key tail.
+        // While transmitting, reject the ordinary lane so RX, TX-monitor, and
+        // external mixed audio cannot reach the radio speaker. CW sidetone uses
+        // its source-specific lane below.
         if (_radio.IsMox)
         {
-            _drainRequested = true;
             SignalWake();
             return;
         }
@@ -219,6 +227,31 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
         if (written < src.Length)
         {
             Interlocked.Add(ref _droppedSamples, src.Length - written);
+        }
+        SignalWake();
+    }
+
+    public void PublishCwSidetone(in AudioFrame frame)
+    {
+        if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz) return;
+        int moxOffGeneration = Volatile.Read(ref _moxOffGeneration);
+        if (!IsEligible() || !_radio.IsMox || _muteState.IsMuted) return;
+
+        _beforeCwSidetoneWriteForTest?.Invoke();
+        var src = frame.Samples.Span;
+        int written = _cwSidetoneRing.Write(src);
+        if (written < src.Length)
+        {
+            Interlocked.Add(ref _droppedSamples, src.Length - written);
+        }
+
+        // An unkey can race the gate above and let the worker clear this ring
+        // before the producer publishes. Request a second consumer-side clear
+        // so those samples cannot survive RX and replay on the next key-down.
+        if (!_radio.IsMox ||
+            Volatile.Read(ref _moxOffGeneration) != moxOffGeneration)
+        {
+            Interlocked.Or(ref _moxDrainRequests, DrainSidetoneForRx);
         }
         SignalWake();
     }
@@ -239,6 +272,18 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
 
     private void OnRadioStateChanged(StateDto state)
     {
+        SignalWake();
+    }
+
+    private void OnMoxChanged(bool on)
+    {
+        // Record the edge, not just the current radio level. A short key-down /
+        // key-up can complete before the sender runs; retaining both requested
+        // drains prevents pre-key RX or keyed sidetone from being replayed.
+        if (!on) Interlocked.Increment(ref _moxOffGeneration);
+        Interlocked.Or(
+            ref _moxDrainRequests,
+            on ? DrainRxForMox : DrainSidetoneForRx);
         SignalWake();
     }
 
@@ -292,8 +337,19 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             {
                 _drainRequested = false;
                 _ring.Clear();
+                _cwSidetoneRing.Clear();
                 _packetFrames = 0;
                 _nextSendTicks = 0; // realign the pacing schedule on resume
+            }
+
+            int moxDrainRequests = Interlocked.Exchange(ref _moxDrainRequests, 0);
+            if (moxDrainRequests != 0)
+            {
+                if ((moxDrainRequests & DrainRxForMox) != 0) _ring.Clear();
+                if ((moxDrainRequests & DrainSidetoneForRx) != 0) _cwSidetoneRing.Clear();
+                _packetFrames = 0;
+                _nextSendTicks = 0;
+                _pacingWaitTicks = 0;
             }
 
             if (!IsEligible())
@@ -304,6 +360,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
                 }
                 _wasEligible = false;
                 _ring.Clear();
+                _cwSidetoneRing.Clear();
                 _packetFrames = 0;
                 _nextSendTicks = 0;
                 _pacingWaitTicks = 0;
@@ -340,6 +397,18 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     {
         _diagBurstThisDrain = 0;
 
+        bool isMox = _radio.IsMox;
+        if (isMox != _lastDrainWasMox)
+        {
+            _lastDrainWasMox = isMox;
+            if (isMox) _ring.Clear();
+            else _cwSidetoneRing.Clear();
+            _packetFrames = 0;
+            _nextSendTicks = 0;
+            _pacingWaitTicks = 0;
+        }
+        var sourceRing = isMox ? _cwSidetoneRing : _ring;
+
         long retryNow = _clock();
         if (_sendRetryAfterTicks > retryNow)
         {
@@ -347,7 +416,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             // hard send failure. Preserve that restraint on the shared
             // transport so a network outage cannot turn the 750 pps sender
             // into a socket-error/log storm before the P2 keepalive disconnects.
-            _ring.Clear();
+            sourceRing.Clear();
             _packetFrames = 0;
             _nextSendTicks = 0;
             _pacingWaitTicks = _sendRetryAfterTicks - retryNow;
@@ -379,7 +448,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             }
 
             int need = PacketFrames - _packetFrames;
-            int read = _ring.Read(scratch[..need]);
+            int read = sourceRing.Read(scratch[..need]);
             if (read == 0)
             {
                 // Nothing buffered: realign the schedule and wait for the
@@ -566,6 +635,10 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     /// the observer instead of the real transport.</summary>
     internal Action<long>? SentObserverForTest { set => _sentObserverForTest = value; }
 
+    /// <summary>Test-only: pause a sidetone publication after its MOX gate but
+    /// before the ring write to force a deterministic unkey race.</summary>
+    internal Action? BeforeCwSidetoneWriteForTest { set => _beforeCwSidetoneWriteForTest = value; }
+
     /// <summary>Test-only: write samples straight into the sender ring, as the
     /// producer would, without going through <see cref="Publish"/>'s gates.
     /// Returns the count actually written.</summary>
@@ -612,7 +685,13 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             if (!_idle.Wait(TimeSpan.FromMilliseconds(Math.Min(20, remainingMs)))) continue;
             // Worker may have just set _idle right before reading the next
             // wake; loop until it actually settles with no pending work.
-            if (!_drainRequested && _ring.Count == 0) return true;
+            if (!_drainRequested &&
+                Volatile.Read(ref _moxDrainRequests) == 0 &&
+                _ring.Count == 0 &&
+                _cwSidetoneRing.Count == 0)
+            {
+                return true;
+            }
         }
     }
 
@@ -621,6 +700,7 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
         // Stop the cross-thread signallers before tearing _wake down.
         _disposed = true;
         _radio.StateChanged -= OnRadioStateChanged;
+        _radio.MoxChanged -= OnMoxChanged;
         _settings.Changed -= OnSettingsChanged;
         _muteState.Changed -= OnMuteChanged;
 

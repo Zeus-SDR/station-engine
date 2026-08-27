@@ -144,6 +144,20 @@ public enum MsgType : byte
     // flight for older clients (e.g. SMeterLive) — 0x19 is purely additive.
     RxMetersV2 = 0x19,
 
+    // Server → client (RX telemetry v2 for a SECONDARY receiver, RxId ≥ 1).
+    // Identical wire layout to RxMetersV2 (0x19) — same RxMetersV2Frame,
+    // RxId carried in the trailing byte — but a DISTINCT type byte so the
+    // multi-DDC per-receiver broadcasts (#1664) are invisible to clients that
+    // predate RxId routing. Such clients fold EVERY 0x19 frame into one global
+    // S-meter store; if the secondary receivers also arrived on 0x19 the RX1
+    // meter would flip to whichever secondary was broadcast last. Because they
+    // ignore unknown types, routing RxId ≥ 1 to 0x27 leaves their RX1 meter
+    // exactly as before. RX1 (RxId 0) always stays on 0x19. Serialize/
+    // Deserialize pick the type byte from RxId; the frontend dispatches 0x19
+    // and 0x27 through the same decoder. VfoState (0x26) is likewise a
+    // server→client frame that lives in this nibble, so 0x27 is consistent.
+    RxMetersV2Secondary = 0x27,
+
     // Server -> client measured RX signal quality. Additive to the legacy
     // S-meter frames: estimated passband SNR plus separately integrated signal and
     // noise powers. NaN fields / zero confidence mean unavailable.

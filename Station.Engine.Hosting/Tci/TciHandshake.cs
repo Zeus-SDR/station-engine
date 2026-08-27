@@ -115,7 +115,7 @@ public static class TciHandshake
         cmds.Add(TciProtocol.Command(
             "dds",
             0,
-            CwOffset.EffectiveLoHz(state)));
+            TciSession.EffectiveReceiverLoHz(state, 0)));
         cmds.Add(TciProtocol.Command(
             "dds",
             1,

@@ -43,6 +43,7 @@
 // License for details.
 
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -138,6 +139,20 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _boardKindSetCount;
     private int _hasN2adr;      // 0 / 1
     private int _mox;           // 0 / 1
+    // One immutable reference keeps every VNA register field coherent in a
+    // TX-loop snapshot. A sweep can never combine a new start frequency with
+    // an old step/count due to concurrent setter calls.
+    private sealed record VnaControl(
+        bool Enabled,
+        uint StartHz,
+        uint StepHz,
+        ushort Points,
+        bool FixedRxGainHigh,
+        byte DriveLevel)
+    {
+        public static readonly VnaControl Disabled = new(false, 0, 0, 0, false, 0);
+    }
+    private VnaControl _vnaControl = VnaControl.Disabled;
     // Separate TUN latch (issue #1325). P1's wire MOX bit rises for both TUN
     // and regular TX, so this internal flag is what ControlFrame consults to
     // OR the per-band OcTune mask on top of OcTx only during TUN.
@@ -267,6 +282,21 @@ public sealed class Protocol1Client : IProtocol1Client
     private long _lastPs4OkTicks;
     private long _lastDatagramTicks;
     private int _psStallFired;
+    // HermesII's one- and two-DDC EP6 datagrams have identical headers and USB
+    // sync. The only trustworthy geometry signal is packet cadence: at rate R,
+    // one DDC emits R/126 packets/s and two DDCs emit R/72. Hold packets until
+    // that cadence converges so a radio which ignored numRx=1 is never walked
+    // with the corrupt 14-byte stride (issue #1802).
+    private const int Ps2DdcCadenceWindowMs = 500;
+    private long _ps2DdcCadenceStarted;
+    private uint _ps2DdcCadenceStartSequence;
+    private bool _ps2DdcCadenceConfirmed;
+    private int _ps2DdcFallbackActive;
+    private int _ps2DdcGeometryRecoveryPending;
+    private int _ps2DdcGeometryRecoveryStage;
+    private long _psTransitionGeneration;
+    internal Func<int, Task>? Ps2DdcGeometryRecoveryBeforeGateForTest;
+    internal bool Ps2DdcFallbackActiveForTest => Volatile.Read(ref _ps2DdcFallbackActive) != 0;
 
     private Socket? _socket;
     private IPEndPoint? _remote;
@@ -306,6 +336,14 @@ public sealed class Protocol1Client : IProtocol1Client
 
     private static bool UsesP1PsTwoDdcLayout(HpsdrBoardKind board) =>
         board == HpsdrBoardKind.HermesII;
+
+    private enum Ps2DdcGeometry
+    {
+        Invalid,
+        Pending,
+        OneDdc,
+        TwoDdc,
+    }
 
     // TX IQ source: WDSP-TXA-driven ring in the live path (task #7/#8), or
     // the built-in test-tone when caller wants a bring-up carrier. Default is
@@ -1374,6 +1412,7 @@ public sealed class Protocol1Client : IProtocol1Client
         Volatile.Write(ref _rxSinkCallStartedTimestamp, 0);
         Volatile.Write(ref _disconnectSignaled, 0);
         RecordInitialStartHandshakeSucceeded();
+        Volatile.Write(ref _ps2DdcGeometryRecoveryStage, 0);
         ResetRxParserState();
 
         // The HTTP request token gates setup only. Linking the live radio
@@ -1464,6 +1503,11 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public async Task StopAsync(CancellationToken ct)
     {
+        bool wasVnaEnabled = VnaEnabled;
+        // Never carry an armed VNA configuration into a later connection.
+        // _mox is already held low for the whole VNA lifetime, so publishing
+        // Disabled cannot expose the normal PA payload as keyed.
+        ClearVna();
         var loopCts = _loopCts;
         if (loopCts is null) return;
 
@@ -1492,9 +1536,29 @@ public sealed class Protocol1Client : IProtocol1Client
 
             Interlocked.Exchange(ref _mox, 0);
             Interlocked.Exchange(ref _tune, 0);
+
+            bool txLoopStopped = false;
+            if (wasVnaEnabled && _txTask is not null)
+            {
+                // The gateware latches VNA. Stop the only competing EP2
+                // writer before sending the final clearing register so an
+                // already-snapshotted VNA frame cannot arrive afterward.
+                try
+                {
+                    await _txTask.WaitAsync(TimeSpan.FromSeconds(2), CancellationToken.None)
+                        .ConfigureAwait(false);
+                    txLoopStopped = true;
+                }
+                catch (TimeoutException)
+                {
+                    _log.LogWarning("TX loop did not exit before HL2 VNA clear.");
+                }
+            }
+
+            if (wasVnaEnabled) SendVnaClearFrameBestEffort();
             SendStartStop(start: false);
 
-            if (_txTask is not null)
+            if (!txLoopStopped && _txTask is not null)
             {
                 try { await _txTask.WaitAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { }
@@ -1519,6 +1583,12 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public Task DisconnectAsync(CancellationToken ct)
     {
+        bool wasVnaEnabled = VnaEnabled;
+        ClearVna();
+        // Direct disconnect without StopAsync is discouraged, but still make
+        // a best-effort clearing write before closing the socket. StopAsync's
+        // ordered TX-loop shutdown is the race-free path.
+        if (wasVnaEnabled) SendVnaClearFrameBestEffort();
         if (_socket is not null)
         {
             try { _socket.Close(); } catch { /* best-effort */ }
@@ -1627,6 +1697,7 @@ public sealed class Protocol1Client : IProtocol1Client
     public void SetBoardKind(HpsdrBoardKind board)
     {
         Interlocked.Exchange(ref _boardKind, (int)board);
+        if (board != HpsdrBoardKind.HermesLite2) ClearVna();
         Interlocked.Increment(ref _boardKindSetCount);
     }
 
@@ -1636,6 +1707,12 @@ public sealed class Protocol1Client : IProtocol1Client
     public void SetHasN2adr(bool hasN2adr) => Interlocked.Exchange(ref _hasN2adr, hasN2adr ? 1 : 0);
     public void SetMox(bool on)
     {
+        // VNA owns the low-power keyed state. Do not let a concurrent normal
+        // TX path leave _mox latched for the instant VNA is cleared; that
+        // could expose the ordinary PA-enable payload before the caller has
+        // deliberately re-keyed normal transmission.
+        if (VnaEnabled) return;
+
         int priorMox = Interlocked.Exchange(ref _mox, on ? 1 : 0);
         if (on && priorMox == 0)
         {
@@ -1666,6 +1743,32 @@ public sealed class Protocol1Client : IProtocol1Client
             if (pendingTx >= 0) Interlocked.Exchange(ref _txAntenna, pendingTx);
         }
     }
+
+    public void ConfigureVna(
+        uint startHz,
+        uint stepHz,
+        ushort points,
+        bool fixedRxGainHigh,
+        byte driveLevel)
+    {
+        if (points == 0)
+            throw new ArgumentOutOfRangeException(nameof(points), "FPGA-scanned VNA requires at least one point.");
+        if (stepHz == 0)
+            throw new ArgumentOutOfRangeException(nameof(stepHz), "FPGA-scanned VNA requires a non-zero step.");
+
+        // Remove any ordinary keyed state before publishing VNA enabled. A
+        // snapshot can therefore observe only normal+unkeyed or VNA+keyed,
+        // never normal+keyed during the transition.
+        if (BoardKind == HpsdrBoardKind.HermesLite2)
+            Interlocked.Exchange(ref _mox, 0);
+        Volatile.Write(ref _vnaControl,
+            new VnaControl(true, startHz, stepHz, points, fixedRxGainHigh, driveLevel));
+    }
+
+    public void ClearVna() => Volatile.Write(ref _vnaControl, VnaControl.Disabled);
+
+    public bool VnaEnabled =>
+        BoardKind == HpsdrBoardKind.HermesLite2 && Volatile.Read(ref _vnaControl).Enabled;
     public void SetDrive(int percent) =>
         Interlocked.Exchange(ref _drivePct, Math.Clamp(percent, 0, 100));
 
@@ -1751,6 +1854,7 @@ public sealed class Protocol1Client : IProtocol1Client
         {
             bool current = Volatile.Read(ref _psEnabled) != 0;
             if (current == on) return; // idempotent — reconnect resync no-op
+            Interlocked.Increment(ref _psTransitionGeneration);
             bool live = _loopCts is not null && _socket is not null && _remote is not null;
             if (!live || !UsesP1PsSafeTransition(BoardKind))
             {
@@ -1761,7 +1865,11 @@ public sealed class Protocol1Client : IProtocol1Client
                 Interlocked.Exchange(ref _psEnabled, on ? 1 : 0);
                 return;
             }
+            if (on)
+                Volatile.Write(ref _ps2DdcGeometryRecoveryStage, 0);
             await RestartWithPsModeAsync(on, ct).ConfigureAwait(false);
+            if (!on)
+                Volatile.Write(ref _ps2DdcGeometryRecoveryStage, 0);
         }
         finally
         {
@@ -1890,6 +1998,10 @@ public sealed class Protocol1Client : IProtocol1Client
         _ps4WinOk = 0;
         _ps4WinFail = 0;
         _ps4FailWarned = false;
+        _ps2DdcCadenceStarted = 0;
+        _ps2DdcCadenceStartSequence = 0;
+        _ps2DdcCadenceConfirmed = false;
+        Volatile.Write(ref _ps2DdcFallbackActive, 0);
         long now = Environment.TickCount64;
         Volatile.Write(ref _lastPs4OkTicks, now);
         Volatile.Write(ref _lastDatagramTicks, now);
@@ -1900,6 +2012,31 @@ public sealed class Protocol1Client : IProtocol1Client
     /// the pre-announce frames so the radio sees one monotonic stream
     /// (piHPSDR likewise never resets send_sequence across run/stop).</summary>
     private uint NextEp2Seq() => (uint)(Interlocked.Increment(ref _ep2SendSeq) - 1);
+
+    /// <summary>
+    /// Clear HL2 register 0x09 twice in one zero-payload EP2 packet. The state
+    /// snapshot is already VNA-disabled and ordinary MOX is low, so this
+    /// cannot energize the PA. StopAsync calls this only after the TX loop has
+    /// exited, guaranteeing that no stale VNA-enable frame follows it.
+    /// </summary>
+    private void SendVnaClearFrameBestEffort()
+    {
+        var sock = _socket;
+        var remote = _remote;
+        if (sock is null || remote is null) return;
+
+        var state = SnapshotState();
+        var buffer = new byte[ControlFrame.PacketLength];
+        ControlFrame.BuildDataPacket(
+            buffer,
+            NextEp2Seq(),
+            ControlFrame.CcRegister.DriveFilter,
+            ControlFrame.CcRegister.DriveFilter,
+            in state);
+        try { sock.SendTo(buffer, remote); }
+        catch (SocketException ex) { _log.LogWarning(ex, "p1.vna.clear send failed"); }
+        catch (ObjectDisposedException) { }
+    }
 
     /// <summary>
     /// Send two EP2 C&amp;C double-frames — (Config, TxFreq) then
@@ -2310,11 +2447,12 @@ public sealed class Protocol1Client : IProtocol1Client
             : (byte)(Volatile.Read(ref _drivePct) * 255 / 100);
 
         bool psOn = Volatile.Read(ref _psEnabled) != 0;
-        bool moxOn = Volatile.Read(ref _mox) != 0;
         var board = (HpsdrBoardKind)Volatile.Read(ref _boardKind);
         bool isHl2 = board == HpsdrBoardKind.HermesLite2;
         bool isC10 = board == HpsdrBoardKind.HermesC10;
         bool is10e = board == HpsdrBoardKind.HermesII;
+        var vna = Volatile.Read(ref _vnaControl);
+        bool moxOn = isHl2 && vna.Enabled || Volatile.Read(ref _mox) != 0;
         UnpackOcMasks(Volatile.Read(ref _ocMasksPacked), out byte ocTxMask, out byte ocRxMask, out byte ocTuneMask);
         // Number of receivers requested in the Config payload (`(N-1) << 3`
         // in C4 bits [5:3]). mi0bot's HL2 path (Thetis console.cs:8186-8265)
@@ -2365,7 +2503,7 @@ public sealed class Protocol1Client : IProtocol1Client
             PreampOn: Volatile.Read(ref _preamp) != 0,
             Atten: new HpsdrAtten(Volatile.Read(ref _attenDb)),
             RxAntenna: (HpsdrAntenna)Volatile.Read(ref _antenna),
-            Mox: Volatile.Read(ref _mox) != 0,
+            Mox: moxOn,
             EnableHl2BandVolts: Volatile.Read(ref _enableHl2BandVolts) != 0,
             AdcDitherEnabled: Volatile.Read(ref _adcDither) != 0,
             AdcRandomEnabled: Volatile.Read(ref _adcRandom) != 0,
@@ -2413,7 +2551,13 @@ public sealed class Protocol1Client : IProtocol1Client
             Adc1Atten: new HpsdrAtten(Volatile.Read(ref _attenAdc1Db)),
             PaEnabled: Volatile.Read(ref _paEnabled) != 0,
             RxAuxInput: Volatile.Read(ref _rxAuxInput),
-            XvtrEnabled: Volatile.Read(ref _xvtrEnabled) != 0);
+            XvtrEnabled: Volatile.Read(ref _xvtrEnabled) != 0,
+            VnaEnabled: vna.Enabled,
+            VnaStartHz: vna.StartHz,
+            VnaStepHz: vna.StepHz,
+            VnaPoints: vna.Points,
+            VnaFixedRxGainHigh: vna.FixedRxGainHigh,
+            VnaDriveLevel: vna.DriveLevel);
     }
 
     private void RxLoop()
@@ -2444,8 +2588,9 @@ public sealed class Protocol1Client : IProtocol1Client
         // TxLoop to emit one EP2 packet. N = rxRate / 48 kHz because the
         // HL2's TX DAC clock runs at a fixed 48 kHz regardless of the RX rate.
         int rxPktCounter = 0;
-        // HermesC10 PS pacing — fractional EP2 credit accumulator (exact
-        // 381 pkt/s release regardless of RX rate; see the 4-DDC branch).
+        // PureSignal RX-clocked TX pacing — fractional EP2 credit accumulator
+        // (exact 381 pkt/s release regardless of RX rate; see the 4-DDC and
+        // 2-DDC branches and PsTxCreditRelease). Shared by HL2 and HermesC10.
         double psTxCredit = 0.0;
 
         try
@@ -2608,30 +2753,15 @@ public sealed class Protocol1Client : IProtocol1Client
                     // RX pkt rate is rateHz/38 (vs rateHz/126 for N=1).
                     // Target TX pkt rate stays at 48k/126 ≈ 381.
                     double rxPktsPerSec = psRateHz / (double)PacketParser.Hl2Ps4DdcSamplesPerPacket;
-                    if (psBoard == HpsdrBoardKind.HermesC10)
+                    // Exact fractional-credit pacing for both 4-DDC boards. The
+                    // old HL2 branch used a rounded-integer divider that
+                    // oversent EP2 by ~2% at 192 kHz (round(5052.6/381)=13 →
+                    // 388.7 pkt/s), draining the fixed-48 kHz TX FIFO and
+                    // breaking up transmit audio (#1404); HermesC10 already
+                    // used this exact path.
+                    if (PsTxCreditRelease(ref psTxCredit, 381.0, rxPktsPerSec))
                     {
-                        // Fractional accumulator — the rounded-integer divider
-                        // over/under-sends EP2 by up to ~10% depending on rate
-                        // (48k: 1263/381 = 3.315 → 3 → +10.5% oversend; 192k:
-                        // ~+2%), which drifts the radio's TX FIFO over a long
-                        // transmission. Accumulate exact credits instead:
-                        // release once per (rxPktsPerSec/381) packets on
-                        // average, error bounded by one packet.
-                        psTxCredit += 381.0 / rxPktsPerSec;
-                        if (psTxCredit >= 1.0)
-                        {
-                            psTxCredit -= 1.0;
-                            try { _txSignal.Release(); } catch (SemaphoreFullException) { }
-                        }
-                    }
-                    else
-                    {
-                        // HL2: shipped rounded-divider pacing, untouched.
-                        int psTxDivider = Math.Max(1, (int)Math.Round(rxPktsPerSec / 381.0));
-                        if ((++rxPktCounter % psTxDivider) == 0)
-                        {
-                            try { _txSignal.Release(); } catch (SemaphoreFullException) { }
-                        }
+                        try { _txSignal.Release(); } catch (SemaphoreFullException) { }
                     }
                     continue;
                 }
@@ -2639,32 +2769,63 @@ public sealed class Protocol1Client : IProtocol1Client
                 bool ps2DdcActive = psEnabled && UsesP1PsTwoDdcLayout(psBoard);
                 if (ps2DdcActive)
                 {
-                    bool parsedOk = HandlePs2DdcPacket(buffer.AsSpan(0, n), micScratch);
-                    if (parsedOk)
+                    bool oneDdcThisPacket = false;
+                    if (Volatile.Read(ref _ps2DdcFallbackActive) == 0)
                     {
-                        failurePolicy.RecordSuccess();
-                        Interlocked.Increment(ref _ps4DdcOkTotal);
-                        Volatile.Write(ref _lastPs4OkTicks, Environment.TickCount64);
-                        Volatile.Write(ref _psStallFired, 0);
+                        Ps2DdcGeometry geometry = ObservePs2DdcGeometry(buffer.AsSpan(0, n));
+                        if (geometry is Ps2DdcGeometry.Invalid or Ps2DdcGeometry.Pending)
+                        {
+                            _ps4WinDatagrams++;
+                            if (geometry == Ps2DdcGeometry.Invalid)
+                            {
+                                Interlocked.Increment(ref _ps4DdcSyncFailTotal);
+                                _ps4WinFail++;
+                            }
+                            Ps4DdcHousekeeping();
+                            continue;
+                        }
+                        if (geometry == Ps2DdcGeometry.OneDdc)
+                        {
+                            Interlocked.Increment(ref _ps4DdcSyncFailTotal);
+                            _ps4WinDatagrams++;
+                            _ps4WinFail++;
+                            BeginPs2DdcGeometryRecovery(ct);
+                            Ps4DdcHousekeeping();
+                            oneDdcThisPacket = true;
+                            // The cadence proved this is one-DDC, so fall through
+                            // to the safe 8-byte parser while recovery runs.
+                        }
                     }
-                    else
-                    {
-                        Interlocked.Increment(ref _ps4DdcSyncFailTotal);
-                    }
-                    _ps4WinDatagrams++;
-                    if (parsedOk) _ps4WinOk++;
-                    else _ps4WinFail++;
-                    Ps4DdcHousekeeping();
 
-                    int psRateHz = CurrentRateHz();
-                    double rxPktsPerSec = psRateHz / (double)PacketParser.TwoDdcSamplesPerPacket;
-                    psTxCredit += 381.0 / rxPktsPerSec;
-                    if (psTxCredit >= 1.0)
+                    // This packet's proven geometry remains authoritative if a
+                    // concurrent recovery failure clears the shared fallback.
+                    if (!oneDdcThisPacket && Volatile.Read(ref _ps2DdcFallbackActive) == 0)
                     {
-                        psTxCredit -= 1.0;
-                        try { _txSignal.Release(); } catch (SemaphoreFullException) { }
+                        bool parsedOk = HandlePs2DdcPacket(buffer.AsSpan(0, n), micScratch);
+                        if (parsedOk)
+                        {
+                            failurePolicy.RecordSuccess();
+                            Interlocked.Increment(ref _ps4DdcOkTotal);
+                            Volatile.Write(ref _lastPs4OkTicks, Environment.TickCount64);
+                            Volatile.Write(ref _psStallFired, 0);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _ps4DdcSyncFailTotal);
+                        }
+                        _ps4WinDatagrams++;
+                        if (parsedOk) _ps4WinOk++;
+                        else _ps4WinFail++;
+                        Ps4DdcHousekeeping();
+
+                        int psRateHz = CurrentRateHz();
+                        double rxPktsPerSec = psRateHz / (double)PacketParser.TwoDdcSamplesPerPacket;
+                        if (PsTxCreditRelease(ref psTxCredit, 381.0, rxPktsPerSec))
+                        {
+                            try { _txSignal.Release(); } catch (SemaphoreFullException) { }
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 var rented = ArrayPool<double>.Shared.Rent(2 * PacketParser.ComplexSamplesPerPacket);
@@ -2900,6 +3061,125 @@ public sealed class Protocol1Client : IProtocol1Client
             try { PsFeedbackStalled?.Invoke(); }
             catch (Exception ex) { _log.LogWarning(ex, "PsFeedbackStalled handler threw"); }
         }
+    }
+
+    private Ps2DdcGeometry ObservePs2DdcGeometry(ReadOnlySpan<byte> packet)
+    {
+        if (!PacketParser.HasValidEp6Framing(packet))
+            return Ps2DdcGeometry.Invalid;
+        if (_ps2DdcCadenceConfirmed)
+            return Ps2DdcGeometry.TwoDdc;
+
+        long now = Stopwatch.GetTimestamp();
+        if (_ps2DdcCadenceStarted == 0)
+        {
+            _ps2DdcCadenceStarted = now;
+            _ps2DdcCadenceStartSequence = BinaryPrimitives.ReadUInt32BigEndian(packet[4..8]);
+            return Ps2DdcGeometry.Pending;
+        }
+
+        TimeSpan elapsed = Stopwatch.GetElapsedTime(_ps2DdcCadenceStarted, now);
+        if (elapsed.TotalMilliseconds < Ps2DdcCadenceWindowMs)
+            return Ps2DdcGeometry.Pending;
+
+        uint sequence = BinaryPrimitives.ReadUInt32BigEndian(packet[4..8]);
+        uint sequenceDelta = sequence - _ps2DdcCadenceStartSequence;
+        // Re-baseline an out-of-order/wrapped packet rather than treating
+        // unsigned wrap as an impossibly fast stream. A real 500 ms window is
+        // at most ~2,700 packets even at 384 kHz/two-DDC; restarting here
+        // prevents a stale baseline from leaving cadence pending forever.
+        if (sequenceDelta > 10_000)
+        {
+            _ps2DdcCadenceStarted = now;
+            _ps2DdcCadenceStartSequence = sequence;
+            return Ps2DdcGeometry.Pending;
+        }
+
+        // Sequence cadence reflects packets emitted by the radio even if UDP
+        // drops some on the host. The floor is intentionally below the expected
+        // two-DDC rate to tolerate clock/batching jitter, while a healthy one-
+        // DDC stream remains well below it (R/126 versus the R/96 boundary).
+        double packetsPerSecond = sequenceDelta / elapsed.TotalSeconds;
+        double twoDdcFloor = CurrentRateHz() / 96.0;
+        if (packetsPerSecond < twoDdcFloor)
+        {
+            _log.LogWarning(
+                "p1.rx.ps2ddc geometry mismatch observed={Observed:F0}pkt/s twoDdcFloor={Floor:F0}pkt/s rate={Rate} — radio remains at one DDC",
+                packetsPerSecond,
+                twoDdcFloor,
+                CurrentRateHz());
+            return Ps2DdcGeometry.OneDdc;
+        }
+
+        _ps2DdcCadenceConfirmed = true;
+        _log.LogInformation(
+            "p1.rx.ps2ddc geometry confirmed observed={Observed:F0}pkt/s rate={Rate}",
+            packetsPerSecond,
+            CurrentRateHz());
+        return Ps2DdcGeometry.TwoDdc;
+    }
+
+    internal Task BeginPs2DdcGeometryRecoveryForTest(CancellationToken loopToken)
+        => BeginPs2DdcGeometryRecovery(loopToken);
+
+    private Task BeginPs2DdcGeometryRecovery(CancellationToken loopToken)
+    {
+        long transitionGeneration = Volatile.Read(ref _psTransitionGeneration);
+        // Load-bearing order: the caller has already proven one-DDC geometry,
+        // so fallback must arm even if a stale recovery still owns pending.
+        Volatile.Write(ref _ps2DdcFallbackActive, 1);
+        if (Interlocked.CompareExchange(ref _ps2DdcGeometryRecoveryPending, 1, 0) != 0)
+            return Task.CompletedTask;
+
+        int stage = Interlocked.Increment(ref _ps2DdcGeometryRecoveryStage);
+        return Task.Run(async () =>
+        {
+            bool gateHeld = false;
+            try
+            {
+                if (Ps2DdcGeometryRecoveryBeforeGateForTest is { } beforeGate)
+                    await beforeGate(stage).ConfigureAwait(false);
+                await _psTransitionGate.WaitAsync(loopToken).ConfigureAwait(false);
+                gateHeld = true;
+                if (_disposed
+                    || loopToken.IsCancellationRequested
+                    || Volatile.Read(ref _psTransitionGeneration) != transitionGeneration
+                    || Volatile.Read(ref _psEnabled) == 0
+                    || !UsesP1PsTwoDdcLayout(BoardKind))
+                    return;
+
+                if (stage == 1)
+                {
+                    _log.LogWarning(
+                        "p1.rx.ps2ddc retrying stopped numRx=1 preannouncement after one-DDC cadence");
+                    await RestartWithPsModeAsync(enable: true, loopToken).ConfigureAwait(false);
+                    return;
+                }
+
+                Volatile.Write(ref _psStallFired, 1);
+                try { PsFeedbackStalled?.Invoke(); }
+                catch (Exception ex) { _log.LogWarning(ex, "PsFeedbackStalled handler threw"); }
+                _log.LogWarning(
+                    "p1.rx.ps2ddc still one-DDC after retry — failing closed to disarmed one-DDC reception");
+                await RestartWithPsModeAsync(enable: false, loopToken).ConfigureAwait(false);
+                Volatile.Write(ref _ps2DdcGeometryRecoveryStage, 0);
+            }
+            catch (OperationCanceledException) when (loopToken.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "p1.rx.ps2ddc geometry recovery failed; restarting cadence detection");
+                // Recovery starts only after a OneDdc verdict, so cadence cannot
+                // be confirmed while fallback skips observation. Any stale
+                // baseline self-heals through the sequence-delta re-baseline.
+                Volatile.Write(ref _ps2DdcFallbackActive, 0);
+            }
+            finally
+            {
+                Volatile.Write(ref _ps2DdcGeometryRecoveryPending, 0);
+                if (gateHeld)
+                    _psTransitionGate.Release();
+            }
+        }, CancellationToken.None);
     }
 
     private uint _lastSeenSequence;
@@ -3320,6 +3600,30 @@ public sealed class Protocol1Client : IProtocol1Client
                 spin.SpinOnce();
             }
         }
+    }
+
+    // Fractional-credit EP2 pacer for the PureSignal RX-clocked TX path.
+    // Every received PS RX packet accrues `targetPktsPerSec / rxPktsPerSec` of
+    // a credit and releases one EP2 send once a whole credit is available, so
+    // the average EP2 rate equals the fixed-48 kHz-derived 381 pkt/s target
+    // with error bounded by a single packet — regardless of the RX packet
+    // rate. This replaces a rounded-integer divider (`round(rxPktsPerSec/381)`)
+    // that over/under-sent by up to ~10% depending on rate (HL2 4-DDC at
+    // 192 kHz: round(5052.6/381)=13 → 5052.6/13 ≈ 388.7 pkt/s, a ~2% oversend).
+    // The oversend drains the radio's fixed-48 kHz TX FIFO across a long
+    // transmission, starving the TX IQ ring into zero-fill and breaking up
+    // transmit audio (#1404). HermesC10 already used this exact-credit path;
+    // HL2's 4-DDC branch now shares it.
+    internal static bool PsTxCreditRelease(ref double credit, double targetPktsPerSec, double rxPktsPerSec)
+    {
+        if (rxPktsPerSec <= 0.0) return false;
+        credit += targetPktsPerSec / rxPktsPerSec;
+        if (credit >= 1.0)
+        {
+            credit -= 1.0;
+            return true;
+        }
+        return false;
     }
 
     private void ReleaseNormalTxCredit()

@@ -232,6 +232,7 @@ public static class StationEngineEndpoints
         endpoints.MapPaThermalEndpoint();
         endpoints.MapRadioHardwareEndpoints();
         endpoints.MapRadioCalibrationEndpoints();
+        endpoints.MapVnaEndpoints();
         endpoints.MapTciEndpoints();
         endpoints.MapHfAutoEndpoints();
         endpoints.MapCatEndpoints();

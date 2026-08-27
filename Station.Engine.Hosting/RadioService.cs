@@ -1961,6 +1961,59 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
+    /// <summary>
+    /// Move a receiver's DDS centre while preserving the receiver VFO's
+    /// offset from that centre. TCI DDS changes move the whole captured
+    /// spectrum; they do not tune channel A onto the DDS frequency.
+    /// </summary>
+    public StateDto SetReceiverDds(int rxIndex, long hz)
+    {
+        if (rxIndex is not (0 or 1))
+            throw new ArgumentOutOfRangeException(nameof(rxIndex));
+
+        long ddsHz = ClampTuningFrequency(hz);
+        var before = Snapshot();
+        var rx2 = before.Rx2();
+        if (rxIndex == 1 && !rx2.Enabled)
+            return before;
+
+        long receiverVfoHz = rxIndex == 0 ? before.VfoHz : rx2.VfoHz;
+        RxMode receiverMode = rxIndex == 0 ? before.Mode : rx2.Mode;
+
+        long currentDdsHz = rxIndex == 0 && before.RadioLoHz > 0
+            ? before.RadioLoHz
+            : CwOffset.EffectiveLoHz(receiverMode, receiverVfoHz);
+        long vfoHz;
+        try
+        {
+            vfoHz = checked(receiverVfoHz + (ddsHz - currentDdsHz));
+        }
+        catch (OverflowException)
+        {
+            return before;
+        }
+        if (!IsExternalFrequencyAvailable(vfoHz))
+            return before;
+
+        if (rxIndex == 0)
+        {
+            Mutate(s => s with { VfoHz = vfoHz, RadioLoHz = ddsHz });
+            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(ddsHz));
+            if (RuntimeBandKey(before.VfoHz) != RuntimeBandKey(vfoHz))
+                RecomputePaAndPush();
+            return Snapshot();
+        }
+
+        long previousTxHz = RadioFrequencyResolver.TxFrequencyHz(before);
+        Mutate(s => WithRx2(s, r => r with { VfoHz = vfoHz }));
+        if (RuntimeBandKey(previousTxHz)
+            != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+        {
+            RecomputePaAndPush();
+        }
+        return Snapshot();
+    }
+
     /// <summary>Receiver-indexed VFO setter for the multi-DDC model.
     /// <paramref name="rxIndex"/> 0 → RX1 (<see cref="SetVfo(long)"/>), 1 → RX2
     /// (<see cref="SetVfoB(long)"/>), ≥ 2 → an extra DDC receiver
@@ -7032,7 +7085,7 @@ public sealed class RadioService : IDisposable
     private void OnPsFeedbackStalled()
     {
         _log.LogWarning(
-            "p1.ps.watchdog auto-disarming PureSignal — no parseable 4-DDC feedback for 2 s while the stream is alive (issue #1302 guard)");
+            "p1.ps.watchdog auto-disarming PureSignal — feedback unavailable: stalled stream or receive geometry never converged");
         _ = Task.Run(() =>
         {
             try { Mutate(s => s with { PsEnabled = false }); }

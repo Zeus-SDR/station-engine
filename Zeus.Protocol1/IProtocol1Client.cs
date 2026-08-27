@@ -118,6 +118,31 @@ public interface IProtocol1Client : IDisposable
     void SetMox(bool on);
 
     /// <summary>
+    /// Configure and key the Hermes-Lite 2 FPGA-scanned VNA registers. VNA
+    /// owns MOX while active because FPGA scan output requires it; ordinary
+    /// <see cref="SetMox"/> calls cannot replace that safe sweep state. All
+    /// values are published atomically to the TX loop. On non-HL2 boards the
+    /// stored state is wire-neutral.
+    /// </summary>
+    void ConfigureVna(
+        uint startHz,
+        uint stepHz,
+        ushort points,
+        bool fixedRxGainHigh,
+        byte driveLevel);
+
+    /// <summary>
+    /// Clear the HL2 VNA state and leave ordinary MOX off. The next Config,
+    /// TxFreq, RxFreq, and DriveFilter writes return to their normal-radio
+    /// byte encoding without keying the PA. A later explicit SetMox(true)
+    /// resumes normal transmission.
+    /// </summary>
+    void ClearVna();
+
+    /// <summary>True when an HL2 VNA configuration is currently armed.</summary>
+    bool VnaEnabled { get; }
+
+    /// <summary>
     /// UI-level TX drive, 0..100 (values outside clamp). Mapped to the 0..255
     /// raw HPSDR drive byte (C0=0x12, C1) inside SnapshotState via
     /// <c>raw = percent * 255 / 100</c>, matching the Protocol-1

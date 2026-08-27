@@ -36,6 +36,23 @@ public static class StationEngineHostingExtensions
         // service registration as the product host, so the engine's
         // /api/system/windows-firewall routes behave identically.
         services.AddSingleton<IWindowsFirewallService, WindowsFirewallService>();
+        // StationEngine is the process that opens the HPSDR UDP sockets, so it is
+        // the executable the firewall rule has to name. Nothing granted that rule
+        // automatically before: the only auto-apply lived in Zeus.Server.Hosting,
+        // which only Zeus.Host (the retired dev bench) references.
+        //
+        // These two are inert until resolved, so they are safe to register here.
+        // WindowsFirewallStartupGrant is NOT: it shells out to netsh and can create
+        // a real firewall rule. Registering it in this shared helper would run it in
+        // every integration test that builds a host — including on the self-hosted
+        // Windows runners, where the rules would accumulate. The engine executable
+        // opts in explicitly; see AddWindowsFirewallStartupGrant.
+        services.AddSingleton<WindowsFirewallGrantStore>();
+        services.AddSingleton<IWindowsFirewallElevationHelper>(sp =>
+            OperatingSystem.IsWindows()
+                ? new ScheduledTaskFirewallElevationHelper(
+                    sp.GetRequiredService<ILogger<ScheduledTaskFirewallElevationHelper>>())
+                : NullFirewallElevationHelper.Instance);
         services.AddSingleton<IProductStreamSource>(_ => NullProductStreamSource.Instance);
         // Real (not null) sink: the SPA's clientErrorBeacon prefers the /ws
         // diagnostic frame, so a null sink would silently discard uncaught
@@ -98,6 +115,12 @@ public static class StationEngineHostingExtensions
             PrefsDbPath.EngineGet()));
         services.AddSingleton<CwSettingsStore>();
         services.AddSingleton<AntennaSettingsStore>();
+        services.AddSingleton<VnaSweepStore>();
+        services.AddSingleton<Hl2VnaSweepHardware>();
+        services.AddSingleton<RadioBridgeVnaSweepHardware>();
+        services.AddSingleton<ConnectedRadioVnaSweepHardware>();
+        services.AddSingleton<IVnaSweepHardware>(sp => sp.GetRequiredService<ConnectedRadioVnaSweepHardware>());
+        services.AddSingleton<VnaService>();
         services.AddSingleton<AudioSettingsStore>();
         services.AddSingleton<Nr3ModelStore>();
         services.AddSingleton<CfcPresetStore>();
@@ -264,6 +287,22 @@ public static class StationEngineHostingExtensions
         services.AddCatServices();
         services.AddSpeTaurusServices();
 
+        return services;
+    }
+
+    /// <summary>
+    /// Opt in to the automatic, once-per-executable Windows Firewall grant.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately separate from <c>AddStationEngine</c>. The grant shells out to
+    /// netsh and can create a real firewall rule, so it must not run inside the
+    /// integration tests that build a host through the shared registration — on the
+    /// self-hosted Windows runners those rules would persist and accumulate. Only
+    /// the StationEngine executable calls this.
+    /// </remarks>
+    public static IServiceCollection AddWindowsFirewallStartupGrant(this IServiceCollection services)
+    {
+        services.AddHostedService<WindowsFirewallStartupGrant>();
         return services;
     }
 }

@@ -234,6 +234,12 @@ public partial class Program
                 ? null
                 : p2AutoConnectEndpoint,
             LanHttpsUrls: lanHttpsUrls));
+        // Windows only in effect. Grants this engine build its inbound firewall
+        // rule once, without a prompt where it can, and never re-asks. Zeus Link
+        // reinstalls the engine to a new version-scoped path on every update, so
+        // the rule genuinely has to be re-pointed; see
+        // docs/designs/windows-firewall-zero-prompt.md.
+        builder.Services.AddWindowsFirewallStartupGrant();
         builder.Services.AddZeusPlugins(
             prefsDbPathProvider: PrefsDbPath.EngineGet,
             options: new PluginManagerOptions

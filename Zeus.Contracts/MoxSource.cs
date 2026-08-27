@@ -87,4 +87,8 @@ public enum MoxSource : byte
     /// immediately on liveness loss and always yields to operator, hardware,
     /// TUNE, CAT, and TCI requests.</summary>
     ProductPlugin = 10,
+    /// <summary>The antenna analyzer's bounded low-power TUNE sweep. It owns
+    /// and releases only its own carrier, preserving UI as the master
+    /// override and keeping CAT/TCI/hardware keying isolated.</summary>
+    Analyzer = 11,
 }

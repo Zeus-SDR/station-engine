@@ -80,7 +80,13 @@ internal readonly record struct ProtectionSample(
     DateTime Now,
     TransmitIntent Intent,
     DateTime KeyedAt,
-    int TimeoutSeconds);
+    int TimeoutSeconds,
+    // Measured forward power (W) and the current tune-drive request (%) gate
+    // the low-power TUN SWR bypass. Defaults are deliberately fail-safe — a
+    // sample built without power context reads as "high power", so protection
+    // is NOT bypassed unless a caller supplies genuinely low readings.
+    double FwdWatts = double.MaxValue,
+    int TuneDrivePercent = 100);
 
 internal readonly record struct ProtectionDecision(
     bool Trip,
@@ -103,6 +109,22 @@ internal sealed class EngineTransmitSafetyModule
     internal static readonly TimeSpan SwrTripDurationTun = TimeSpan.FromMilliseconds(500);
     internal static readonly TimeSpan SwrStartupGraceMox = TimeSpan.FromMilliseconds(300);
     internal static readonly TimeSpan SwrStartupGraceTun = TimeSpan.FromMilliseconds(500);
+
+    // Thetis-style low-power TUN SWR bypass. An external ATU (e.g. an LDG
+    // autotuner) deliberately presents a wildly mismatched load while it hunts
+    // for a match, and a slow tuner can search for several seconds — longer
+    // than the 500 ms sustain window — which nuisance-trips today's flat
+    // 6.0:1 TUN guard (issue #1659). Thetis suppresses SWR protection during
+    // TUN, but only while the transmitted power stays low enough that a bad
+    // match cannot harm the PA. Zeus mirrors that: while TUN is active AND
+    // both the measured forward power and the tune-drive request stay within
+    // these guarded limits, the SWR trip is suppressed so the tuner can hunt.
+    // Above either limit the normal 6.0:1 / 500 ms TUN trip still applies, MOX
+    // protection is untouched, and the overall TX timeout always bounds the
+    // transmission. This is NOT a blanket time grace — extreme SWR at real
+    // power still drops the PA immediately.
+    internal const double SwrTripTunBypassMaxFwdWatts = 25.0;
+    internal const int SwrTripTunBypassMaxDrivePercent = 25;
 
     private readonly object _sync = new();
     private DateTime? _swrAboveThresholdSince;
@@ -268,6 +290,19 @@ internal sealed class EngineTransmitSafetyModule
         }
 
         bool isTun = sample.Intent == TransmitIntent.Tun;
+
+        // Low-power TUN bypass (see the constants above): while tuning into an
+        // external ATU at low power, let the tuner hunt through a bad match
+        // without dropping the PA. The TX-timeout guard (already evaluated
+        // above) remains the sole bound on transmission length here.
+        if (isTun
+            && sample.FwdWatts <= SwrTripTunBypassMaxFwdWatts
+            && sample.TuneDrivePercent <= SwrTripTunBypassMaxDrivePercent)
+        {
+            lock (_sync) _swrAboveThresholdSince = null;
+            return ProtectionDecision.None;
+        }
+
         var threshold = isTun ? SwrTripThresholdTun : SwrTripThresholdMox;
         var sustain = isTun ? SwrTripDurationTun : SwrTripDurationMox;
         var grace = isTun ? SwrStartupGraceTun : SwrStartupGraceMox;

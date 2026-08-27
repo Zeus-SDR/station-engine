@@ -513,6 +513,35 @@ public sealed class TxService
         return false;
     }
 
+    internal bool ValidateAnalyzerSweep(long startHz, long endHz, int points, out string? error)
+    {
+        StateDto state = _radio.Snapshot();
+        if (state.TxReceiverIndex != 0 || RadioFrequencyResolver.IsSplitEnabledForTx(state) || state.XitEnabled)
+        {
+            error = "Select RX1 as the TX receiver and turn SPLIT and XIT off before an antenna sweep.";
+            return false;
+        }
+
+        TransmitIntent? active;
+        lock (_sync) active = _activeIntent;
+        for (int i = 0; i < points; i++)
+        {
+            long hz = startHz + (long)Math.Round((endHz - startHz) * i / (double)(points - 1));
+            var candidate = state with { VfoHz = hz };
+            TransmitSafetyDecision decision = _safety.EvaluateKeyOn(
+                TransmitIntent.Tun,
+                CaptureSafetySnapshot(candidate, active, MoxSource.Analyzer));
+            if (!decision.Allowed)
+            {
+                error = $"Analyzer sweep blocked at {hz / 1_000_000.0:F6} MHz: {decision.OperatorText}";
+                return false;
+            }
+        }
+
+        error = null;
+        return true;
+    }
+
     private TransmitSafetyDecision EvaluateDriveRequest(int requestedPercent)
     {
         TransmitIntent? active;

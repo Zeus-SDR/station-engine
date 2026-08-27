@@ -924,8 +924,9 @@ public sealed record TxLevelingConfig(
     double CompressorGainDb = 0.0,
     // Controlled-envelope SSB overshoot control. Thetis only runs CESSB when
     // the speech compressor is running; the engine also suppresses it for
-    // digital/test-bypass audio and while PureSignal is armed. Default OFF is
-    // deliberate for fresh installs and legacy payloads that omit the field.
+    // digital/test-bypass audio. PureSignal follows CESSB in WDSP's TXA chain,
+    // so the two controls may run together. Default OFF is deliberate for
+    // fresh installs and legacy payloads that omit the field.
     bool CessbEnabled = false,
     // Zeus WDSP 2.0 extends Thetis's fixed 3 kHz controller with a 4 kHz
     // profile. Legacy payloads use the conservative 3 kHz profile.

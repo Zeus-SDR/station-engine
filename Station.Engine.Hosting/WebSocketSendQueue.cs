@@ -219,6 +219,7 @@ internal sealed class WebSocketSendQueue
         MsgType.PsMeters or
         MsgType.RxMeter or
         MsgType.RxMetersV2 or
+        MsgType.RxMetersV2Secondary or
         MsgType.RxSignalQuality or
         MsgType.PaTemp or
         MsgType.MicPeak or

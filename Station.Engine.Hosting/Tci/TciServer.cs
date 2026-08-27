@@ -351,7 +351,7 @@ public sealed class TciServer : IHostedService, IDisposable
             TciProtocol.Command(
                 "dds",
                 0,
-                CwOffset.EffectiveLoHz(state)));
+                TciSession.EffectiveReceiverLoHz(state, 0)));
         BroadcastRateLimited(
             "vfo:1,0",
             TciProtocol.Command(

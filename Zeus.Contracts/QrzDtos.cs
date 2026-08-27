@@ -42,6 +42,8 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Text.Json.Serialization;
+
 namespace Zeus.Contracts;
 
 public sealed record QrzLoginRequest(string Username, string Password);
@@ -85,7 +87,10 @@ public sealed record QrzStation(
     string? TimeZone = null,
     bool? ObservesDst = null,
     // Operator birth year, when public.
-    int? Born = null);
+    int? Born = null,
+    // null / "qrz" = QRZ's own pin; "fcc" = reconciled against FCC ULS.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? LocationSource = null);
 
 public sealed record QrzStatus(
     bool Connected,

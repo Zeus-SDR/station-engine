@@ -425,10 +425,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // TXA-open TxLevelingConfig default. Written/read under _txaLock.
     private bool _txCompressorEnabled;
     // Operator's requested CESSB state. Effective native run additionally
-    // requires the speech compressor, a voice path, and PureSignal disarmed.
-    // Volatile because SetPsEnabled restores it while holding _psLock rather
-    // than _txaLock.
-    private volatile bool _txCessbEnabled;
+    // requires the speech compressor and a voice path. WDSP orders osctrl
+    // before iqc, so PureSignal corrects the already CESSB-shaped reference,
+    // matching Thetis where the two controls remain independent.
+    private bool _txCessbEnabled;
     private int _txCessbBandwidthHz = 3000;
     // 0 unknown, 1 available, -1 missing (older bundled/system libwdsp).
     private int _cessbBandwidthExportState;
@@ -2977,7 +2977,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             int compressorRun = EffectiveTxRun(_txCompressorEnabled);
-            int cessbRun = compressorRun != 0 && _txCessbEnabled && !_psEnabled ? 1 : 0;
+            int cessbRun = compressorRun != 0 && _txCessbEnabled ? 1 : 0;
             RunNativeLifecycleCriticalSection(() =>
             {
                 if (cessbRun == 0)
@@ -3690,9 +3690,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (enabled)
             {
                 _psEnabled = true;
-                // Remove CESSB before calibration/correction starts. The
-                // effective-state helper keeps COMP running but switches
-                // osctrl off first, so PS never sees the non-linear envelope.
+                // Re-assert the operator's COMP/CESSB topology before PS
+                // starts. WDSP runs osctrl before iqc, so PureSignal corrects
+                // the CESSB-shaped reference instead of replacing that stage.
                 ApplyTxCompressorAndCessbRuns(id);
                 // Reset diagnostic counters so the first state transition
                 // and the first 100 pscc blocks log on every fresh arm.
@@ -3740,13 +3740,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 }
                 NativeMethods.SetPSRunCal(id, 0);
                 NativeMethods.SetPSControl(id, 1, 0, 0, 0);
-                // Keep the CESSB interlock asserted until both native PS
-                // controls are down. Only then publish PS-off and restore the
-                // operator's effective COMP/CESSB topology.
                 _psEnabled = false;
-                // Restore the operator's effective CESSB state. A saved OFF,
-                // disabled compressor, or active digital/test bypass remains
-                // off after PureSignal disarms.
+                // PS and CESSB are independent, but re-assert the operator's
+                // effective topology after both native PS controls are down.
                 ApplyTxCompressorAndCessbRuns(id);
             }
         }

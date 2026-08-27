@@ -362,6 +362,7 @@ public sealed class StreamingHub
             case MsgType.PsMeters:
             case MsgType.RxMeter:
             case MsgType.RxMetersV2:
+            case MsgType.RxMetersV2Secondary:
             case MsgType.RxSignalQuality:
             case MsgType.PaTemp:
             case MsgType.MicPeak:

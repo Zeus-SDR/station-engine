@@ -379,7 +379,20 @@ internal static class ControlFrame
         // CwSidetoneFreq (0x20) frame. Both default 0 so a non-CW snapshot
         // emits byte-identical 0x1E / 0x20 payloads to the pre-fix wire.
         byte CwSidetoneLevel = 0,
-        int CwSidetoneFreqHz = 0);
+        int CwSidetoneFreqHz = 0,
+        // Hermes-Lite 2 FPGA-scanned VNA control. These fields are ignored
+        // unless Board is HermesLite2 AND VnaEnabled is true. Start frequency
+        // replaces TxFreq, step Hz replaces RxFreq, and VnaPoints owns the
+        // complete DriveFilter C3:C4 word while the sweep is active.
+        bool VnaEnabled = false,
+        uint VnaStartHz = 0,
+        uint VnaStepHz = 0,
+        ushort VnaPoints = 0,
+        // Config register bit 10: false = fixed -6 dB, true = fixed +6 dB.
+        bool VnaFixedRxGainHigh = false,
+        // Separate from normal transmitter drive so an operator's calibrated
+        // PA drive setting cannot leak into the low-power VNA path.
+        byte VnaDriveLevel = 0);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -388,6 +401,7 @@ internal static class ControlFrame
     public static int WriteCcBytes(Span<byte> cc, CcRegister register, in CcState state)
     {
         if (cc.Length < 5) throw new ArgumentException("cc span < 5 bytes", nameof(cc));
+        bool hl2Vna = IsHl2Vna(in state);
 
         // CcRegister values are already the wire-byte encodings (pre-shifted
         // address with bit 0 cleared for MOX). Just OR the MOX bit in.
@@ -399,8 +413,19 @@ internal static class ControlFrame
                 WriteConfigPayload(cc[1..], in state);
                 break;
 
-            case CcRegister.RxFreq:
             case CcRegister.TxFreq:
+                // HL2 FPGA scan: register 0x01 is the first sweep frequency.
+                BinaryPrimitives.WriteUInt32BigEndian(
+                    cc[1..5], hl2Vna ? state.VnaStartHz : (uint)state.VfoAHz);
+                break;
+
+            case CcRegister.RxFreq:
+                // HL2 FPGA scan repurposes RX1 NCO register 0x02 as the
+                // unsigned frequency increment in Hz per returned point.
+                BinaryPrimitives.WriteUInt32BigEndian(
+                    cc[1..5], hl2Vna ? state.VnaStepHz : (uint)state.VfoAHz);
+                break;
+
             case CcRegister.RxFreq2:
             case CcRegister.RxFreq3:
             case CcRegister.RxFreq4:
@@ -422,10 +447,19 @@ internal static class ControlFrame
                 // class firmware uses C3[7] with the opposite polarity: it is
                 // the active-high T/R-relay-disable bit. The setting is
                 // configuration, not PTT: firmware gates actual RF with MOX.
-                cc[1] = state.DriveLevel;
+                cc[1] = hl2Vna ? state.VnaDriveLevel : state.DriveLevel;
                 cc[2] = 0;
                 cc[3] = 0;
                 cc[4] = 0;
+                if (hl2Vna)
+                {
+                    // Register 0x09: C2[7] enables VNA, and the full C3:C4
+                    // word becomes vna_count. Do not compose PA, ATU, Alex,
+                    // or filter bits into this payload while VNA owns it.
+                    cc[2] = 0x80;
+                    BinaryPrimitives.WriteUInt16BigEndian(cc[3..5], state.VnaPoints);
+                    break;
+                }
                 if (state.Board == HpsdrBoardKind.HermesLite2)
                 {
                     if (state.PaEnabled) cc[2] |= 0x08;
@@ -515,6 +549,9 @@ internal static class ControlFrame
 
         return 5;
     }
+
+    private static bool IsHl2Vna(in CcState state) =>
+        state.Board == HpsdrBoardKind.HermesLite2 && state.VnaEnabled;
 
     private static void WriteAttenuatorPayload(Span<byte> c14, in CcState s)
     {
@@ -744,8 +781,10 @@ internal static class ControlFrame
 
     private static void WriteConfigPayload(Span<byte> c14, in CcState s)
     {
+        bool hl2Vna = IsHl2Vna(in s);
         // C1: sample rate at [1:0], clock source (Atlas-era) at [6:4] — left 0 for Hermes+.
-        byte c1 = (byte)((byte)s.Rate & 0x03);
+        // FPGA-scanned VNA always runs one 48 ksps receiver.
+        byte c1 = hl2Vna ? (byte)0 : (byte)((byte)s.Rate & 0x03);
         c14[0] = c1;
 
         // C2: class-E PA at bit 0; OC pins (N2ADR filter board on HL2, user-
@@ -760,11 +799,16 @@ internal static class ControlFrame
         //      host-side flag — to keep extra bits (amp bypass, external tuner
         //      start) off voice / CW / digital transmissions.
         byte ocPins = 0;
-        if (s.Board == HpsdrBoardKind.HermesLite2 && s.HasN2adr)
+        if (!hl2Vna && s.Board == HpsdrBoardKind.HermesLite2 && s.HasN2adr)
         {
             ocPins |= N2adrBands.RxOcMask(s.VfoAHz);
         }
-        if (s.Mox)
+        if (hl2Vna)
+        {
+            // Never key user OC, tune, or automatic N2ADR filter outputs
+            // during a low-power VNA sweep.
+        }
+        else if (s.Mox)
         {
             ocPins |= (byte)(s.UserOcTxMask & 0x7F);
             if (s.TuneActive) ocPins |= (byte)(s.UserOcTuneMask & 0x7F);
@@ -798,7 +842,14 @@ internal static class ControlFrame
             // (DATA[10] / DATA[12]). Driving bit 4 from the operator's preamp
             // toggle (the prior behaviour) disabled the PSU clock — a latent
             // bug; HL2 RX gain is the LNA register (0x0a), not a C3 bit.
-            if (s.EnableHl2BandVolts) c3 |= 1 << 3;
+            if (hl2Vna)
+            {
+                // DATA[10] = Config C3[2]: fixed VNA RX gain,
+                // 0 = -6 dB and 1 = +6 dB. Suppress Band Volts and every
+                // normal relay/aux contribution while the sweep is active.
+                if (s.VnaFixedRxGainHigh) c3 |= 1 << 2;
+            }
+            else if (s.EnableHl2BandVolts) c3 |= 1 << 3;
         }
         else
         {
@@ -820,9 +871,12 @@ internal static class ControlFrame
         // Thetis asserts it with an aux route, and an explicit BYPASS request
         // uses RX OUT alone. The HermesC10 PS override remains the sole special
         // case and retains its historical byte 0x20 exactly.
-        c3 |= s.Board == HpsdrBoardKind.HermesC10 && s.PsEnabled && s.Mox
-            ? EncodePsBypassOrRxAntennaC3Bits(s.RxAntenna, s.Board, s.PsEnabled, s.Mox)
-            : EncodeRxAuxC3Bits(s.RxAuxInput, s.RxAntenna, s.Board);
+        if (!hl2Vna)
+        {
+            c3 |= s.Board == HpsdrBoardKind.HermesC10 && s.PsEnabled && s.Mox
+                ? EncodePsBypassOrRxAntennaC3Bits(s.RxAntenna, s.Board, s.PsEnabled, s.Mox)
+                : EncodeRxAuxC3Bits(s.RxAuxInput, s.RxAntenna, s.Board);
+        }
         c14[2] = c3;
 
         // C4: Alex TX antenna [1:0], duplex [2] = 1 (always, per
@@ -831,7 +885,7 @@ internal static class ControlFrame
         // is 0; HL2 PS armed bumps to 1 (= 2 receivers, paired DDC0/DDC1
         // layout). Capped at 7 by the 3-bit field.
         byte c4 = 1 << 2;
-        c4 |= (byte)((s.NumReceiversMinusOne & 0x07) << 3);
+        if (!hl2Vna) c4 |= (byte)((s.NumReceiversMinusOne & 0x07) << 3);
         // TX antenna relay select C4[1:0] (external-port parity audit, GAP-P1-1).
         // Thetis networkproto1.c:463-468 case 0: ANT3 → 0b10, ANT2 → 0b01, ANT1 →
         // 0b00. Only emitted on P1 boards with Alex TX relays;
@@ -839,12 +893,15 @@ internal static class ControlFrame
         // band ANT2/3 (band rows are board-agnostic) can never reroute the
         // transmitter on a relay-less board. Default Ant1 → 0 → byte-identical
         // to before this audit.
-        c4 |= EncodeTrxAntennaC4Bits(
-            s.RxAntenna,
-            s.TxAntenna,
-            s.Board,
-            s.Mox,
-            explicitRxAux: s.RxAuxInput >= 0);
+        if (!hl2Vna)
+        {
+            c4 |= EncodeTrxAntennaC4Bits(
+                s.RxAntenna,
+                s.TxAntenna,
+                s.Board,
+                s.Mox,
+                explicitRxAux: s.RxAuxInput >= 0);
+        }
         c14[3] = c4;
     }
 

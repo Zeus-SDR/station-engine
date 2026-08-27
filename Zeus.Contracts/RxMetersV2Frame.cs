@@ -82,6 +82,22 @@ namespace Zeus.Contracts;
 //              RXA chain so the same cal offset applies.
 //   SignalMaxBin — dBm, calibrated strongest FFT bin inside the active
 //              receive passband, with the analyzer's decaying peak applied.
+//   RxId     — the receiver this reading belongs to (0 = RX1/primary,
+//              1 = RX2, …). Appended after SignalMaxBin so every earlier
+//              client decodes the leading fields unchanged and simply
+//              treats an absent RxId as 0 (RX1). The multi-DDC S-meter uses
+//              this so the operator's focused receiver shows its OWN
+//              passband reading rather than always tracking RX1 (#1664).
+//
+// Type byte and mixed-version safety (#1664): the leading byte is derived
+// from RxId — RX1 (RxId 0) serialises as RxMetersV2 (0x19), every SECONDARY
+// receiver (RxId ≥ 1) serialises as RxMetersV2Secondary (0x27). This is what
+// keeps clients that predate RxId routing correct: they fold every 0x19 frame
+// into ONE global S-meter store, so putting the secondary receivers on 0x19
+// would make an unaware client's RX1 meter flip to whichever secondary was
+// broadcast last even while the operator stays on RX1. Those clients ignore
+// unknown types, so 0x27 is silently dropped and their RX1 meter is untouched.
+// Deserialize accepts either type byte; the decoded RxId is authoritative.
 //
 // Sentinel handling: a stage whose underlying WDSP path hasn't started
 // (channel just opened, IQ not yet flowing, etc.) returns ≈ −400. The
@@ -95,15 +111,21 @@ public readonly record struct RxMetersV2Frame(
     float AgcGain,
     float AgcEnvPk,
     float AgcEnvAv,
-    float SignalMaxBin = -200f)
+    float SignalMaxBin = -200f,
+    byte RxId = 0)
 {
     public const int LegacyByteLength = 1 + 4 * 7;
-    public const int ByteLength = 1 + 4 * 8;
+    public const int MaxBinByteLength = 1 + 4 * 8;
+    public const int ByteLength = 1 + 4 * 8 + 1;
 
     public void Serialize(IBufferWriter<byte> writer)
     {
         var span = writer.GetSpan(ByteLength);
-        span[0] = (byte)MsgType.RxMetersV2;
+        // Secondary receivers (RxId ≥ 1) get their own type byte so RxId-unaware
+        // clients ignore them instead of pinning their RX1 meter (#1664).
+        span[0] = RxId == 0
+            ? (byte)MsgType.RxMetersV2
+            : (byte)MsgType.RxMetersV2Secondary;
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(1, 4), SignalPk);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(5, 4), SignalAv);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(9, 4), AdcPk);
@@ -112,6 +134,7 @@ public readonly record struct RxMetersV2Frame(
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(21, 4), AgcEnvPk);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(25, 4), AgcEnvAv);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(29, 4), SignalMaxBin);
+        span[33] = RxId;
         writer.Advance(ByteLength);
     }
 
@@ -119,8 +142,9 @@ public readonly record struct RxMetersV2Frame(
     {
         if (bytes.Length < LegacyByteLength)
             throw new InvalidDataException($"RxMetersV2Frame requires at least {LegacyByteLength} bytes, got {bytes.Length}");
-        if (bytes[0] != (byte)MsgType.RxMetersV2)
-            throw new InvalidDataException($"expected RxMetersV2 (0x{(byte)MsgType.RxMetersV2:X2}), got 0x{bytes[0]:X2}");
+        if (bytes[0] != (byte)MsgType.RxMetersV2
+            && bytes[0] != (byte)MsgType.RxMetersV2Secondary)
+            throw new InvalidDataException($"expected RxMetersV2 (0x{(byte)MsgType.RxMetersV2:X2}) or RxMetersV2Secondary (0x{(byte)MsgType.RxMetersV2Secondary:X2}), got 0x{bytes[0]:X2}");
         return new RxMetersV2Frame(
             SignalPk: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(1, 4)),
             SignalAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(5, 4)),
@@ -129,8 +153,9 @@ public readonly record struct RxMetersV2Frame(
             AgcGain: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(17, 4)),
             AgcEnvPk: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(21, 4)),
             AgcEnvAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(25, 4)),
-            SignalMaxBin: bytes.Length >= ByteLength
+            SignalMaxBin: bytes.Length >= MaxBinByteLength
                 ? BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(29, 4))
-                : -200f);
+                : -200f,
+            RxId: bytes.Length >= ByteLength ? bytes[33] : (byte)0);
     }
 }

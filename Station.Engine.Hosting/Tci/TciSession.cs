@@ -959,13 +959,7 @@ public sealed class TciSession : IDisposable
         TransverterSettingsDto? transverterSettings = null)
     {
         var settings = transverterSettings ?? new TransverterSettingsDto();
-        bool covered = settings.Enabled
-            ? rfHz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
-                || (settings.Bands is null
-                    ? TransverterFrequencyConverter.TryToIfHz(rfHz, settings, out _)
-                    : TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out _))
-            : radio.IsExternalFrequencyAvailable(rfHz);
-        if (!covered)
+        if (!IsCoveredFrequency(radio, rfHz, settings))
         {
             return;
         }
@@ -1017,11 +1011,22 @@ public sealed class TciSession : IDisposable
         }
         else if (args.Length >= 2 && TciProtocol.TryParseLong(args[1], out long hz))
         {
-            // Set DDS (same as channel-A VFO). External source — see HandleVfo.
             if (hz <= 0) return;
-            SetVfoChannel(_radio, rx, 0, hz, CurrentTransverterSettings);
+            if (!IsCoveredFrequency(_radio, hz, CurrentTransverterSettings)) return;
+            _radio.SetReceiverDds(rx, hz);
         }
     }
+
+    private static bool IsCoveredFrequency(
+        RadioService radio,
+        long rfHz,
+        TransverterSettingsDto settings)
+        => settings.Enabled
+            ? rfHz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                || (settings.Bands is null
+                    ? TransverterFrequencyConverter.TryToIfHz(rfHz, settings, out _)
+                    : TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out _))
+            : radio.IsExternalFrequencyAvailable(rfHz);
 
     private void HandleIf(string[] args)
     {
@@ -1097,6 +1102,8 @@ public sealed class TciSession : IDisposable
 
     internal static long EffectiveReceiverLoHz(StateDto state, int receiver)
     {
+        if (receiver == 0 && state.RadioLoHz > 0)
+            return state.RadioLoHz;
         var rx = ReceiverState(state, receiver);
         return CwOffset.EffectiveLoHz(rx.Mode, rx.VfoHz);
     }

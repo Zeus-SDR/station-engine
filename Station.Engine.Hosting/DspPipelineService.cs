@@ -2749,12 +2749,32 @@ public class DspPipelineService : BackgroundService,
     private long WidebandViewportTargetCenterHz(StateDto state)
     {
         long configured = Interlocked.Read(ref _widebandTargetCenterHz);
-        var centerHz = configured != long.MinValue
-            ? configured
-            : state.RadioLoHz > 0
+        long rfFallbackHz = state.RadioLoHz > 0
             ? state.RadioLoHz
             : CwOffset.EffectiveLoHz(state);
-        return Math.Clamp(centerHz, 0L, (long)WidebandSpectrumAnalyzer.DisplaySpanHz);
+        return ResolveWidebandViewportCenterHz(
+            configured, rfFallbackHz, _radio.ToHardwareFrequencyHz);
+    }
+
+    // The raw wideband display spectrum is the hardware 0–60 MHz IF span, and
+    // this centre is fed straight to the detail DDC's NCO (SetDisplayDdc /
+    // SetVfoHz) — a hardware frequency. A configured pan target is already in
+    // that hardware IF domain (ApplyWidebandZoomRequest clamps it to 0–60 MHz)
+    // and is only re-clamped, but the tuned-LO fallback (RadioLoHz / CW LO) is
+    // external RF. With a transverter active that RF LO sits far outside
+    // 0–60 MHz (e.g. 144 MHz on 2 m), so translate it to the hardware IF where
+    // the transverter injects the signal (e.g. 28 MHz) before clamping —
+    // otherwise it pins to the 60 MHz display ceiling and both the panadapter
+    // scale and the detail DDC land on an empty band edge instead of the
+    // transverter passband (issue #1486). Pure/injected converter so the
+    // domain translation can be unit-tested without a live pipeline.
+    internal static long ResolveWidebandViewportCenterHz(
+        long configuredCenterHz, long rfFallbackHz, Func<long, long> toHardwareHz)
+    {
+        long hardwareCenterHz = configuredCenterHz != long.MinValue
+            ? configuredCenterHz
+            : toHardwareHz(rfFallbackHz);
+        return Math.Clamp(hardwareCenterHz, 0L, (long)WidebandSpectrumAnalyzer.DisplaySpanHz);
     }
 
     private async Task RunWidebandDisplayAnalyzerAsync(CancellationToken ct)
@@ -3064,6 +3084,12 @@ public class DspPipelineService : BackgroundService,
             _audioSinks[i].Publish(in frame);
     }
 
+    private void PublishCwSidetoneAudio(in AudioFrame frame)
+    {
+        for (int i = 0; i < _audioSinks.Length; i++)
+            _audioSinks[i].PublishCwSidetone(in frame);
+    }
+
     // Fan out a mute-EXEMPT frame (local monitor audio the operator explicitly
     // asked to hear, such as Recorder playback or TX Monitor preview).
     // Only NativeAudioSink honours it; every other sink inherits the interface's
@@ -3099,6 +3125,18 @@ public class DspPipelineService : BackgroundService,
         var span = audioBuf.AsSpan(0, count);
         span.Clear();
         bool sidetoneWrote = _sidetone?.RenderInto(span) ?? false;
+        if (sidetoneWrote)
+        {
+            var sidetoneFrame = new AudioFrame(
+                Seq: _audioSeq + 1,
+                TsUnixMs: nowMs,
+                RxId: 0,
+                Channels: 1,
+                SampleRateHz: (uint)AudioOutputRateHz,
+                SampleCount: (ushort)count,
+                Samples: new ReadOnlyMemory<float>(audioBuf, 0, count));
+            PublishCwSidetoneAudio(in sidetoneFrame);
+        }
         if (externalRxCount > 0)
             for (int i = 0; i < externalRxCount; i++) span[i] += externalRx[i];
         if (sidetoneWrote || externalRxCount > 0)
@@ -9848,6 +9886,35 @@ public class DspPipelineService : BackgroundService,
             }
             _hub.Broadcast(v2);
             RxMetersV2Updated?.Invoke(channel, v2);
+
+            // Per-receiver S-meter (#1664). Everything above reads only the
+            // primary WDSP channel, so the UI S-meter always tracked RX1 no
+            // matter which receiver the operator had focused and tuned.
+            // Broadcast a receiver-tagged RxMetersV2 for every live secondary
+            // receiver (RxId = receiver index; RX1 is RxId 0, carried above) so
+            // the frontend can render the focused receiver's own passband
+            // reading. Only the tagged v2 frame is emitted here — the legacy
+            // 0x14 frame, Auto-AGC servo, passband SNR, and the live-diagnostics
+            // snapshot stay bound to RX1.
+            for (int ri = 1; ri < MaxReceivers; ri++)
+            {
+                if (!SecondaryReceiverEnabled(ri, state)) continue;
+                int secChan = Volatile.Read(ref _secondaryRx[ri].ChannelId);
+                if (secChan < 0) continue;
+                var (_, secVfoHz, _, _, _) = SecondaryRxParams(state, ri);
+                double secBaseCalOffsetDb = RadioCalibrations.RxMeterOffsetDb(
+                    _radio.EffectiveBoardKind,
+                    _radio.EffectiveOrionMkIIVariant)
+                    + _radio.TransverterMeterCorrectionDb(secVfoHz)
+                    + RxAttenuatorMeterOffsetDb(state, ReceiverAdcSource(state, ri));
+                double secCalOffsetDb = AddOperatorSMeterOffset(
+                    secBaseCalOffsetDb,
+                    operatorSMeterOffsetDb);
+                var secRx = engine.GetRxStageMeters(secChan);
+                var secV2 = BuildRxMetersV2(secRx, secCalOffsetDb) with { RxId = (byte)ri };
+                _hub.Broadcast(secV2);
+                RxMetersV2Updated?.Invoke(secChan, secV2);
+            }
 
             // Passband SNR uses WDSP's independent average-power PSD
             // output. Never substitute the visual waterfall floor: its peak

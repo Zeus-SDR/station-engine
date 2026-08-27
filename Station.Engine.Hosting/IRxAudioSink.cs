@@ -23,6 +23,16 @@ public interface IRxAudioSink
     void Publish(in AudioFrame frame);
 
     /// <summary>
+    /// Publish a CW sidetone-only frame. The default is a no-op because the
+    /// ordinary audio frame still carries the sidetone to host outputs. Radio
+    /// speaker sinks may override this lane when they must distinguish local
+    /// sidetone from RX, TX-monitor, or external mixed audio while keyed.
+    /// Runs on the DSP tick thread under the same cost model as
+    /// <see cref="Publish"/>.
+    /// </summary>
+    void PublishCwSidetone(in AudioFrame frame) { }
+
+    /// <summary>
     /// Publish a frame that is EXEMPT from the operator's RX master mute
     /// (<see cref="RxAudioMuteState"/>). Used only for local monitor audio the
     /// operator explicitly asked to hear — Recorder playback and TX Monitor

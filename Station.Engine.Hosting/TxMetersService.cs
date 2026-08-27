@@ -73,6 +73,9 @@ public sealed class TxMetersService : BackgroundService
     /// Arguments: (fwdWatts, refWatts, swr, alcPk, alcGr)
     /// </summary>
     public event Action<float, float, float, float, float>? TxMetersUpdated;
+    /// <summary>Unsmoothened calibrated-bridge ADC pair for bounded analyzer
+    /// capture. Handlers run on the radio RX thread and must not block.</summary>
+    public event Action<ushort, ushort>? RawPowerTelemetryUpdated;
 
     // Wire FWD ≤ 2 W as a floor for SWR; below the bridge noise dominates
     // and the ratio is meaningless (Thetis does the same in console.cs:25974).
@@ -147,6 +150,10 @@ public sealed class TxMetersService : BackgroundService
     private bool _seenPaTempSample;
     private DateTimeOffset? _paTempUpdatedUtc;
     private bool _seenSample;
+    private ushort _latestRawFwd;
+    private ushort _latestRawRef;
+    private bool _seenRawFwd;
+    private bool _seenRawRef;
     // Last time a PaTempFrame was broadcast, so the 10 Hz MOX loop can
     // throttle itself down to the 2 Hz PA cadence without a separate timer.
     private DateTime _lastPaTempBroadcastAtUtc = DateTime.MinValue;
@@ -216,6 +223,8 @@ public sealed class TxMetersService : BackgroundService
         switch (reading.C0Address & C0AddrMask)
         {
             case C0AddrAlexFwd:
+                _latestRawFwd = reading.Ain1;
+                _seenRawFwd = true;
                 ApplySmoothed(ref _fwdAdc, reading.Ain1);
                 TrackPeak(ref _fwdAdcPeak, reading.Ain1);
                 // Ain0 on this slot is the HL2 Q6 temperature ADC. Smooth
@@ -231,6 +240,8 @@ public sealed class TxMetersService : BackgroundService
                 }
                 break;
             case C0AddrAlexRef:
+                _latestRawRef = reading.Ain0;
+                _seenRawRef = true;
                 ApplySmoothed(ref _refAdc, reading.Ain0);
                 TrackPeak(ref _refAdcPeak, reading.Ain0);
                 lock (_sync)
@@ -244,6 +255,14 @@ public sealed class TxMetersService : BackgroundService
                 // FWD/REF meter pair. Silently ignored — protection/alerts
                 // are a later slice.
                 break;
+        }
+        if (_seenRawFwd && _seenRawRef)
+        {
+            ushort fwd = _latestRawFwd;
+            ushort reverse = _latestRawRef;
+            _seenRawFwd = false;
+            _seenRawRef = false;
+            RawPowerTelemetryUpdated?.Invoke(fwd, reverse);
         }
     }
 
@@ -263,6 +282,7 @@ public sealed class TxMetersService : BackgroundService
             _diagLastFwdAin1 = fwdAdc;
             _diagLastRefAin0 = refAdc;
         }
+        RawPowerTelemetryUpdated?.Invoke(fwdAdc, refAdc);
     }
 
     // Hold the highest raw ADC seen since the last publish-tick reset. Called
@@ -525,6 +545,9 @@ public sealed class TxMetersService : BackgroundService
 
                     bool isTun = _tx.IsTunOn;
                     DateTime keyedAt = (isTun ? _tx.TunStartedAt : _tx.MoxStartedAt) ?? DateTime.UtcNow;
+                    // Tune drive gates the low-power TUN SWR bypass; irrelevant
+                    // to MOX so only read it while tuning.
+                    int tuneDrivePct = isTun ? _radio.Snapshot().TunePct : 100;
                     // P3 display-only (2026-07): under Protocol 3 the FWD/REF ADCs
                     // feeding this meter arrive from the sidecar board-health
                     // telemetry (Protocol3SidecarFrameForwarder), whose raw scale
@@ -536,7 +559,7 @@ public sealed class TxMetersService : BackgroundService
                     // P3. Re-enable this trip once the P3 raw→watts calibration is
                     // confirmed against a known load.
                     if (!_radio.IsProtocol3Active
-                        && EvaluateSwrTrip(swr, DateTime.UtcNow, isTun, keyedAt) is { } tripReason)
+                        && EvaluateSwrTrip(swr, DateTime.UtcNow, isTun, keyedAt, fwdW, tuneDrivePct) is { } tripReason)
                     {
                         // TryTripForAlert is idempotent — a second caller on the
                         // same tick (e.g. timeout firing concurrently) finds MOX
@@ -676,7 +699,17 @@ public sealed class TxMetersService : BackgroundService
     /// passes <see cref="DateTime.UtcNow"/>. Firing resets the timer so the
     /// caller gets exactly one trip per sustained excursion.
     /// </summary>
-    internal string? EvaluateSwrTrip(double swr, DateTime now, bool isTun, DateTime keyedAt)
+    // fwdWatts/tuneDrivePercent feed the low-power TUN SWR bypass in
+    // EngineTransmitSafetyModule. They default to fail-safe "high power"
+    // sentinels so a caller that omits them never accidentally suppresses
+    // protection; the live meter loop always supplies the measured values.
+    internal string? EvaluateSwrTrip(
+        double swr,
+        DateTime now,
+        bool isTun,
+        DateTime keyedAt,
+        double fwdWatts = double.MaxValue,
+        int tuneDrivePercent = 100)
     {
         var decision = _tx.Safety.ObserveProtection(new ProtectionSample(
             ProtectionEvidenceState.Available,
@@ -684,7 +717,9 @@ public sealed class TxMetersService : BackgroundService
             now,
             isTun ? TransmitIntent.Tun : TransmitIntent.Mox,
             keyedAt,
-            TimeoutSeconds: 0));
+            TimeoutSeconds: 0,
+            FwdWatts: fwdWatts,
+            TuneDrivePercent: tuneDrivePercent));
         return decision.Trip ? decision.OperatorText : null;
     }
 
@@ -825,6 +860,10 @@ public sealed class TxMetersService : BackgroundService
             _seenPaTempSample = false;
             _paTempUpdatedUtc = null;
             _seenSample = false;
+            _latestRawFwd = 0;
+            _latestRawRef = 0;
+            _seenRawFwd = false;
+            _seenRawRef = false;
             _diagFwdSlotCount = 0;
             _diagRefSlotCount = 0;
             _diagPaTempSlotCount = 0;
@@ -883,6 +922,10 @@ public sealed class TxMetersService : BackgroundService
             _seenPaTempSample = false;
             _paTempUpdatedUtc = null;
             _seenSample = false;
+            _latestRawFwd = 0;
+            _latestRawRef = 0;
+            _seenRawFwd = false;
+            _seenRawRef = false;
             _diagFwdSlotCount = 0;
             _diagRefSlotCount = 0;
             _diagLastFwdAin1 = 0;

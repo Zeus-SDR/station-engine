@@ -13,7 +13,27 @@ namespace Zeus.Server;
 public interface IWindowsFirewallService
 {
     WindowsFirewallStatus GetStatus();
+
+    /// <summary>
+    /// Same as <see cref="GetStatus"/> but additionally probes for the rule so the
+    /// caller can tell "no rule" from "rule present" from "rule points somewhere
+    /// else". The probe is a read-only <c>netsh show rule</c>, so it needs no
+    /// elevation and raises no UAC prompt.
+    /// </summary>
+    Task<WindowsFirewallStatus> GetStatusAsync(CancellationToken ct = default);
+
     Task<WindowsFirewallApplyResult> ApplyAllowRuleAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// As <see cref="ApplyAllowRuleAsync(CancellationToken)"/>, but when
+    /// <paramref name="allowElevation"/> is false the non-elevated
+    /// <c>netsh add</c> is the last thing tried — no <c>runas</c>, so no UAC
+    /// prompt can appear. The startup grant uses this to exhaust every silent
+    /// option before it considers interrupting the operator.
+    /// </summary>
+    Task<WindowsFirewallApplyResult> ApplyAllowRuleAsync(
+        bool allowElevation,
+        CancellationToken ct = default);
 }
 
 public sealed record WindowsFirewallStatus(
@@ -21,7 +41,13 @@ public sealed record WindowsFirewallStatus(
     bool CanApply,
     string RuleName,
     string? ProgramPath,
-    string Message);
+    string Message,
+    // null = not probed (non-Windows, or the synchronous GetStatus overload).
+    bool? RulePresent = null,
+    // Only meaningful when RulePresent is true. False means a rule with our name
+    // exists but allows a different executable -- the usual aftermath of
+    // reinstalling into a different folder, and it allows nothing.
+    bool? RuleMatchesProgram = null);
 
 public sealed record WindowsFirewallApplyResult(
     bool Supported,
@@ -98,7 +124,57 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
             Message: "Ready to add the Zeus inbound allow rule.");
     }
 
-    public async Task<WindowsFirewallApplyResult> ApplyAllowRuleAsync(CancellationToken ct = default)
+    public async Task<WindowsFirewallStatus> GetStatusAsync(CancellationToken ct = default)
+    {
+        var status = GetStatus();
+        if (!status.Supported || string.IsNullOrWhiteSpace(status.ProgramPath))
+            return status;
+
+        FirewallRuleProbe probe;
+        try
+        {
+            probe = await _runner.ProbeAsync(RuleName, status.ProgramPath, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A probe failure must not degrade into "no rule" -- that would nag an
+            // operator who is already protected. Leave the flags null (unknown).
+            _log.LogDebug(ex, "windows.firewall.probe failed path={ProgramPath}", status.ProgramPath);
+            return status;
+        }
+
+        var message = status.Message;
+        if (probe.Exists && probe.MatchesProgram)
+        {
+            message = "Zeus is allowed through Windows Firewall.";
+        }
+        else if (probe.Exists)
+        {
+            // Rule present but pointing elsewhere. Silent and total: it allows
+            // nothing, and the operator has no way to notice without being told.
+            message = "A firewall rule with this name exists but allows a different "
+                    + "copy of Zeus. Apply the rule to repoint it at this one.";
+        }
+        else
+        {
+            message = "Zeus is not allowed through Windows Firewall. Without this rule "
+                    + "the radio will most likely not be found.";
+        }
+
+        return status with
+        {
+            Message = message,
+            RulePresent = probe.Exists,
+            RuleMatchesProgram = probe.Exists ? probe.MatchesProgram : null,
+        };
+    }
+
+    public Task<WindowsFirewallApplyResult> ApplyAllowRuleAsync(CancellationToken ct = default) =>
+        ApplyAllowRuleAsync(allowElevation: true, ct);
+
+    public async Task<WindowsFirewallApplyResult> ApplyAllowRuleAsync(
+        bool allowElevation,
+        CancellationToken ct = default)
     {
         var status = GetStatus();
         if (!status.Supported || !status.CanApply || string.IsNullOrWhiteSpace(status.ProgramPath))
@@ -145,6 +221,23 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 RuleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows Firewall rule applied.");
+        }
+
+        if (!allowElevation)
+        {
+            // Caller asked for silent-only. Report the failure without prompting so
+            // it can try a non-interactive path (the elevated helper task) first.
+            _log.LogInformation(
+                "windows.firewall.rule direct apply failed exit={ExitCode}; elevation not permitted by caller",
+                direct.ExitCode);
+            return new(
+                Supported: true,
+                Applied: false,
+                ElevationAttempted: false,
+                ElevationCanceled: false,
+                RuleName,
+                ProgramPath: status.ProgramPath,
+                Message: "Windows Firewall rule needs administrator approval.");
         }
 
         _log.LogInformation(

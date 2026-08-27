@@ -23,8 +23,10 @@ public static class WindowsFirewallEndpoints
         // scoped to the running Zeus executable. POST is local-only so a LAN
         // browser cannot trigger a UAC prompt on the host machine.
         endpoints.MapGet("/api/system/windows-firewall",
-            (HttpContext ctx, IWindowsFirewallService firewall) =>
-                Results.Ok(FirewallStatusDto(firewall.GetStatus(), LocalRequestGuard.IsLocalRequest(ctx))));
+            async (HttpContext ctx, IWindowsFirewallService firewall, CancellationToken ct) =>
+                Results.Ok(FirewallStatusDto(
+                    await firewall.GetStatusAsync(ct),
+                    LocalRequestGuard.IsLocalRequest(ctx))));
 
         endpoints.MapPost("/api/system/windows-firewall/allow",
             async (HttpContext ctx, IWindowsFirewallService firewall, CancellationToken ct) =>
@@ -61,6 +63,8 @@ public static class WindowsFirewallEndpoints
         LocalRequest = localRequest,
         status.RuleName,
         status.ProgramPath,
+        status.RulePresent,
+        status.RuleMatchesProgram,
         Message = localRequest
             ? status.Message
             : "Open Settings on the Windows machine running Zeus to change Windows Firewall.",
