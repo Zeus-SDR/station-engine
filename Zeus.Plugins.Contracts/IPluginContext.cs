@@ -95,9 +95,52 @@ public interface IRadioStateReader
     string Band { get; }
     bool Mox { get; }
 
+    /// <summary>Transmit drive, 0..100. Default keeps existing hosts and test
+    /// doubles source-compatible.</summary>
+    int DrivePercent => 0;
+
+    /// <summary>Microphone gain in dB.</summary>
+    double MicGainDb => 0;
+
+    /// <summary>Live transmit telemetry, or null when the host publishes none.
+    /// Default returns null so existing hosts need no change.</summary>
+    ITxTelemetry? Telemetry => null;
+
     event Action<long> FrequencyChanged;
     event Action<string> ModeChanged;
     event Action<bool> MoxChanged;
+}
+
+/// <summary>
+/// One tick of transmit telemetry.
+/// <para>
+/// <see cref="WirePeak"/> is the load-bearing field: it is the peak sample
+/// actually handed to the radio, so zero while keyed means nothing is going
+/// out. PA current, temperature, FIFO depth and packet rate all read healthy
+/// in that case, which is what makes the failure hard to see.
+/// </para>
+/// </summary>
+/// <param name="SignalDbm">Receive signal strength.</param>
+/// <param name="MicPeakDbfs">Microphone input peak; negative infinity when silent.</param>
+/// <param name="WirePeak">Peak transmit sample, 0..32767.</param>
+/// <param name="ForwardWatts">Forward power, where the hardware can measure it.</param>
+/// <param name="ReflectedWatts">Reflected power, where the hardware can measure it.</param>
+/// <param name="PaTempC">Power amplifier temperature in degrees Celsius.</param>
+public readonly record struct TxFrame(
+    double SignalDbm,
+    double MicPeakDbfs,
+    int WirePeak,
+    double ForwardWatts,
+    double ReflectedWatts,
+    double PaTempC);
+
+/// <summary>
+/// Push feed of transmit telemetry, reached through
+/// <see cref="IRadioStateReader.Telemetry"/>. Granted by ReadRadioState.
+/// </summary>
+public interface ITxTelemetry
+{
+    event Action<TxFrame> Updated;
 }
 
 /// <summary>Mutating radio controller. Granted by ControlRadio.</summary>
@@ -106,4 +149,35 @@ public interface IRadioController
     Task SetFrequencyAsync(long hz, CancellationToken ct = default);
     Task SetModeAsync(string mode, CancellationToken ct = default);
     Task SetMoxAsync(bool keyed, CancellationToken ct = default);
+
+    // Transmit path. Every member below defaults to a no-op so a host that
+    // does not implement it stays source-compatible on ABI 1.
+
+    /// <summary>Key the tune carrier, independent of the audio chain.</summary>
+    Task SetTuneAsync(bool on, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Transmit drive, 0..100.</summary>
+    Task SetDrivePercentAsync(int percent, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Ceiling on drive, 1..100. Protects the PA and anything after it.</summary>
+    Task SetDriveMaxPercentAsync(int percent, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Microphone gain in dB.</summary>
+    Task SetMicGainDbAsync(double db, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Leveler maximum gain in dB.</summary>
+    Task SetLevelerMaxGainDbAsync(double db, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Where transmit audio comes from, e.g. host or radio microphone.</summary>
+    Task SetTxAudioSourceAsync(string source, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    /// <summary>Transmit filter edges in Hz.</summary>
+    Task SetTxFilterAsync(int lowHz, int highHz, CancellationToken ct = default)
+        => Task.CompletedTask;
 }
