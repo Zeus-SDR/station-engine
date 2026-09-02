@@ -6,9 +6,10 @@ namespace Zeus.Plugins.Contracts;
 
 /// <summary>
 /// What the host gives a plugin during <see cref="IZeusPlugin.InitializeAsync"/>.
-/// Capability-gated: <see cref="RadioController"/> et al. are null unless
-/// the manifest declared the matching <see cref="PluginCapabilities"/> AND
-/// the user granted it.
+/// Capability-routed: <see cref="RadioController"/> et al. are null unless
+/// the manifest declared the matching <see cref="PluginCapabilities"/> and
+/// the host provides the service. ABI 1 automatically grants every declared
+/// capability; declarations are not a security sandbox or consent prompt.
 /// </summary>
 public interface IPluginContext
 {
@@ -35,7 +36,7 @@ public interface IPluginContext
     /// </summary>
     string HostDataDirectory => string.Empty;
 
-    /// <summary>Capabilities actually granted (intersect of manifest + user choice).</summary>
+    /// <summary>Capabilities declared by the manifest and available to this plugin.</summary>
     PluginCapabilities GrantedCapabilities { get; }
 
     /// <summary>Scoped key/value settings store (LiteDB-backed, isolated per plugin).</summary>
@@ -43,13 +44,13 @@ public interface IPluginContext
 
     /// <summary>
     /// Read-only radio state stream. Null if
-    /// <see cref="PluginCapabilities.ReadRadioState"/> was not granted.
+    /// <see cref="PluginCapabilities.ReadRadioState"/> was not declared or is unavailable.
     /// </summary>
     IRadioStateReader? Radio { get; }
 
     /// <summary>
     /// Mutating radio controller. Null if
-    /// <see cref="PluginCapabilities.ControlRadio"/> was not granted.
+    /// <see cref="PluginCapabilities.ControlRadio"/> was not declared or is unavailable.
     /// </summary>
     IRadioController? RadioController { get; }
 
@@ -66,7 +67,7 @@ public interface IPluginContext
     /// <summary>
     /// Host-mediated QRZ callsign lookup, reusing the operator's stored QRZ
     /// credentials + session + rate-limit gate. Null unless
-    /// <see cref="PluginCapabilities.NetworkAccess"/> was granted and the host
+    /// <see cref="PluginCapabilities.NetworkAccess"/> was declared and the host
     /// has QRZ configured. Default implementation returns null so existing
     /// hosts / test doubles need no change.
     /// </summary>

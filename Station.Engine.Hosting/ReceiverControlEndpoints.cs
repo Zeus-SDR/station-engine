@@ -47,6 +47,8 @@ public static class ReceiverControlEndpoints
                     req.FilterLowHz,
                     req.FilterHighHz,
                     radio.Snapshot().CtunEnabled);
+                if (req.AfGainDb.HasValue)
+                    external.SetAfGainDb(req.AfGainDb.Value);
                 return Results.Ok(radio.Snapshot());
             }
 

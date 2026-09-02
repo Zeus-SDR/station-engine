@@ -5,7 +5,7 @@ namespace Zeus.Plugins.Contracts.Registry;
 
 /// <summary>
 /// Top-level <c>registry.json</c> served by the plugin registry repo
-/// (default <c>Zeus-SDR/openhpsdr-zeus-plugins</c>).
+/// (default <c>Zeus-SDR/zeus-community-features</c>).
 /// </summary>
 public sealed record RegistryCatalog
 {
@@ -44,6 +44,13 @@ public sealed record PluginEntry
 
     [JsonPropertyName("verified")]
     public bool Verified { get; init; }
+
+    /// <summary>
+    /// Catalog lane used by the Features UI. Entries that predate this field
+    /// are official so existing registries remain backward compatible.
+    /// </summary>
+    [JsonPropertyName("channel")]
+    public string Channel { get; init; } = "official";
 
     [JsonPropertyName("subscription")]
     public PluginSubscription? Subscription { get; init; }

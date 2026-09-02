@@ -22,6 +22,7 @@ public sealed class VnaService
 {
     private const int MinimumPoints = 3;
     private readonly IVnaSweepHardware _hardware;
+    private readonly VnaHardwareRouter _router;
     private readonly VnaSweepStore _store;
     private readonly RadioService _radio;
     private readonly ILogger<VnaService> _log;
@@ -32,17 +33,27 @@ public sealed class VnaService
 
     public VnaService(
         IVnaSweepHardware hardware,
+        VnaHardwareRouter router,
         VnaSweepStore store,
         RadioService radio,
         ILogger<VnaService> log)
     {
         _hardware = hardware;
+        _router = router;
         _store = store;
         _radio = radio;
         _log = log;
     }
 
     public VnaCapabilityDto Capability() => _hardware.Capability;
+    public VnaSourceStatusDto SourceStatus() => _router.SourceStatus();
+    public Task<VnaSourceStatusDto> SelectSourceAsync(
+        VnaSourceSelectionRequest request, CancellationToken cancellationToken)
+    {
+        if (Status().Running)
+            throw new InvalidOperationException("Cancel the active sweep before changing measurement source.");
+        return _router.SelectAsync(request.Source, request.DeviceId, cancellationToken);
+    }
     public VnaStatusDto Status() { lock (_sync) return _status; }
     public IReadOnlyList<VnaSweepDto> Sweeps() => _store.GetSweeps();
     public IReadOnlyList<VnaCalibrationDto> Calibrations() => _store.GetCalibrations();
@@ -69,14 +80,14 @@ public sealed class VnaService
                 progress, linked.Token).ConfigureAwait(false);
             IReadOnlyList<VnaComplexSample> raw = capture.Samples;
             if (raw.Count != request.Points)
-                throw new InvalidOperationException($"Radio returned {raw.Count} VNA points; expected {request.Points}.");
+                throw new InvalidOperationException($"Analyzer returned {raw.Count} VNA points; expected {request.Points}.");
 
             var (points, calibrated) = BuildPoints(raw, request.Kind, request.CalibrationId,
                 capture.ReflectionCalibrated, capture.Vector);
             string label = string.IsNullOrWhiteSpace(request.Label)
                 ? $"{request.Band} {request.Antenna} {DateTimeOffset.Now:g}"
                 : request.Label.Trim();
-            string board = _radio.ConnectedBoardKind.ToString();
+            string board = _hardware.Capability.Board;
             string radioKey = RadioKey();
             var result = new VnaSweepDto(
                 Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow, radioKey, board,
@@ -119,7 +130,7 @@ public sealed class VnaService
                 new Progress<int>(UpdateProgress), linked.Token).ConfigureAwait(false);
             IReadOnlyList<VnaComplexSample> raw = capture.Samples;
             if (raw.Count != request.Points)
-                throw new InvalidOperationException($"Radio returned {raw.Count} calibration points; expected {request.Points}.");
+                throw new InvalidOperationException($"Analyzer returned {raw.Count} calibration points; expected {request.Points}.");
 
             string id = string.IsNullOrWhiteSpace(request.CalibrationId)
                 ? Guid.NewGuid().ToString("N")
@@ -205,6 +216,9 @@ public sealed class VnaService
 
     private string RadioKey()
     {
+        VnaCapabilityDto capability = _hardware.Capability;
+        if (string.Equals(capability.Source, "nanovna", StringComparison.OrdinalIgnoreCase))
+            return $"nanovna:{capability.Board}";
         StateDto state = _radio.Snapshot();
         return $"p1:{_radio.ConnectedBoardKind}:{state.Endpoint ?? "unknown"}";
     }

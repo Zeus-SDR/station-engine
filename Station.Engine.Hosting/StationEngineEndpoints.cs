@@ -179,6 +179,7 @@ public static class StationEngineEndpoints
         // it 404'd against a standalone engine in attach mode.
         endpoints.MapWindowsFirewallEndpoints();
         endpoints.MapStationEngineCapabilitiesEndpoint();
+        endpoints.MapGodsEyeEndpoints();
         endpoints.MapNativeAudioEndpoints();
         endpoints.MapRadioStateEndpoint();
         endpoints.MapRadioConnectionEndpoints();
@@ -197,6 +198,7 @@ public static class StationEngineEndpoints
         endpoints.MapReceiverGainProtectionEndpoints();
         endpoints.MapTxControlEndpoints();
         endpoints.MapTxTimingAndTestEndpoints();
+        endpoints.MapTxDiagnosticsEndpoint();
         endpoints.MapPureSignalEndpoints();
         endpoints.MapTxMonitorEndpoint();
         endpoints.MapReceiverDspEndpoints();

@@ -70,7 +70,7 @@ public static class TxTimingAndTestEndpoints
             return Results.Ok(snapshot);
         });
 
-        endpoints.MapPost("/api/tx/qrm/text", (SignalJammerTextRequest req, SignalJammerTxSource qrm) =>
+        endpoints.MapPost("/api/tx/qrm/text", (SignalJammerTextRequest req, SignalJammerTxSource qrm, HttpContext context) =>
         {
             if (req is null || string.IsNullOrWhiteSpace(req.SamplesBase64))
                 return Results.BadRequest(new { error = "samplesBase64 required" });
@@ -79,7 +79,14 @@ public static class TxTimingAndTestEndpoints
 
             try
             {
-                var snapshot = qrm.EnqueueText(samples, req.SampleRate, req.AutoTransmit);
+                var remoteLeaseId = RemoteTxLease.TryGet(context, out var leaseId)
+                    ? leaseId
+                    : null;
+                var snapshot = qrm.EnqueueText(
+                    samples,
+                    req.SampleRate,
+                    req.AutoTransmit,
+                    remoteLeaseId);
                 log.LogInformation(
                     "api.tx.qrm.text samples={Samples} rate={Rate} autoTx={AutoTx} queued={Queued}",
                     samples.Length, req.SampleRate, req.AutoTransmit, snapshot.TextQueued);
@@ -101,17 +108,28 @@ public static class TxTimingAndTestEndpoints
 
         // TX timeout (issue #1270). Maximum single-transmission length that
         // TxMetersService allows before it trips MOX/TUN to protect the PA.
-        // 0 disables the guard entirely; any other value is clamped to
-        // [30, 600] s, so the echoed value may differ from the request. A
-        // pre-warning AlertKind.TxTimeoutWarning is emitted ~30 s before the
-        // trip fires so the operator gets a heads-up rather than a silent drop.
+        // 0 disables the guard entirely only when the request explicitly
+        // acknowledges that a disconnect during transmission may leave the
+        // radio keyed. Any other value must be in [30, 600] s. A pre-warning
+        // AlertKind.TxTimeoutWarning is emitted ~30 s before the trip fires so
+        // the operator gets a heads-up rather than a silent drop.
         endpoints.MapPost("/api/tx/timeout", (TxTimeoutSetRequest req, RadioService r) =>
         {
-            log.LogInformation("api.tx.timeout seconds={S}", req.Seconds);
+            log.LogInformation(
+                "api.tx.timeout seconds={S} disconnectRiskAcknowledged={Acknowledged}",
+                req.Seconds,
+                req.AcknowledgeDisconnectRisk);
             if (req.Seconds != 0 && (req.Seconds < RadioService.MinTxTimeoutSec || req.Seconds > RadioService.MaxTxTimeoutSec))
                 return Results.BadRequest(new { error = $"seconds must be 0 (disabled) or {RadioService.MinTxTimeoutSec}..{RadioService.MaxTxTimeoutSec}" });
-            var state = r.SetTxTimeoutSec(req.Seconds);
-            return Results.Ok(new { txTimeoutSec = state.TxTimeoutSec });
+            try
+            {
+                var state = r.SetTxTimeoutSec(req.Seconds, req.AcknowledgeDisconnectRisk);
+                return Results.Ok(new { txTimeoutSec = state.TxTimeoutSec });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         // TUN drive %. Symmetric with /api/tx/drive; the same PA-gain math applies,
@@ -129,7 +147,7 @@ public static class TxTimingAndTestEndpoints
 
         // Two-tone test generator (TXA PostGen mode=1). Protocol-agnostic — works
         // on both P1 and P2 because it only touches WDSP TXA, not the wire format.
-        endpoints.MapPost("/api/tx/twotone", (TwoToneSetRequest req, RadioService r, TxService tx) =>
+        endpoints.MapPost("/api/tx/twotone", (TwoToneSetRequest req, RadioService r, TxService tx, HttpContext context) =>
         {
             log.LogInformation(
                 "api.tx.twotone enabled={On} f1={F1} f2={F2} mag={Mag}",
@@ -144,7 +162,10 @@ public static class TxTimingAndTestEndpoints
             // the MOX side-effect — Thetis parity, setup.cs:11162-11165. Returns the
             // post-mutate snapshot via Snapshot(); on a connect-interlock failure
             // the request is rejected with 400.
-            if (!tx.TrySetTwoTone(req, out var err))
+            var ok = RemoteTxLease.TryGet(context, out var leaseId)
+                ? tx.TrySetRemoteTwoTone(req, leaseId, out var err)
+                : tx.TrySetTwoTone(req, out err);
+            if (!ok)
                 return Results.BadRequest(new { error = err });
             return Results.Ok(r.Snapshot());
         });

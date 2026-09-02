@@ -37,6 +37,7 @@ public interface IExternalReceiverControlPort
         bool ctun);
 
     void SetCenter(long centerHz);
+    void SetAfGainDb(double db);
     void SetMuted(bool muted);
     void SetZoom(int level);
 }
@@ -52,6 +53,7 @@ public sealed class NullExternalReceiverControlPort : IExternalReceiverControlPo
         bool ctun) { }
 
     public void SetCenter(long centerHz) { }
+    public void SetAfGainDb(double db) { }
     public void SetMuted(bool muted) { }
     public void SetZoom(int level) { }
 }

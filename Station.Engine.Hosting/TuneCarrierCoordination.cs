@@ -48,7 +48,8 @@ internal sealed class TuneCarrierCommandCoordinator(
     internal async Task<TuneCarrierCommandResult> SetAsync(
         bool on,
         TxService tx,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? remoteTxLeaseId = null)
     {
         CancellationTokenSource? onCancellation = null;
         long generation;
@@ -76,7 +77,7 @@ internal sealed class TuneCarrierCommandCoordinator(
         try
         {
             if (!on)
-                return ApplyTxState(false, tx);
+                return ApplyTxState(false, tx, remoteTxLeaseId);
 
             // Repeated ON is idempotent. In particular, never turn an already
             // armed amplifier tuner back off by sending its momentary button a
@@ -117,7 +118,7 @@ internal sealed class TuneCarrierCommandCoordinator(
                     }
                 }
 
-                return ApplyTxState(true, tx);
+                return ApplyTxState(true, tx, remoteTxLeaseId);
             }
         }
         catch (OperationCanceledException) when (on && !cancellationToken.IsCancellationRequested)
@@ -138,9 +139,15 @@ internal sealed class TuneCarrierCommandCoordinator(
         }
     }
 
-    private static TuneCarrierCommandResult ApplyTxState(bool on, TxService tx)
+    private static TuneCarrierCommandResult ApplyTxState(
+        bool on,
+        TxService tx,
+        string? remoteTxLeaseId)
     {
-        if (!tx.TrySetTun(on, out var error))
+        var success = remoteTxLeaseId is null
+            ? tx.TrySetTun(on, out var error)
+            : tx.TrySetRemoteTun(on, remoteTxLeaseId, out error);
+        if (!success)
             return new(false, tx.IsTunOn, false, error);
         return new(true, tx.IsTunOn, false);
     }

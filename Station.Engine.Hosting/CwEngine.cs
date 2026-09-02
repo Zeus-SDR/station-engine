@@ -84,6 +84,7 @@ public sealed class CwEngine : BackgroundService
     // _abortLock so RawKeyAsync(false) can decide whether the in-flight
     // cancel applies — keyer:0 must not truncate an unrelated text send.
     private bool _currentIsRawKey;
+    private string? _currentRemoteTxLeaseId;
     private readonly object _abortLock = new();
 
     /// <summary>Raised on every state transition. Subscribers must not block;
@@ -103,6 +104,7 @@ public sealed class CwEngine : BackgroundService
         // (or a trip happens). Owner==null on the falling edge means MOX
         // was just released; if it wasn't us doing the release, cancel.
         _tx.TxActiveChanged += OnTxActiveChanged;
+        _tx.RemoteTxLeaseRevoked += OnRemoteTxLeaseRevoked;
         // Bridge the in-process Status event onto the wire so connected
         // clients (the React macro pad) see state edges without polling.
         Status += BroadcastStatus;
@@ -116,13 +118,19 @@ public sealed class CwEngine : BackgroundService
     /// <see cref="WpmDefault"/>. Returns immediately; keying happens on
     /// the worker thread.
     /// </summary>
-    public ValueTask SendAsync(string text, int? wpm, CancellationToken ct)
+    public ValueTask SendAsync(
+        string text,
+        int? wpm,
+        CancellationToken ct,
+        string? remoteTxLeaseId = null)
     {
         ArgumentNullException.ThrowIfNull(text);
         int requested = wpm ?? _settings?.Get().Wpm ?? WpmDefault;
         int effective = Math.Clamp(requested, WpmMin, WpmMax);
         Interlocked.Increment(ref _pendingJobs);
-        return _jobs.Writer.WriteAsync(new CwJob(text, effective, RawKeyDown: false, DurationMs: null), ct);
+        return _jobs.Writer.WriteAsync(
+            new CwJob(text, effective, RawKeyDown: false, DurationMs: null, remoteTxLeaseId),
+            ct);
     }
 
     /// <summary>
@@ -140,7 +148,7 @@ public sealed class CwEngine : BackgroundService
         {
             Interlocked.Increment(ref _pendingJobs);
             return _jobs.Writer.WriteAsync(
-                new CwJob(string.Empty, 0, RawKeyDown: true, DurationMs: durationMs),
+                new CwJob(string.Empty, 0, RawKeyDown: true, DurationMs: durationMs, RemoteTxLeaseId: null),
                 ct);
         }
 
@@ -197,6 +205,7 @@ public sealed class CwEngine : BackgroundService
             {
                 _currentAbort = jobCts;
                 _currentIsRawKey = job.RawKeyDown;
+                _currentRemoteTxLeaseId = job.RemoteTxLeaseId;
             }
             try
             {
@@ -213,12 +222,12 @@ public sealed class CwEngine : BackgroundService
                     CwEngineState.Aborting, job.Text, job.Wpm,
                     Volatile.Read(ref _pendingJobs),
                     Reason: "aborted"));
-                TryReleaseMox("aborted");
+                TryReleaseMox("aborted", job.RemoteTxLeaseId);
             }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "cw.play failed text={Text} wpm={Wpm}", Truncate(job.Text), job.Wpm);
-                TryReleaseMox("error");
+                TryReleaseMox("error", job.RemoteTxLeaseId);
             }
             finally
             {
@@ -226,6 +235,7 @@ public sealed class CwEngine : BackgroundService
                 {
                     if (ReferenceEquals(_currentAbort, jobCts)) _currentAbort = null;
                     _currentIsRawKey = false;
+                    _currentRemoteTxLeaseId = null;
                 }
                 jobCts.Dispose();
             }
@@ -234,6 +244,16 @@ public sealed class CwEngine : BackgroundService
             // into the next iteration without a flicker.
             if (Volatile.Read(ref _pendingJobs) == 0)
                 Notify(new CwEngineStatus(CwEngineState.Idle, string.Empty, 0, 0));
+        }
+    }
+
+    private void OnRemoteTxLeaseRevoked(string leaseId)
+    {
+        lock (_abortLock)
+        {
+            if (!string.Equals(_currentRemoteTxLeaseId, leaseId, StringComparison.Ordinal)) return;
+            try { _currentAbort?.Cancel(); }
+            catch (ObjectDisposedException) { }
         }
     }
 
@@ -258,7 +278,10 @@ public sealed class CwEngine : BackgroundService
         long txHz = RadioFrequencyResolver.TxFrequencyHz(snap);
         int basebandHz = ResolveBasebandHz(snap);
 
-        if (!_tx.TrySetMox(true, MoxSource.Cwx, out var err))
+        var keyed = job.RemoteTxLeaseId is null
+            ? _tx.TrySetMox(true, MoxSource.Cwx, out var err)
+            : _tx.TrySetRemoteMox(true, job.RemoteTxLeaseId, MoxSource.Cwx, out err);
+        if (!keyed)
         {
             _log.LogWarning("cw.mox.refused text={Text} reason={Err}", Truncate(job.Text), err);
             Notify(new CwEngineStatus(
@@ -345,7 +368,7 @@ public sealed class CwEngine : BackgroundService
         // ring depth — we deliberately keep the ring shallow above.)
         try { await Task.Delay(20, ct).ConfigureAwait(false); }
         catch (OperationCanceledException) { throw; }
-        TryReleaseMox("done");
+        TryReleaseMox("done", job.RemoteTxLeaseId);
     }
 
     /// <summary>
@@ -457,10 +480,10 @@ public sealed class CwEngine : BackgroundService
 
         try { await Task.Delay(20, CancellationToken.None).ConfigureAwait(false); }
         catch (OperationCanceledException) { /* shouldn't fire — token is None */ }
-        TryReleaseMox(releasedByCancel ? "keyer.up" : "keyer.duration");
+        TryReleaseMox(releasedByCancel ? "keyer.up" : "keyer.duration", job.RemoteTxLeaseId);
     }
 
-    private void TryReleaseMox(string reason)
+    private void TryReleaseMox(string reason, string? remoteTxLeaseId = null)
     {
         // Host CW is done keying — re-arm the P2 internal keyer (cleared
         // unconditionally, even if UI/trip took MOX from us, so a paddle works
@@ -470,7 +493,10 @@ public sealed class CwEngine : BackgroundService
         // dropped it under us. Idempotent at the TxService layer either way.
         if (_tx.MoxOwner == MoxSource.Cwx)
         {
-            _tx.TrySetMox(false, MoxSource.Cwx, out _);
+            if (remoteTxLeaseId is null)
+                _tx.TrySetMox(false, MoxSource.Cwx, out _);
+            else
+                _tx.TrySetRemoteMox(false, remoteTxLeaseId, MoxSource.Cwx, out _);
             _log.LogInformation("cw.mox.released reason={Reason}", reason);
         }
     }
@@ -587,5 +613,10 @@ public sealed class CwEngine : BackgroundService
 
     private static string Truncate(string s) => s.Length <= 40 ? s : s[..40] + "…";
 
-    private readonly record struct CwJob(string Text, int Wpm, bool RawKeyDown, int? DurationMs);
+    private readonly record struct CwJob(
+        string Text,
+        int Wpm,
+        bool RawKeyDown,
+        int? DurationMs,
+        string? RemoteTxLeaseId);
 }

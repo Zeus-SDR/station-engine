@@ -104,6 +104,7 @@ public sealed class RadioService : IDisposable
     internal const int MaxFilterPresetLabelLength = 12;
 
     private readonly object _sync = new();
+    private bool _paCalibrationInvariantLeaseActive;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RadioService> _log;
     private readonly DspSettingsStore _dspSettingsStore;
@@ -460,6 +461,33 @@ public sealed class RadioService : IDisposable
     // CmdGeneral[58]). RadioService pushes to the P1 client directly because
     // it owns _activeClient.
     public event Action<PaRuntimeSnapshot>? PaSnapshotChanged;
+
+    internal bool TryBeginPaCalibrationInvariantLease(out string? error)
+    {
+        lock (_sync)
+        {
+            if (_paCalibrationInvariantLeaseActive)
+            {
+                error = "PA calibration already owns the radio state.";
+                return false;
+            }
+            _paCalibrationInvariantLeaseActive = true;
+        }
+        error = null;
+        return true;
+    }
+
+    internal void EndPaCalibrationInvariantLease()
+    {
+        lock (_sync) _paCalibrationInvariantLeaseActive = false;
+    }
+
+    private void ThrowIfPaCalibrationInvariantMutation(string setting)
+    {
+        if (_paCalibrationInvariantLeaseActive)
+            throw new InvalidOperationException(
+                $"{setting} cannot change while PA calibration is running.");
+    }
     // Fires on every MOX / TUN edge. P1 side is pushed directly via
     // ActiveClient?.SetMox; these events give DspPipelineService the hook it
     // needs to forward the same bit into a live Protocol2Client, which owns
@@ -1997,7 +2025,11 @@ public sealed class RadioService : IDisposable
 
         if (rxIndex == 0)
         {
-            Mutate(s => s with { VfoHz = vfoHz, RadioLoHz = ddsHz });
+            Mutate(s =>
+            {
+                ThrowIfPaCalibrationInvariantMutation("RX1 DDS");
+                return s with { VfoHz = vfoHz, RadioLoHz = ddsHz };
+            });
             ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(ddsHz));
             if (RuntimeBandKey(before.VfoHz) != RuntimeBandKey(vfoHz))
                 RecomputePaAndPush();
@@ -2206,6 +2238,7 @@ public sealed class RadioService : IDisposable
         // mutation would let a now-hidden receiver be selected after disable.
         Mutate(s =>
         {
+            ThrowIfPaCalibrationInvariantMutation("TX receiver");
             previousTx = TxFrequencyHzLocked(s);
             int target = ClampTxReceiverIndexUnderLock(index);
             // TxVfo stays as the legacy A/B projection (index 1 -> B, else A)
@@ -2236,6 +2269,7 @@ public sealed class RadioService : IDisposable
         long previousTx = 0;
         Mutate(s =>
         {
+            ThrowIfPaCalibrationInvariantMutation("SPLIT");
             // This check runs inside Mutate's _sync critical section so key-on
             // cannot slip between admission and the frequency-state edit.
             if (_mox || _tunActive || _txFrequencyTransition) return null;
@@ -2402,7 +2436,13 @@ public sealed class RadioService : IDisposable
     /// the dial" (Thetis <c>CATChangesCenterFreq=true</c>). Mirrors Thetis
     /// <c>ClickTuneDisplay</c> (console.cs:43143).
     /// </summary>
-    public StateDto SetVfo(long hz, bool fromExternal)
+    public StateDto SetVfo(long hz, bool fromExternal) =>
+        SetVfoCore(hz, fromExternal, paCalibrationOwner: false);
+
+    internal StateDto SetPaCalibrationVfo(long hz) =>
+        SetVfoCore(hz, fromExternal: true, paCalibrationOwner: true);
+
+    private StateDto SetVfoCore(long hz, bool fromExternal, bool paCalibrationOwner)
     {
         long clamped = ClampTuningFrequency(hz);
         // VFO lock guards operator dial tuning only. External sources
@@ -2420,6 +2460,8 @@ public sealed class RadioService : IDisposable
         int sampleRate;
         lock (_sync)
         {
+            if (!paCalibrationOwner)
+                ThrowIfPaCalibrationInvariantMutation("VFO");
             previous = _state.VfoHz;
             currentMode = _state.Mode;
             ctun = _state.CtunEnabled;
@@ -2438,7 +2480,12 @@ public sealed class RadioService : IDisposable
             long ifCapHz = (long)(sampleRate * 0.45);
             if (Math.Abs(shiftHz) <= ifCapHz)
             {
-                Mutate(s => s with { VfoHz = clamped });
+                Mutate(s =>
+                {
+                    if (!paCalibrationOwner)
+                        ThrowIfPaCalibrationInvariantMutation("VFO");
+                    return s with { VfoHz = clamped };
+                });
                 if (RuntimeBandKey(previous) != RuntimeBandKey(clamped))
                 {
                     RecomputePaAndPush();
@@ -2466,7 +2513,12 @@ public sealed class RadioService : IDisposable
         // retune the hardware NCO to the dial's effective LO (CW: dial ∓
         // pitch), which leaves the WDSP CTUN-shift stage at zero.
         long radioLoNew = CwOffset.EffectiveLoHz(currentMode, clamped);
-        Mutate(s => s with { VfoHz = clamped, RadioLoHz = radioLoNew });
+        Mutate(s =>
+        {
+            if (!paCalibrationOwner)
+                ThrowIfPaCalibrationInvariantMutation("VFO");
+            return s with { VfoHz = clamped, RadioLoHz = radioLoNew };
+        });
         ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(radioLoNew));
         // Band edge crossed? Per-band PA gain / OC bits may have swapped — push
         // the new snapshot before the next TX frame ships. Cheap when no
@@ -2490,6 +2542,16 @@ public sealed class RadioService : IDisposable
             }
         }
         return Snapshot();
+    }
+
+    internal bool RestoreVfoIfCurrent(long hz, long expectedCurrent)
+    {
+        lock (_sync)
+        {
+            if (_state.VfoHz != expectedCurrent) return false;
+            SetPaCalibrationVfo(hz);
+            return true;
+        }
     }
 
     /// <summary>
@@ -2659,7 +2721,11 @@ public sealed class RadioService : IDisposable
         // instead of the dial (issue #1332). RestoreLoAfterTx puts the RX
         // centre back on un-key. Internal alignment callers reach
         // SetRadioLoUnchecked so the key-down snap and un-key restore still land.
-        lock (_sync) { if (_mox) return Snapshot(); }
+        lock (_sync)
+        {
+            ThrowIfPaCalibrationInvariantMutation("Radio LO");
+            if (_mox || _tunActive) return Snapshot();
+        }
         return SetRadioLoUnchecked(hz);
     }
 
@@ -2875,10 +2941,14 @@ public sealed class RadioService : IDisposable
     public StateDto SetXit(bool? enabled, long? hz)
     {
         bool keyed;
-        Mutate(s => s with
+        Mutate(s =>
         {
-            XitEnabled = enabled ?? s.XitEnabled,
-            XitHz = hz is long h ? Math.Clamp(h, -RitXitMaxHz, RitXitMaxHz) : s.XitHz,
+            ThrowIfPaCalibrationInvariantMutation("XIT");
+            return s with
+            {
+                XitEnabled = enabled ?? s.XitEnabled,
+                XitHz = hz is long h ? Math.Clamp(h, -RitXitMaxHz, RitXitMaxHz) : s.XitHz,
+            };
         });
         lock (_sync) keyed = _mox;
         // Live update while transmitting (tune/MOX): re-place the carrier now.
@@ -3020,12 +3090,32 @@ public sealed class RadioService : IDisposable
     public StateDto SetMode(RxMode mode) => SetMode(mode, TxVfo.A);
 
     public StateDto SetMode(RxMode mode, TxVfo receiver)
-        => SetModeCore(mode, receiver, onlyIfRx1ModeIs: null)!;
+        => SetModeCore(mode, receiver, onlyIfRx1ModeIs: null, paCalibrationOwner: false)!;
+
+    internal StateDto SetPaCalibrationMode(RxMode mode)
+        => SetModeCore(mode, TxVfo.A, onlyIfRx1ModeIs: null, paCalibrationOwner: true)!;
 
     internal StateDto? SetModeIfRx1ModeIs(RxMode mode, RxMode expectedCurrent)
         => SetModeCore(mode, TxVfo.A, expectedCurrent);
 
-    private StateDto? SetModeCore(RxMode mode, TxVfo receiver, RxMode? onlyIfRx1ModeIs)
+    internal bool RestoreModeIfCurrent(RxMode mode, RxMode expectedCurrent)
+    {
+        lock (_sync)
+        {
+            if (_state.Mode != expectedCurrent) return false;
+            long preservedVfoHz = _state.VfoHz;
+            SetPaCalibrationMode(mode);
+            if (_state.VfoHz != preservedVfoHz)
+                SetPaCalibrationVfo(preservedVfoHz);
+            return true;
+        }
+    }
+
+    private StateDto? SetModeCore(
+        RxMode mode,
+        TxVfo receiver,
+        RxMode? onlyIfRx1ModeIs,
+        bool paCalibrationOwner = false)
     {
         if (!Enum.IsDefined(receiver))
             throw new ArgumentOutOfRangeException(nameof(receiver), receiver, "Unknown VFO receiver");
@@ -3042,6 +3132,8 @@ public sealed class RadioService : IDisposable
         bool targetBAtSet = false;
         Mutate(s =>
         {
+            if (!paCalibrationOwner)
+                ThrowIfPaCalibrationInvariantMutation("Mode");
             // Close the recall TOCTOU window before touching mode/filter caches.
             if (onlyIfRx1ModeIs is RxMode expected && s.Mode != expected)
                 return null;
@@ -4489,12 +4581,12 @@ public sealed class RadioService : IDisposable
     public int TxPostTxRxMuteDelayMs => Volatile.Read(ref _txPostTxRxMuteDelayMs);
 
     // ---- TX timeout (issue #1270) ---------------------------------------
-    // 0 = disabled (the operator turned the guard off entirely — the reporter
-    // and KB2UKA both asked for this). Otherwise minimum 30 s so an operator
-    // can shorten the guard for CW/digital ops while still leaving a safety
-    // window; maximum 600 s = 10 min so a very long QSO tail can't defeat PA
-    // protection unless the operator explicitly disables it. Default preserves
-    // the historical FR-6 120 s value.
+    // 0 = disabled, but every server caller must explicitly acknowledge the
+    // disconnect/stuck-key risk before applying that value. Otherwise minimum
+    // 30 s so an operator can shorten the guard for CW/digital ops while still
+    // leaving a safety window; maximum 600 s = 10 min so a very long QSO tail
+    // can't defeat PA protection unless the operator explicitly disables it.
+    // Default preserves the historical FR-6 120 s value.
     internal const int DisabledTxTimeoutSec = 0;
     internal const int MinTxTimeoutSec = 30;
     internal const int MaxTxTimeoutSec = 600;
@@ -4508,14 +4600,24 @@ public sealed class RadioService : IDisposable
 
     /// <summary>
     /// Set the maximum single-transmission length in seconds. A value &lt;= 0
-    /// disables the guard entirely; otherwise it is clamped to
+    /// disables the guard entirely, but only when
+    /// <paramref name="acknowledgeDisconnectRisk"/> is true; otherwise it is clamped to
     /// [<see cref="MinTxTimeoutSec"/>, <see cref="MaxTxTimeoutSec"/>].
     /// Returns the updated snapshot so the caller can surface the applied
     /// value (which may be clamped or 0 = disabled).
     /// </summary>
-    public StateDto SetTxTimeoutSec(int seconds)
+    /// <exception cref="InvalidOperationException">The caller requested a
+    /// disabled timeout without acknowledging that a disconnect during
+    /// transmission may leave the radio keyed.</exception>
+    public StateDto SetTxTimeoutSec(int seconds, bool acknowledgeDisconnectRisk = false)
     {
         int clamped = ClampTxTimeoutSec(seconds);
+        if (clamped == DisabledTxTimeoutSec && !acknowledgeDisconnectRisk)
+        {
+            throw new InvalidOperationException(
+                "Disabling the TX timeout requires acknowledgement that a disconnect during transmission may leave the radio keyed.");
+        }
+
         Interlocked.Exchange(ref _txTimeoutSec, clamped);
         Mutate(s => s with { TxTimeoutSec = clamped });
         return Snapshot();
@@ -4716,16 +4818,27 @@ public sealed class RadioService : IDisposable
     internal bool SetTuneDriveIfCurrent(int percent, int expectedCurrent)
         => SetTuneDriveCore(percent, persist: false, expectedCurrent, abortIfTxActive: true);
 
+    internal bool SetPaCalibrationTuneDriveIfCurrent(int percent, int expectedCurrent)
+        => SetTuneDriveCore(
+            percent,
+            persist: false,
+            expectedCurrent,
+            abortIfTxActive: true,
+            paCalibrationOwner: true);
+
     private bool SetTuneDriveCore(
         int percent,
         bool persist,
         int? onlyIfTunePctIs = null,
-        bool abortIfTxActive = false)
+        bool abortIfTxActive = false,
+        bool paCalibrationOwner = false)
     {
         int requested = Math.Clamp(percent, 0, 100);
         int clamped = 0;
         Mutate(s =>
         {
+            if (!paCalibrationOwner)
+                ThrowIfPaCalibrationInvariantMutation("TUN power");
             // Close recall's value and key-up TOCTOU windows atomically.
             if ((onlyIfTunePctIs is int expected && s.TunePct != expected) ||
                 (abortIfTxActive && (_mox || _tunActive)))
@@ -5219,20 +5332,21 @@ public sealed class RadioService : IDisposable
     public StateDto SetDriveMaximum(int percent)
     {
         int maximum = Math.Clamp(percent, 1, 100);
-        lock (_productPluginDriveCapGate)
-        {
-            int productCap = Volatile.Read(ref _productPluginDriveCapPct);
-            if (productCap > maximum)
-                Interlocked.Exchange(ref _productPluginDriveCapPct, maximum);
-        }
         Mutate(s =>
         {
+            ThrowIfPaCalibrationInvariantMutation("Drive maximum");
             int drive = Math.Min(s.DrivePct, maximum);
             int tune = Math.Min(s.TunePct, maximum);
             Interlocked.Exchange(ref _drivePct, drive);
             Interlocked.Exchange(ref _tunePct, tune);
             return s with { DrivePct = drive, DriveMaxPct = maximum, TunePct = tune };
         });
+        lock (_productPluginDriveCapGate)
+        {
+            int productCap = Volatile.Read(ref _productPluginDriveCapPct);
+            if (productCap > maximum)
+                Interlocked.Exchange(ref _productPluginDriveCapPct, maximum);
+        }
         // Reduce live RF before touching storage, then persist this infrequent
         // hardware-protection setting before acknowledging the change so an
         // abrupt exit cannot restore an older, higher ceiling on next launch.
@@ -5856,6 +5970,8 @@ public sealed class RadioService : IDisposable
         bool psDisarmed = false;
         Mutate(s =>
         {
+            if (req.Enabled)
+                ThrowIfPaCalibrationInvariantMutation("PureSignal");
             // This is the sole writer of persisted arm intent. Runtime safety
             // disarms (watchdog, disconnect, sanitize) use Mutate directly and
             // therefore cannot erase the operator's decision.

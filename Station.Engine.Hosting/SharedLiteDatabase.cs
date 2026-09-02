@@ -432,12 +432,24 @@ public static class SharedLiteDatabase
         // WAL first: if it cannot be moved, nothing has been touched and the
         // quarantine retries cleanly next launch. Moving the DB first could
         // strand the log if the second move failed, complicating recovery.
-        var log = path + "-log";
+        var log = LiteDbLogPath(path);
         if (File.Exists(log))
-            MoveWithRetry(log, backup + "-log");
+            MoveWithRetry(log, LiteDbLogPath(backup));
         if (File.Exists(path))
             MoveWithRetry(path, backup);
         return backup;
+    }
+
+    private static string LiteDbLogPath(string databasePath)
+    {
+        var directory = Path.GetDirectoryName(databasePath);
+        var fileName = Path.GetFileName(databasePath);
+        var logFileName = Path.GetFileNameWithoutExtension(fileName)
+            + "-log"
+            + Path.GetExtension(fileName);
+        return string.IsNullOrEmpty(directory)
+            ? logFileName
+            : Path.Combine(directory, logFileName);
     }
 
     private static void MoveWithRetry(string source, string destination)

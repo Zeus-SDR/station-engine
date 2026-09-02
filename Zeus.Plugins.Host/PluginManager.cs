@@ -102,6 +102,7 @@ public sealed class PluginManager : IHostedService, IAsyncDisposable
 
         var pluginDirs = Directory.EnumerateDirectories(root)
             .Where(d => File.Exists(Path.Combine(d, "plugin.json"))
+                        && !IsBackupDirectory(d)
                         && !File.Exists(Path.Combine(d, PendingDeleteMarker))
                         && !suppressedDirs.Contains(Path.GetFullPath(d))
                         && !IsAlreadyActiveDirectory(d))
@@ -188,6 +189,9 @@ public sealed class PluginManager : IHostedService, IAsyncDisposable
     /// files were still locked at uninstall time (Windows ALC file locks).
     /// Marked dirs are deleted — and never activated — on the next boot.</summary>
     public const string PendingDeleteMarker = ".pending-delete";
+
+    private static bool IsBackupDirectory(string dir) =>
+        Path.GetFileName(dir).Contains(".backup-", StringComparison.OrdinalIgnoreCase);
 
     private void SweepPendingDeletes(string root)
     {

@@ -31,3 +31,10 @@ public interface ILogbookPluginV2 : ILogbookPlugin
     Task<int> UpdateQslStatusAsync(IReadOnlyList<LogbookQslStatusUpdate> updates, CancellationToken ct = default);
     Task<IReadOnlyList<string>> GetAllTagsAsync(CancellationToken ct = default);
 }
+
+/// <summary>
+/// Logbook SDK 1.5 coordinate-capable provider. Implementing this marker means
+/// the provider persists and returns <see cref="LogbookNewEntry.Lat"/> and
+/// <see cref="LogbookNewEntry.Lon"/> as an exact pair.
+/// </summary>
+public interface ILogbookPluginV3 : ILogbookPluginV2;

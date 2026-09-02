@@ -269,6 +269,37 @@ public static class StationProtocolEndpoints
             return Results.Ok(new { previousEnabled, enabled = state.TxMonitorEnabled });
         });
 
+        endpoints.MapPost("/api/station/tx/lease", (HttpContext context) =>
+        {
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            if (!RemoteTxLease.TryGet(context, out var leaseId))
+                return Results.BadRequest(new { error = "valid remote TX lease is required" });
+            var tx = context.RequestServices.GetService<TxService>();
+            if (tx is null) return Results.NotFound();
+            return tx.RegisterRemoteTxLease(leaseId)
+                ? Results.Ok()
+                : Results.StatusCode(StatusCodes.Status429TooManyRequests);
+        });
+
+        // Product-host remote dead-man seam. This route is both loopback-only
+        // and covered by StationAccessTokenAuthorization; it is intentionally
+        // stronger than the operator-facing MOX/TUN endpoints because a lost
+        // remote transport must clear every TX source without tails.
+        endpoints.MapPost("/api/station/tx/safe-idle", (HttpContext context) =>
+        {
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            if (!RemoteTxLease.TryGet(context, out var leaseId))
+                return Results.BadRequest(new { error = "remote TX lease is required" });
+            var tx = context.RequestServices.GetService<TxService>();
+            if (tx is null) return Results.NotFound();
+            return Results.Ok(new
+            {
+                released = tx.ForceRemoteDisconnectSafeIdle(leaseId),
+            });
+        });
+
         return endpoints;
     }
 

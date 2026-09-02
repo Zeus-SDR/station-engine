@@ -162,7 +162,8 @@ public sealed record ChatStatusDto(
     bool FreqPublic = true,
     bool SeeAllFreq = false,
     bool NotifySound = false,
-    string NotifySoundId = "lightning");
+    string NotifySoundId = "lightning",
+    long SignalingGeneration = 0);
 
 /// <summary>
 /// A chat channel visible to the operator: the public lobby, an admin-created
@@ -202,7 +203,8 @@ public sealed record ChatPttSignal(
     string? Room = null,
     string? OverId = null,
     long? SourceEpoch = null,
-    ChatPttIceCandidate? Ice = null)
+    ChatPttIceCandidate? Ice = null,
+    long? TargetEpoch = null)
 {
     /// <summary>Maximum accepted WebRTC SDP length, mirrored by the relay.</summary>
     public const int MaxSdpLength = 64_000;
@@ -328,7 +330,14 @@ public sealed record ChatPttRequest(
     string? Sdp = null,
     string? Room = null,
     string? OverId = null,
-    ChatPttIceCandidate? Ice = null);
+    ChatPttIceCandidate? Ice = null,
+    long? TargetEpoch = null);
+
+public sealed record ChatPttTargetsRequest(string To, string? Room = null, string? OverId = null);
+public sealed record ChatPttTargetsResponse(
+    IReadOnlyList<long> TargetEpochs,
+    string? Room = null,
+    bool TimedOut = false);
 
 public sealed record ChatTdoaRequestSignalRequest(
     string To,

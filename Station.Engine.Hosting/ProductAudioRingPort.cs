@@ -67,6 +67,8 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     // Kept as one stable diagnostic field for station API compatibility.
     private long _txLegOpenedCount;
     private long _rxLegOpenedCount;
+    private int _rxLastRenderKind;
+    private float _rxLastRenderedSample;
     private bool _disposed;
 
     public ProductAudioRingPort(ILogger<ProductAudioRingPort> log)
@@ -155,6 +157,8 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             Interlocked.Exchange(ref _rxConsecutiveMisses, 0);
             Interlocked.Exchange(ref _txOpenUntilTimestamp, 0);
             Interlocked.Exchange(ref _rxOpenUntilTimestamp, 0);
+            Volatile.Write(ref _rxLastRenderKind, 0);
+            Volatile.Write(ref _rxLastRenderedSample, 0f);
             session.PendingTimer = new Timer(
                 static state =>
                 {
@@ -429,6 +433,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             var openUntil = Interlocked.Read(ref openUntilTimestamp);
             if (openUntil != 0 && Stopwatch.GetTimestamp() < openUntil)
             {
+                ApplyRxDryTransition(block48k);
                 Interlocked.Increment(ref bypassedBlocks);
                 return;
             }
@@ -439,7 +444,9 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                     ResponseDeadlineFor(block48k.Length),
                     out _))
             {
-                processed.AsSpan(0, block48k.Length).CopyTo(block48k);
+                ApplyRxProcessedTransition(
+                    block48k,
+                    processed.AsSpan(0, block48k.Length));
                 Interlocked.Increment(ref processedBlocks);
                 Interlocked.Exchange(ref consecutiveMisses, 0);
                 if (openUntil != 0
@@ -473,11 +480,13 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                     "product-audio {Leg} leg paused after {Misses} consecutive missed deadlines; passing audio through unprocessed for {CooldownMs} ms",
                     leg, LegOpenMissThreshold, (int)LegOpenCooldown.TotalMilliseconds);
             }
+            ApplyRxDryTransition(block48k);
         }
         catch (Exception)
         {
             // The original block is copied only after a full matching reply,
             // so every transport failure remains clean passthrough.
+            ApplyRxDryTransition(block48k);
         }
         finally
         {
@@ -486,6 +495,51 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         }
 
         Interlocked.Increment(ref bypassedBlocks);
+    }
+
+    private void ApplyRxProcessedTransition(Span<float> dry, ReadOnlySpan<float> processed)
+    {
+        var priorKind = Volatile.Read(ref _rxLastRenderKind);
+        var count = priorKind == 2
+            ? Math.Min(ProductAudioTransportPipeline.TransitionSamples, dry.Length)
+            : 0;
+        if (count > 1)
+        {
+            var denominator = count - 1f;
+            for (var index = 0; index < count; index++)
+            {
+                var mix = index / denominator;
+                dry[index] += (processed[index] - dry[index]) * mix;
+            }
+            processed[count..].CopyTo(dry[count..]);
+        }
+        else
+        {
+            processed.CopyTo(dry);
+        }
+        Volatile.Write(ref _rxLastRenderedSample, dry[^1]);
+        Volatile.Write(ref _rxLastRenderKind, 1);
+    }
+
+    private void ApplyRxDryTransition(Span<float> dry)
+    {
+        if (dry.IsEmpty) return;
+        if (Volatile.Read(ref _rxLastRenderKind) == 1)
+        {
+            var count = Math.Min(ProductAudioTransportPipeline.TransitionSamples, dry.Length);
+            if (count > 1)
+            {
+                var start = Volatile.Read(ref _rxLastRenderedSample);
+                var denominator = count - 1f;
+                for (var index = 0; index < count; index++)
+                {
+                    var mix = index / denominator;
+                    dry[index] = start + (dry[index] - start) * mix;
+                }
+            }
+        }
+        Volatile.Write(ref _rxLastRenderedSample, dry[^1]);
+        Volatile.Write(ref _rxLastRenderKind, 2);
     }
 
     public void Dispose()
@@ -626,18 +680,16 @@ internal enum ProductAudioTransportStatus
 }
 
 /// <summary>
-/// Adaptive response transport window for Station -&gt; Product audio. Responses
-/// are keyed by their ring sequence, while dry fallback is keyed by the source
-/// sequence reported by Product's processing delay. Consistently late responses
-/// raise the held delay one block at a time without moving the target backwards.
+/// Fixed one-block response runway for Station -&gt; Product TX audio. Responses
+/// and retained dry blocks are keyed by ring sequence. Every callback advances
+/// the render target exactly once; a late response is never retried after its
+/// aligned dry block has already been emitted.
 /// </summary>
 internal sealed class ProductAudioTransportPipeline
 {
-    // SDR-VST3 starts TX two blocks behind the producer and retains 32 blocks.
-    // That fixed runway absorbs ordinary process scheduling jitter before it
-    // can alternate spectrally different wet and dry blocks at the speaker.
     internal const int SlotCount = AudioRingProtocol.SlotCount;
-    internal const int InitialRenderDelayBlocks = 2;
+    internal const int TransitionSamples = 64;
+    internal const int InitialRenderDelayBlocks = 1;
     private readonly float[][] _dry = CreateBuffers();
     private readonly float[][] _processed = CreateBuffers();
     private readonly long[] _drySequences = new long[SlotCount];
@@ -648,11 +700,11 @@ internal sealed class ProductAudioTransportPipeline
     private long _firstSequence;
     private long _lastRenderedResponse;
     private int _lastProcessingDelay;
-    private int _renderDelayBlocks = InitialRenderDelayBlocks;
     private bool _hasRenderedTarget;
     private ProductAudioTransportStatus _lastTargetStatus;
+    private float _lastRenderedSample;
 
-    internal int RenderDelayBlocks => _renderDelayBlocks;
+    internal int RenderDelayBlocks => InitialRenderDelayBlocks;
     internal long LastRenderedResponse => _lastRenderedResponse;
 
     internal void Reset()
@@ -662,9 +714,9 @@ internal sealed class ProductAudioTransportPipeline
         _firstSequence = 0;
         _lastRenderedResponse = 0;
         _lastProcessingDelay = 0;
-        _renderDelayBlocks = InitialRenderDelayBlocks;
         _hasRenderedTarget = false;
         _lastTargetStatus = ProductAudioTransportStatus.Priming;
+        _lastRenderedSample = 0f;
     }
 
     internal void RememberDry(long sequence, ReadOnlySpan<float> block)
@@ -696,13 +748,15 @@ internal sealed class ProductAudioTransportPipeline
         if (submittedSequence == _firstSequence)
         {
             currentDry.CopyTo(output);
+            RememberRendered(output, ProductAudioTransportStatus.DryFallback);
             return ProductAudioTransportStatus.Priming;
         }
 
-        var targetResponse = submittedSequence - _renderDelayBlocks;
+        var targetResponse = submittedSequence - InitialRenderDelayBlocks;
         if (targetResponse < _firstSequence)
         {
             currentDry.CopyTo(output);
+            RememberRendered(output, ProductAudioTransportStatus.DryFallback);
             return ProductAudioTransportStatus.Priming;
         }
         _lastRenderedResponse = targetResponse;
@@ -741,11 +795,6 @@ internal sealed class ProductAudioTransportPipeline
             ? _dry[dryIndex].AsSpan(0, currentDry.Length)
             : currentDry;
         ApplyTransitionRamp(fallbackDry, output, ProductAudioTransportStatus.DryFallback);
-        // Copy SDR-VST3's no-wait latency ratchet. Increasing by one makes the
-        // next callback retry this same target instead of walking past a late
-        // processed block. The delay never chatters downward during a session.
-        if (_renderDelayBlocks < SlotCount - 2)
-            _renderDelayBlocks++;
         return ProductAudioTransportStatus.DryFallback;
     }
 
@@ -754,17 +803,43 @@ internal sealed class ProductAudioTransportPipeline
         Span<float> output,
         ProductAudioTransportStatus targetStatus)
     {
-        var shouldRamp = !_hasRenderedTarget || _lastTargetStatus != targetStatus;
-        _hasRenderedTarget = true;
-        _lastTargetStatus = targetStatus;
-        if (!shouldRamp) return;
-        if (output.Length <= 1) return;
-        var denominator = output.Length - 1f;
-        for (var index = 0; index < output.Length; index++)
+        var shouldRamp = _hasRenderedTarget && _lastTargetStatus != targetStatus;
+        if (shouldRamp)
         {
-            var mix = index / denominator;
-            output[index] = currentDry[index] + (output[index] - currentDry[index]) * mix;
+            var count = Math.Min(TransitionSamples, output.Length);
+            if (count > 1)
+            {
+                var denominator = count - 1f;
+                if (targetStatus == ProductAudioTransportStatus.Processed)
+                {
+                    for (var index = 0; index < count; index++)
+                    {
+                        var mix = index / denominator;
+                        output[index] = currentDry[index]
+                            + (output[index] - currentDry[index]) * mix;
+                    }
+                }
+                else
+                {
+                    var start = _lastRenderedSample;
+                    for (var index = 0; index < count; index++)
+                    {
+                        var mix = index / denominator;
+                        output[index] = start + (output[index] - start) * mix;
+                    }
+                }
+            }
         }
+        RememberRendered(output, targetStatus);
+    }
+
+    private void RememberRendered(
+        ReadOnlySpan<float> output,
+        ProductAudioTransportStatus status)
+    {
+        if (!output.IsEmpty) _lastRenderedSample = output[^1];
+        _hasRenderedTarget = true;
+        _lastTargetStatus = status;
     }
 
     private static int Index(long sequence) => (int)(sequence & (SlotCount - 1));

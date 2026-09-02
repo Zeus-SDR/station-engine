@@ -84,6 +84,12 @@ public sealed class KiwiSdrService : BackgroundService,
     private RxMode _mode = RxMode.USB;
     private int _filterLowHz = 100;
     private int _filterHighHz = 2_850;
+    private double _afGainDb;
+    private double _afGainTargetDb;
+    // Consumer-thread-only applied gain. Read slews it toward the volatile
+    // target at the same 60 dB/s rate as the hardware RX 2 dB / 30 Hz cap,
+    // while interpolating across each returned block to avoid scalar steps.
+    private double _appliedAfGainLinear = 1.0;
     private bool _muted;
     // Kiwi-native waterfall zoom. z7 preserves the integration's previous
     // initial ~234 kHz view; every subsequent integer step halves the span.
@@ -123,6 +129,7 @@ public sealed class KiwiSdrService : BackgroundService,
     // onset isn't clipped, slower release (~50 ms) so tails fade without a click.
     private const double SqlAttackPerSample = 1.0 / 60.0;
     private const double SqlReleasePerSample = 1.0 / 600.0;
+    private const double AfGainSlewDbPerSecond = 60.0;
 
     private int CurrentZoomLevel() => Math.Clamp(Volatile.Read(ref _zoomLevel), 0, DefaultZoomCap);
 
@@ -246,7 +253,27 @@ public sealed class KiwiSdrService : BackgroundService,
             if (n <= 0) break;
             dropped += n;
         }
-        return _audioBus.Read(dst);
+        int read = _audioBus.Read(dst);
+        if (read > 0)
+        {
+            double startGain = _appliedAfGainLinear;
+            double startDb = 20.0 * Math.Log10(Math.Max(startGain, 1e-9));
+            double targetDb = Volatile.Read(ref _afGainTargetDb);
+            double maxStepDb = AfGainSlewDbPerSecond * read / OutRateHz;
+            double deltaDb = targetDb - startDb;
+            double endDb = Math.Abs(deltaDb) <= maxStepDb
+                ? targetDb
+                : startDb + Math.Sign(deltaDb) * maxStepDb;
+            double endGain = Math.Pow(10.0, endDb / 20.0);
+            for (int i = 0; i < read; i++)
+            {
+                double t = (i + 1) / (double)read;
+                double gain = startGain + (endGain - startGain) * t;
+                dst[i] = (float)(dst[i] * gain);
+            }
+            _appliedAfGainLinear = endGain;
+        }
+        return read;
     }
 
     // Test seam: feed the audio bus directly (bypassing the live KiwiSdrClient)
@@ -552,6 +579,16 @@ public sealed class KiwiSdrService : BackgroundService,
         RaiseChanged();
     }
 
+    public void SetAfGainDb(double db)
+    {
+        lock (_sync)
+        {
+            _afGainDb = Math.Clamp(db, -50.0, 20.0);
+            Volatile.Write(ref _afGainTargetDb, _afGainDb);
+        }
+        RaiseChanged();
+    }
+
     /// <summary>External-receiver control port: set an absolute native zoom
     /// level about the current centre. Kept as the port's contract; the slice
     /// window and the wheel both go through the anchored overloads below.</summary>
@@ -653,7 +690,7 @@ public sealed class KiwiSdrService : BackgroundService,
                 FilterLowHz: _filterLowHz,
                 FilterHighHz: _filterHighHz,
                 FilterPresetName: null,
-                AfGainDb: 0.0,
+                AfGainDb: _afGainDb,
                 SampleRateHz: OutRateHz,
                 Muted: _muted,
                 Name: "Kiwi");

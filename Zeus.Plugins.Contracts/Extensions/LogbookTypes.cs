@@ -22,7 +22,11 @@ public sealed record LogbookNewEntry(
     string? State = null,
     string? Comment = null,
     DateTime? QsoDateTimeUtc = null,
-    Dictionary<string, string>? AdifFields = null);
+    Dictionary<string, string>? AdifFields = null)
+{
+    public double? Lat { get; init; }
+    public double? Lon { get; init; }
+}
 
 public sealed record LogbookEntrySnapshot(
     string Id,
@@ -57,6 +61,8 @@ public sealed record LogbookEntrySnapshot(
     public string? Rig { get; init; }
     public string? Antenna { get; init; }
     public double? TxPowerW { get; init; }
+    public double? Lat { get; init; }
+    public double? Lon { get; init; }
 }
 
 /// <summary>

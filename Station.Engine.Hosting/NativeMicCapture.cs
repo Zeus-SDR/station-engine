@@ -46,6 +46,11 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 {
     private const int MicBlockSamples = 960;        // 20 ms @ 48 kHz, matches browser worklet
     private const int MicBlockBytes = MicBlockSamples * 4;
+    // Four blocks bound the worst-case queued mic age to 80 ms. If processing
+    // falls farther behind, keeping current audio is safer than transmitting
+    // stale speech after the stall clears.
+    private const int CaptureQueueBlocks = 4;
+    private static readonly TimeSpan MaximumCaptureBlockAge = TimeSpan.FromMilliseconds(80);
 
     // A native capture-device open can block inside miniaudio indefinitely when
     // Windows reports a stale / exclusive / malformed endpoint. Keep that off
@@ -76,14 +81,41 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private int _channels;
     // -1 means the compatibility default: mix every capture channel.
     private int _inputChannel = -1;
-    private readonly float[] _accum = new float[MicBlockSamples];
+    private float[] _accum = new float[MicBlockSamples];
     private int _accumFill;
+    private long _accumGeneration;
     // Which capture channel the partially filled block was sourced from, so a
     // selection change mid-block is discarded rather than spliced. -1 = mix all.
     private int _accumChannel = -1;
     // Pre-allocated payload buffer reused for every flush; OnMicPcmBytes
     // takes ReadOnlyMemory<byte> but doesn't retain it, so reuse is safe.
     private readonly byte[] _payload = new byte[MicBlockBytes];
+
+    // The native audio callback is a real-time producer. Product processing,
+    // plugin preview, and WDSP can take locks or cross process boundaries, so
+    // none of that work may run synchronously on the capture callback. This
+    // fixed queue adds no steady-state delay while absorbing scheduler jitter.
+    private readonly object _captureQueueSync = new();
+    private readonly float[][] _captureQueue = CreateCaptureQueue();
+    private readonly long[] _captureQueueGenerations = new long[CaptureQueueBlocks];
+    private readonly long[] _captureQueueTimestamps = new long[CaptureQueueBlocks];
+    private float[] _workerBlock = new float[MicBlockSamples];
+    private readonly AutoResetEvent _captureQueueReady = new(false);
+    private readonly Thread _captureWorker;
+    private readonly Func<long, long, bool> _captureBlockValidator;
+    private int _captureQueueRead;
+    private int _captureQueueWrite;
+    private int _captureQueueCount;
+    private long _captureGeneration;
+    private volatile bool _captureWorkerStopping;
+    private int _captureQueueOverflows;
+    private int _captureQueueOverflowLogged;
+    private int _captureResourceCleanupClaimed;
+
+    internal TimeSpan CaptureWorkerJoinTimeout { get; set; } = TimeSpan.FromSeconds(2);
+    internal bool CaptureWorkerAlive => _captureWorker.IsAlive;
+    internal bool CaptureResourcesCleaned =>
+        Volatile.Read(ref _captureResourceCleanupClaimed) != 0;
 
     private long _totalSamplesIn;
     private long _totalBlocksOut;
@@ -106,6 +138,27 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         _inputFactory = new NativeMicInputFactory();
         _recoveryToken = _recoveryCancellation.Token;
         _inputChannel = deviceSettings?.Get().InputChannel ?? -1;
+        _captureBlockValidator = IsCapturedBlockCurrent;
+        _captureWorker = new Thread(CaptureWorkerLoop)
+        {
+            IsBackground = true,
+            Name = "zeus-mic-ingest",
+        };
+        try
+        {
+            // This thread now owns the latency-sensitive Product -> WDSP path.
+            // Priority promotion is best-effort because not every Unix host
+            // permits changing managed thread priority.
+            _captureWorker.Priority = ThreadPriority.AboveNormal;
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException
+                                   or ThreadStateException
+                                   or System.Security.SecurityException
+                                   or UnauthorizedAccessException)
+        {
+            _log.LogDebug(ex, "audio.native.tx ingest worker priority promotion unavailable");
+        }
+        _captureWorker.Start();
     }
 
     internal NativeMicCapture(
@@ -182,6 +235,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             try { _input?.Stop(); }
             catch (Exception ex) { _log.LogWarning(ex, "audio.native.tx stop threw"); }
         }
+        ClearCaptureQueue();
         return Task.CompletedTask;
     }
 
@@ -199,7 +253,29 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _recoveryCancellation.Cancel();
             CloseInputLocked(dispose: true);
         }
-        _recoveryCancellation.Dispose();
+        lock (_captureQueueSync)
+        {
+            _captureWorkerStopping = true;
+            Interlocked.Increment(ref _captureGeneration);
+            _captureQueueRead = 0;
+            _captureQueueWrite = 0;
+            _captureQueueCount = 0;
+            // Signal before releasing the monitor. Otherwise the worker can
+            // observe stopping, exit, and dispose this handle before Dispose
+            // calls Set(), producing an ObjectDisposedException race.
+            _captureQueueReady.Set();
+        }
+        bool workerStopped = _captureWorker != Thread.CurrentThread
+            && _captureWorker.Join(CaptureWorkerJoinTimeout);
+        if (!workerStopped)
+        {
+            _log.LogWarning("audio.native.tx ingest worker did not stop within shutdown deadline");
+            // Downstream Product/WDSP code may still be returning. Leave the
+            // wait handle and cancellation source alive so the background
+            // worker can observe the stop flag and exit safely afterward.
+            return;
+        }
+        CleanupCaptureWorkerResources();
     }
 
     public Task SetInputDeviceAsync(string? deviceId, CancellationToken cancellationToken = default)
@@ -237,6 +313,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
         _deviceSettings?.SetInputChannel(inputChannel);
         Volatile.Write(ref _inputChannel, inputChannel ?? -1);
+        ClearCaptureQueue();
         return Task.CompletedTask;
     }
 
@@ -284,12 +361,17 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     {
         lock (_deviceSync)
         {
+            bool routeChanged = open != _externalInputOpen
+                || !string.Equals(
+                    NormalizeDeviceId(deviceId),
+                    _externalInputDeviceId,
+                    StringComparison.Ordinal);
             _externalInputDeviceId = open ? NormalizeDeviceId(deviceId) : null;
             _externalInputOpen = open;
             Volatile.Write(ref _sampleRate, open ? sampleRate : 0);
             Volatile.Write(ref _channels, open ? channels : 0);
             Volatile.Write(ref _inputError, null);
-            if (!open) ResetAccumulation();
+            if (!open || routeChanged) ResetAccumulation();
         }
     }
 
@@ -531,12 +613,25 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     {
         _accumFill = 0;
         _accumChannel = Volatile.Read(ref _inputChannel);
+        ClearCaptureQueue();
+    }
+
+    private void ClearCaptureQueue()
+    {
+        lock (_captureQueueSync)
+        {
+            Interlocked.Increment(ref _captureGeneration);
+            _captureQueueRead = 0;
+            _captureQueueWrite = 0;
+            _captureQueueCount = 0;
+        }
     }
 
     // Internal for tests: lets the capture-diagnostics test drive the
     // miniaudio data-callback seam directly with synthetic frames.
     internal void OnCaptureData(ReadOnlySpan<float> input, uint frameCount, uint channels)
     {
+        long callbackGeneration = Volatile.Read(ref _captureGeneration);
         int frames = (int)frameCount;
         int ch = (int)channels;
         if (frames == 0 || ch == 0) return;
@@ -561,6 +656,13 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _accumFill = 0;
             _accumChannel = selectedChannel;
+        }
+        if (_accumFill == 0)
+            _accumGeneration = callbackGeneration;
+        else if (_accumGeneration != callbackGeneration)
+        {
+            _accumFill = 0;
+            _accumGeneration = callbackGeneration;
         }
 
         while (srcIdx < frames)
@@ -619,7 +721,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 // air, so its per-plugin IN / OUT / GR preview meters must not
                 // animate from it either (same source-awareness as the level
                 // meter above).
-                CompleteAccumulatedBlock();
+                CompleteAccumulatedBlock(_accumGeneration);
+                _accumGeneration = callbackGeneration;
             }
         }
     }
@@ -631,6 +734,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     /// </summary>
     internal void AcceptHostMonoCapture(ReadOnlySpan<float> monoSamples)
     {
+        long callbackGeneration = Volatile.Read(ref _captureGeneration);
         int sourceIndex = 0;
         // -2 is an internal source key distinct from every System channel and
         // from mix-all (-1). Never splice a partial System block with ASIO.
@@ -638,6 +742,13 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _accumFill = 0;
             _accumChannel = -2;
+        }
+        if (_accumFill == 0)
+            _accumGeneration = callbackGeneration;
+        else if (_accumGeneration != callbackGeneration)
+        {
+            _accumFill = 0;
+            _accumGeneration = callbackGeneration;
         }
 
         while (sourceIndex < monoSamples.Length)
@@ -649,19 +760,127 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             sourceIndex += take;
             Interlocked.Add(ref _totalSamplesIn, take);
             if (_accumFill == MicBlockSamples)
-                CompleteAccumulatedBlock();
+            {
+                CompleteAccumulatedBlock(_accumGeneration);
+                _accumGeneration = callbackGeneration;
+            }
         }
     }
 
-    private void CompleteAccumulatedBlock()
+    private void CompleteAccumulatedBlock(long blockGeneration)
     {
+        bool queued = false;
+        long enqueuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        lock (_captureQueueSync)
+        {
+            if (!_captureWorkerStopping
+                && blockGeneration == Volatile.Read(ref _captureGeneration))
+            {
+                if (_captureQueueCount == CaptureQueueBlocks)
+                {
+                    // Drop the oldest pending block, never the newest. A hard
+                    // downstream stall is already unrecoverable in real time;
+                    // this prevents old words from going out late afterward.
+                    _captureQueueRead = (_captureQueueRead + 1) % CaptureQueueBlocks;
+                    _captureQueueCount--;
+                    Interlocked.Increment(ref _captureQueueOverflows);
+                }
+
+                // Swap ownership of preallocated buffers. The callback holds
+                // this monitor for pointer/index updates only; the 960-sample
+                // copy and all downstream work happen outside it.
+                float[] replacementAccum = _captureQueue[_captureQueueWrite];
+                _captureQueue[_captureQueueWrite] = _accum;
+                _accum = replacementAccum;
+                _captureQueueGenerations[_captureQueueWrite] =
+                    blockGeneration;
+                _captureQueueTimestamps[_captureQueueWrite] = enqueuedAt;
+                _captureQueueWrite = (_captureQueueWrite + 1) % CaptureQueueBlocks;
+                _captureQueueCount++;
+                queued = true;
+            }
+        }
+        _accumFill = 0;
+        if (queued)
+        {
+            _captureQueueReady.Set();
+        }
+    }
+
+    private void CaptureWorkerLoop()
+    {
+        try
+        {
+            CaptureWorkerLoopCore();
+        }
+        finally
+        {
+            if (_disposed)
+                CleanupCaptureWorkerResources();
+        }
+    }
+
+    private void CaptureWorkerLoopCore()
+    {
+        while (true)
+        {
+            bool haveBlock;
+            long generation = 0;
+            long enqueuedAt = 0;
+            lock (_captureQueueSync)
+            {
+                haveBlock = _captureQueueCount != 0;
+                if (haveBlock)
+                {
+                    float[] replacementWorker = _captureQueue[_captureQueueRead];
+                    _captureQueue[_captureQueueRead] = _workerBlock;
+                    _workerBlock = replacementWorker;
+                    generation = _captureQueueGenerations[_captureQueueRead];
+                    enqueuedAt = _captureQueueTimestamps[_captureQueueRead];
+                    _captureQueueRead = (_captureQueueRead + 1) % CaptureQueueBlocks;
+                    _captureQueueCount--;
+                }
+                else if (_captureWorkerStopping)
+                {
+                    return;
+                }
+            }
+
+            if (!haveBlock)
+            {
+                _captureQueueReady.WaitOne();
+                continue;
+            }
+
+            ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
+            int overflows = Interlocked.Exchange(ref _captureQueueOverflows, 0);
+            if (overflows != 0 && ++_captureQueueOverflowLogged <= 4)
+                _log.LogError(
+                    "audio.native.tx ingest queue overflow count={Count} (suppressed after 4); dropped oldest pending block",
+                    overflows);
+        }
+    }
+
+    private void CleanupCaptureWorkerResources()
+    {
+        if (Interlocked.Exchange(ref _captureResourceCleanupClaimed, 1) != 0)
+            return;
+        _captureQueueReady.Dispose();
+        _recoveryCancellation.Dispose();
+    }
+
+    private void ProcessCapturedBlock(
+        ReadOnlySpan<float> block,
+        long generation,
+        long enqueuedAt)
+    {
+        if (!IsCapturedBlockCurrent(generation, enqueuedAt)) return;
+
         if (_ingest.ActiveSource == MicBlockSource.Host)
         {
             try
             {
-                _previewProcessor.ProcessPreview(
-                    new ReadOnlySpan<float>(_accum, 0, MicBlockSamples),
-                    sampleRate: 48_000);
+                _previewProcessor.ProcessPreview(block, sampleRate: 48_000);
             }
             catch (Exception ex)
             {
@@ -671,29 +890,48 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             }
         }
 
-        FlushBlock();
-        _accumFill = 0;
-    }
+        // Preview may call an out-of-process plugin and take an unbounded
+        // amount of time. Revalidate immediately after it returns.
+        if (!IsCapturedBlockCurrent(generation, enqueuedAt)) return;
 
-    private void FlushBlock()
-    {
         // Encode f32le. On x64 / arm64 .NET targets, the host float endianness
         // matches the wire format (little-endian), so MemoryMarshal.AsBytes
         // produces the wanted payload directly. BinaryPrimitives is the safe
         // alternative if we ever target a big-endian runtime, but Zeus targets
         // none today.
-        var srcBytes = MemoryMarshal.AsBytes(new ReadOnlySpan<float>(_accum, 0, MicBlockSamples));
+        var srcBytes = MemoryMarshal.AsBytes(block);
         srcBytes.CopyTo(_payload);
+
+        // A channel/device/stop invalidation can race the small payload copy.
+        // This is the final gate before samples enter Product and WDSP.
+        if (!IsCapturedBlockCurrent(generation, enqueuedAt)) return;
 
         try
         {
-            _ingest.OnMicPcmBytesFromMic(new ReadOnlyMemory<byte>(_payload));
+            _ingest.OnMicPcmBytesFromMic(
+                new ReadOnlyMemory<byte>(_payload),
+                new MicBlockValidity(
+                    _captureBlockValidator,
+                    generation,
+                    enqueuedAt));
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "audio.native.tx ingest threw on flush");
         }
         Interlocked.Increment(ref _totalBlocksOut);
+    }
+
+    private bool IsCapturedBlockCurrent(long generation, long enqueuedAt) =>
+        generation == Volatile.Read(ref _captureGeneration)
+        && System.Diagnostics.Stopwatch.GetElapsedTime(enqueuedAt) <= MaximumCaptureBlockAge;
+
+    private static float[][] CreateCaptureQueue()
+    {
+        var queue = new float[CaptureQueueBlocks][];
+        for (int i = 0; i < queue.Length; i++)
+            queue[i] = new float[MicBlockSamples];
+        return queue;
     }
 
     private void OnDeviceNotification(int kind, int generation)
@@ -709,6 +947,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _ => $"kind={kind}",
         };
         _log.LogInformation("audio.native.tx event {Event}", label);
+        if (kind is 2 or 3 or 4)
+            ResetAccumulation();
         if (kind == 3 && ConfiguredInputDeviceId is null)
             _activeInputDeviceId = ResolveDefaultInputDeviceId();
         if (kind == 2) ScheduleRecovery(generation);

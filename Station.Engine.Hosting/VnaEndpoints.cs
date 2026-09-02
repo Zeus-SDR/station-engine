@@ -7,6 +7,14 @@ public static class VnaEndpoints
     public static IEndpointRouteBuilder MapVnaEndpoints(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapGet("/api/vna/capability", (VnaService service) => Results.Ok(service.Capability()));
+        endpoints.MapGet("/api/vna/source", (VnaService service) => Results.Ok(service.SourceStatus()));
+        endpoints.MapPost("/api/vna/source", async (VnaSourceSelectionRequest request,
+            VnaService service, HttpContext context) =>
+        {
+            try { return Results.Ok(await service.SelectSourceAsync(request, context.RequestAborted)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
+        });
         endpoints.MapGet("/api/vna/status", (VnaService service) => Results.Ok(service.Status()));
         endpoints.MapGet("/api/vna/sweeps", (VnaService service) => Results.Ok(service.Sweeps()));
         endpoints.MapGet("/api/vna/calibrations", (VnaService service) => Results.Ok(service.Calibrations()));

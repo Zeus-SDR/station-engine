@@ -76,6 +76,18 @@ internal enum MicBlockSource
 }
 
 /// <summary>
+/// Optional native-capture lifetime guard. Browser, radio, TCI, WAV, and
+/// Product-plugin callers omit it and retain their existing behavior.
+/// </summary>
+internal readonly record struct MicBlockValidity(
+    Func<long, long, bool> Validator,
+    long Generation,
+    long EnqueuedAt)
+{
+    public bool IsCurrent => Validator(Generation, EnqueuedAt);
+}
+
+/// <summary>
 /// Bridges browser-side mic audio to WDSP TXA and onward to the EP2 IQ
 /// payload. Inputs are 960-sample f32le blocks from the /ws MicPcm frame
 /// (20 ms @ 48 kHz mono); the service accumulates into WDSP's native block
@@ -143,7 +155,6 @@ public sealed class TxAudioIngest : IDisposable
     private const int FreeDvTxTailDrainSlackMs = 120;   // headroom over the measured backlog
     private const int FreeDvTxTailCeilingMs = 1200;     // absolute runaway cap on the drain
     private const int FreeDvTxTailGuardMs = 160;        // post-drain FIFO flush hold
-    private const int VoiceTailIngressSettleMs = 40;    // allow final browser/WS mic frame to arrive
     private const int RogerBeepDurationMs = 180;
     private const int RogerBeepDspFlushCeilingMs = 200;
     private const int RogerBeepFlushSilentBlocks = 2;
@@ -443,8 +454,8 @@ public sealed class TxAudioIngest : IDisposable
 
     /// <summary>
     /// Voice-mode end-of-over TX tail. The operator-configured delay is a wire
-    /// MOX hold, not just a sleep: while the hold is active, allow the last
-    /// already-in-flight mic frame to arrive, then quiesce the mic hot path,
+    /// MOX hold, not just a sleep: while the hold is active, allow late mic
+    /// frames to arrive for a bounded portion, then quiesce the mic hot path,
     /// pad any partial WDSP accumulator to one full TX block, push that IQ to
     /// the P1/P2 transport, and wait out the remainder of the configured hold.
     /// Without the pad/flush step, a final &lt;TXA block-size syllable can sit in
@@ -465,10 +476,13 @@ public sealed class TxAudioIngest : IDisposable
             return false;
 
         long freq = System.Diagnostics.Stopwatch.Frequency;
-        long startTs = System.Diagnostics.Stopwatch.GetTimestamp();
+        long startTs = _stopwatchTicks();
         long deadline = startTs + (long)(freq * (tailDelayMs / 1000.0));
 
-        int settleMs = Math.Min(VoiceTailIngressSettleMs, Math.Max(0, tailDelayMs / 3));
+        // Keep ingress open for the first third of the configured hold so
+        // delayed capture/browser frames remain eligible, reserving the rest
+        // for the final WDSP flush and transport drain before MOX drops.
+        int settleMs = tailDelayMs / 3;
         if (settleMs > 0) Thread.Sleep(settleMs);
 
         if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
@@ -882,6 +896,17 @@ public sealed class TxAudioIngest : IDisposable
         OnMicPcmBytes(f32lePayload, MicBlockSource.Host);
     }
 
+    internal void OnMicPcmBytesFromMic(
+        ReadOnlyMemory<byte> f32lePayload,
+        MicBlockValidity validity)
+    {
+        long now = Environment.TickCount64;
+        if (ShouldSuppressForAuthoritativeSource(now)) return;
+        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
+        if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
+        OnMicPcmBytes(f32lePayload, MicBlockSource.Host, validity);
+    }
+
     /// <summary>
     /// Source-tagged entry point for radio-digitised jack audio (Saturn mic /
     /// line-in / balanced-XLR, arriving on UDP 1026 and re-blocked to 960
@@ -931,7 +956,14 @@ public sealed class TxAudioIngest : IDisposable
     // The source tag arbitrates the HOST↔RADIO single-select gate IN-LOCK (see
     // _activeSource); TCI/WAV bypass that compare as operator-explicit overrides.
     internal void OnMicPcmBytes(ReadOnlyMemory<byte> f32lePayload, MicBlockSource source)
+        => OnMicPcmBytes(f32lePayload, source, validity: null);
+
+    private void OnMicPcmBytes(
+        ReadOnlyMemory<byte> f32lePayload,
+        MicBlockSource source,
+        MicBlockValidity? validity)
     {
+        if (!IsCurrent(validity)) return;
         if (f32lePayload.Length != MicBlockBytes)
         {
             lock (_sync) _droppedFrames++;
@@ -976,7 +1008,7 @@ public sealed class TxAudioIngest : IDisposable
             lock (_sync) _droppedFrames++;
             return;
         }
-        ProcessMicPcm(samples, source);
+        ProcessMicPcm(samples, source, validity);
     }
 
     private void OnProductPluginTxAudio(ReadOnlySpan<float> samples)
@@ -1025,7 +1057,10 @@ public sealed class TxAudioIngest : IDisposable
     internal bool SetProductPluginSpeechBypassForTest(long generation, bool bypass) =>
         SetProductPluginSpeechBypass(generation, bypass);
 
-    private void ProcessMicPcm(ReadOnlySpan<float> samples, MicBlockSource source)
+    private void ProcessMicPcm(
+        ReadOnlySpan<float> samples,
+        MicBlockSource source,
+        MicBlockValidity? validity = null)
     {
 
         // Gate: process mic samples when MOX is on (normal TX) OR when the TX
@@ -1168,10 +1203,27 @@ public sealed class TxAudioIngest : IDisposable
                 _droppedFrames++;
                 return;
             }
+            var incoming = _accumulator.AsSpan(_accumulatorFill, MicBlockSamples);
             for (int i = 0; i < MicBlockSamples; i++)
+                incoming[i] = DspPipelineService.SanitizeAudioSample(samples[i]);
+
+            // Product audio is paced by the native 20 ms microphone cadence,
+            // not WDSP's protocol-dependent 512/256-sample drain geometry.
+            // Process the complete sanitized ingress frame once, then retain
+            // its result for WDSP reblocking below. The modem still replaces
+            // that processed speech after reblocking, preserving the existing
+            // Product -> modem -> WDSP ordering. Linear ProductPlugin sources
+            // continue to bypass the operator's Audio Suite when requested.
+            if (_productAudio.Active
+                && (source != MicBlockSource.ProductPlugin
+                    || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
             {
-                float sample = samples[i];
-                _accumulator[_accumulatorFill + i] = DspPipelineService.SanitizeAudioSample(sample);
+                _productAudio.ProcessTx(incoming);
+            }
+            if (!IsCurrent(validity))
+            {
+                _accumulatorFill = 0;
+                return;
             }
             _accumulatorFill += MicBlockSamples;
             _totalMicSamples += MicBlockSamples;
@@ -1183,19 +1235,19 @@ public sealed class TxAudioIngest : IDisposable
                 // FreeDV modem signal (in place, same count, internally
                 // buffered). WDSP's USB TXA then SSB-modulates the modem audio.
                 // No-op unless FreeDV is the active mode.
-                // A linear product-plugin source (Recorder/SSTV) must bypass
-                // the out-of-process Audio Suite as well as the in-engine TX
-                // plugin seam and WDSP speech stages. Voice Keyer leaves this
-                // flag clear and continues through the operator's TX chain.
-                if (_productAudio.Active
-                    && (source != MicBlockSource.ProductPlugin
-                        || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
-                    _productAudio.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
                 if (_audioModem.Active)
                     _audioModem.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
                 int produced = engine.ProcessTxBlock(
                     new ReadOnlySpan<float>(_scratchMic, 0, blockSize),
                     new Span<float>(_scratchIq, 0, 2 * iqOut));
+                // Product/WDSP calls may stall after the native capture route
+                // changed or the block deadline expired. Never publish their
+                // now-stale IQ to either radio transport.
+                if (!IsCurrent(validity))
+                {
+                    _accumulatorFill = 0;
+                    return;
+                }
                 if (produced > 0)
                 {
                     var iqSpan = new ReadOnlySpan<float>(_scratchIq, 0, 2 * produced);
@@ -1282,6 +1334,9 @@ public sealed class TxAudioIngest : IDisposable
             }
         }
     }
+
+    private static bool IsCurrent(MicBlockValidity? validity) =>
+        validity is not { } guarded || guarded.IsCurrent;
 
     private bool ShouldSuppressIdleMonitorPreviewBlock(ReadOnlySpan<float> samples)
     {

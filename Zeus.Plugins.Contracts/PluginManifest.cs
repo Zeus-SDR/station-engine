@@ -122,9 +122,9 @@ public sealed record PanelContribution
     public string Icon { get; init; } = "Box";
 
     /// <summary>
-    /// Named slot in the Zeus shell the panel renders into. Known slots:
-    /// <c>workspace.amplifier</c>, <c>settings.plugins</c>,
-    /// <c>topbar.right</c>. Unknown slots are ignored.
+    /// Named slot in the Zeus shell the panel renders into. Supported
+    /// conventions are <c>workspace.&lt;feature&gt;</c>,
+    /// <c>tx-audio-tools.chain</c>, and <c>rx-audio-tools.chain</c>.
     /// </summary>
     [JsonPropertyName("slot")]
     public required string Slot { get; init; }

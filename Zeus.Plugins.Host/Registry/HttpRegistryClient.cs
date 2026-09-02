@@ -16,7 +16,7 @@ public sealed class HttpRegistryClient : IRegistryClient
     public const string SourceUrlEnvVar = "ZEUS_PLUGIN_REGISTRY_URL";
 
     public const string DefaultUrl =
-        "https://downloads.zeussdr.com/plugins/registry.json";
+        "https://raw.githubusercontent.com/Zeus-SDR/zeus-community-features/main/registry.json";
 
     private readonly HttpClient _http;
     private readonly ILogger<HttpRegistryClient>? _log;

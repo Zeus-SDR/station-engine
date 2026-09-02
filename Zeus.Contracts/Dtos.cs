@@ -1937,9 +1937,14 @@ public sealed record SignalJammerTextRequest(
 
 /// <summary>TX timeout in whole seconds — how long a single MOX or TUN
 /// transmission may run before the protection guard fires. A value of 0
-/// disables the timeout entirely (no guard); otherwise clamped server-side to
-/// [30, 600]. See <see cref="StateDto.TxTimeoutSec"/>.</summary>
-public sealed record TxTimeoutSetRequest(int Seconds);
+/// disables the timeout entirely (no guard) and is accepted only when
+/// <paramref name="AcknowledgeDisconnectRisk"/> is true, confirming that the
+/// operator understands a disconnect during transmission may leave the radio
+/// keyed. Non-zero values must be in [30, 600]. See
+/// <see cref="StateDto.TxTimeoutSec"/>.</summary>
+public sealed record TxTimeoutSetRequest(
+    int Seconds,
+    bool AcknowledgeDisconnectRisk = false);
 
 // TUN has its own drive % so the operator can pre-set a lower tune level
 // without touching the MOX drive. Same per-band PA gain compensates both,

@@ -30,6 +30,8 @@ license. Its full license text is preserved in
 | Zeus RADE shim | release-matched source under `native/radae/shim/` | BSD-2-Clause | First-party C ABI shim compiled into the RADE shared library; the exact shim inputs and hashes are recorded in `native/radae/vendor/BINARY-SOURCE-BINDING.json`. | `RADE-zeus-shim-LICENSE` |
 | codec2 LDPC primitives in RADE | pinned Thetis-RADE composition above | Mixed per-file; composite LGPL-2.1-only, with LGPL-2.1 section 3 election to GPL-2.0-or-later for the conveyed copies | Five units are compiled into the RADE shared library for the end-of-over text path. `gp_interleaver.c` is LGPL-2.1-only; the Iterative Solutions portion of `mpdecode_core.c` is LGPL-2.1-or-later; `HRA_56_56.c`, `ldpc_codes.c`, and `phi0.c` carry no per-file grant and inherit Codec2 1.2.0's LGPL-2.1. Original provenance and the election are preserved in `RADE-LGPL-SECTION-3-NOTICE.md`; exact source is materialized under `native/radae/vendor/`. | `Codec2-COPYING` |
 | LiteDB | 5.0.20, package commit `9843a4e38b4d46d544a3261f9711dbc559c4c4fc` | MIT | Direct NuGet dependency of `Station.Engine.Hosting`; used for local engine preferences. | `LiteDB-LICENSE` |
+| Vallado SGP4/SDP4 C# core | `aholinch/sgp4` commit `552cb1489a52c3023ae70cb6c7e239e84c5950fe`, Vallado 2016 core | Unlicense | Vendored numerical core under `Zeus.Server.Hosting/Satellites/Vallado*.cs`; used for near-Earth and deep-space satellite propagation. Derived upstream from the CSSI/Vallado implementation and *Revisiting Spacetrack Report #3*. | `SGP4-Unlicense` |
+| God's Eye View | `bilawalsidhu/gods-eye-view` commit `d8f1742783cddd6bbc86033d0db06dc6ec746304` | MIT | Its provider-degradation and live-layer composition informed the independent Gods Eye implementation under `Zeus.Server.Hosting/GodsEye*`; no upstream datasets or models are conveyed. | `Gods-Eye-View-LICENSE` |
 | System.IO.Ports and platform runtime packages | 10.0.0, package commit `b0f34d51fccc69fd334253924abd8d6853fad7aa` | MIT | Direct NuGet dependency of `Station.Engine.Hosting` for migrated CAT serial-port support. The package resolves the matching native runtime packages for supported platforms. | `Microsoft-dotnet-LICENSE`; `Microsoft-dotnet-THIRD-PARTY-NOTICES` |
 | Microsoft.Extensions.Logging.Abstractions | 10.0.0, package commit `b0f34d51fccc69fd334253924abd8d6853fad7aa` | MIT | Direct NuGet dependency of the Protocol 1, Protocol 2, and DSP projects. | `Microsoft-dotnet-LICENSE`; `Microsoft-dotnet-THIRD-PARTY-NOTICES` |
 | Microsoft.Extensions.DependencyInjection.Abstractions | 10.0.0, package commit `b0f34d51fccc69fd334253924abd8d6853fad7aa` | MIT | Transitive NuGet dependency of the logging abstractions package. | `Microsoft-dotnet-LICENSE`; `Microsoft-dotnet-THIRD-PARTY-NOTICES` |
@@ -77,4 +79,34 @@ texts and upstream source links below.
 - codec2: <https://github.com/drowe67/codec2>
 - RADE composition: <https://github.com/sv1eia/Thetis-RADE>
 - LiteDB: <https://github.com/mbdavid/LiteDB>
+- Vallado SGP4/SDP4 C# core: <https://github.com/aholinch/sgp4>
 - .NET: <https://github.com/dotnet/dotnet>
+
+## Vallado SGP4/SDP4 C# core — Unlicense
+
+The following is the full verbatim license text preserved by the upstream repository:
+
+> This is free and unencumbered software released into the public domain.
+>
+> Anyone is free to copy, modify, publish, use, compile, sell, or
+> distribute this software, either in source code form or as a compiled
+> binary, for any purpose, commercial or non-commercial, and by any
+> means.
+>
+> In jurisdictions that recognize copyright laws, the author or authors
+> of this software dedicate any and all copyright interest in the
+> software to the public domain. We make this dedication for the benefit
+> of the public at large and to the detriment of our heirs and
+> successors. We intend this dedication to be an overt act of
+> relinquishment in perpetuity of all present and future rights to this
+> software under copyright law.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+> EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+> MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+> IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+> OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+> ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+> OTHER DEALINGS IN THE SOFTWARE.
+>
+> For more information, please refer to <http://unlicense.org>

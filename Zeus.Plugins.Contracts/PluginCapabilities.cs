@@ -2,11 +2,11 @@
 namespace Zeus.Plugins.Contracts;
 
 /// <summary>
-/// Capability flags a plugin declares in its manifest. The host grants
-/// each capability at first load (user prompt) and stores the decision in
-/// scoped persistence. Ungranted capabilities surface as null services on
-/// <see cref="IPluginContext"/> — the plugin SHOULD null-check rather
-/// than reflect over the context.
+/// Capability flags a plugin declares in its manifest. ABI 1 automatically
+/// grants every declared capability. These flags describe and route access;
+/// they are not a security sandbox or an operator-consent boundary. Services
+/// that were not declared, or are unavailable on the host, surface as null on
+/// <see cref="IPluginContext"/>.
 /// </summary>
 [Flags]
 public enum PluginCapabilities

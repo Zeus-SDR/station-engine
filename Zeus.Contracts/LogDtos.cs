@@ -74,7 +74,9 @@ public sealed record LogEntry(
     DateTime? QrzQslRcvdUtc = null,
     string? Rig = null,
     string? Antenna = null,
-    double? TxPowerW = null);
+    double? TxPowerW = null,
+    double? Lat = null,
+    double? Lon = null);
 
 public sealed record CreateLogEntryRequest(
     string Callsign,
@@ -91,7 +93,10 @@ public sealed record CreateLogEntryRequest(
     int? ItuZone = null,
     string? State = null,
     string? Comment = null,
-    DateTime? QsoDateTimeUtc = null);
+    DateTime? QsoDateTimeUtc = null,
+    double? Lat = null,
+    double? Lon = null,
+    bool QrzLookupAttempted = false);
 
 public sealed record QrzSyncResponse(
     int FetchedCount,

@@ -27,6 +27,7 @@ internal sealed class SignalJammerTxSource : BackgroundService
     private readonly Func<string?>? _requestTextMox;
     private readonly Action? _releaseTextMox;
     private readonly Func<bool> _ownsTextMox;
+    private TxService? _tx;
     private readonly ILogger<SignalJammerTxSource> _log;
     private readonly SignalJammerGenerator _generator = new();
     private readonly float[] _block = new float[BlockSamples];
@@ -36,6 +37,7 @@ internal sealed class SignalJammerTxSource : BackgroundService
     private float[]? _textSamples;
     private int _textIndex;
     private bool _textAutoReleaseMox;
+    private string? _textRemoteTxLeaseId;
     private long _lastAppliedVersion = -1;
 
     public SignalJammerTxSource(
@@ -54,6 +56,8 @@ internal sealed class SignalJammerTxSource : BackgroundService
             () => tx.MoxOwner == MoxSource.QrmText,
             log)
     {
+        _tx = tx;
+        tx.RemoteTxLeaseRevoked += OnRemoteTxLeaseRevoked;
     }
 
     internal SignalJammerTxSource(
@@ -62,6 +66,17 @@ internal sealed class SignalJammerTxSource : BackgroundService
         ILogger<SignalJammerTxSource> log)
         : this(emit, isMoxOn, null, null, null, log)
     {
+    }
+
+    internal SignalJammerTxSource(
+        Action<ReadOnlyMemory<byte>> emit,
+        Func<bool> isMoxOn,
+        TxService tx,
+        ILogger<SignalJammerTxSource> log)
+        : this(emit, isMoxOn, null, null, null, log)
+    {
+        _tx = tx;
+        tx.RemoteTxLeaseRevoked += OnRemoteTxLeaseRevoked;
     }
 
     internal SignalJammerTxSource(
@@ -94,7 +109,8 @@ internal sealed class SignalJammerTxSource : BackgroundService
     public SignalJammerTxSnapshot EnqueueText(
         ReadOnlySpan<float> samples,
         int sampleRate,
-        bool autoTransmit = false)
+        bool autoTransmit = false,
+        string? remoteTxLeaseId = null)
     {
         if (!TxMicBlockResampler.IsSupportedInputSampleRate(sampleRate))
             throw new ArgumentOutOfRangeException(nameof(sampleRate), sampleRate,
@@ -116,24 +132,59 @@ internal sealed class SignalJammerTxSource : BackgroundService
         bool autoReleaseMox = false;
         if (autoTransmit)
         {
+            if (remoteTxLeaseId is not null
+                && _tx is not null
+                && _isMoxOn()
+                && !_tx.IsRemoteLeaseOwner(remoteTxLeaseId))
+            {
+                throw new InvalidOperationException(
+                    "TX is owned by another local or remote source");
+            }
             if (!_isMoxOn())
             {
-                string? error = _requestTextMox is null
-                    ? "auto TX unavailable"
-                    : _requestTextMox();
+                string? error;
+                if (remoteTxLeaseId is not null && _tx is not null)
+                    error = _tx.TrySetRemoteMox(
+                        true,
+                        remoteTxLeaseId,
+                        MoxSource.QrmText,
+                        out var remoteError)
+                            ? null
+                            : remoteError ?? "MOX refused";
+                else
+                    error = _requestTextMox is null
+                        ? "auto TX unavailable"
+                        : _requestTextMox();
                 if (error is not null)
                     throw new InvalidOperationException(error);
             }
-            autoReleaseMox = _ownsTextMox();
+            autoReleaseMox = remoteTxLeaseId is not null && _tx is not null
+                ? _tx.IsRemoteLeaseOwner(remoteTxLeaseId, MoxSource.QrmText)
+                : _ownsTextMox();
         }
 
-        lock (_sync)
+        SignalJammerTxSnapshot snapshot = default!;
+        void CommitText()
         {
-            _textSamples = output.ToArray();
-            _textIndex = 0;
-            _textAutoReleaseMox = autoReleaseMox;
-            return SnapshotLocked();
+            lock (_sync)
+            {
+                _textSamples = output.ToArray();
+                _textIndex = 0;
+                _textAutoReleaseMox = autoReleaseMox;
+                _textRemoteTxLeaseId = remoteTxLeaseId;
+                snapshot = SnapshotLocked();
+            }
         }
+        if (remoteTxLeaseId is not null && _tx is not null)
+        {
+            if (!_tx.TryRunRemoteLeaseOperation(remoteTxLeaseId, CommitText, out var error))
+                throw new InvalidOperationException(error);
+        }
+        else
+        {
+            CommitText();
+        }
+        return snapshot;
     }
 
     public SignalJammerTxSnapshot Snapshot()
@@ -197,35 +248,50 @@ internal sealed class SignalJammerTxSource : BackgroundService
 
     private bool TryPumpOnce()
     {
-        SignalJammerTxSettings settings;
+        (bool Release, string? RemoteTxLeaseId) releaseAutoTextAfterEmit;
         lock (_sync)
         {
             if (!_isMoxOn() || (!_settings.Enabled && !HasQueuedTextLocked())) return false;
-            settings = _settings;
+            var settings = _settings;
             if (_lastAppliedVersion != settings.Version)
             {
                 _generator.Reset();
                 _lastAppliedVersion = settings.Version;
             }
-        }
 
-        Array.Clear(_block, 0, _block.Length);
-        if (settings.Enabled)
-            _generator.Fill(_block, settings);
-        bool releaseAutoTextAfterEmit = MixQueuedText(_block);
-        Limit(_block);
-        EncodeF32Le(_block, _payload);
-        _emit(new ReadOnlyMemory<byte>(_payload, 0, _payload.Length));
-        if (releaseAutoTextAfterEmit)
-            ReleaseAutoTextMox();
+            Array.Clear(_block, 0, _block.Length);
+            if (settings.Enabled)
+                _generator.Fill(_block, settings);
+            releaseAutoTextAfterEmit = MixQueuedText(_block);
+            Limit(_block);
+            EncodeF32Le(_block, _payload);
+            // Revocation takes this same lock through its synchronous hook.
+            // Once disconnect returns, no block from that lease can still be
+            // waiting to enter the ingest path under a newer TX owner.
+            _emit(new ReadOnlyMemory<byte>(_payload, 0, _payload.Length));
+        }
+        if (releaseAutoTextAfterEmit.Release)
+            ReleaseAutoTextMox(releaseAutoTextAfterEmit.RemoteTxLeaseId);
         return true;
     }
 
-    private bool MixQueuedText(Span<float> destination)
+    private void OnRemoteTxLeaseRevoked(string leaseId)
     {
         lock (_sync)
         {
-            if (!HasQueuedTextLocked()) return false;
+            if (!string.Equals(_textRemoteTxLeaseId, leaseId, StringComparison.Ordinal)) return;
+            _textSamples = null;
+            _textIndex = 0;
+            _textAutoReleaseMox = false;
+            _textRemoteTxLeaseId = null;
+        }
+    }
+
+    private (bool Release, string? RemoteTxLeaseId) MixQueuedText(Span<float> destination)
+    {
+        lock (_sync)
+        {
+            if (!HasQueuedTextLocked()) return (false, null);
             var text = _textSamples!;
             int take = Math.Min(destination.Length, text.Length - _textIndex);
             for (int i = 0; i < take; i++)
@@ -234,22 +300,27 @@ internal sealed class SignalJammerTxSource : BackgroundService
             if (_textIndex >= text.Length)
             {
                 bool releaseAutoMox = _textAutoReleaseMox;
+                var remoteTxLeaseId = _textRemoteTxLeaseId;
                 _textSamples = null;
                 _textIndex = 0;
                 _textAutoReleaseMox = false;
-                return releaseAutoMox;
+                _textRemoteTxLeaseId = null;
+                return (releaseAutoMox, remoteTxLeaseId);
             }
-            return false;
+            return (false, null);
         }
     }
 
-    private void ReleaseAutoTextMox()
+    private void ReleaseAutoTextMox(string? remoteTxLeaseId)
     {
-        if (_releaseTextMox is null) return;
+        if (_releaseTextMox is null && (remoteTxLeaseId is null || _tx is null)) return;
         try
         {
             Thread.Sleep(AutoTransmitReleaseGuard);
-            _releaseTextMox();
+            if (remoteTxLeaseId is not null && _tx is not null)
+                _tx.TrySetRemoteMox(false, remoteTxLeaseId, MoxSource.QrmText, out _);
+            else
+                _releaseTextMox?.Invoke();
         }
         catch (Exception ex)
         {

@@ -76,7 +76,17 @@ public sealed class TxService
     // <see cref="TryTripForAlert"/> (always wins). Null when MOX is off.
     private MoxSource? _moxOwner;
     private long _productPluginMoxGeneration;
+    // Opaque, process-local identity of the authenticated remote session that
+    // owns the current TX intent. Null for every local/hardware/plugin source.
+    // Guarded by _sync and only mutated while _transitionSync is held.
+    private string? _remoteTxLeaseId;
+    // Only live transport generations are admitted. Disconnect removes the
+    // generation, so delayed work stays invalid without retaining tombstones.
+    private readonly HashSet<string> _activeRemoteTxLeases = new(StringComparer.Ordinal);
+    internal const int MaxRemoteTxLeases = 64;
     private MoxSource? _tunOwner;
+    private MoxSource? _pendingTunOwner;
+    private bool _paCalibrationLeaseActive;
     // TX pre-key (MOX/TUNE) delay window deadline, in Stopwatch ticks (issue #630).
     // 0 = no active window. Armed on a UI voice-MOX or UI TUNE rising edge when
     // RadioService.TxMoxPreKeyDelayMs > 0; the IQ producers substitute silence
@@ -289,6 +299,41 @@ public sealed class TxService
     /// <see cref="TxActiveChanged"/> falling edge to tell apart "I dropped
     /// MOX myself" from "the operator overrode me from the UI".</summary>
     public MoxSource? MoxOwner { get { lock (_sync) return _moxOwner; } }
+    internal MoxSource? TunOwner
+    {
+        get { lock (_sync) return _tunOwner ?? _pendingTunOwner; }
+    }
+
+    internal bool TryBeginPaCalibrationLease(out string? error)
+    {
+        lock (_transitionSync)
+        {
+            lock (_sync)
+            {
+                if (_paCalibrationLeaseActive)
+                {
+                    error = "PA calibration is already running.";
+                    return false;
+                }
+                if (_activeIntent is not null)
+                {
+                    error = $"TX held by {_activeIntent}; unkey before PA calibration.";
+                    return false;
+                }
+                _paCalibrationLeaseActive = true;
+            }
+        }
+        error = null;
+        return true;
+    }
+
+    internal void EndPaCalibrationLease()
+    {
+        lock (_transitionSync)
+        {
+            lock (_sync) _paCalibrationLeaseActive = false;
+        }
+    }
     internal EngineTransmitSafetyModule Safety => _safety;
     internal long TransitionRevision { get { lock (_sync) return _transitionRevision; } }
     internal bool IsMicIqProducerAllowed
@@ -484,10 +529,22 @@ public sealed class TxService
             profile);
     }
 
-    private bool EvaluateAdmission(TransmitIntent intent, MoxSource? source, out string? error)
+    private bool EvaluateAdmission(
+        TransmitIntent intent,
+        MoxSource? source,
+        out string? error,
+        bool paCalibrationLeaseOwner = false)
     {
         TransmitIntent? active;
-        lock (_sync) active = _activeIntent;
+        lock (_sync)
+        {
+            active = _activeIntent;
+            if (_paCalibrationLeaseActive && !paCalibrationLeaseOwner)
+            {
+                error = "PA calibration owns the transmitter.";
+                return false;
+            }
+        }
         var decision = _safety.EvaluateKeyOn(
             intent,
             CaptureSafetySnapshot(_radio.Snapshot(), active, source));
@@ -740,6 +797,7 @@ public sealed class TxService
             _tunStartedAt = null;
             _moxOwner = null;
             _productPluginMoxGeneration = 0;
+            _remoteTxLeaseId = null;
             _tunOwner = null;
             IsTwoToneOn = false;
             Interlocked.Exchange(ref _preKeyOpenAtTicks, 0);
@@ -1059,6 +1117,187 @@ public sealed class TxService
     }
 
     /// <summary>
+    /// Emergency convergence for an authenticated remote session whose
+    /// essential transport disappeared while it held transmit authority.
+    /// Unlike an operator key-up this bypasses voice, modem, and roger-beep
+    /// tails and clears every host-driven transmit intent (MOX, TUN, and
+    /// two-tone) regardless of the UI ownership tag used by the remote API.
+    /// The normal transition lock makes this atomic with key-down, so a request
+    /// already in flight either completes before this convergence or observes
+    /// the caller's revoked session authority before it can enter afterward.
+    /// </summary>
+    internal bool ForceRemoteDisconnectSafeIdle(string leaseId)
+    {
+        if (string.IsNullOrWhiteSpace(leaseId)) return false;
+        lock (_transitionSync)
+        {
+            bool wasActive;
+            lock (_sync)
+            {
+                _activeRemoteTxLeases.Remove(leaseId);
+            }
+            // Purge/cancel lease-tagged producers before another source can
+            // take ownership after this serialized transition returns.
+            NotifyRemoteTxLeaseRevoked(leaseId);
+            lock (_sync)
+            {
+                if (!string.Equals(_remoteTxLeaseId, leaseId, StringComparison.Ordinal))
+                    return false;
+                wasActive = _activeIntent is not null || _moxOn || _tunOn || IsTwoToneOn;
+            }
+
+            PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
+            ConvergeToSafeIdle(faultLatched: false);
+            if (wasActive)
+                _log.LogWarning("tx.remote.disconnect forced safe idle");
+            BroadcastMoxState(moxOn: false, tunOn: false);
+            return true;
+        }
+    }
+
+    internal event Action<string>? RemoteTxLeaseRevoked;
+
+    private void NotifyRemoteTxLeaseRevoked(string leaseId)
+    {
+        var subscribers = RemoteTxLeaseRevoked;
+        if (subscribers is null) return;
+        foreach (Action<string> subscriber in subscribers.GetInvocationList())
+        {
+            try { subscriber(leaseId); }
+            catch (Exception ex)
+            {
+                // Producer cleanup is defense-in-depth. One faulty subscriber
+                // must never prevent the wire/DSP emergency convergence below.
+                _log.LogError(ex, "tx.remote.disconnect producer revoke hook failed");
+            }
+        }
+    }
+
+    internal bool RegisterRemoteTxLease(string leaseId)
+    {
+        if (!RemoteTxLease.IsValid(leaseId)) return false;
+        lock (_transitionSync)
+        lock (_sync)
+        {
+            if (_activeRemoteTxLeases.Contains(leaseId)) return true;
+            if (_activeRemoteTxLeases.Count >= MaxRemoteTxLeases) return false;
+            return _activeRemoteTxLeases.Add(leaseId);
+        }
+    }
+
+    internal int RegisteredRemoteTxLeaseCount
+    {
+        get { lock (_sync) return _activeRemoteTxLeases.Count; }
+    }
+
+    internal bool TryRunRemoteLeaseOperation(
+        string leaseId,
+        Action operation,
+        out string? error)
+    {
+        lock (_transitionSync)
+        {
+            if (!ValidateRemoteLease(leaseId, out error)) return false;
+            operation();
+            return true;
+        }
+    }
+
+    internal bool TrySetRemoteMox(
+        bool on,
+        string leaseId,
+        MoxSource source,
+        out string? error)
+    {
+        lock (_transitionSync)
+        {
+            // Validation must share the transition lock with the mutation.
+            // Otherwise disconnect can revoke the lease between validation
+            // and key-down, allowing delayed work to re-key the station.
+            if (!ValidateRemoteLease(leaseId, out error)) return false;
+            if (!CanRemoteLeaseMutateCurrentIntent(leaseId, on, out error)) return false;
+            var success = TrySetMox(on, source, out error);
+            if (success && on)
+                lock (_sync) _remoteTxLeaseId = leaseId;
+            return success;
+        }
+    }
+
+    internal bool TrySetRemoteTun(bool on, string leaseId, out string? error)
+    {
+        lock (_transitionSync)
+        {
+            if (!ValidateRemoteLease(leaseId, out error)) return false;
+            if (!CanRemoteLeaseMutateCurrentIntent(leaseId, on, out error)) return false;
+            var success = TrySetTun(on, MoxSource.UI, out error);
+            if (success && on)
+                lock (_sync) _remoteTxLeaseId = leaseId;
+            return success;
+        }
+    }
+
+    internal bool TrySetRemoteTwoTone(TwoToneSetRequest request, string leaseId, out string? error)
+    {
+        lock (_transitionSync)
+        {
+            if (!ValidateRemoteLease(leaseId, out error)) return false;
+            if (!CanRemoteLeaseMutateCurrentIntent(leaseId, request.Enabled, out error)) return false;
+            var success = TrySetTwoTone(request, out error);
+            if (success && request.Enabled)
+                lock (_sync) _remoteTxLeaseId = leaseId;
+            return success;
+        }
+    }
+
+    internal bool IsRemoteLeaseOwner(string leaseId, MoxSource? source = null)
+    {
+        lock (_sync)
+            return string.Equals(_remoteTxLeaseId, leaseId, StringComparison.Ordinal)
+                && (source is null || _moxOwner == source);
+    }
+
+    private bool CanRemoteLeaseMutateCurrentIntent(
+        string leaseId,
+        bool keyDown,
+        out string? error)
+    {
+        lock (_sync)
+        {
+            if (_activeIntent is null)
+            {
+                error = null;
+                return true;
+            }
+            if (string.Equals(_remoteTxLeaseId, leaseId, StringComparison.Ordinal))
+            {
+                error = null;
+                return true;
+            }
+            error = keyDown
+                ? "TX is owned by another local or remote source"
+                : "this remote session does not own the active transmission";
+            return false;
+        }
+    }
+
+    private bool ValidateRemoteLease(string leaseId, out string? error)
+    {
+        lock (_sync)
+        {
+            if (!string.IsNullOrWhiteSpace(leaseId)
+                && _activeRemoteTxLeases.Contains(leaseId))
+            {
+                error = null;
+                return true;
+            }
+        }
+        error = string.IsNullOrWhiteSpace(leaseId)
+            ? "remote TX lease is required"
+            : "remote TX lease is not active";
+        return false;
+    }
+
+    /// <summary>
     /// Arm or disarm the TwoTone test generator AND key MOX. Mirrors the Thetis
     /// chkTestIMD_CheckedChanged path (setup.cs:11162-11165, 11189-11216):
     /// TwoTone owns the MOX state while armed and unconditionally drops it on
@@ -1154,6 +1393,16 @@ public sealed class TxService
         => TrySetTun(on, MoxSource.UI, out error);
 
     public bool TrySetTun(bool on, MoxSource source, out string? error)
+        => TrySetTunCore(on, source, paCalibrationLeaseOwner: false, out error);
+
+    internal bool TrySetPaCalibrationTun(bool on, out string? error)
+        => TrySetTunCore(on, MoxSource.Analyzer, paCalibrationLeaseOwner: true, out error);
+
+    private bool TrySetTunCore(
+        bool on,
+        MoxSource source,
+        bool paCalibrationLeaseOwner,
+        out string? error)
     {
         if (on) TransmitRequested?.Invoke(source);
         lock (_transitionSync)
@@ -1185,7 +1434,11 @@ public sealed class TxService
                 return true;
             }
 
-            if (!EvaluateAdmission(TransmitIntent.Tun, source, out error)) return false;
+            if (!EvaluateAdmission(
+                    TransmitIntent.Tun,
+                    source,
+                    out error,
+                    paCalibrationLeaseOwner)) return false;
             if (active == TransmitIntent.Tun) { error = null; return true; }
 
             int preKeyMs = source == MoxSource.UI ? _radio.TxMoxPreKeyDelayMs : 0;
@@ -1193,6 +1446,7 @@ public sealed class TxService
             long revision = NextTransitionRevision();
             _safety.AdmitExplicitRequest();
             _radio.SetHardwareCwSafetyBlocked(true);
+            lock (_sync) _pendingTunOwner = source;
             try
             {
                 PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
@@ -1209,7 +1463,11 @@ public sealed class TxService
                 _radio.AlignLoForTx();
                 _radio.NotifyTunActive(true);
                 _pipeline.SetMox(true);
-                if (!EvaluateAdmission(TransmitIntent.Tun, source, out error))
+                if (!EvaluateAdmission(
+                        TransmitIntent.Tun,
+                        source,
+                        out error,
+                        paCalibrationLeaseOwner))
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
                 _radio.SetMox(true);
                 _pipeline.CommitTxEgress(revision);
@@ -1227,6 +1485,10 @@ public sealed class TxService
                 ConvergeToSafeIdle(faultLatched: true);
                 error = ex.Message;
                 return false;
+            }
+            finally
+            {
+                lock (_sync) _pendingTunOwner = null;
             }
         }
     }

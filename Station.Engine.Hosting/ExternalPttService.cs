@@ -133,6 +133,10 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // dit/dah while the internal keyer runs — so the host monitor sidetone
     // tracks the gateware's shaped key-down. Owned by the P2 RX thread only.
     private bool _p2PrevSidetone;
+    // Orion 2.2b10 added the shaped keyout signal above. Older Orion-MkII DLE
+    // gateware exposes only the raw dot/dash inputs, so those builds need the
+    // paddle level as their best available host-monitor sidetone source.
+    private bool _p2UseLegacyPaddleSidetone;
     // Single-shot timer used to debounce falling edges. Created lazily and
     // re-armed via Change(); the underlying System.Threading.Timer is thread
     // safe so cancellation from the RX thread and fire-and-handle on the
@@ -378,7 +382,19 @@ public sealed class ExternalPttService : IHostedService, IDisposable
 
     private void OnP2Connected(Zeus.Protocol2.Protocol2Client client)
     {
-        lock (_sync) { _p2Client = client; _owned = false; _hwHigh = false; _p2PrevPtt = false; _p2PrevSidetone = false; }
+        bool legacyPaddleSidetone = UsesLegacyP2PaddleSidetone(
+            _radio.ConnectedBoardKind,
+            _radio.EffectiveOrionMkIIVariant,
+            _radio.ConnectedFirmware);
+        lock (_sync)
+        {
+            _p2Client = client;
+            _owned = false;
+            _hwHigh = false;
+            _p2PrevPtt = false;
+            _p2PrevSidetone = false;
+            _p2UseLegacyPaddleSidetone = legacyPaddleSidetone;
+        }
         client.TelemetryReceived += OnP2Telemetry;
     }
 
@@ -392,6 +408,7 @@ public sealed class ExternalPttService : IHostedService, IDisposable
             _owned = false;
             _p2PrevPtt = false;
             _p2PrevSidetone = false;
+            _p2UseLegacyPaddleSidetone = false;
             ++_moxOpSeq;
             _moxWorkPending = false;
         }
@@ -408,15 +425,14 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // PttIn level. Runs on the Protocol2Client RX thread.
     private void OnP2Telemetry(Zeus.Protocol2.P2TelemetryReading reading)
     {
-        // The P2 FPGA internal keyer shapes CW locally and reports its
-        // key-down envelope in the hi-priority status (byte 0 bit 7). It
-        // toggles per dit/dah independently of the held PTT-IN line, so drive
-        // the host monitor sidetone off THIS bit — the P2 analog of the P1
-        // CwKeyDownChanged (C0[2]) path — BEFORE the PttIn edge gate below,
-        // which would otherwise swallow every element that doesn't also move
-        // PTT. Without this the internal keyer transmits fine but the operator
-        // hears no local sidetone through Zeus's audio bus (#1524).
-        bool sidetone = reading.SidetoneActive;
+        // Modern P2 gateware reports its shaped key-down envelope in byte 0
+        // bit 7. Pre-2.2b10 Orion DLE builds lack that signal, so the
+        // connection-scoped compatibility path substitutes dot/dash input.
+        // Drive either source before the PttIn edge gate below, which would
+        // otherwise swallow every element while the PTT level remains held.
+        bool sidetone = _p2UseLegacyPaddleSidetone
+            ? reading.DotIn || reading.DashIn
+            : reading.SidetoneActive;
         if (sidetone != _p2PrevSidetone)
         {
             _p2PrevSidetone = sidetone;
@@ -427,6 +443,23 @@ public sealed class ExternalPttService : IHostedService, IDisposable
         if (ptt == _p2PrevPtt) return; // no edge
         _p2PrevPtt = ptt;
         HandleRawPtt(ptt);
+    }
+
+    private static bool UsesLegacyP2PaddleSidetone(
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant,
+        string? firmware)
+    {
+        if (board != HpsdrBoardKind.OrionMkII || variant is not (
+            OrionMkIIVariant.Anan7000DLE or
+            OrionMkIIVariant.Anan8000DLE or
+            OrionMkIIVariant.OrionMkII))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(firmware)) return false;
+        string normalized = firmware.Trim().Replace('b', '.').Replace('B', '.');
+        return Version.TryParse(normalized, out var version)
+            && version < new Version(2, 2, 10);
     }
 
     // ---- Shared debounce / hang / ownership engine -----------------------

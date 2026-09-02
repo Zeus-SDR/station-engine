@@ -2,13 +2,13 @@
 namespace Zeus.Plugins.Contracts;
 
 /// <summary>
-/// Host-mediated QRZ.com callsign lookup, granted via
+/// Host-mediated QRZ.com callsign lookup, declared via
 /// <see cref="PluginCapabilities.NetworkAccess"/>. The host performs the
 /// lookup using the OPERATOR'S OWN stored QRZ credentials, session, and shared
 /// rate-limit gate — so a plugin never asks the user for QRZ credentials a
 /// second time, never stores keys, and can't stampede QRZ. Surfaced as
-/// <see cref="IPluginContext.Qrz"/>; null there when the capability wasn't
-/// granted or the host has no QRZ subscription configured.
+/// <see cref="IPluginContext.Qrz"/>; null there when the capability was not
+/// declared or the host has no QRZ subscription configured.
 /// </summary>
 public interface IQrzLookup
 {

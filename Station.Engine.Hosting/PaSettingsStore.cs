@@ -40,6 +40,12 @@ public sealed class PaSettingsStore : IDisposable
     private readonly ILiteCollection<PaGlobalEntry> _globals;
     private readonly ILogger<PaSettingsStore> _log;
     private readonly object _sync = new();
+    // Calibration edits must affect the live drive calculation without
+    // becoming durable until the entire eleven-band run succeeds.  The
+    // overlay is visible to GetAll (and therefore RadioService) but never
+    // touches LiteDB; ClearCalibrationOverlay provides atomic rollback.
+    private PaSettingsDto? _calibrationOverlay;
+    private bool _calibrationCommitInProgress;
     // Dedup key for the cross-board PA-gain substitution warning (issue #1180).
     // PaBandEntry rows are not board-scoped, so a value stored under one board
     // family's semantics survives a session into another board family — fired
@@ -55,6 +61,15 @@ public sealed class PaSettingsStore : IDisposable
     private readonly HashSet<(HpsdrBoardKind Board, OrionMkIIVariant Variant)> _maxPowerWarned = new();
 
     public event Action? Changed;
+
+    public bool CalibrationOverlayActive
+    {
+        get
+        {
+            lock (_sync)
+                return _calibrationOverlay is not null || _calibrationCommitInProgress;
+        }
+    }
 
     public PaSettingsStore(ILogger<PaSettingsStore> log, string? dbPathOverride = null)
     {
@@ -88,6 +103,8 @@ public sealed class PaSettingsStore : IDisposable
     {
         lock (_sync)
         {
+            if (_calibrationOverlay is not null)
+                return _calibrationOverlay;
             var g = _globals.FindAll().FirstOrDefault();
             // When nothing is persisted yet, seed the global with board-specific
             // defaults so new operators don't land in the "PaMaxPowerWatts=0 →
@@ -317,62 +334,158 @@ public sealed class PaSettingsStore : IDisposable
         }
     }
 
-    public void Save(PaSettingsDto dto)
+    public void Save(PaSettingsDto dto) => Save(dto, calibrationCommit: false);
+
+    private void Save(PaSettingsDto dto, bool calibrationCommit)
     {
         lock (_sync)
         {
-            var existingGlobal = _globals.FindAll().FirstOrDefault();
-            var g = existingGlobal ?? new PaGlobalEntry();
-            g.PaEnabled = dto.Global.PaEnabled;
-            g.PaMaxPowerWatts = Math.Max(0, dto.Global.PaMaxPowerWatts);
-            g.UpdatedUtc = DateTime.UtcNow;
-            if (existingGlobal is null) _globals.Insert(g);
-            else _globals.Update(g);
-
-            foreach (var band in dto.Bands)
+            if (!calibrationCommit &&
+                (_calibrationOverlay is not null || _calibrationCommitInProgress))
+                throw new InvalidOperationException(
+                    "PA settings are locked while calibration is running.");
+            if (!_db.BeginTrans())
+                throw new InvalidOperationException(
+                    "Could not begin the PA settings transaction.");
+            try
             {
-                if (!BandUtils.HfBands.Contains(band.Band)) continue;
-                var existing = _bands.FindOne(x => x.Band == band.Band);
-                // DX masks are 4-bit per the EU2AV spec (bits 0..3 ->
-                // DX OUT 7..10); narrow to 0x0F before persisting so the
-                // bench API can't smuggle bits the wire path will drop.
-                byte dxTx = (byte)(band.OcDxTx & 0x0F);
-                byte dxRx = (byte)(band.OcDxRx & 0x0F);
-                // OcTune is a 7-bit additive mask (issue #1325); mirror the
-                // OcTx/OcRx narrowing so a bench PUT can't smuggle bit 7.
-                byte tune = (byte)(band.OcTune & 0x7F);
-                byte tx = (byte)(band.OcTx & 0x7F);
-                byte rx = (byte)(band.OcRx & 0x7F);
-                if (existing is null)
+                var existingGlobal = _globals.FindAll().FirstOrDefault();
+                var g = existingGlobal ?? new PaGlobalEntry();
+                g.PaEnabled = dto.Global.PaEnabled;
+                g.PaMaxPowerWatts = Math.Max(0, dto.Global.PaMaxPowerWatts);
+                g.UpdatedUtc = DateTime.UtcNow;
+                if (existingGlobal is null) _globals.Insert(g);
+                else _globals.Update(g);
+
+                foreach (var band in dto.Bands)
                 {
-                    _bands.Insert(new PaBandEntry
+                    if (!BandUtils.HfBands.Contains(band.Band)) continue;
+                    var existing = _bands.FindOne(x => x.Band == band.Band);
+                    byte dxTx = (byte)(band.OcDxTx & 0x0F);
+                    byte dxRx = (byte)(band.OcDxRx & 0x0F);
+                    byte tune = (byte)(band.OcTune & 0x7F);
+                    byte tx = (byte)(band.OcTx & 0x7F);
+                    byte rx = (byte)(band.OcRx & 0x7F);
+                    if (existing is null)
                     {
-                        Band = band.Band,
-                        PaGainDb = band.PaGainDb,
-                        DisablePa = band.DisablePa,
-                        OcTx = tx,
-                        OcRx = rx,
-                        OcDxTx = dxTx,
-                        OcDxRx = dxRx,
-                        OcTune = tune,
-                        UpdatedUtc = DateTime.UtcNow,
-                    });
+                        _bands.Insert(new PaBandEntry
+                        {
+                            Band = band.Band,
+                            PaGainDb = band.PaGainDb,
+                            DisablePa = band.DisablePa,
+                            OcTx = tx,
+                            OcRx = rx,
+                            OcDxTx = dxTx,
+                            OcDxRx = dxRx,
+                            OcTune = tune,
+                            UpdatedUtc = DateTime.UtcNow,
+                        });
+                    }
+                    else
+                    {
+                        existing.PaGainDb = band.PaGainDb;
+                        existing.DisablePa = band.DisablePa;
+                        existing.OcTx = tx;
+                        existing.OcRx = rx;
+                        existing.OcDxTx = dxTx;
+                        existing.OcDxRx = dxRx;
+                        existing.OcTune = tune;
+                        existing.UpdatedUtc = DateTime.UtcNow;
+                        _bands.Update(existing);
+                    }
                 }
-                else
-                {
-                    existing.PaGainDb = band.PaGainDb;
-                    existing.DisablePa = band.DisablePa;
-                    existing.OcTx = tx;
-                    existing.OcRx = rx;
-                    existing.OcDxTx = dxTx;
-                    existing.OcDxRx = dxRx;
-                    existing.OcTune = tune;
-                    existing.UpdatedUtc = DateTime.UtcNow;
-                    _bands.Update(existing);
-                }
+                _db.Commit();
+            }
+            catch
+            {
+                _db.Rollback();
+                throw;
             }
         }
         Changed?.Invoke();
+    }
+
+    public PaSettingsDto BeginCalibrationOverlay(
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant)
+    {
+        PaSettingsDto snapshot;
+        lock (_sync)
+        {
+            if (_calibrationOverlay is not null || _calibrationCommitInProgress)
+                throw new InvalidOperationException(
+                    "PA calibration overlay is already active.");
+            snapshot = GetAll(board, variant);
+            _calibrationOverlay = snapshot;
+        }
+        Changed?.Invoke();
+        return snapshot;
+    }
+
+    public void BeginCalibrationOverlay(PaSettingsDto snapshot)
+    {
+        lock (_sync)
+        {
+            if (_calibrationOverlay is not null || _calibrationCommitInProgress)
+                throw new InvalidOperationException("PA calibration overlay is already active.");
+            _calibrationOverlay = snapshot;
+        }
+        Changed?.Invoke();
+    }
+
+    public void SetCalibrationGain(string band, double paGainDb)
+    {
+        lock (_sync)
+        {
+            var current = _calibrationOverlay
+                ?? throw new InvalidOperationException("PA calibration overlay is not active.");
+            var bands = current.Bands
+                .Select(row => row.Band == band ? row with { PaGainDb = paGainDb } : row)
+                .ToArray();
+            _calibrationOverlay = current with { Bands = bands };
+        }
+        Changed?.Invoke();
+    }
+
+    public void CompleteCalibrationOverlay(bool persist)
+    {
+        PaSettingsDto? completed;
+        bool refreshAfterFailedCommit = false;
+        lock (_sync)
+        {
+            completed = _calibrationOverlay;
+            _calibrationOverlay = null;
+            _calibrationCommitInProgress = persist && completed is not null;
+        }
+
+        try
+        {
+            if (persist && completed is not null)
+                Save(completed, calibrationCommit: true);
+            else
+                Changed?.Invoke();
+        }
+        catch
+        {
+            // Save rolled its transaction back, but RadioService last observed
+            // the transient overlay. Force it to recompute from durable values
+            // so a failed commit cannot leave calibration drive live on-air.
+            refreshAfterFailedCommit = true;
+            throw;
+        }
+        finally
+        {
+            lock (_sync) _calibrationCommitInProgress = false;
+            if (refreshAfterFailedCommit)
+            {
+                try { Changed?.Invoke(); }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex,
+                        "pa.calibration.rollback_refresh.failed");
+                }
+            }
+        }
     }
 
     public void Dispose() => _dbLease.Dispose();

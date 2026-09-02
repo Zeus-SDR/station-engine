@@ -230,12 +230,42 @@ public static class RadioHardwareEndpoints
         {
             if (req.Global is null || req.Bands is null)
                 return Results.BadRequest(new { error = "global and bands required" });
+            if (store.CalibrationOverlayActive)
+                return Results.Conflict(new { error = "PA settings are locked while calibration is running." });
             if (req.Global.PaMaxPowerWatts < 0)
                 return Results.BadRequest(new { error = "paMaxPowerWatts must be >= 0" });
-            store.Save(new PaSettingsDto(req.Global, req.Bands));
+            try
+            {
+                store.Save(new PaSettingsDto(req.Global, req.Bands));
+            }
+            catch (InvalidOperationException) when (store.CalibrationOverlayActive)
+            {
+                return Results.Conflict(new
+                {
+                    error = "PA settings are locked while calibration is running.",
+                });
+            }
             return Results.Ok(store.GetAll(
                 radio.EffectiveBoardKind,
                 radio.EffectiveOrionMkIIVariant));
+        });
+
+        endpoints.MapGet("/api/pa-settings/calibration", (PaCalibrationService calibration) =>
+            Results.Ok(calibration.Status));
+
+        endpoints.MapPost("/api/pa-settings/calibration", (
+            PaCalibrationStartRequest req,
+            PaCalibrationService calibration) =>
+        {
+            if (!calibration.TryStart(req, out var error))
+                return Results.Conflict(new { error });
+            return Results.Accepted("/api/pa-settings/calibration", calibration.Status);
+        });
+
+        endpoints.MapDelete("/api/pa-settings/calibration", (PaCalibrationService calibration) =>
+        {
+            calibration.Cancel();
+            return Results.Accepted("/api/pa-settings/calibration", calibration.Status);
         });
 
         return endpoints;

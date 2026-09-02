@@ -158,6 +158,18 @@ public class DspPipelineService : BackgroundService,
     /// safe from the request thread.</summary>
     public void SetTxMonitorMeterOnly(bool on) => _txMonitorMeterOnly = on;
     public bool TxMonitorMeterOnly => _txMonitorMeterOnly;
+    public const double MinTxMonitorVolumeDb = -60.0;
+    public const double MaxTxMonitorVolumeDb = 0.0;
+    private double _txMonitorVolumeDb;
+    public double TxMonitorVolumeDb => Volatile.Read(ref _txMonitorVolumeDb);
+
+    public double SetTxMonitorVolumeDb(double db)
+    {
+        if (!double.IsFinite(db)) db = 0.0;
+        double applied = Math.Clamp(db, MinTxMonitorVolumeDb, MaxTxMonitorVolumeDb);
+        Volatile.Write(ref _txMonitorVolumeDb, applied);
+        return applied;
+    }
 
     internal struct RxAudioLevelerState
     {
@@ -931,6 +943,12 @@ public class DspPipelineService : BackgroundService,
         }
 
         public int ChannelId = -1; // -1 = inactive; Volatile.Read/Write(ref ChannelId)
+        // Raised-cosine fade-in samples remaining on a freshly opened channel.
+        // Armed to SecondaryRxOpenFadeInSamples when EnsureSecondaryRxChannel
+        // opens a new WDSP channel and consumed by the audio tick; 0 once the
+        // ramp completes or the channel is closed. Cross-thread (armed on the
+        // state thread, consumed on the DSP tick thread) — Volatile.Read/Write.
+        public int FadeInSamplesRemaining;
         // Hardware DDC centre (this receiver's analogue of RX1's RadioLoHz). Under
         // CTUN it stays frozen while the dial roams within the window; with CTUN off
         // it follows the dial. Recentres if the dial would leave the captured DDC
@@ -1498,6 +1516,13 @@ public class DspPipelineService : BackgroundService,
     // post-processed RX block that is actually broadcast.
     private const int RxFadeSamples = 240;          // 5 ms @ 48 kHz
     internal const int RxPostTxFadeInSamples = 3840; // 80 ms @ 48 kHz
+    // Raised-cosine fade-in applied to the first audio blocks of a freshly
+    // opened secondary receiver (RX2..RXn). A newly opened WDSP RX channel
+    // starts with an unconverged AGC and can emit a large first block; summed
+    // unramped into the additive RX mix bus (MixRxAudioN) that lands as an
+    // audible click/distortion the instant RX2 is toggled on. Mirrors RX1's
+    // post-TX raised-cosine resume so every receiver enters the mix smoothly.
+    internal const int SecondaryRxOpenFadeInSamples = RxPostTxFadeInSamples;
     private const int RxPostTxAudioCadenceHz = 30;
     internal const int DefaultRxPostTxMuteBlocks = 6; // ~200 ms at the 30 Hz audio cadence
     private volatile bool _rxFadeOutPending;        // first RX block after MOX↑
@@ -6633,6 +6658,16 @@ public class DspPipelineService : BackgroundService,
         try
         {
             ApplyStateToSecondaryRxChannel(engine, rxIndex, opened, s);
+            // Fresh channel: ramp its first audio blocks into the additive mix
+            // bus so toggling the receiver on doesn't dump an unconverged,
+            // full-scale block and click/distort. Mirrors RX1's post-TX resume.
+            // Arm the fade BEFORE publishing ChannelId: the audio tick gates on
+            // ChannelId (Volatile.Read, acquire) then reads FadeInSamplesRemaining.
+            // Writing the counter first, then ChannelId (Volatile.Write, release),
+            // guarantees any tick that observes the new channel also observes the
+            // armed fade — otherwise a tick interleaving between the two writes
+            // would mix the first unramped block with the counter still 0.
+            Volatile.Write(ref rx.FadeInSamplesRemaining, SecondaryRxOpenFadeInSamples);
             Volatile.Write(ref rx.ChannelId, opened);
             _log.LogInformation(
                 "dsp.pipeline rx{Rx} opened channel={Channel} rate={Rate} vfoHz={VfoHz}",
@@ -6658,6 +6693,7 @@ public class DspPipelineService : BackgroundService,
     {
         if (chan < 0) return;
         Volatile.Write(ref _secondaryRx[rxIndex].ChannelId, -1);
+        Volatile.Write(ref _secondaryRx[rxIndex].FadeInSamplesRemaining, 0);
         // NaN = "no value applied yet" — a future reopen snaps to the
         // operator's target instead of slewing from this stale value.
         _secondaryRx[rxIndex].ResetAppliedState();
@@ -6677,6 +6713,7 @@ public class DspPipelineService : BackgroundService,
         for (int i = 1; i < MaxReceivers; i++)
         {
             Volatile.Write(ref _secondaryRx[i].ChannelId, -1);
+            Volatile.Write(ref _secondaryRx[i].FadeInSamplesRemaining, 0);
             // See SecondaryRx.AppliedAfGainDb — engine swap discards any
             // prior slewed state, so the new channel snaps to its target.
             _secondaryRx[i].ResetAppliedState();
@@ -8726,6 +8763,17 @@ public class DspPipelineService : BackgroundService,
         return count;
     }
 
+    internal static void ApplyTxMonitorVolume(Span<float> samples, double volumeDb)
+    {
+        double clampedDb = Math.Clamp(
+            double.IsFinite(volumeDb) ? volumeDb : 0.0,
+            MinTxMonitorVolumeDb,
+            MaxTxMonitorVolumeDb);
+        if (clampedDb >= 0.0) return;
+        float gain = (float)Math.Pow(10.0, clampedDb / 20.0);
+        for (int i = 0; i < samples.Length; i++) samples[i] *= gain;
+    }
+
     internal static bool ShouldMixExternalRxIntoTxMonitor(
         int externalRxCount,
         bool txMonitorMeterOnly,
@@ -9349,8 +9397,23 @@ public class DspPipelineService : BackgroundService,
             int want = Math.Min(audioSampleCount, sec.AudioBuf.Length);
             int n = want > 0 ? engine.ReadAudio(secChan, sec.AudioBuf.AsSpan(0, want)) : 0;
             if (n > 0)
+            {
+                // Ramp the first blocks of a freshly opened channel so RX2-on
+                // enters the additive mix (below) smoothly instead of dumping an
+                // unconverged full-scale block. Applied before the plugin tap and
+                // the mix so every consumer sees the same faded audio.
+                int fadeRemaining = Volatile.Read(ref sec.FadeInSamplesRemaining);
+                if (fadeRemaining > 0)
+                {
+                    int fadeNext = ApplyRxPostTxFadeIn(
+                        sec.AudioBuf.AsSpan(0, n),
+                        fadeRemaining,
+                        SecondaryRxOpenFadeInSamples);
+                    Volatile.Write(ref sec.FadeInSamplesRemaining, fadeNext);
+                }
                 _productPluginAudio?.PublishRxAudio(
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
+            }
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
             // affect the additive MixRxAudioN bus. With DUP on, every unmuted
@@ -9757,6 +9820,11 @@ public class DspPipelineService : BackgroundService,
                 // taps; null subscriber list = no cost. Fire it before Kiwi is
                 // added to the operator monitor so the air tap stays TX-only.
                 TxMonitorAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, monCount));
+                // Monitor volume is an operator playback preference, not a
+                // TX-chain control. Apply it only after diagnostics and the
+                // TX-air tap have observed the unmodified signal. External RX
+                // is mixed below and therefore keeps its own AF level.
+                ApplyTxMonitorVolume(audioBuf.AsSpan(0, monCount), TxMonitorVolumeDb);
             }
 
             // Meter-only monitor (Auto Tune) intentionally has no monitor

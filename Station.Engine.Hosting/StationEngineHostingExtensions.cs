@@ -10,7 +10,8 @@ namespace Zeus.Server;
 public sealed record StationEngineHostingOptions(
     bool NativeAudioOutputEnabled = false,
     string? P2AutoConnectEndpoint = null,
-    IReadOnlyList<string>? LanHttpsUrls = null);
+    IReadOnlyList<string>? LanHttpsUrls = null,
+    string? GodsEyeDatabasePath = null);
 
 /// <summary>Registers the complete standalone station-engine runtime.</summary>
 public static class StationEngineHostingExtensions
@@ -119,7 +120,9 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<Hl2VnaSweepHardware>();
         services.AddSingleton<RadioBridgeVnaSweepHardware>();
         services.AddSingleton<ConnectedRadioVnaSweepHardware>();
-        services.AddSingleton<IVnaSweepHardware>(sp => sp.GetRequiredService<ConnectedRadioVnaSweepHardware>());
+        services.AddSingleton<NanoVnaSweepHardware>();
+        services.AddSingleton<VnaHardwareRouter>();
+        services.AddSingleton<IVnaSweepHardware>(sp => sp.GetRequiredService<VnaHardwareRouter>());
         services.AddSingleton<VnaService>();
         services.AddSingleton<AudioSettingsStore>();
         services.AddSingleton<Nr3ModelStore>();
@@ -153,6 +156,8 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<BottomPinStore>();
         services.AddSingleton<PanWfSplitStore>();
         services.AddSingleton<OperatorIdentityStore>();
+        services.AddGodsEyeServices(options.GodsEyeDatabasePath ?? PrefsDbPath.EngineGet(),
+            fallbackGrid: provider => provider.GetService<OperatorIdentityStore>()?.Get().Grid);
         // Zeus Link bundle settings mirror (feature toggles + amplifier
         // configs as one opaque product JSON document). Product database, same
         // reasoning as the operator UI families above: it must ride the
@@ -215,6 +220,7 @@ public static class StationEngineHostingExtensions
         });
         services.AddProtocol2ConnectionServices();
         services.AddSingleton<FrequencyCalibrationService>();
+        services.AddSingleton<PaCalibrationService>();
         services.AddSingleton<ImdMeasureService>();
         services.AddSingleton<TdoaSolver>();
         services.AddSingleton<IKiwiTdoaCaptureTransport, KiwiTdoaCaptureTransport>();
@@ -224,6 +230,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<IInstalledFeatureState, NoInstalledFeatureState>();
         services.AddSingleton<TuneCarrierCommandCoordinator>();
         services.AddSingleton<TxAudioIngest>();
+        services.AddSingleton<TxDiagnosticsService>();
         services.AddSingleton<TxAudioIngestStartup>();
         services.AddSingleton<TxMicMeterService>();
         services.AddSingleton<SignalJammerTxSource>();

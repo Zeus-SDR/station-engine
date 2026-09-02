@@ -122,3 +122,15 @@ public sealed record VnaStatusDto(
     string? ActiveAntenna,
     string? ActiveBand,
     string? Error);
+
+public sealed record VnaSourceStatusDto(
+    string Source,
+    string? DeviceId,
+    string? DeviceName,
+    bool Connected,
+    string? Error,
+    IReadOnlyList<string> Devices);
+
+public sealed record VnaSourceSelectionRequest(
+    string Source,
+    string? DeviceId = null);

@@ -11,10 +11,13 @@ public static class TxControlEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
-        endpoints.MapPost("/api/tx/mox", (MoxSetRequest req, TxService tx) =>
+        endpoints.MapPost("/api/tx/mox", (MoxSetRequest req, TxService tx, HttpContext context) =>
         {
             log.LogInformation("api.tx.mox on={On}", req.On);
-            if (!tx.TrySetMox(req.On, out var err)) return Results.Conflict(new { error = err });
+            var ok = RemoteTxLease.TryGet(context, out var leaseId)
+                ? tx.TrySetRemoteMox(req.On, leaseId, MoxSource.UI, out var err)
+                : tx.TrySetMox(req.On, out err);
+            if (!ok) return Results.Conflict(new { error = err });
             return Results.Ok(new { moxOn = tx.IsMoxOn });
         });
 
@@ -22,9 +25,12 @@ public static class TxControlEndpoints
         // playback happens on the engine's worker. WPM null = engine default
         // (currently 20); the engine clamps to 5..50. Empty text is allowed —
         // produces no symbols and resolves to Idle without keying.
-        endpoints.MapPost("/api/cw/send", async (CwSendRequest req, CwEngine cw) =>
+        endpoints.MapPost("/api/cw/send", async (CwSendRequest req, CwEngine cw, HttpContext context) =>
         {
-            await cw.SendAsync(req.Text ?? string.Empty, req.Wpm, default).ConfigureAwait(false);
+            var leaseId = RemoteTxLease.TryGet(context, out var remoteLease)
+                ? remoteLease
+                : null;
+            await cw.SendAsync(req.Text ?? string.Empty, req.Wpm, default, leaseId).ConfigureAwait(false);
             return Results.Accepted();
         });
 
@@ -128,9 +134,17 @@ public static class TxControlEndpoints
             TunSetRequest req,
             TxService tx,
             [Microsoft.AspNetCore.Mvc.FromServices] TuneCarrierCommandCoordinator coordinator,
+            HttpContext context,
             CancellationToken cancellationToken) =>
         {
-            var result = await coordinator.SetAsync(req.On, tx, cancellationToken)
+            var remoteLeaseId = RemoteTxLease.TryGet(context, out var leaseId)
+                ? leaseId
+                : null;
+            var result = await coordinator.SetAsync(
+                    req.On,
+                    tx,
+                    cancellationToken,
+                    remoteLeaseId)
                 .ConfigureAwait(false);
             if (!result.Success)
             {
@@ -211,12 +225,14 @@ public static class TxControlEndpoints
                 enabled,
                 meterOnly = enabled && pipe.TxMonitorMeterOnly,
                 monitorOnTransmit = tx.MonitorOnTransmit,
+                volumeDb = pipe.TxMonitorVolumeDb,
             });
         }
 
         static IResult SetAudioSuitePreview(
             PreviewSetRequest body,
-            TxService tx)
+            TxService tx,
+            DspPipelineService pipe)
         {
             bool meterOnly = body.Enabled && (body.MeterOnly ?? false);
             var state = tx.ApplyTxMonitorPreview(
@@ -229,6 +245,7 @@ public static class TxControlEndpoints
                 enabled = state.Enabled,
                 meterOnly = state.MeterOnly,
                 monitorOnTransmit = state.MonitorOnTransmit,
+                volumeDb = pipe.TxMonitorVolumeDb,
             });
         }
 
@@ -242,6 +259,12 @@ public static class TxControlEndpoints
         endpoints.MapPut("/api/audio-suite/preview", SetAudioSuitePreview);
         endpoints.MapGet("/api/tx-audio-suite/preview", GetAudioSuitePreview);
         endpoints.MapPut("/api/tx-audio-suite/preview", SetAudioSuitePreview);
+        endpoints.MapPut("/api/tx-audio-suite/monitor-volume", (
+            MonitorVolumeSetRequest body,
+            DspPipelineService pipe) => Results.Ok(new
+            {
+                volumeDb = pipe.SetTxMonitorVolumeDb(body.VolumeDb),
+            }));
 
         // Preview-path toggle. The engine call lives in
         // DspPipelineService.UpdateState so it lands beside the rest of the
@@ -326,3 +349,5 @@ internal sealed record PreviewSetRequest(
     bool Enabled,
     bool? MeterOnly = null,
     bool? MonitorOnTransmit = null);
+
+internal sealed record MonitorVolumeSetRequest(double VolumeDb);

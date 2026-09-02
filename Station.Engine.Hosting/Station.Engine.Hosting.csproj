@@ -63,4 +63,20 @@
     <Content Include="BandPlans\**\*.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- Gods Eye remains physically beside the full GPL server host, but the
+       standalone station engine owns and compiles the radio-free implementation. -->
+  <ItemGroup>
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\AisStreamClient.cs" Link="GodsEye\AisStreamClient.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\CameraFeedService.cs" Link="GodsEye\CameraFeedService.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeLandMask.cs" Link="GodsEye\GodsEyeLandMask.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeModels.cs" Link="GodsEye\GodsEyeModels.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeParsers.cs" Link="GodsEye\GodsEyeParsers.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeViewerRegistry.cs" Link="GodsEye\GodsEyeViewerRegistry.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEyeFeedsService.cs" Link="GodsEye\GodsEyeFeedsService.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEyeSettingsStore.cs" Link="GodsEye\GodsEyeSettingsStore.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\SatelliteSettingsStore.cs" Link="GodsEye\SatelliteSettingsStore.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\SatelliteTrackingService.cs" Link="GodsEye\SatelliteTrackingService.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\Satellites\*.cs" Link="GodsEye\Satellites\%(Filename)%(Extension)" />
+  </ItemGroup>
+
 </Project>

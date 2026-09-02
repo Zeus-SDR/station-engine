@@ -148,6 +148,50 @@ do not include the optional ASIO host bridge are therefore distributed as
 **GPL-3.0-or-later**. Windows distributions that include that bridge are
 conveyed under **GPL-3.0-only**, as described below.
 
+## Vallado SGP4/SDP4 orbital propagator
+
+The satellite-tracking implementation under
+[`Zeus.Server.Hosting/Satellites/`](Zeus.Server.Hosting/Satellites/) includes a
+vendored C# translation of David Vallado's 2016 SGP4 numerical core from
+[`aholinch/sgp4`](https://github.com/aholinch/sgp4) at commit
+[`552cb1489a52c3023ae70cb6c7e239e84c5950fe`](https://github.com/aholinch/sgp4/tree/552cb1489a52c3023ae70cb6c7e239e84c5950fe).
+The upstream project is released under the **Unlicense**, a public-domain
+dedication, and is compatible with Zeus's GPL-2.0-or-later distribution. Zeus
+retains the reference core close to upstream for numerical auditability;
+strict TLE validation, coordinate transforms, pass prediction, persistence,
+HTTP integration, and API surfaces are first-party Zeus code and remain
+visibly separated from it.
+
+The upstream implementation follows the Center for Space Standards and
+Innovation (CSSI) reference implementation by David Vallado and the
+formulation published in *Revisiting Spacetrack Report #3*. It is present so
+both the near-Earth SGP4 path and the SDP4 deep-space resonance/periodic path
+use the published verification lineage instead of a new approximation. The
+complete Unlicense text is preserved in
+[`packaging/station-engine/THIRD-PARTY-LICENSES/SGP4-Unlicense`](packaging/station-engine/THIRD-PARTY-LICENSES/SGP4-Unlicense)
+and reproduced in the station-engine third-party inventory.
+
+## Gods Eye live data providers
+
+The Gods Eye feature is behaviorally derived from Bilawal Sidhu's
+[`bilawalsidhu/gods-eye-view`](https://github.com/bilawalsidhu/gods-eye-view),
+reviewed at commit `d8f1742783cddd6bbc86033d0db06dc6ec746304`. Its MIT-licensed map-stack
+degradation model, layer/source composition, sensor-style presentation, tactical
+overlays, view bookmarks, and tracked-contact interaction model informed Zeus's
+independent TypeScript and C# implementation. No bundled datasets or 3D models
+from that project are redistributed. The upstream MIT text is preserved at
+`packaging/station-engine/THIRD-PARTY-LICENSES/Gods-Eye-View-LICENSE` and in
+the station-engine third-party inventory.
+
+Gods Eye displays operator-selected, transient data from upstream services;
+Zeus does not vendor or redistribute their datasets. The feature's own window
+identifies key requirements and opt-in behavior. Zeus acknowledges CelesTrak,
+the U.S. Geological Survey (USGS), OpenSky Network, AISStream, NASA Fire
+Information for Resource Management System (FIRMS), Launch Library 2 / The
+Space Devs, Alabama DOT ALGO Traffic, Caltrans District 4, Wisconsin 511,
+adsb.lol, Radio Browser, GBFS and CityBikes providers, TomTom, OpenStreetMap,
+Esri World Imagery, and Re:Earth Terrain / Mapterhorn.
+
 ## WDSP
 
 Zeus loads **WDSP** (Warren Pratt, NR0V) via P/Invoke for all on-air DSP.
@@ -432,7 +476,39 @@ cross-reference for HPSDR client behaviour. DeskHPSDR is maintained by
 **Heiko, DL1BZ** at [github.com/dl1bz/deskhpsdr](https://github.com/dl1bz/deskhpsdr)
 and is licensed GPL-2.0-or-later, compatible with Zeus.
 
+## Relationship to NanoVNA-Saver
+
+Zeus's independent NanoVNA serial adapter was developed with reference to
+[NanoVNA-Saver](https://github.com/NanoVNA-Saver/nanovna-saver), maintained by
+the NanoVNA-Saver authors and licensed GPL-3.0-or-later. The reference
+established the device shell conventions used by compatible NanoVNA firmware:
+115200-baud serial transport, CR-terminated commands, the `ch>` prompt,
+scan-mask acquisition on newer firmware, and the legacy
+`sweep` / `frequencies` / `data 0` fallback. Zeus does not bundle
+NanoVNA-Saver or its Python, Qt, NumPy, or SciPy dependencies.
+
+The Zeus station engine is GPL-2.0-or-later, so its "or later" clause is
+license-compatible with this GPL-3.0-or-later reference work.
+
 ## Third-party assets and imagery
+
+### CesiumJS
+
+The optional Gods Eye 3D renderer uses **CesiumJS 1.144.0**, distributed under
+the Apache License 2.0. Cesium is loaded only when the operator enables and
+opens Gods Eye; the checked-in web payload contains the minimized Cesium
+runtime assets required by that renderer. The dependency's license and notices
+are identified by the checked-in lockfile and shipped in the web payload at
+`/legal/CesiumJS-LICENSE.md`.
+
+### hls.js
+
+The Gods Eye camera viewer uses **hls.js 1.7.1**, Copyright (c) 2017
+Dailymotion, distributed under the Apache License 2.0, to play public traffic
+and weather camera HLS streams on browser engines without native HLS playback.
+It is loaded only when the operator opens a live camera on such an engine. The
+dependency's license is identified by the checked-in lockfile and shipped in
+the web payload at `/legal/hls.js-LICENSE.md`.
 
 ### Bouncy Castle Cryptography for .NET
 

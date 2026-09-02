@@ -274,19 +274,19 @@ public static class PrefsDbPath
         }
     }
 
-    private static bool MoveCorruptAside(string dbPath, ILogger? log)
+    internal static bool MoveCorruptAside(string dbPath, ILogger? log)
     {
         var stamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
         var bak = $"{dbPath}.corrupt-{stamp}.bak";
         try
         {
             // Move the DB and any LiteDB sidecar (the -log transaction file) so a
-            // half-checkpointed pair can't re-corrupt the fresh DB. Best-effort
-            // per file; only move what exists.
+            // half-checkpointed pair can't re-corrupt the fresh DB. Move the WAL
+            // first so a locked sidecar leaves the database pair untouched.
             foreach (var (src, dst) in new[]
             {
+                (LiteDbLogPath(dbPath), LiteDbLogPath(bak)),
                 (dbPath, bak),
-                (dbPath + "-log", bak + "-log"),
             })
             {
                 if (File.Exists(src)) File.Move(src, dst);
@@ -408,7 +408,20 @@ public static class PrefsDbPath
     private static void TryDeleteDbFiles(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { /* best effort */ }
-        try { if (File.Exists(path + "-log")) File.Delete(path + "-log"); } catch { /* best effort */ }
+        var logPath = LiteDbLogPath(path);
+        try { if (File.Exists(logPath)) File.Delete(logPath); } catch { /* best effort */ }
+    }
+
+    private static string LiteDbLogPath(string databasePath)
+    {
+        var directory = Path.GetDirectoryName(databasePath);
+        var fileName = Path.GetFileName(databasePath);
+        var logFileName = Path.GetFileNameWithoutExtension(fileName)
+            + "-log"
+            + Path.GetExtension(fileName);
+        return string.IsNullOrEmpty(directory)
+            ? logFileName
+            : Path.Combine(directory, logFileName);
     }
 
     // Copy an existing .db into profiles/<name>.db. Derives the name from the
