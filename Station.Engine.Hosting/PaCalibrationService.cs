@@ -272,16 +272,8 @@ public sealed class PaCalibrationService
                 cancellationToken.ThrowIfCancellationRequested();
                 EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
                 CalibrationPoint point = frequencies[band];
-                // Apply the mode BEFORE pinning the exact VFO. Entering CW
-                // deliberately bumps the dial by ±cw_pitch
-                // (CwOffset.DialBumpForModeTransition), so writing the frequency
-                // first would leave VfoHz off the requested midpoint once the
-                // mode change lands, and the invariant check would misread that
-                // internal bump as operator interference and abort. Setting mode
-                // first lets the bump happen, then the VFO write pins the exact
-                // midpoint the invariant expects — mirroring RestoreModeIfCurrent.
-                _radio.SetPaCalibrationMode(point.Mode);
                 _radio.SetPaCalibrationVfo(point.FrequencyHz);
+                _radio.SetPaCalibrationMode(point.Mode);
                 expectedVfoHz = point.FrequencyHz;
                 expectedMode = point.Mode;
                 currentTune = _radio.Snapshot().TunePct;
