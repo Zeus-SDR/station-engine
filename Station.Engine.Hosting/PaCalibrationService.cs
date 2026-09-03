@@ -24,6 +24,14 @@ public sealed record PaCalibrationStatus(
 public sealed class PaCalibrationService
 {
     private static readonly int[] TargetsWatts = [10, 25, 50];
+    // Full-byte PA gain is attenuation: 70 dB is the least-drive value the
+    // encoder accepts. Each target must approach from here because neither a
+    // persisted seed nor the preceding target proves the PA's response.
+    private const double ConservativeStartGainDb = 70d;
+    private const double MinimumMeasurableWatts = 0.1d;
+    // Below the meter floor, 10 dB raises an ideal plant by at most 10x, so
+    // the next reading remains below 1 W and the 10 W target's 12.5 W trip.
+    private const double UnmeasurablePowerRampDb = 10d;
     private readonly RadioService _radio;
     private readonly TxService _tx;
     private readonly TxMetersService _meters;
@@ -272,8 +280,16 @@ public sealed class PaCalibrationService
                 cancellationToken.ThrowIfCancellationRequested();
                 EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
                 CalibrationPoint point = frequencies[band];
-                _radio.SetPaCalibrationVfo(point.FrequencyHz);
+                // Apply the mode BEFORE pinning the exact VFO. Entering CW
+                // deliberately bumps the dial by ±cw_pitch
+                // (CwOffset.DialBumpForModeTransition), so writing the frequency
+                // first would leave VfoHz off the requested midpoint once the
+                // mode change lands, and the invariant check would misread that
+                // internal bump as operator interference and abort. Setting mode
+                // first lets the bump happen, then the VFO write pins the exact
+                // midpoint the invariant expects — mirroring RestoreModeIfCurrent.
                 _radio.SetPaCalibrationMode(point.Mode);
+                _radio.SetPaCalibrationVfo(point.FrequencyHz);
                 expectedVfoHz = point.FrequencyHz;
                 expectedMode = point.Mode;
                 currentTune = _radio.Snapshot().TunePct;
@@ -282,6 +298,7 @@ public sealed class PaCalibrationService
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
+                    _pa.SetCalibrationGain(band, ConservativeStartGainDb);
                     int requestedTunePct = Math.Clamp(
                         (int)Math.Round(targetWatts * 100d /
                             originalSettings.Global.PaMaxPowerWatts), 1, 100);
@@ -470,17 +487,13 @@ public sealed class PaCalibrationService
             consecutiveInTolerance = 0;
             lastToleranceSampleUtc = DateTimeOffset.MinValue;
 
-            if (measured < 0.1f)
-            {
-                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
-                continue;
-            }
-
             PaBandSettingsDto row = _pa.GetAll(
                     _radio.EffectiveBoardKind,
                     _radio.EffectiveOrionMkIIVariant)
                 .Bands.First(b => b.Band == band);
-            double nextGain = ComputeNextGainDb(row.PaGainDb, measured, targetWatts);
+            double nextGain = measured < MinimumMeasurableWatts
+                ? Math.Max(0d, row.PaGainDb - UnmeasurablePowerRampDb)
+                : ComputeNextGainDb(row.PaGainDb, measured, targetWatts);
             if (Math.Abs(nextGain - row.PaGainDb) < 0.05)
                 throw new InvalidOperationException(
                     $"{band} could not converge at {targetWatts:0.0} W.");

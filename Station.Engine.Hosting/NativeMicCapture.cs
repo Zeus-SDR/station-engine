@@ -62,6 +62,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly ILogger<NativeMicCapture> _log;
     private readonly AudioDeviceSettingsStore? _deviceSettings;
     private readonly INativeMicInputFactory _inputFactory;
+    private readonly Action _promoteWorker;
 
     private INativeMicInput? _input;
     private readonly object _deviceSync = new();
@@ -130,12 +131,30 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         ITxAudioPreviewProcessor previewProcessor,
         ILogger<NativeMicCapture> log,
         AudioDeviceSettingsStore? deviceSettings = null)
+        : this(
+            ingest,
+            previewProcessor,
+            log,
+            deviceSettings,
+            new NativeMicInputFactory())
+    {
+    }
+
+    internal NativeMicCapture(
+        TxAudioIngest ingest,
+        ITxAudioPreviewProcessor previewProcessor,
+        ILogger<NativeMicCapture> log,
+        AudioDeviceSettingsStore? deviceSettings,
+        INativeMicInputFactory inputFactory,
+        Action? promoteWorker = null)
     {
         _ingest = ingest;
         _previewProcessor = previewProcessor;
         _log = log;
         _deviceSettings = deviceSettings;
-        _inputFactory = new NativeMicInputFactory();
+        _inputFactory = inputFactory;
+        _promoteWorker = promoteWorker ??
+            (() => Zeus.Protocol2.RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log));
         _recoveryToken = _recoveryCancellation.Token;
         _inputChannel = deviceSettings?.Get().InputChannel ?? -1;
         _captureBlockValidator = IsCapturedBlockCurrent;
@@ -159,17 +178,6 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _log.LogDebug(ex, "audio.native.tx ingest worker priority promotion unavailable");
         }
         _captureWorker.Start();
-    }
-
-    internal NativeMicCapture(
-        TxAudioIngest ingest,
-        ITxAudioPreviewProcessor previewProcessor,
-        ILogger<NativeMicCapture> log,
-        AudioDeviceSettingsStore? deviceSettings,
-        INativeMicInputFactory inputFactory)
-        : this(ingest, previewProcessor, log, deviceSettings)
-    {
-        _inputFactory = inputFactory;
     }
 
     public string? ConfiguredInputDeviceId => _deviceSettings?.Get().InputDeviceId;
@@ -811,6 +819,10 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     {
         try
         {
+            // This synchronous worker owns the latency-sensitive mic -> WDSP
+            // handoff. Match the protocol senders' pro-audio scheduling so a
+            // short managed-thread stall cannot drain the radio's small TX FIFO.
+            _promoteWorker();
             CaptureWorkerLoopCore();
         }
         finally

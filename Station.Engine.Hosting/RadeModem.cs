@@ -45,6 +45,10 @@ internal sealed class RadeModem : IRadeModemCore
     // live latency ceiling: it is a finite PTT-held tail, not live backlog.
     private const int TxTailCapacity = 131_072;
     private const int MaxBlock = 8192;               // generous cap on a 48 kHz audio block
+    // SDR-VST3 attenuates RADE V1's near-full-scale modem waveform before the
+    // output interpolator.  Keep the same level for live, residual, and EOO
+    // frames so transitions at the end of an over do not jump in amplitude.
+    internal const float TxOutputScale = 0.5f;
 
     // Native handles — published to the hot paths via Volatile; IntPtr.Zero means
     // "do not process" (closed / reconfiguring / native missing). RX and TX use
@@ -407,14 +411,16 @@ internal sealed class RadeModem : IRadeModemCore
                 Volatile.Write(ref _txMicLevelDb, RadeNativeMethods.zeus_rade_tx_mic_level_db(h));
                 _txMicClip = RadeNativeMethods.zeus_rade_tx_mic_clip(h) != 0;
                 if (n > ntx) n = ntx;
-                for (int i = 0; i < n; i++) _txModemReal[i] = _txIqOut[2 * i];
+                CopyScaledModemReal(_txIqOut, _txModemReal, n);
                 int up = _txUp.Process(_txModemReal.AsSpan(0, n), _txInterp);
                 WriteBounded(_txOut48, _txInterp.AsSpan(0, up));
             }
 
-            // 3. drain modem audio into the block; silence-pad the remainder.
-            int filled = _txOut48.Read(block48k);
-            if (filled < block48k.Length) block48k.Slice(filled).Clear();
+            // 3. Emit only complete host blocks.  On underrun, preserve the
+            // partial FIFO for the next tick and send a full silent block.  A
+            // partial read would splice zeros into the modem waveform and lose
+            // the samples needed to restore its continuous framing.
+            ReadLiveBlockOrSilence(_txOut48, block48k);
         }
         finally
         {
@@ -509,7 +515,7 @@ internal sealed class RadeModem : IRadeModemCore
                     FloatToShort(_tx16Float, _tx16Short, nspeech);
                     int n = RadeNativeMethods.zeus_rade_tx(h, _tx16Short, _txIqOut);
                     if (n > ntx) n = ntx;
-                    for (int i = 0; i < n; i++) _txModemReal[i] = _txIqOut[2 * i];
+                    CopyScaledModemReal(_txIqOut, _txModemReal, n);
                     int up = _txUp.Process(_txModemReal.AsSpan(0, n), _txInterp);
                     WriteTailExact(_txInterp.AsSpan(0, up));
                 }
@@ -519,7 +525,7 @@ internal sealed class RadeModem : IRadeModemCore
                 {
                     int n = RadeNativeMethods.zeus_rade_tx_eoo(h, _txIqOut);
                     if (n > _txNEooOut) n = _txNEooOut;
-                    for (int i = 0; i < n; i++) _txModemReal[i] = _txIqOut[2 * i];
+                    CopyScaledModemReal(_txIqOut, _txModemReal, n);
                     int up = _txUp.Process(_txModemReal.AsSpan(0, n), _txInterp);
                     WriteTailExact(_txInterp.AsSpan(0, up));
                 }
@@ -568,6 +574,24 @@ internal sealed class RadeModem : IRadeModemCore
         int filled = _txOut48.Read(block48k);
         if (filled < block48k.Length) block48k.Slice(filled).Clear();
         return filled;
+    }
+
+    internal static void CopyScaledModemReal(float[] interleavedIq, float[] modemReal, int count)
+    {
+        for (int i = 0; i < count; i++)
+            modemReal[i] = interleavedIq[2 * i] * TxOutputScale;
+    }
+
+    internal static bool ReadLiveBlockOrSilence(FreeDvSampleRing ring, Span<float> block)
+    {
+        if (ring.Count < block.Length)
+        {
+            block.Clear();
+            return false;
+        }
+
+        ring.Read(block);
+        return true;
     }
 
     private static void WriteBounded(FreeDvSampleRing ring, ReadOnlySpan<float> src)

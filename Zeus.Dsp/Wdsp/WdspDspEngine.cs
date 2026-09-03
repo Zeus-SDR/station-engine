@@ -613,6 +613,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private int _monitorFilterLow = 150;
     private int _monitorFilterHigh = 2850;
     private const double TxMonitorFixedAgcGainDb = 0.0;
+    // RXAbp1Check applies gain=2 whenever the AM demodulator is running
+    // (native/wdsp/RXA.c). Cancel that receive-chain compensation only on the
+    // private TX monitor so AM/SAM preview retains the same headroom as the
+    // suppressed-carrier modes instead of clipping before playback volume.
+    private const double TxMonitorAmCompensationDb = -6.020599913279624;
 
     // The first ordinary RXA opened by the pipeline is RX1, the channel whose
     // state MOX transitions must preserve/restore. TX Monitor later opens a
@@ -3121,6 +3126,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_monitorChannelId is int monId)
             {
                 SetMode(monId, mode);
+                ApplyTxMonitorAgc(monId, mapped);
             }
         }
         _log.LogInformation("wdsp.setTxMode mode={Mode}", mapped);
@@ -3464,7 +3470,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // audio ring so the first preview block starts from silence.
             SetMode(id, MapRxaToRxMode(_txCurrentMode));
             SetFilter(id, _monitorFilterLow, _monitorFilterHigh);
-            ApplyTxMonitorAgc(id);
+            ApplyTxMonitorAgc(id, _txCurrentMode);
             _monitorMode = _txCurrentMode;
             _monitorChannelId = id;
             _log.LogInformation(
@@ -3473,14 +3479,17 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         }
     }
 
-    private void ApplyTxMonitorAgc(int id)
+    private void ApplyTxMonitorAgc(int id, RxaMode mode)
     {
-        ApplyAgcCore(id, new AgcConfig(AgcMode.Fixed, FixedGainDb: TxMonitorFixedAgcGainDb));
-        NativeMethods.SetRXAAGCTop(id, TxMonitorFixedAgcGainDb);
+        double gainDb = mode is RxaMode.AM or RxaMode.SAM
+            ? TxMonitorAmCompensationDb
+            : TxMonitorFixedAgcGainDb;
+        ApplyAgcCore(id, new AgcConfig(AgcMode.Fixed, FixedGainDb: gainDb));
+        NativeMethods.SetRXAAGCTop(id, gainDb);
         if (_channels.TryGetValue(id, out var state))
         {
             state.CurrentAgcMode = AgcMode.Fixed;
-            state.AgcTopDb = TxMonitorFixedAgcGainDb;
+            state.AgcTopDb = gainDb;
         }
     }
 

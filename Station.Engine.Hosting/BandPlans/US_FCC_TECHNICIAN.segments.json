@@ -6,6 +6,7 @@
     { "lowHz": 3500000,  "highHz": 3525000,  "label": "80M — no Technician privilege",  "allocation": "Reserved", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
     { "lowHz": 3525000,  "highHz": 3600000,  "label": "80M CW (Technician)",            "allocation": "Amateur",  "modeRestriction": "CwOnly",       "maxPowerW": 200,  "notes": "Tech/Novice CW only, 200 W PEP (§97.313(c))" },
     { "lowHz": 3600000,  "highHz": 4000000,  "label": "75M — no Technician privilege",  "allocation": "Reserved", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
+    { "lowHz": 5330500,  "highHz": 5406400,  "label": "60M — no Technician privilege",  "allocation": "Reserved", "modeRestriction": "Any",         "maxPowerW": null, "notes": "Technician has no 60 m privileges" },
     { "lowHz": 7000000,  "highHz": 7025000,  "label": "40M — no Technician privilege",  "allocation": "Reserved", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
     { "lowHz": 7025000,  "highHz": 7125000,  "label": "40M CW (Technician)",            "allocation": "Amateur",  "modeRestriction": "CwOnly",       "maxPowerW": 200,  "notes": "Tech/Novice CW only, 200 W PEP" },
     { "lowHz": 7125000,  "highHz": 7300000,  "label": "40M — no Technician privilege",  "allocation": "Reserved", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
