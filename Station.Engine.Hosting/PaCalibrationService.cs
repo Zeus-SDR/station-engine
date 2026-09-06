@@ -24,17 +24,23 @@ public sealed record PaCalibrationStatus(
 public sealed class PaCalibrationService
 {
     private static readonly int[] TargetsWatts = [10, 25, 50];
+    internal const double CalibrationToleranceFraction = 0.10d;
     // Full-byte PA gain is attenuation: 70 dB is the least-drive value the
     // encoder accepts. Each target must approach from here because neither a
     // persisted seed nor the preceding target proves the PA's response.
     private const double ConservativeStartGainDb = 70d;
     private const double MinimumMeasurableWatts = 0.1d;
-    // Below the meter floor, 10 dB raises an ideal plant by at most 10x, so
-    // the next reading remains below 1 W and the 10 W target's 12.5 W trip.
-    private const double UnmeasurablePowerRampDb = 10d;
+    // A 1 dB output-raising correction changes ideal power by only ~26%.
+    // Real PA/meter paths are not linear across a large gain change, so this
+    // deliberately slow ramp prevents a low reading from commanding a leap
+    // past the configured safety limit.
+    internal const double MaxGainAdjustmentDb = 1d;
+    private const int AdjustmentSampleCount = 3;
+    private static readonly TimeSpan AdjustmentSampleSpacing = TimeSpan.FromMilliseconds(75);
     private readonly RadioService _radio;
     private readonly TxService _tx;
     private readonly TxMetersService _meters;
+    private readonly DspPipelineService _pipeline;
     private readonly PaSettingsStore _pa;
     private readonly IBandPlanService _bandPlan;
     private readonly ILogger<PaCalibrationService> _log;
@@ -51,6 +57,7 @@ public sealed class PaCalibrationService
         RadioService radio,
         TxService tx,
         TxMetersService meters,
+        DspPipelineService pipeline,
         PaSettingsStore pa,
         IBandPlanService bandPlan,
         ILogger<PaCalibrationService> log)
@@ -58,6 +65,7 @@ public sealed class PaCalibrationService
         _radio = radio;
         _tx = tx;
         _meters = meters;
+        _pipeline = pipeline;
         _pa = pa;
         _bandPlan = bandPlan;
         _log = log;
@@ -113,6 +121,7 @@ public sealed class PaCalibrationService
                     _tx.EndPaCalibrationLease();
                     return false;
                 }
+                state = _radio.DisarmPureSignalForPaCalibration();
             }
             catch
             {
@@ -177,8 +186,6 @@ public sealed class PaCalibrationService
             RadioFrequencyResolver.IsSplitEnabledForTx(state) ||
             state.XitEnabled)
             return "Select RX1 for TX and turn SPLIT and XIT off before starting calibration.";
-        if (state.PsEnabled)
-            return "Disarm PureSignal before starting PA calibration.";
         if (!settings.Global.PaEnabled)
             return "Enable the PA before starting calibration.";
         if (settings.Global.PaMaxPowerWatts < 50)
@@ -198,6 +205,8 @@ public sealed class PaCalibrationService
         CancellationToken cancellationToken)
     {
         bool success = false;
+        int safetyPercent = originalSettings.Global.PaCalibrationSafetyPercent;
+        double ratedOutputWatts = originalSettings.Global.PaMaxPowerWatts;
         int originalTune = originalState.TunePct;
         int currentTune = originalTune;
         long expectedVfoHz = originalState.VfoHz;
@@ -255,10 +264,16 @@ public sealed class PaCalibrationService
                 }
                 if (_armedSafetyTargetWatts is double target &&
                     calibrationOwnsTun &&
-                    IsOverPower(forwardWatts, target) &&
+                    IsOverPower(
+                        forwardWatts,
+                        target,
+                        safetyPercent,
+                        ratedOutputWatts) &&
                     _safetyTripMessage is null)
                 {
-                    trip = $"Safety stop: measured {forwardWatts:0.0} W exceeds 125% of the {target:0.0} W target.";
+                    double limit = SafetyLimitWatts(
+                        target, safetyPercent, ratedOutputWatts);
+                    trip = $"Safety stop: measured {forwardWatts:0.0} W exceeds the {limit:0.0} W limit ({safetyPercent}% of the {target:0.0} W target, capped at {ratedOutputWatts:0.0} W rated output).";
                     _safetyTripMessage = trip;
                 }
             }
@@ -272,6 +287,10 @@ public sealed class PaCalibrationService
         _meters.RawPowerTelemetryUpdated += OnRawPower;
         try
         {
+            if (!await _pipeline.WaitForPsDisarmAsync().ConfigureAwait(false))
+                throw new InvalidOperationException(
+                    "PureSignal did not disarm completely; PA calibration was not started.");
+            EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
             Dictionary<string, CalibrationPoint> frequencies = ResolveBandFrequencies();
             int completed = 0;
 
@@ -293,51 +312,77 @@ public sealed class PaCalibrationService
                 expectedVfoHz = point.FrequencyHz;
                 expectedMode = point.Mode;
                 currentTune = _radio.Snapshot().TunePct;
+                _pa.SetCalibrationGain(band, ConservativeStartGainDb);
 
-                foreach (int targetWatts in TargetsWatts)
+                int firstTargetWatts = TargetsWatts[0];
+                int firstTunePct = Math.Clamp(
+                    (int)Math.Round(firstTargetWatts * 100d /
+                        originalSettings.Global.PaMaxPowerWatts), 1, 100);
+                if (!_radio.SetPaCalibrationTuneDriveIfCurrent(firstTunePct, currentTune))
+                    throw new ExternalCalibrationStateChangedException(
+                        "PA calibration stopped because TUN power changed outside calibration.");
+                currentTune = _radio.Snapshot().TunePct;
+                while (samples.Reader.TryRead(out _)) { }
+                ArmSafetyTarget(firstTargetWatts, expectedVfoHz, expectedMode);
+                Update("running", band, firstTargetWatts, null, completed,
+                    $"Keying TUN for {band}; calibrating the shared band gain at {firstTargetWatts:0.0} W");
+
+                if (!_tx.TrySetPaCalibrationTun(true, out string? keyError))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
-                    _pa.SetCalibrationGain(band, ConservativeStartGainDb);
-                    int requestedTunePct = Math.Clamp(
-                        (int)Math.Round(targetWatts * 100d /
-                            originalSettings.Global.PaMaxPowerWatts), 1, 100);
-                    if (!_radio.SetPaCalibrationTuneDriveIfCurrent(requestedTunePct, currentTune))
+                    if (_tx.TunOwner is not null && _tx.TunOwner != MoxSource.Analyzer)
                         throw new ExternalCalibrationStateChangedException(
-                            "PA calibration stopped because TUN power changed outside calibration.");
-                    currentTune = _radio.Snapshot().TunePct;
-                    double appliedTargetWatts = targetWatts;
-                    while (samples.Reader.TryRead(out _)) { }
-                    ArmSafetyTarget(appliedTargetWatts, expectedVfoHz, expectedMode);
-                    Update("running", band, appliedTargetWatts, null, completed,
-                        $"Keying TUN at {appliedTargetWatts:0.0} W configured target");
+                            "PA calibration stopped because another controller keyed TUN.");
+                    throw new InvalidOperationException(keyError ?? "TUN was refused.");
+                }
 
-                    if (!_tx.TrySetPaCalibrationTun(true, out string? keyError))
+                try
+                {
+                    foreach (int targetWatts in TargetsWatts)
                     {
-                        if (_tx.TunOwner is not null && _tx.TunOwner != MoxSource.Analyzer)
-                            throw new ExternalCalibrationStateChangedException(
-                                "PA calibration stopped because another controller keyed TUN.");
-                        throw new InvalidOperationException(keyError ?? "TUN was refused.");
-                    }
+                        cancellationToken.ThrowIfCancellationRequested();
+                        EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
+                        bool calibratingGain = targetWatts == firstTargetWatts;
+                        if (!calibratingGain)
+                        {
+                            // Arm the higher target before raising TUN drive so a
+                            // fresh raw meter sample is checked against the right
+                            // limit throughout the live transition.
+                            ArmSafetyTarget(targetWatts, expectedVfoHz, expectedMode);
+                            int requestedTunePct = Math.Clamp(
+                                (int)Math.Round(targetWatts * 100d /
+                                    originalSettings.Global.PaMaxPowerWatts), 1, 100);
+                            if (!_radio.SetPaCalibrationTuneDriveIfCurrent(requestedTunePct, currentTune))
+                                throw new ExternalCalibrationStateChangedException(
+                                    "PA calibration stopped because TUN power changed outside calibration.");
+                            currentTune = _radio.Snapshot().TunePct;
+                            while (samples.Reader.TryRead(out _)) { }
+                            Update("running", band, targetWatts, null, completed,
+                                $"Holding {band} shared gain; checking {targetWatts:0.0} W");
+                        }
 
-                    try
-                    {
                         await ConvergeAsync(
-                            band, appliedTargetWatts, completed,
+                            band, targetWatts, completed,
                             expectedVfoHz, expectedMode,
-                            invariant, samples.Reader,
+                            invariant,
+                            safetyPercent,
+                            ratedOutputWatts,
+                            samples.Reader,
+                            calibratingGain,
+                            calibratingGain
+                                ? TimeSpan.FromMilliseconds(700)
+                                : TimeSpan.FromMilliseconds(350),
                             cancellationToken).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        _tx.TrySetPaCalibrationTun(false, out _);
-                        ArmSafetyTarget(null);
-                    }
 
-                    completed++;
-                    Update("running", band, appliedTargetWatts, null, completed,
-                        $"{band} {appliedTargetWatts:0.0} W complete");
-                    await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                        completed++;
+                        Update("running", band, targetWatts, null, completed,
+                            $"{band} {targetWatts:0.0} W complete");
+                        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    _tx.TrySetPaCalibrationTun(false, out _);
+                    ArmSafetyTarget(null);
                 }
             }
 
@@ -426,12 +471,18 @@ public sealed class PaCalibrationService
         long expectedVfoHz,
         RxMode expectedMode,
         RunInvariant invariant,
+        int safetyPercent,
+        double ratedOutputWatts,
         ChannelReader<ForwardPowerSample> samples,
+        bool allowGainAdjustment,
+        TimeSpan initialSettleDelay,
         CancellationToken cancellationToken)
     {
-        DateTimeOffset settleUntilUtc = DateTimeOffset.UtcNow.AddMilliseconds(700);
+        DateTimeOffset settleUntilUtc = DateTimeOffset.UtcNow + initialSettleDelay;
         DateTimeOffset lastToleranceSampleUtc = DateTimeOffset.MinValue;
         int consecutiveInTolerance = 0;
+        DateTimeOffset lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
+        var adjustmentSamples = new List<float>(AdjustmentSampleCount);
 
         for (int attempt = 0; attempt < 30; attempt++)
         {
@@ -460,11 +511,17 @@ public sealed class PaCalibrationService
             Update("running", band, targetWatts, measured, completed,
                 $"Adjusting {band}: {measured:0.0} W / {targetWatts:0.0} W");
 
-            if (IsOverPower(measured, targetWatts))
+            if (IsOverPower(
+                measured,
+                targetWatts,
+                safetyPercent,
+                ratedOutputWatts))
             {
                 _tx.TrySetTun(false, MoxSource.UI, out _);
+                double limit = SafetyLimitWatts(
+                    targetWatts, safetyPercent, ratedOutputWatts);
                 throw new InvalidOperationException(
-                    $"Safety stop: measured {measured:0.0} W exceeds 125% of the {targetWatts:0.0} W target.");
+                    $"Safety stop: measured {measured:0.0} W exceeds the {limit:0.0} W limit ({safetyPercent}% of the {targetWatts:0.0} W target, capped at {ratedOutputWatts:0.0} W rated output).");
             }
 
             if (sample.SampledAtUtc < settleUntilUtc)
@@ -475,6 +532,8 @@ public sealed class PaCalibrationService
 
             if (measured > 0 && IsWithinTolerance(measured, targetWatts))
             {
+                adjustmentSamples.Clear();
+                lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
                 if (sample.SampledAtUtc - lastToleranceSampleUtc >=
                     TimeSpan.FromMilliseconds(75))
                 {
@@ -487,27 +546,46 @@ public sealed class PaCalibrationService
             consecutiveInTolerance = 0;
             lastToleranceSampleUtc = DateTimeOffset.MinValue;
 
+            // A single low reading immediately after a key/re-key can be a
+            // stale meter value. Base corrections on three fresh readings so
+            // one transient cannot command a large drive change.
+            if (sample.SampledAtUtc - lastAdjustmentSampleUtc >= AdjustmentSampleSpacing)
+            {
+                adjustmentSamples.Add(measured);
+                lastAdjustmentSampleUtc = sample.SampledAtUtc;
+            }
+            if (adjustmentSamples.Count < AdjustmentSampleCount)
+            {
+                attempt--;
+                continue;
+            }
+
+            double adjustmentWatts = adjustmentSamples
+                .OrderBy(watts => watts)
+                .ElementAt(adjustmentSamples.Count / 2);
+            adjustmentSamples.Clear();
+            lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
+
+            if (!allowGainAdjustment)
+                throw new InvalidOperationException(
+                    $"{band} has one shared PA gain setting and could not hold {targetWatts:0.0} W after the {TargetsWatts[0]:0.0} W calibration.");
+
             PaBandSettingsDto row = _pa.GetAll(
                     _radio.EffectiveBoardKind,
                     _radio.EffectiveOrionMkIIVariant)
                 .Bands.First(b => b.Band == band);
-            double nextGain = measured < MinimumMeasurableWatts
-                ? Math.Max(0d, row.PaGainDb - UnmeasurablePowerRampDb)
-                : ComputeNextGainDb(row.PaGainDb, measured, targetWatts);
+            double requestedGain = adjustmentWatts < MinimumMeasurableWatts
+                ? row.PaGainDb - MaxGainAdjustmentDb
+                : ComputeNextGainDb(row.PaGainDb, adjustmentWatts, targetWatts);
+            double nextGain = LimitGainAdjustment(row.PaGainDb, requestedGain);
             if (Math.Abs(nextGain - row.PaGainDb) < 0.05)
                 throw new InvalidOperationException(
                     $"{band} could not converge at {targetWatts:0.0} W.");
 
-            if (!_tx.TrySetPaCalibrationTun(false, out string? unkeyError))
-                throw new InvalidOperationException(
-                    unkeyError ?? "Could not unkey TUN for adjustment.");
             EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
             _pa.SetCalibrationGain(band, Math.Round(nextGain, 2));
             while (samples.TryRead(out _)) { }
             ThrowIfCalibrationAborted();
-            if (!_tx.TrySetPaCalibrationTun(true, out string? rekeyError))
-                throw new InvalidOperationException(
-                    rekeyError ?? "Could not re-key TUN after adjustment.");
             settleUntilUtc = DateTimeOffset.UtcNow.AddMilliseconds(350);
         }
 
@@ -616,18 +694,36 @@ public sealed class PaCalibrationService
         return null;
     }
 
-    internal static bool IsOverPower(double measuredWatts, double targetWatts) =>
-        measuredWatts > targetWatts * 1.25d;
+    internal static bool IsOverPower(
+        double measuredWatts,
+        double targetWatts,
+        int safetyPercent = PaSettingsStore.DefaultCalibrationSafetyPercent,
+        double ratedOutputWatts = double.PositiveInfinity) =>
+        measuredWatts > SafetyLimitWatts(
+            targetWatts, safetyPercent, ratedOutputWatts);
+
+    internal static double SafetyLimitWatts(
+        double targetWatts,
+        int safetyPercent,
+        double ratedOutputWatts) =>
+        Math.Min(targetWatts * safetyPercent / 100d, ratedOutputWatts);
 
     internal static bool IsWithinTolerance(double measuredWatts, double targetWatts) =>
         targetWatts > 0d &&
-        Math.Abs(measuredWatts - targetWatts) <= targetWatts * 0.03d + 1e-9d;
+        Math.Abs(measuredWatts - targetWatts) <=
+            targetWatts * CalibrationToleranceFraction + 1e-9d;
 
     internal static double ComputeNextGainDb(
         double currentGainDb, double measuredWatts, double targetWatts) =>
         Math.Clamp(
             currentGainDb + 10d * Math.Log10(measuredWatts / targetWatts),
             0d, 70d);
+
+    internal static double LimitGainAdjustment(double currentGainDb, double requestedGainDb) =>
+        Math.Clamp(
+            requestedGainDb,
+            currentGainDb - MaxGainAdjustmentDb,
+            currentGainDb + MaxGainAdjustmentDb);
 
     private static PaCalibrationStatus IdleStatus() =>
         new("idle", null, null, null, 0,

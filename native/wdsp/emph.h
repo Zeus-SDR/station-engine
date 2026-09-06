@@ -25,31 +25,18 @@ warren@wpratt.com
 */
 
 /********************************************************************************************************
-*                                                   *
-*               Partitioned Overlap-Save FM Pre-Emphasis                *
-*                                                   *
+*																										*
+*								Partitioned Overlap-Save FM Pre-Emphasis								*
+*																										*
 ********************************************************************************************************/
 
 #ifndef _emphp_h
 #define _emphp_h
-#include "firmin.h"
-typedef struct _emphp {
-  int run;
-  int position;
-  int size;
-  int nc;
-  int mp;
-  double* in;
-  double* out;
-  int ctype;
-  double f_low;
-  double f_high;
-  double rate;
-  FIRCORE p;
-} emphp, *EMPHP;
+
+typedef struct _emphp* EMPHP;
 
 extern EMPHP create_emphp (int run, int position, int size, int nc, int mp,
-                           double* in, double* out, int rate, int ctype, double f_low, double f_high);
+	double* in, double* out, int rate, int ctype, double f_low, double f_high);
 
 extern void destroy_emphp (EMPHP a);
 
@@ -69,36 +56,38 @@ __declspec (dllexport) void SetTXAFMEmphNC (int channel, int nc);
 
 __declspec (dllexport) void SetTXAFMPreEmphFreqs(int channel, double low, double high);
 
+extern void SetTXAFMPreEmphRun(int channel, int run);
+
 #endif
 
 /********************************************************************************************************
-*                                                   *
-*                   Overlap-Save FM Pre-Emphasis                  *
-*                                                   *
+*																										*
+*										Overlap-Save FM Pre-Emphasis									*
+*																										*
 ********************************************************************************************************/
 
 #ifndef _emph_h
 #define _emph_h
 
-typedef struct _emph {
-  int run;
-  int position;
-  int size;
-  double* in;
-  double* out;
-  int ctype;
-  double f_low;
-  double f_high;
-  double* infilt;
-  double* product;
-  double* mults;
-  double rate;
-  fftw_plan CFor;
-  fftw_plan CRev;
+typedef struct _emph
+{
+	int run;
+	int position;
+	int size;
+	double* in;
+	double* out;
+	int ctype;
+	double f_low;
+	double f_high;
+	double* infilt;
+	double* product;
+	double* mults;
+	double rate;
+	fftw_plan CFor;
+	fftw_plan CRev;
 } emph, *EMPH;
 
-extern EMPH create_emph (int run, int position, int size, double* in, double* out, int rate, int ctype, double f_low,
-                         double f_high);
+extern EMPH create_emph (int run, int position, int size, double* in, double* out, int rate, int ctype, double f_low, double f_high);
 
 extern void destroy_emph (EMPH a);
 

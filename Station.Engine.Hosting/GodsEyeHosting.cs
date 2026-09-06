@@ -51,6 +51,13 @@ public static class GodsEyeHosting
             client.MaxResponseContentBufferSize = GodsEyeFeedsService.MaxResponseBytes;
             client.DefaultRequestHeaders.UserAgent.ParseAdd("ZeusSDR/1.0 (+https://github.com/Zeus-SDR/zeussdr)");
         });
+        services.AddSingleton<GodsEyeAircraftTracker>();
+        services.AddHttpClient(GodsEyeAircraftTracker.HttpClientName, client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(8);
+            client.MaxResponseContentBufferSize = 256 * 1024;
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("ZeusSDR/1.0 (+https://github.com/Zeus-SDR/zeussdr)");
+        });
         services.AddHttpClient(CameraFeedService.HttpClientName, client =>
         {
             client.Timeout = CameraFeedService.RequestTimeout;
@@ -137,6 +144,15 @@ public static class GodsEyeHosting
             {
                 var snapshot = feeds.GetLayer(layer);
                 return snapshot is null ? Results.NotFound() : Results.Ok(snapshot);
+            });
+        endpoints.MapGet("/api/godseye/aircraft/{icao}",
+            async (string icao, GodsEyeAircraftTracker tracker, GodsEyeSettingsStore settings, CancellationToken cancellationToken) =>
+            {
+                if (!GodsEyeAircraftTracker.IsValidIcao(icao)) return Results.BadRequest(new { error = "Invalid aircraft address." });
+                var configured = settings.GetPublic();
+                if (!configured.Aircraft.Enabled && configured.MilitaryFlights?.Enabled != true)
+                    return Results.Ok(new GodsEyeAircraftReport(GodsEyeFreshness.Unavailable, null, "Aircraft layers are disabled."));
+                return Results.Ok(await tracker.GetAsync(icao, cancellationToken).ConfigureAwait(false));
             });
         endpoints.MapGet("/api/godseye/cameras",
             (double? lat, double? lon, CameraFeedService cameras, GodsEyeSettingsStore settings,

@@ -277,7 +277,7 @@ extern double SetPSTXDelay (int channel, double delay);
 extern void SetPSHWPeak (int channel, double peak);
 extern void GetPSHWPeak (int channel, double* peak);
 extern void GetPSMaxTX (int channel, double* maxtx);
-extern void GetPSDisp (int channel, double* x, double* ym, double* yc, double* ys, double* cm, double* cc, double* cs);
+extern void GetPSDisp (int channel, double* x, double* ym, double* yc, double* ys, double* xm_cor, double* ym_cor, double* xa_cor, double* ya_cor, int* nsamps_out, int* cpts_out, double* phs_ref_deg_out);
 extern void SetPSFeedbackRate (int channel, int rate);
 
 //
@@ -1024,3 +1024,33 @@ extern void SetTXALevelerTop (int channel, double maxgain);
 
 extern char* wisdom_get_status(void);
 extern int WDSPwisdom (char* directory);
+
+extern void SetTXACFIRCurve (int channel, int DD, int R, int Pairs, int runrate, int cicrate, double cutoff, int xtype, double xbw);
+
+extern int GetRXANNRModel (int channel);
+
+extern void SetNNRModelPath (const char* path);
+
+extern void SetNNRModelPathSlot (int slot, const char* path);
+
+extern void SetRXANNRAlpha (int channel, double alpha);
+
+extern void SetRXANNRAlphaKnee (int channel, double knee_db);
+
+extern void SetRXANNRMaskFloor (int channel, double floor_db);
+
+extern void SetRXANNRMaxGain (int channel, double gmax_db);
+
+extern int SetRXANNRModel (int channel, int slot);
+
+extern void SetRXANNRPosition (int channel, int position);
+
+extern void SetRXANNRRun (int channel, int setit);
+
+extern void SetRXANNRSmooth (int channel, double att_ms, double rel_ms);
+
+extern void SetRXANNRTau (int channel, double tau);
+
+extern void SetRXANNRTestMode (int channel, int mode);
+
+extern void SetRXANNRcmode (int channel, int cmode);

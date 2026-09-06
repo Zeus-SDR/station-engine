@@ -4823,7 +4823,9 @@ public sealed class RadioService : IDisposable
             percent,
             persist: false,
             expectedCurrent,
-            abortIfTxActive: true,
+            // Calibration owns TUN and deliberately changes its drive between
+            // the 10, 25, and 50 W checks while staying keyed on a band.
+            abortIfTxActive: false,
             paCalibrationOwner: true);
 
     private bool SetTuneDriveCore(
@@ -6000,6 +6002,17 @@ public sealed class RadioService : IDisposable
     internal StateDto FailClosedPureSignalRuntime()
     {
         Mutate(s => s.PsEnabled ? s with { PsEnabled = false } : s);
+        return Snapshot();
+    }
+
+    /// <summary>
+    /// Disarm PureSignal for PA calibration without changing the operator's
+    /// persisted arm intent. The unconditional state broadcast also re-drives
+    /// the hardware transition if runtime state was already fail-closed.
+    /// </summary>
+    internal StateDto DisarmPureSignalForPaCalibration()
+    {
+        Mutate(s => s with { PsEnabled = false });
         return Snapshot();
     }
 

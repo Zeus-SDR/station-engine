@@ -31,17 +31,17 @@ public enum WdspEngineVersionState : byte
 /// <summary>
 /// The version of the libwdsp actually loaded into this process, as reported by
 /// <c>GetWDSPVersion</c> (native/wdsp/version.c). The raw value is the version
-/// number times 100 — v2.00 reports 200 — because WDSP versions always carry
+/// number times 100 — v2.10 reports 210 — because WDSP versions always carry
 /// exactly two digits to the right of the decimal point.
 ///
-/// Zeus targets WDSP 2.0. A stale libwdsp loads silently and every
-/// WDSP-2.0-dependent behaviour then misbehaves with no other signal, which is
+/// Zeus targets WDSP 2.10. A stale libwdsp loads silently and every
+/// WDSP-2.10-dependent behaviour then misbehaves with no other signal, which is
 /// why this value is logged at DSP start and published in diagnostics.
 /// </summary>
 public readonly record struct WdspEngineVersion
 {
-    /// <summary>Raw value Zeus requires: WDSP v2.00.</summary>
-    public const int RequiredRaw = 200;
+    /// <summary>Raw value Zeus requires: WDSP v2.10.</summary>
+    public const int RequiredRaw = 210;
 
     /// <summary>Human form used whenever no version could be read.</summary>
     public const string UnknownDisplay = "unknown";
@@ -74,15 +74,15 @@ public readonly record struct WdspEngineVersion
     /// Classifies a raw <c>GetWDSPVersion</c> return value. Anything at or above
     /// <see cref="RequiredRaw"/> is <see cref="WdspEngineVersionState.Ok"/>;
     /// everything else — including a nonsensical zero or negative — is a
-    /// mismatch, because it is definitively not the 2.0 engine Zeus targets.
+    /// mismatch, because it is definitively not the 2.10 engine Zeus targets.
     /// </summary>
     public static WdspEngineVersion FromRaw(int raw) =>
         new(raw >= RequiredRaw ? WdspEngineVersionState.Ok : WdspEngineVersionState.Mismatch, raw);
 
-    /// <summary>Human form of <see cref="Raw"/>: 200 renders as "2.00", 114 as "1.14".</summary>
+    /// <summary>Human form of <see cref="Raw"/>: 210 renders as "2.10", 114 as "1.14".</summary>
     public string Display => Format(Raw);
 
-    /// <summary>Human form of the version Zeus requires ("2.00").</summary>
+    /// <summary>Human form of the version Zeus requires ("2.10").</summary>
     public static string RequiredDisplay => Format(RequiredRaw);
 
     /// <summary>

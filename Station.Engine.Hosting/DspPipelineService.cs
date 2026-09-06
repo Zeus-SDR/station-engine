@@ -3126,6 +3126,18 @@ public class DspPipelineService : BackgroundService,
             _audioSinks[i].PublishExempt(in frame);
     }
 
+    private void PublishTxMonitorAudio(in AudioFrame frame)
+    {
+        for (int i = 0; i < _audioSinks.Length; i++)
+            _audioSinks[i].PublishTxMonitor(in frame);
+    }
+
+    private void PublishTxMonitorExemptAudio(in AudioFrame frame)
+    {
+        for (int i = 0; i < _audioSinks.Length; i++)
+            _audioSinks[i].PublishTxMonitorExempt(in frame);
+    }
+
     private void PublishTxSuppressedAudio(float[] audioBuf, int sampleCount, double nowMs, SquelchConfig squelch)
         => PublishTxSuppressedAudio(
             audioBuf, sampleCount, nowMs, squelch, ReadOnlySpan<float>.Empty, 0);
@@ -6269,11 +6281,31 @@ public class DspPipelineService : BackgroundService,
     // On HermesC10 the P1 wire call is the stop/drain/restart transition —
     // the receiver count is never flipped on a live stream.
     private readonly object _psArmWorkSync = new();
-    private Task _psArmWork = Task.CompletedTask;
+    private Task<bool> _psArmWork = Task.FromResult(true);
 
     /// <summary>Tail of the PS arm/disarm worker chain — awaitable by tests
     /// to observe completion of all scheduled transitions.</summary>
-    internal Task PsArmWorkForTests { get { lock (_psArmWorkSync) return _psArmWork; } }
+    internal Task PsArmWorkForTests => WaitForPsArmTransitionsAsync();
+
+    internal Task WaitForPsArmTransitionsAsync()
+    {
+        lock (_psArmWorkSync) return _psArmWork;
+    }
+
+    internal async Task<bool> WaitForPsDisarmAsync()
+    {
+        Task<bool> work;
+        lock (_psArmWorkSync) work = _psArmWork;
+        if (!await work.ConfigureAwait(false)) return false;
+        if (_radio.Snapshot().PsEnabled || _radio.ActiveClient?.PsEnabled == true)
+            return false;
+        lock (_engineLock)
+            return _engine is not ExternalProtocol3TxDspEngine
+                {
+                    PureSignalEnabled: true,
+                    PureSignalArmed: true,
+                };
+    }
 
     private bool IsPsArmWorkComplete()
     {
@@ -6339,7 +6371,7 @@ public class DspPipelineService : BackgroundService,
                         : P1PsEngineArmSupported(
                             p1Connected: executionP1 is not null,
                             executionP1?.BoardKind ?? _radio.ConnectedBoardKind);
-                    await RunPsArmTransitionAsync(
+                    return await RunPsArmTransitionAsync(
                             enable,
                             executionP1,
                             engine,
@@ -6349,12 +6381,13 @@ public class DspPipelineService : BackgroundService,
                 catch (Exception ex)
                 {
                     _log.LogError(ex, "ps.arm transition target={Enable} failed", enable);
+                    return false;
                 }
             });
         }
     }
 
-    private async Task RunPsArmTransitionAsync(
+    private async Task<bool> RunPsArmTransitionAsync(
         bool enable, IProtocol1Client? p1, IDspEngine engine, bool engineArmSupported)
     {
         // A capability-gated external P3 engine owns its matching p3app route
@@ -6362,13 +6395,17 @@ public class DspPipelineService : BackgroundService,
         // startup remains disarmed and P1/P2 retain their wire-first ordering.
         if (engine is ExternalProtocol3TxDspEngine { PureSignalEnabled: true })
         {
+            bool applied = false;
             lock (_engineLock)
             {
                 if (ReferenceEquals(engine, _engine))
+                {
                     engine.SetPsEnabled(enable);
+                    applied = true;
+                }
             }
             if (!enable) DrainPsFeedback();
-            return;
+            return applied && externalPsStateMatches(engine, enable);
         }
 
         if (enable)
@@ -6383,7 +6420,7 @@ public class DspPipelineService : BackgroundService,
                     p1?.PsEnabled,
                     p1?.BoardKind ?? _radio.ConnectedBoardKind,
                     p1 is not null && ReferenceEquals(_radio.ActiveClient, p1));
-                return;
+                return false;
             }
             if (engineArmSupported)
             {
@@ -6391,28 +6428,40 @@ public class DspPipelineService : BackgroundService,
                 // receive partial/glitched samples, scheck flags binfo[6] and
                 // calcc thrashes through LRESET instead of converging.
                 await Task.Delay(100).ConfigureAwait(false);
+                bool applied;
                 lock (_engineLock)
                 {
                     // The engine may have been replaced (reconnect) since this
                     // request was scheduled; the new engine's resync re-arms
                     // through its own state replay, so skip a stale arm.
-                    if (ReferenceEquals(engine, _engine))
+                    applied = ReferenceEquals(engine, _engine);
+                    if (applied)
                         engine.SetPsEnabled(true);
                 }
+                if (!applied) return false;
             }
+            return true;
         }
         else
         {
+            bool engineDisarmed;
             lock (_engineLock)
             {
-                if (ReferenceEquals(engine, _engine))
+                engineDisarmed = ReferenceEquals(engine, _engine);
+                if (engineDisarmed)
                     engine.SetPsEnabled(false);
             }
             _p2Client?.SetPsFeedbackEnabled(false);
-            await SetAndReconcileP1PsEnabledAsync(p1, false).ConfigureAwait(false);
+            bool wireDisarmed = await SetAndReconcileP1PsEnabledAsync(p1, false)
+                .ConfigureAwait(false);
             _radio.ApplyBoardKindToActiveClientIfSafe();
             DrainPsFeedback();
+            return engineDisarmed && wireDisarmed;
         }
+
+        static bool externalPsStateMatches(IDspEngine engine, bool enabled) =>
+            engine is ExternalProtocol3TxDspEngine externalPs &&
+            externalPs.PureSignalArmed == enabled;
     }
 
     private async Task<bool> SetAndReconcileP1PsEnabledAsync(
@@ -9863,9 +9912,9 @@ public class DspPipelineService : BackgroundService,
                         SampleCount: (ushort)publishCount,
                         Samples: new ReadOnlyMemory<float>(audioBuf, 0, publishCount));
                     if (rxAudioMuted)
-                        PublishExemptAudio(in publishFrame);
+                        PublishTxMonitorExemptAudio(in publishFrame);
                     else
-                        PublishAudio(in publishFrame);
+                        PublishTxMonitorAudio(in publishFrame);
                 }
             }
         }

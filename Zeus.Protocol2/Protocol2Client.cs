@@ -225,6 +225,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // preserving packet boundaries, this makes Poll(write) + SendTo atomic with
     // respect to the command, TX-IQ, and speaker sender threads.
     private readonly object _udpSendGate = new();
+    internal delegate int DatagramSink(ReadOnlySpan<byte> packet, IPEndPoint endpoint, bool requireImmediate);
+    internal DatagramSink? DatagramSinkForTesting { get; set; }
     private Action<byte[]>? _cmdHighPrioritySinkForTesting;
     private Action<int, byte[]>? _commandSinkForTesting;
     private Action<int, byte[]>? _speakerAudioSinkForTesting;
@@ -580,6 +582,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqPacketsInFlight;
     private long _txIqQueueWriteFailures;
     private long _txIqSendFailures;
+    // Owned by the TX sender. Successful packets must not reset this cadence:
+    // an intermittently failing NIC can otherwise log at the packet rate.
+    private bool _txIqSendWarningLogged;
+    private long _txIqLastSendWarningTimestamp;
+    private long _txIqPendingSendWarnings;
+    private long _txIqSuppressedSendWarnings;
     private long _txIqResetDrainedPackets;
     private int _txIqLastPacketsPerSecond;
     private long _txIqLastFifoModelSamples;
@@ -668,13 +676,29 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         return SendDatagram(packet, speakerEndpoint, requireImmediate: true);
     }
 
-    private int SendDatagram(
+    internal int SendDatagram(
         ReadOnlySpan<byte> packet,
         IPEndPoint endpoint,
         bool requireImmediate = false)
     {
-        lock (_udpSendGate)
+        bool gateTaken = false;
+        try
         {
+            // Speaker and TX IQ have dedicated sender workers. Checking socket
+            // readiness only after waiting for another sender still stalls
+            // those workers during command/socket congestion.
+            if (requireImmediate)
+            {
+                if (!Monitor.TryEnter(_udpSendGate))
+                    throw new SocketException((int)SocketError.WouldBlock);
+                gateTaken = true;
+            }
+            else
+            {
+                Monitor.Enter(_udpSendGate, ref gateTaken);
+            }
+            if (DatagramSinkForTesting is { } testSink)
+                return testSink(packet, endpoint, requireImmediate);
             var socket = _sock ?? throw new ObjectDisposedException(nameof(Protocol2Client));
             // The RX loop deliberately uses a blocking ReceiveFrom. Do not make
             // the whole shared socket non-blocking just for speaker egress.
@@ -686,6 +710,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 throw new SocketException((int)SocketError.WouldBlock);
 
             return socket.SendTo(packet, SocketFlags.None, endpoint);
+        }
+        finally
+        {
+            if (gateTaken) Monitor.Exit(_udpSendGate);
         }
     }
 
@@ -2288,26 +2316,17 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                     Interlocked.Increment(ref _txIqSendFailures);
                                     continue;
                                 }
-                                fifoSamples += TxIqSamplesPerPacket;
                                 // ArrayPool may return a larger array; send exactly the
                                 // 1444-byte Protocol-2 payload, synchronously, before reuse.
-                                SendDatagram(packet.AsSpan(0, BufLen), ep, requireImmediate: true);
+                                SendTxIqDatagram(packet.AsSpan(0, BufLen), ep, ref fifoSamples);
                                 rateCount++;
                                 Interlocked.Increment(ref _txIqPacketsSent);
                             }
                         }
                         catch (ObjectDisposedException) { break; }
-                        catch (SocketException ex) when (ex.SocketErrorCode is
-                            SocketError.WouldBlock or
-                            SocketError.NoBufferSpaceAvailable or
-                            SocketError.TimedOut)
-                        {
-                            Interlocked.Increment(ref _txIqSendFailures);
-                        }
                         catch (SocketException ex)
                         {
-                            Interlocked.Increment(ref _txIqSendFailures);
-                            _log.LogWarning(ex, "p2.txiq send failed");
+                            RecordTxIqSendFailure(ex, Stopwatch.GetTimestamp());
                         }
 
                         if (now - lastRateTicks >= ticksPerSecond)
@@ -2322,8 +2341,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                 Volatile.Write(ref _txIqLastPacketsPerSecond, rateCount);
                                 Interlocked.Exchange(ref _txIqLastFifoModelSamples, (long)Math.Round(fifoSamples));
                                 Interlocked.Exchange(ref _txIqLastRateUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
-                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0}",
-                                    rateCount, fifoSamples);
+                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed}",
+                                    rateCount, fifoSamples, Interlocked.Read(ref _txIqSendFailures),
+                                    _txIqSuppressedSendWarnings);
                             }
                             catch { /* never let a diagnostic kill TX */ }
                             rateCount = 0;
@@ -2356,6 +2376,36 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // to a value that, when sign-extended on the far side, wraps to
         // −8_388_608 — a full-scale negative spike on the loudest sample.
         return (int)MathF.Round(v * 8_388_607.0f);
+    }
+
+    internal void RecordTxIqSendFailure(SocketException error, long timestamp)
+    {
+        long failures = Interlocked.Increment(ref _txIqSendFailures);
+        if (error.SocketErrorCode is SocketError.WouldBlock or SocketError.NoBufferSpaceAvailable or SocketError.TimedOut)
+            return;
+        // Apply the gate before invoking the logger: formatting an exception
+        // and flushing it to disk at 800 packets/s can prolong a NIC fault.
+        if (_txIqSendWarningLogged
+            && timestamp - _txIqLastSendWarningTimestamp < Stopwatch.Frequency)
+        {
+            _txIqPendingSendWarnings++;
+            _txIqSuppressedSendWarnings++;
+            return;
+        }
+        _txIqSendWarningLogged = true;
+        _txIqLastSendWarningTimestamp = timestamp;
+        long suppressed = _txIqPendingSendWarnings;
+        _txIqPendingSendWarnings = 0;
+        _log.LogWarning(error, "p2.txiq send failed error={Error} suppressed={Suppressed} totalFailures={Failures}",
+            error.SocketErrorCode, suppressed, failures);
+    }
+
+    internal void SendTxIqDatagram(ReadOnlySpan<byte> packet, IPEndPoint endpoint, ref double fifoSamples)
+    {
+        SendDatagram(packet, endpoint, requireImmediate: true);
+        // Failed sends leave the radio FIFO unchanged. Counting dropped
+        // packets would delay recovery while waiting on imaginary samples.
+        fifoSamples += TxIqSamplesPerPacket;
     }
 
     private void SendCmdGeneral()

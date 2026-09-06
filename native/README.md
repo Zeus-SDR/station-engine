@@ -1,9 +1,9 @@
 # native/ — WDSP cross-platform build
 
-This directory vendors the WDSP DSP engine (Warren Pratt, GPLv3) and builds it
+This directory vendors the WDSP DSP engine (Warren Pratt, GPL-2.0-or-later) and builds it
 as a shared library that `Zeus.Dsp` loads via P/Invoke.
 
-Source baseline: **upstream WDSP 1.29** (Warren Pratt) plus a
+Source baseline: **WDSP 2.10 (upstream revision 2.1.0)** (Warren Pratt) plus a
 `linux_port.{c,h}` portability shim and `#ifdef _WIN32` guards to get WDSP off
 MSVC. Thetis's own WDSP tree is MSVC-only and is **not** suitable as an
 upstream.
@@ -12,7 +12,7 @@ Layout:
 
 ```
 native/
-  wdsp/                  # vendored upstream WDSP 1.29 .c/.h
+  wdsp/                  # vendored WDSP 2.10 .c/.h
   wdsp/stubs/nr3/        # no-op rnnr_stub.c + rnnoise.h (used when WDSP_WITH_NR3=OFF)
   wdsp/stubs/nr4/        # no-op sbnr_stub.c + specbleach_adenoiser.h (used when WDSP_WITH_NR4=OFF)
   wdsp/wdsp_export.h     # WDSP_EXPORT visibility macro (replaces PORT)
@@ -39,6 +39,21 @@ and embedded into `libwdsp.{so,dylib,dll}` — no extra runtime library to ship.
 See `native/libspecbleach/VENDORING.md` for re-vendoring notes.
 
 ## Build on macOS (arm64 / x86_64)
+
+Packaged FFTW builds use `bash native/wdsp/build-macos-fftw.sh arm64 14.0
+native/fftw-arm64-install` (or `x86_64 12.0 native/fftw-x64-install`). The
+script pins FFTW 3.3.10 and its archive checksum, preserves Mach timer
+detection missing from the upstream CMake configuration template, and checks
+the deployment target. Do not substitute a library whose planner cannot
+measure execution time: FFTW silently falls back to estimated costs.
+
+The native workflow enables `WDSP_BUILD_FFTW_TESTS` for both precisions. These
+tests require fresh PATIENT plans with measured costs and verify an FFT
+round trip. Linux ARM64 enables FFTW's ARMv8 virtual counter; Windows ARM64 uses a
+`QueryPerformanceCounter` adapter through the overlay triplet. Both avoid
+the coarse `clock()` timer's long planning delays. The
+existing native-content wisdom stamp detects either WDSP or FFTW changes
+and invalidates only `wdspWisdom01`, preserving preferences and calibrations.
 
 ```sh
 brew install fftw cmake
@@ -75,7 +90,8 @@ For local development:
 ```powershell
 # Install dependencies
 vcpkg install fftw3:x64-windows-static-md
-# or for ARM64: vcpkg install fftw3:arm64-windows-static
+# or for ARM64:
+vcpkg install fftw3:arm64-windows-static --overlay-triplets=native/vcpkg-triplets
 
 # Configure (x64)
 cmake -S native\wdsp -B native\build -G "Visual Studio 17 2022" -A x64 `
@@ -155,37 +171,15 @@ Release packaging status:
   them through the manual native workflow before committing native artifact
   updates.
 
-## Source modifications vs. upstream
+## Source provenance and local patches
 
-Diff against upstream WDSP 1.29 is intentionally tiny:
+See [wdsp/ZEUS-PATCHES.md](wdsp/ZEUS-PATCHES.md) for the pinned 2.10 source
+mirrors, upstream manual, and the exact integration changes to retain when
+upgrading. Zeus carries NR3/NR4, CESSB controls, filter/cache improvements,
+PureSignal compatibility and platform fixes; replacing every C/header file
+with an upstream directory would remove features.
 
-1. `comm.h` — replaced `#define PORT __declspec(dllexport)` with an include of
-   `wdsp_export.h` and `#define PORT WDSP_EXPORT`. This is the single change
-   needed to get proper symbol export on all three OSes.
-2. `wdsp_export.h` — new file, holds the cross-platform visibility macro.
-3. `stubs/nr3/rnnoise.h` + `stubs/nr4/specbleach_adenoiser.h` — minimal opaque
-   types so `rnnr.h` / `sbnr.h` compile without librnnoise / libspecbleach
-   available. Each lives in its own subdirectory so the CMake gate can include
-   only the stub matching the OFF flag, avoiding header collisions with the
-   real library include path.
-4. `stubs/nr3/rnnr_stub.c` + `stubs/nr4/sbnr_stub.c` — no-op replacements for
-   `rnnr.c` / `sbnr.c`. These provide the entry points RXA.c calls (with
-   `run` stuck at 0, the NR branches never execute) so we can build without
-   pulling in the upstream noise-reduction libraries.
-
-No other files are modified. `linux_port.{c,h}` does all the Win32 → POSIX
-shimming (pthreads, aligned malloc, Sleep, `__declspec`).
-
-## Re-vendoring upstream WDSP
-
-Bumping to a newer WDSP snapshot is mechanical:
-
-```sh
-rm native/wdsp/*.c native/wdsp/*.h
-cp /path/to/new-wdsp-1.29/*.{c,h} native/wdsp/
-# re-apply the comm.h PORT edit (see step 1 above)
-./native/build.sh
-```
-
-Don't copy upstream `.o` files, `Makefile`, or `COMPILE.*` notes — we own the
-build system now.
+Re-vendoring must compare against the prior upstream baseline, apply only the
+new upstream changes, preserve that patch inventory, and rebuild every packaged
+native runtime. Validate actual runtime versions and managed entry points with
+`WdspRuntimeCompatibilityTests`, plus the full DSP and repository gates.

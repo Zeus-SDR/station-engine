@@ -23,6 +23,14 @@ public interface IRxAudioSink
     void Publish(in AudioFrame frame);
 
     /// <summary>
+    /// Publish audible TX-monitor audio. The default preserves the ordinary
+    /// output path used by browser and radio-speaker sinks. Native PC audio
+    /// overrides this lane so monitor samples can bypass the RX anti-crackle
+    /// prebuffer without changing RX buffering itself.
+    /// </summary>
+    void PublishTxMonitor(in AudioFrame frame) => Publish(in frame);
+
+    /// <summary>
     /// Publish a CW sidetone-only frame. The default is a no-op because the
     /// ordinary audio frame still carries the sidetone to host outputs. Radio
     /// speaker sinks may override this lane when they must distinguish local
@@ -45,4 +53,11 @@ public interface IRxAudioSink
     /// under the same cost model as <see cref="Publish"/>.
     /// </summary>
     void PublishExempt(in AudioFrame frame) { }
+
+    /// <summary>
+    /// Publish audible TX-monitor audio while exempt from RX master mute.
+    /// The default preserves each sink's existing mute-exempt behavior;
+    /// native PC audio overrides this to select its low-latency lane.
+    /// </summary>
+    void PublishTxMonitorExempt(in AudioFrame frame) => PublishExempt(in frame);
 }

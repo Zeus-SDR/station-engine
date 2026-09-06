@@ -33,6 +33,10 @@ namespace Zeus.Server;
 // the next C&C/HPC tick.
 public sealed class PaSettingsStore : IDisposable
 {
+    public const int DefaultCalibrationSafetyPercent = 125;
+    public const int MinCalibrationSafetyPercent = 105;
+    public const int MaxCalibrationSafetyPercent = 200;
+
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<PaBandEntry> _bands;
@@ -112,10 +116,12 @@ public sealed class PaSettingsStore : IDisposable
             var global = g is null
                 ? new PaGlobalSettingsDto(
                     PaEnabled: true,
-                    PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant))
+                    PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant),
+                    PaCalibrationSafetyPercent: DefaultCalibrationSafetyPercent)
                 : new PaGlobalSettingsDto(
                     g.PaEnabled,
-                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant));
+                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant),
+                    NormalizeCalibrationSafetyPercent(g.PaCalibrationSafetyPercent));
 
             var existing = _bands.FindAll().ToDictionary(e => e.Band, e => e);
             var bands = BandUtils.HfBands
@@ -146,7 +152,8 @@ public sealed class PaSettingsStore : IDisposable
     {
         var global = new PaGlobalSettingsDto(
             PaEnabled: true,
-            PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant));
+            PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant),
+            PaCalibrationSafetyPercent: DefaultCalibrationSafetyPercent);
         var bands = BandUtils.HfBands
             .Select(b => new PaBandSettingsDto(
                 b,
@@ -266,10 +273,12 @@ public sealed class PaSettingsStore : IDisposable
             return g is null
                 ? new PaGlobalSettingsDto(
                     PaEnabled: true,
-                    PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant))
+                    PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant),
+                    PaCalibrationSafetyPercent: DefaultCalibrationSafetyPercent)
                 : new PaGlobalSettingsDto(
                     g.PaEnabled,
-                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant));
+                    ResolveMaxPowerWattsForBoard(g.PaMaxPowerWatts, board, variant),
+                    NormalizeCalibrationSafetyPercent(g.PaCalibrationSafetyPercent));
         }
     }
 
@@ -353,6 +362,8 @@ public sealed class PaSettingsStore : IDisposable
                 var g = existingGlobal ?? new PaGlobalEntry();
                 g.PaEnabled = dto.Global.PaEnabled;
                 g.PaMaxPowerWatts = Math.Max(0, dto.Global.PaMaxPowerWatts);
+                g.PaCalibrationSafetyPercent = NormalizeCalibrationSafetyPercent(
+                    dto.Global.PaCalibrationSafetyPercent);
                 g.UpdatedUtc = DateTime.UtcNow;
                 if (existingGlobal is null) _globals.Insert(g);
                 else _globals.Update(g);
@@ -488,6 +499,11 @@ public sealed class PaSettingsStore : IDisposable
         }
     }
 
+    internal static int NormalizeCalibrationSafetyPercent(int percent) =>
+        percent is >= MinCalibrationSafetyPercent and <= MaxCalibrationSafetyPercent
+            ? percent
+            : DefaultCalibrationSafetyPercent;
+
     public void Dispose() => _dbLease.Dispose();
 
 }
@@ -566,6 +582,8 @@ public sealed class PaGlobalEntry
     public int Id { get; set; }
     public bool PaEnabled { get; set; } = true;
     public int PaMaxPowerWatts { get; set; }
+    public int PaCalibrationSafetyPercent { get; set; } =
+        PaSettingsStore.DefaultCalibrationSafetyPercent;
     // NOTE: legacy rows persisted before #124 may carry an `OcTune` column.
     // LiteDB's BsonMapper silently ignores unknown fields when deserializing,
     // so existing PaSettings rows survive a load → save roundtrip with the

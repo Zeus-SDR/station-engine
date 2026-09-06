@@ -25,7 +25,8 @@ namespace Zeus.Server;
 public sealed class GodsEyeFeedsService : BackgroundService
 {
     public const string HttpClientName = "GodsEyeFeeds";
-    public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+    // Overpass permits 20 seconds of execution; allow transport and queue time as well.
+    public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(40);
     internal static readonly TimeSpan OpenSkyAnonymousMinimumInterval = TimeSpan.FromMinutes(15);
     internal const double OpenSkyMaximumBoundsAreaSquareDegrees = 399;
     internal static readonly TimeSpan AisHealthyConnectionThreshold = TimeSpan.FromMinutes(5);

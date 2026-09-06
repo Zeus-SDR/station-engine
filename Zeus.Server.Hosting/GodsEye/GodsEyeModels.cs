@@ -64,7 +64,8 @@ public static class CameraSourceNames
     public const string AlabamaDot = "alabamaDot";
     public const string Caltrans = "caltrans";
     public const string WisconsinDot = "wisconsinDot";
-    public static readonly string[] All = [AlabamaDot, Caltrans, WisconsinDot];
+    public const string NewYorkCityDot = "nycDot";
+    public static readonly string[] All = [AlabamaDot, Caltrans, WisconsinDot, NewYorkCityDot];
 }
 
 public sealed record CameraDto(

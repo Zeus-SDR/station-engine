@@ -157,8 +157,8 @@ void SetRXARNNRRun (int channel, int run) {
   RNNR a = rxa[channel].rnnr.p;
 
   if (a->run != run) {
-    RXAbp1Check (channel, rxa[channel].amd.p->run, rxa[channel].snba.p->run,
-                 rxa[channel].emnr.p->run, rxa[channel].anf.p->run, rxa[channel].anr.p->run,
+    RXAbp1CheckEx (channel, rxa[channel].amd.p->run, rxa[channel].snba.p->run,
+                 rxa[channel].emnr.p->run, getRun_nnr(rxa[channel].nnr.p), rxa[channel].anf.p->run, rxa[channel].anr.p->run,
                  run, rxa[channel].sbnr.p->run); // NR3 + NR4 support
     EnterCriticalSection (&ch[channel].csDSP);
     a->run = run;

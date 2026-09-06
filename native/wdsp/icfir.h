@@ -2,7 +2,7 @@
 
 This file is part of a program that implements a Software-Defined Radio.
 
-Copyright (C) 2018 Warren Pratt, NR0V
+Copyright (C) 2018, 2026 Warren Pratt, NR0V
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -26,29 +26,11 @@ warren@pratt.one
 
 #ifndef _icfir_h
 #define _icfir_h
-#include "firmin.h"
-typedef struct _icfir {
-  int run;
-  int size;
-  int nc;
-  int mp;
-  double* in;
-  double* out;
-  int runrate;
-  int cicrate;
-  int DD;
-  int R;
-  int Pairs;
-  double cutoff;
-  double scale;
-  int xtype;
-  double xbw;
-  int wintype;
-  FIRCORE p;
-} icfir, *ICFIR;
+
+typedef struct _icfir *ICFIR;
 
 extern ICFIR create_icfir (int run, int size, int nc, int mp, double* in, double* out, int runrate, int cicrate,
-                           int DD, int R, int Pairs, double cutoff, int xtype, double xbw, int wintype);
+	int DD, int R, int Pairs, double cutoff, int xtype, double xbw, int wintype);
 
 extern void destroy_icfir (ICFIR a);
 
@@ -63,8 +45,5 @@ extern void setSamplerate_icfir (ICFIR a, int rate);
 extern void setSize_icfir (ICFIR a, int size);
 
 extern void setOutRate_icfir (ICFIR a, int rate);
-
-extern double* icfir_impulse (int N, int DD, int R, int Pairs, double runrate, double cicrate,
-                              double cutoff, int xtype, double xbw, int rtype, double scale, int wintype);
 
 #endif

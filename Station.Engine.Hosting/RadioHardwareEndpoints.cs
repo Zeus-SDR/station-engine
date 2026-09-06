@@ -234,6 +234,12 @@ public static class RadioHardwareEndpoints
                 return Results.Conflict(new { error = "PA settings are locked while calibration is running." });
             if (req.Global.PaMaxPowerWatts < 0)
                 return Results.BadRequest(new { error = "paMaxPowerWatts must be >= 0" });
+            if (req.Global.PaCalibrationSafetyPercent is < PaSettingsStore.MinCalibrationSafetyPercent
+                or > PaSettingsStore.MaxCalibrationSafetyPercent)
+                return Results.BadRequest(new
+                {
+                    error = $"paCalibrationSafetyPercent must be {PaSettingsStore.MinCalibrationSafetyPercent}..{PaSettingsStore.MaxCalibrationSafetyPercent}",
+                });
             try
             {
                 store.Save(new PaSettingsDto(req.Global, req.Bands));

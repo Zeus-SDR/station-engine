@@ -243,6 +243,7 @@ HANDLE _beginthread( void( __cdecl *start_address )( void * ), unsigned stack_si
   // function.
   //
   void sendbuf(void *arg); // declared in analyzer.c but not in header file
+  void doPSCorrChange(void *arg); // WDSP 2.10 keeps this declaration private to calcc.c
   char tname[64];
 
   if (start_address == &wdspmain) {

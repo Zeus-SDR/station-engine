@@ -333,6 +333,15 @@ public sealed record ChatPttRequest(
     ChatPttIceCandidate? Ice = null,
     long? TargetEpoch = null);
 
+/// <summary>Authoritative result for a key/end edge when supported by the relay.</summary>
+public sealed record ChatPttSendResponse(
+    bool Ok,
+    bool Accepted,
+    string? Scope = null,
+    string? Code = null,
+    string? Message = null,
+    bool Retryable = false);
+
 public sealed record ChatPttTargetsRequest(string To, string? Room = null, string? OverId = null);
 public sealed record ChatPttTargetsResponse(
     IReadOnlyList<long> TargetEpochs,

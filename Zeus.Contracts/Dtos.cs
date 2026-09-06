@@ -2351,7 +2351,8 @@ public sealed record PaBandSettingsDto(
 // band-select state; the per-band additive mask sidesteps that shape.
 public sealed record PaGlobalSettingsDto(
     bool PaEnabled = true,
-    int PaMaxPowerWatts = 0);
+    int PaMaxPowerWatts = 0,
+    int PaCalibrationSafetyPercent = 125);
 
 public sealed record PaSettingsDto(
     PaGlobalSettingsDto Global,

@@ -72,7 +72,8 @@ public static class GodsEyeParsers
                 || lon is null || lat is null || !TryCoordinate(lat.Value, lon.Value, out var latitude, out var longitude)) continue;
             var icao = row[0].GetString()?.Trim() ?? $"aircraft-{result.Count}";
             var callsign = row[1].ValueKind == JsonValueKind.String ? row[1].GetString()?.Trim() : null;
-            var timestamp = row[4].TryGetInt64(out var seconds) ? DateTimeOffset.FromUnixTimeSeconds(Math.Max(0, seconds)) : DateTimeOffset.UnixEpoch;
+            var timestamp = row[3].ValueKind == JsonValueKind.Number && row[3].TryGetInt64(out var seconds)
+                ? SafeUnixSeconds(seconds) : DateTimeOffset.UnixEpoch;
             TryNullableDouble(row[7], out var altitude);
             TryNullableDouble(row[9], out var velocityMs);
             TryNullableDouble(row[10], out var heading);
@@ -141,8 +142,9 @@ public static class GodsEyeParsers
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object) return [];
         if (!root.TryGetProperty("ac", out var aircraft) || aircraft.ValueKind != JsonValueKind.Array) return [];
-        var timestamp = SafeUnixSeconds(root.TryGetProperty("now", out var now) && now.TryGetDouble(out var unixSeconds)
-            ? unixSeconds : 0);
+        var reportedTime = root.TryGetProperty("now", out var now) && now.TryGetDouble(out var value) ? value : 0;
+        // readsb-compatible endpoints use milliseconds; older snapshots used seconds.
+        var timestamp = SafeUnixSeconds(reportedTime > 100_000_000_000 ? reportedTime / 1_000 : reportedTime);
         var result = new List<GodsEyeItemDto>();
         foreach (var item in aircraft.EnumerateArray())
         {
@@ -155,7 +157,10 @@ public static class GodsEyeParsers
             var altitude = TryNumber(item, "alt_baro", out var altitudeFeet) ? altitudeFeet * 0.3048 : (double?)null;
             var speed = TryNumber(item, "gs", out var groundSpeed) ? groundSpeed : (double?)null;
             var heading = TryNumber(item, "track", out var track) ? track : (double?)null;
-            result.Add(new GodsEyeItemDto(hex, name, lat, lon, timestamp,
+            var positionTime = TryNumber(item, "seen_pos", out var ageSeconds) && ageSeconds >= 0
+                ? timestamp - TimeSpan.FromSeconds(Math.Min(ageSeconds, (timestamp - DateTimeOffset.UnixEpoch).TotalSeconds))
+                : timestamp;
+            result.Add(new GodsEyeItemDto(hex, name, lat, lon, positionTime,
                 HeadingDeg: heading, SpeedKnots: speed, AltitudeM: altitude,
                 Status: Text(item, "t"), Callsign: callsign));
         }

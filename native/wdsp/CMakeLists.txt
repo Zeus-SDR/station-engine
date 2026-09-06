@@ -5,7 +5,7 @@
 #   Linux   : libwdsp.so     (x86_64, arm64)
 #   Windows : wdsp.dll       (x64, arm64) — untested here, target is CMake-friendly
 #
-# Source is vendored upstream WDSP 2.00 (Warren Pratt) plus a linux_port.c
+# Source is vendored upstream WDSP 2.10 (Warren Pratt) plus a linux_port.c
 # portability shim. Only the PORT macro in comm.h is patched (→ WDSP_EXPORT in
 # wdsp_export.h) so every upstream __declspec(dllexport) resolves to the right
 # platform-specific visibility attribute.
@@ -24,7 +24,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 project(wdsp
-    VERSION 2.00.0
+    VERSION 2.10.0
     DESCRIPTION "WDSP DSP engine, packaged for Zeus"
     LANGUAGES C
 )
@@ -32,6 +32,7 @@ project(wdsp
 option(WDSP_WITH_NR3 "Build with RNNoise (NR3) support — xiph/rnnoise vendored under native/rnnoise/" ON)
 option(WDSP_WITH_NR4 "Build with libspecbleach (NR4 / SBNR) support — vendored under native/libspecbleach/" ON)
 option(WDSP_BUILD_OSCTRL_TESTS "Build deterministic CESSB overshoot-controller tests" OFF)
+option(WDSP_BUILD_FFTW_TESTS "Verify FFTW measured planning and transform correctness" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
@@ -42,7 +43,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # -----------------------------------------------------------------------------
-# Source list (mirrors upstream WDSP 2.00 Makefile SOURCES, minus rnnr.c and
+# Source list (mirrors upstream WDSP 2.10 Makefile SOURCES, minus rnnr.c and
 # sbnr.c which are gated below per-flag).
 # -----------------------------------------------------------------------------
 set(WDSP_SOURCES
@@ -51,7 +52,7 @@ set(WDSP_SOURCES
     delay.c dexp.c div.c doublepole.c eer.c emnr.c emph.c eq.c extrapolate.c fcurve.c
     FDnoiseIQ.c fir.c firmin.c fmd.c fmmod.c fmsq.c gain.c gaussian.c gen.c
     icfir.c iir.c impulse_cache.c iobuffs.c iqc.c linux_port.c lmath.c main.c
-    matchedCW.c meter.c meterlog10.c nbp.c nob.c nobII.c nurbs.c nurbs_fit.c
+    matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c nob.c nobII.c nurbs.c nurbs_fit.c
     nurbs_spline.c osctrl.c patchpanel.c phrot.c resample.c reshb.c rmatch.c
     RXA.c sender.c shift.c siphon.c slew.c snb.c snoop.c ssql.c syncbuffs.c
     TXA.c utilities.c varsamp.c version.c wbfm.c wcpAGC.c wisdom.c zetaHat.c
@@ -105,7 +106,7 @@ else()
         -Wno-unused-variable
         -Wno-unused-function
         -Wno-deprecated-non-prototype
-        -Wno-implicit-function-declaration
+        -Werror=implicit-function-declaration
         -Wno-incompatible-pointer-types
     )
     target_compile_definitions(wdsp PRIVATE _GNU_SOURCE)
@@ -227,7 +228,7 @@ if(WDSP_WITH_NR4)
         # the build log; we don't own this source so we don't fix them.
         target_compile_options(specbleach PRIVATE
             -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable
-            -Wno-incompatible-pointer-types -Wno-implicit-function-declaration
+            -Wno-incompatible-pointer-types -Werror=implicit-function-declaration
         )
     endif()
 
@@ -404,6 +405,26 @@ if(WDSP_BUILD_OSCTRL_TESTS)
         target_link_libraries(wdsp_osctrl_tests PRIVATE m)
     endif()
     add_test(NAME wdsp_osctrl_tests COMMAND wdsp_osctrl_tests)
+endif()
+
+if(WDSP_BUILD_FFTW_TESTS)
+    enable_testing()
+    get_target_property(fftw_test_libraries wdsp LINK_LIBRARIES)
+    set(fftw_test_precisions double)
+    if(WDSP_WITH_NR4)
+        list(APPEND fftw_test_precisions float)
+    endif()
+    foreach(precision IN LISTS fftw_test_precisions)
+        set(test_target fftw_${precision}_planning_tests)
+        add_executable(${test_target} tests/fftw_planning_tests.c)
+        target_include_directories(${test_target} PRIVATE $<TARGET_PROPERTY:wdsp,INCLUDE_DIRECTORIES>)
+        target_link_directories(${test_target} PRIVATE $<TARGET_PROPERTY:wdsp,LINK_DIRECTORIES>)
+        target_link_libraries(${test_target} PRIVATE ${fftw_test_libraries})
+        if(precision STREQUAL "float")
+            target_compile_definitions(${test_target} PRIVATE TEST_FFTW_FLOAT)
+        endif()
+        add_test(NAME ${test_target} COMMAND ${test_target})
+    endforeach()
 endif()
 
 message(STATUS "wdsp: build type = ${CMAKE_BUILD_TYPE}")

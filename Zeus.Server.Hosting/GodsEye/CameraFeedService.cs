@@ -39,6 +39,7 @@ public sealed class CameraFeedService : BackgroundService
         new(CameraSourceNames.AlabamaDot, "Alabama DOT ALGO Traffic", "Alabama Department of Transportation", "https://api.algotraffic.com/v4.0/Cameras", TimeSpan.FromMinutes(15), CameraAdapters.ParseAlabama),
         new(CameraSourceNames.Caltrans, "Caltrans District 4", "California Department of Transportation", "https://cwwp2.dot.ca.gov/data/d4/cctv/cctvStatusD04.json", TimeSpan.FromMinutes(15), CameraAdapters.ParseCaltrans),
         new(CameraSourceNames.WisconsinDot, "Wisconsin 511", "Wisconsin Department of Transportation", CameraAdapters.WisconsinUrl, TimeSpan.FromMinutes(10), CameraAdapters.ParseWisconsin, CameraAdapters.FetchWisconsinPagesAsync),
+        new(CameraSourceNames.NewYorkCityDot, "NYC DOT traffic cameras", "New York City Department of Transportation", "https://webcams.nyctmc.org/api/cameras", TimeSpan.FromMinutes(15), CameraAdapters.ParseNewYorkCity),
     ];
 
     private readonly IHttpClientFactory _clients;
@@ -333,6 +334,30 @@ internal static class CameraAdapters
 {
     internal const string WisconsinUrl = "https://511wi.gov/List/GetData/Cameras";
     private static readonly Uri WisconsinBaseUri = new("https://511wi.gov/");
+
+    internal static CameraParseResult ParseNewYorkCity(string json, CameraSource source)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var result = new List<CameraCandidate>();
+        var skipped = 0;
+        foreach (var item in doc.RootElement.EnumerateArray())
+        {
+            try
+            {
+                var id = String(item, "id");
+                if (string.IsNullOrWhiteSpace(id)) { skipped++; continue; }
+                var latitude = Number(item, "latitude");
+                var longitude = Number(item, "longitude");
+                if (!double.IsFinite(latitude) || !double.IsFinite(longitude) || Math.Abs(latitude) > 90 || Math.Abs(longitude) > 180)
+                { skipped++; continue; }
+                result.Add(Build(source, id, String(item, "name") ?? id, latitude, longitude,
+                    String(item, "imageUrl"), 30, null, CameraStreamType.None,
+                    bool.TryParse(String(item, "isOnline"), out var online) && online));
+            }
+            catch (Exception) { skipped++; }
+        }
+        return new(result, skipped);
+    }
 
     internal static CameraParseResult ParseAlabama(string json, CameraSource source)
     {

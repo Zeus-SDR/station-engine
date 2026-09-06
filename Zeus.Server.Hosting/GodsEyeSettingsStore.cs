@@ -220,7 +220,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
                 var key = value.ApiKey is null ? existing?.ApiKey ?? "" : value.ApiKey.Trim();
                 var sources = layer == GodsEyeLayerNames.Cameras
                     ? CameraSourceNames.All.ToDictionary(source => source,
-                        source => value.Sources?.GetValueOrDefault(source) ?? existing?.Sources?.GetValueOrDefault(source) ?? true,
+                        source => CameraSourceEnabled(source, value.Sources, existing?.Sources),
                         StringComparer.Ordinal)
                     : null;
                 var normalized = Normalize(new GodsEyeLayerSettings(layer, value.Enabled, value.CadenceSeconds, value.RadiusKm, value.MaxCount, key, sources), fallback);
@@ -283,6 +283,13 @@ public sealed class GodsEyeSettingsStore : IDisposable
             throw new ArgumentException("Provider credentials must not exceed 1024 characters.");
     }
 
+    private static bool CameraSourceEnabled(string source, IReadOnlyDictionary<string, bool>? incoming,
+        IReadOnlyDictionary<string, bool>? fallback)
+    {
+        if (incoming is not null && incoming.TryGetValue(source, out var enabled)) return enabled;
+        return fallback?.GetValueOrDefault(source, true) ?? true;
+    }
+
     private static GodsEyeLayerSettings Normalize(GodsEyeLayerSettings value, GodsEyeLayerSettings fallback) => value with
     {
         CadenceSeconds = Math.Clamp(value.CadenceSeconds, MinimumCadence(value.Layer), 7 * 24 * 60 * 60),
@@ -292,7 +299,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
         Sources = value.Layer == GodsEyeLayerNames.Cameras
             ? fallback.Sources!.ToDictionary(
                 pair => pair.Key,
-                pair => value.Sources?.GetValueOrDefault(pair.Key) ?? pair.Value,
+                pair => CameraSourceEnabled(pair.Key, value.Sources, fallback.Sources),
                 StringComparer.Ordinal)
             : value.Sources,
     };

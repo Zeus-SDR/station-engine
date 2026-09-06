@@ -71,6 +71,7 @@
     <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeLandMask.cs" Link="GodsEye\GodsEyeLandMask.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeModels.cs" Link="GodsEye\GodsEyeModels.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeParsers.cs" Link="GodsEye\GodsEyeParsers.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeAircraftTracker.cs" Link="GodsEye\GodsEyeAircraftTracker.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeViewerRegistry.cs" Link="GodsEye\GodsEyeViewerRegistry.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEyeFeedsService.cs" Link="GodsEye\GodsEyeFeedsService.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEyeSettingsStore.cs" Link="GodsEye\GodsEyeSettingsStore.cs" />

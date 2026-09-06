@@ -111,6 +111,9 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // tail drains in <300 ms so the operator doesn't keep hearing the
     // pre-MOX tail of their own voice after keying.
     private const int PreviewRingCapacity = 16_384;
+    // At most ~85 ms of emergency slack. Normal depth is one 30 Hz DSP block
+    // or less because the playback callback drains at the same 48 kHz rate.
+    private const int TxMonitorRingCapacity = 4_096;
 
     private readonly ILogger<NativeAudioSink> _log;
     private readonly bool _outputEnabled;
@@ -130,6 +133,12 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // service start phase fires, all singletons in the cycle exist.
     private readonly IServiceProvider? _services;
     private readonly FloatSpscRing _ring = new(RingCapacity);
+    // TX monitor is latency-sensitive (the operator is hearing their own
+    // voice), unlike bursty RX audio. Keep it on a dedicated ring so it never
+    // waits for the RX path's 90 ms anti-crackle cushion. The device callback
+    // drains whatever is available immediately and pads only that callback's
+    // short tail with silence.
+    private readonly FloatSpscRing _txMonitorRing = new(TxMonitorRingCapacity);
     private readonly FloatSpscRing _previewRing = new(PreviewRingCapacity);
     private readonly object _deviceSync = new();
 
@@ -611,6 +620,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     private void ResetForDeviceOpen()
     {
         _ring.Clear();
+        _txMonitorRing.Clear();
         _previewRing.Clear();
         _rebuffering = true;
     }
@@ -648,6 +658,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // thread; matches FloatSpscRing.Count's relaxed-reader contract
     // (best-effort snapshot, may be off by one in a race window).
     internal int CurrentRingDepth => _ring.Count;
+    internal int CurrentTxMonitorRingDepth => _txMonitorRing.Count;
 
     internal void RenderPlaybackForTest(Span<float> output, uint frameCount, uint channels) =>
         OnPlaybackData(output, frameCount, channels);
@@ -723,6 +734,29 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         MaybeLog();
     }
 
+    public void PublishTxMonitor(in AudioFrame frame)
+    {
+        if (_muteState.IsMuted) return;
+        PublishTxMonitorCore(in frame);
+    }
+
+    public void PublishTxMonitorExempt(in AudioFrame frame) =>
+        PublishTxMonitorCore(in frame);
+
+    private void PublishTxMonitorCore(in AudioFrame frame)
+    {
+        if (!_outputEnabled) return;
+        if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz)
+            return;
+
+        var src = frame.Samples.Span;
+        _txMonitorRing.Write(src);
+        // TX preview is an audible producer in its own right. In particular,
+        // mute-exempt preview may be the only audio reaching this sink, so it
+        // must keep the playback-callback watchdog alive even while RX is muted.
+        MaybeRecoverStalledOutput(allowWhileMuted: true);
+    }
+
     // Effective prebuffer/refill cushion for a device callback of
     // <paramref name="totalFrames"/> frames: the larger of the 90 ms floor and
     // four callbacks deep, capped to leave one callback of ring headroom (a
@@ -752,6 +786,31 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
             ? stackalloc float[totalFrames]
             : new float[totalFrames];
 
+        // Self-monitor has priority and starts on the very next device
+        // callback. In particular, it does not wait for the RX ring to reach
+        // PlaybackPrebufferSamples. A partial monitor callback is padded with
+        // silence rather than held, because holding is the latency this lane
+        // exists to remove.
+        // If output was stalled, discard old self-monitor audio before reading.
+        // The operator should hear the current syllable after recovery, not an
+        // increasingly delayed replay. Skip is consumer-owned and therefore
+        // preserves the ring's SPSC contract.
+        int txMonitorQueued = _txMonitorRing.Count;
+        if (txMonitorQueued > totalFrames * 2)
+            _txMonitorRing.Skip(txMonitorQueued - totalFrames);
+        int txMonitorRead = _txMonitorRing.Read(mono);
+        bool renderingTxMonitor = txMonitorRead > 0;
+        if (renderingTxMonitor && txMonitorRead < totalFrames)
+            mono[txMonitorRead..].Clear();
+        if (renderingTxMonitor)
+        {
+            // TX monitor replaces local RX at the pipeline. Clear the RX tail
+            // here on its owning consumer thread so old receive audio cannot
+            // mix with self-monitor or play after it.
+            _ring.Clear();
+            _rebuffering = true;
+        }
+
         // Size the cushion to the LARGER of the 90 ms floor and 4× this device's
         // actual callback (the negotiated period may exceed our 480-frame
         // request). #742.
@@ -769,7 +828,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         // state never trims. One O(1) skip corrects a flood or a drift step;
         // the discarded samples are tallied as overruns. Protocol-agnostic —
         // P2 keeps the ring near-empty so this never fires there.
-        if (!_rebuffering)
+        if (!renderingTxMonitor && !_rebuffering)
         {
             int latencyCeiling = Math.Min(prebufferTarget * 2, RingCapacity - totalFrames);
             if (_ring.Count > latencyCeiling)
@@ -782,7 +841,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
         bool rxSilence = false;
         int queued = _ring.Count;
-        if (_rebuffering)
+        if (!renderingTxMonitor && _rebuffering)
         {
             if (queued >= prebufferTarget)
             {
@@ -793,14 +852,18 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
                 rxSilence = true;
             }
         }
-        else if (queued < totalFrames)
+        else if (!renderingTxMonitor && queued < totalFrames)
         {
             _rebuffering = true;
             rxSilence = true;
             Interlocked.Increment(ref _rebufferEvents);
         }
 
-        if (rxSilence)
+        if (renderingTxMonitor)
+        {
+            // The direct lane already filled mono above.
+        }
+        else if (rxSilence)
         {
             mono.Clear();
             Interlocked.Add(ref _underrunSamples, totalFrames);
@@ -882,13 +945,17 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     /// enqueued, so a muted or input-idle sink (Publish not reached / returns
     /// early) never trips it.
     /// </summary>
-    private void MaybeRecoverStalledOutput()
+    private void MaybeRecoverStalledOutput(bool allowWhileMuted = false)
     {
         if (!_outputActive) return;
         long now = _monotonicMs();
         long last = Interlocked.Read(ref _lastCallbackMs);
         if (!ShouldRecoverStalledCallback(
-                _outputActive, _muteState.IsMuted, last, now, StallRecoveryThresholdMs))
+                _outputActive,
+                muted: !allowWhileMuted && _muteState.IsMuted,
+                last,
+                now,
+                StallRecoveryThresholdMs))
             return;
         // Single-flight until a callback fires again (OnPlaybackData re-arms) or a
         // fresh device is adopted — so a persistent stall schedules exactly one

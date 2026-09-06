@@ -35,6 +35,14 @@ public static class ServiceCollectionExtensions
             options: options));
         services.AddHostedService(sp => sp.GetRequiredService<PluginManager>());
 
+        // Read-only radio state for plugins holding ReadRadioState. Registered
+        // here (rather than in a specific host) so IPluginContext.Radio is wired
+        // in EVERY host that installs the plugin system — the standalone station
+        // engine as well as the retired monolithic host. Without this the engine
+        // granted the capability but PluginManager resolved a null reader.
+        // TryAdd lets a host substitute a richer reader if it ever needs one.
+        services.TryAddSingleton<Zeus.Plugins.Contracts.IRadioStateReader, RadioStateReader>();
+
         // Registry + installer — uses the typed HttpClient pattern so
         // operators can replace the default user-agent / timeouts via
         // IHttpClientFactory configuration if needed.
