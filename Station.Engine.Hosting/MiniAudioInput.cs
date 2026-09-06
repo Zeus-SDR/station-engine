@@ -4,6 +4,7 @@
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA), Christian Suarez (N9WAR), and contributors.
 
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Zeus.Server;
 
@@ -45,14 +46,35 @@ internal sealed class NativeMicInputFactory : INativeMicInputFactory
         new MiniAudioInput(
             onFrames,
             onNotify,
-            deviceIdHex,
+            deviceIdHex ?? (DisplayHardwareProfile.Current().IsNativeG2 ? ResolveDefaultInputDeviceId() : null),
             preferSampleRate: 48_000,
             preferChannels: 1,
             periodFrames: 480,
             periods: 2);
 
     public string? ResolveDefaultInputDeviceId() =>
-        MiniAudioDevices.Enumerate().Inputs.FirstOrDefault(device => device.IsDefault)?.Id;
+        SelectDefaultInputDeviceId(MiniAudioDevices.Enumerate().Inputs, DisplayHardwareProfile.Current().IsNativeG2);
+
+    internal static string? SelectDefaultInputDeviceId(IReadOnlyList<MiniAudioDeviceInfo> inputs, bool nativeG2)
+    {
+        if (!nativeG2) return inputs.FirstOrDefault(device => device.IsDefault)?.Id;
+        var microphones = inputs.Where(device => !IsOutputMonitor(device)).ToArray();
+        return (microphones.FirstOrDefault(device => device.IsDefault) ?? microphones.FirstOrDefault())?.Id
+            ?? throw new InvalidOperationException("No microphone is available. Output monitors are not selected automatically on G2.");
+    }
+
+    private static bool IsOutputMonitor(MiniAudioDeviceInfo device)
+    {
+        // PulseAudio device IDs are UTF-8 names in the miniaudio ID buffer;
+        // inspect the stable ID because display names may be localized.
+        try
+        {
+            var id = Encoding.UTF8.GetString(Convert.FromHexString(device.Id)).TrimEnd('\0');
+            if (id.EndsWith(".monitor", StringComparison.Ordinal)) return true;
+        }
+        catch (FormatException) { }
+        return device.Name.StartsWith("Monitor of ", StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 internal sealed class MiniAudioInput : INativeMicInput

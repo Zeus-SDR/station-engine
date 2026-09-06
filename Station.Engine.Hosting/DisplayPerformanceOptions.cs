@@ -6,6 +6,7 @@
 
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 
 namespace Zeus.Server;
@@ -17,14 +18,16 @@ public sealed record DisplayPerformanceSnapshot(
     bool PreferWebglWaterfall,
     int RxAnalyzerFftSize,
     int PanadapterWidth,
-    int? DefaultConnectSampleRateHz);
+    int? DefaultConnectSampleRateHz,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool NativeG2 = false);
 
 public readonly record struct DisplayHardwareProfile(
     Architecture ProcessArchitecture,
     Architecture OSArchitecture,
     int ProcessorCount,
     bool IsLinuxOs,
-    string? DeviceTreeModel)
+    string? DeviceTreeModel,
+    bool G2DesktopInstalled = false)
 {
     private const string DeviceTreeModelPath = "/proc/device-tree/model";
 
@@ -55,7 +58,7 @@ public readonly record struct DisplayHardwareProfile(
             DeviceTreeModel: null);
 
         return probe.IsLinuxArm64
-            ? probe with { DeviceTreeModel = ReadDeviceTreeModel() }
+            ? probe with { DeviceTreeModel = ReadDeviceTreeModel(), G2DesktopInstalled = ReadG2PackageMarker() }
             : probe;
     }
 
@@ -65,6 +68,8 @@ public readonly record struct DisplayHardwareProfile(
     public bool IsLinuxArm64 =>
         IsLinuxOs &&
         (ProcessArchitecture == Architecture.Arm64 || OSArchitecture == Architecture.Arm64);
+
+    public bool IsNativeG2 => IsLinuxArm64 && G2DesktopInstalled;
 
     // Pi-class means Linux arm64 boards targeted by the low-power profile.
     // Core count catches Pi 4/5 and Pi CM4/CM5 systems; the device-tree model
@@ -82,6 +87,13 @@ public readonly record struct DisplayHardwareProfile(
 
         return KnownSbcModelMarkers.Any(marker =>
             model.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ReadG2PackageMarker()
+    {
+        try { return File.ReadAllText("/usr/share/zeus-link-g2/package-kind").Trim() == "deb-g2"; }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 
     private static string? ReadDeviceTreeModel()
@@ -150,7 +162,8 @@ public static class DisplayPerformanceOptions
                 PreferWebglWaterfall: forceWebgl || envFps < DefaultFrameRateHz,
                 RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
                 PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
-                DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration));
+                DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
+                NativeG2: hw.IsNativeG2);
         }
 
         var profile = FirstNonBlank(
@@ -171,12 +184,15 @@ public static class DisplayPerformanceOptions
         {
             return new DisplayPerformanceSnapshot(
                 Profile: auto ? "auto->low-power" : "low-power",
-                MaxFrameRateHz: LowPowerFrameRateHz,
+                MaxFrameRateHz: hw.IsNativeG2 &&
+                    hw.DeviceTreeModel?.Contains("Raspberry Pi Compute Module 5", StringComparison.OrdinalIgnoreCase) == true
+                        ? DefaultFrameRateHz : LowPowerFrameRateHz,
                 LowPower: true,
                 PreferWebglWaterfall: true,
                 RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(LowPowerRxAnalyzerFftSize, configuration, environment),
                 PanadapterWidth: ResolvePanadapterWidth(LowPowerPanadapterWidth, configuration, environment),
-                DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration));
+                DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
+                NativeG2: hw.IsNativeG2);
         }
 
         return new DisplayPerformanceSnapshot(
@@ -186,7 +202,8 @@ public static class DisplayPerformanceOptions
             PreferWebglWaterfall: forceWebgl,
             RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
             PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
-            DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration));
+            DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
+            NativeG2: hw.IsNativeG2);
     }
 
     public static bool TryParseFrameRate(string? raw, out double frameRateHz)

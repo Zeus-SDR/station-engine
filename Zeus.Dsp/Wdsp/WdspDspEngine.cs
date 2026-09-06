@@ -4058,19 +4058,13 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         if (txa is not int id) return;
         lock (_psLock)
         {
-            // Two-phase reset+restore — matches Thetis PSForm.cs:760-783
-            // (timer2code Monitor → SetNewValues → RestoreOperation) and
-            // pihpsdr's tx_ps_reset → tx_ps_resume pattern (transmitter.c
-            // :2478-2502). Phase 1 clears calcc to LRESET with mancal/
-            // automode zeroed (drops any in-flight fit). Phase 2 restores
-            // the saved Auto/Single mode so calcc autorestarts. Without
-            // phase 2, automode stays 0 and calcc parks at LRESET forever
-            // — which on a Patch-A-gated AutoAttenuate loop means info[5]
-            // never increments past 1 and the loop stalls after one step.
-            NativeMethods.SetPSControl(id, 1, 0, 0, 0);
+            // calcc consumes reset on a later feedback block. Publish reset
+            // and the saved mode together, as SetPsEnabled does, so a second
+            // control write cannot clear the request before it is observed.
+            // LRESET clears reset itself and resumes the selected mode.
             int mancal = _psSingle ? 1 : 0;
             int automode = (_psAuto && !_psSingle) ? 1 : 0;
-            NativeMethods.SetPSControl(id, 0, mancal, automode, 0);
+            NativeMethods.SetPSControl(id, 1, mancal, automode, 0);
         }
         _log.LogInformation("wdsp.resetPs auto={Auto} single={Single}", _psAuto, _psSingle);
     }

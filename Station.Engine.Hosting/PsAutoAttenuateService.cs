@@ -187,13 +187,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private bool _stallWarned;
     private static readonly TimeSpan StallThreshold = TimeSpan.FromSeconds(5);
 
-    // Wedge watchdog — distinct from the cal==0 stall above. Here calcc fit
-    // fine, then FROZE at a non-zero info5 while keyed in auto mode (the
-    // mid-TX arm/disarm wedge: stuck in LCALC, cor=1 on a stale curve →
-    // splatter). Auto mode re-fits continuously, so info5 frozen for
-    // >StallThreshold = wedged; recover with a clean calcc reset, rate-limited
-    // so a persistent wedge can't reset-storm. (Single-cal / manual hold
-    // legitimately freezes info5, so this is gated on auto mode only.)
+    // Only LCALC waits for a calculation to finish. COLLECT can wait for
+    // voice peaks indefinitely, and DELAY follows the operator's loop timing.
+    // A stale fit count in either state is not evidence of a hung calculation.
     private int _lastWedgeCal = -1;
     private long _lastWedgeCalChangeMs;
     private long _lastWedgeResetMs;
@@ -488,7 +484,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
     // single deterministic ticks through the real gate + dispatch chain
     // without the PeriodicTimer — mirrors the ForTest seams elsewhere in
     // Station.Engine.Hosting (InternalsVisibleTo Zeus.Server.Tests).
-    internal void Tick1()
+    internal void Tick1() => Tick1(Environment.TickCount64);
+
+    internal void Tick1(long nowMs)
     {
         var s = _radio.Snapshot();
 
@@ -615,7 +613,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
         var stallPsm = engine.GetPsStageMeters();
         if (stallPsm.CalibrationAttempts == 0)
         {
-            long now = Environment.TickCount64;
+            long now = nowMs;
             if (_stallStartTickMs == 0)
             {
                 _stallStartTickMs = now;
@@ -640,50 +638,30 @@ public sealed class PsAutoAttenuateService : BackgroundService
             }
         }
 
-        // Wedge watchdog — info5 frozen at a NON-zero value while keyed in
-        // auto mode = calcc stalled in LCALC on a stale curve (see field
-        // comment). Reset calcc to recover; rate-limited to one reset per
-        // window so a hard wedge can't reset-storm. Gated on auto mode because
-        // single-cal / manual hold freezes info5 by design.
-        //
-        // ONLY fire in the active compute states (LCOLLECT=4 .. LDELAY=7): a
-        // genuine stale-curve wedge is stuck in LCALC(6). When calcc is parked
-        // in a WAIT state — LRESET(0)/LWAIT(1)/LMOXDELAY(2)/LSETUP(3) — info5 is
-        // frozen by design (waiting for MOX/feedback), and a reset is both
-        // FUTILE (it just re-enters LWAIT) and DESTRUCTIVE (it tears down the
-        // live correction). On the G2 desktop two-tone this exact loop —
-        // reset → LWAIT → frozen → reset every 5 s — periodically blew the
-        // correction away, holding IMD ~10 dB worse than a stable curve (#559).
-        // Also skip when we've deliberately locked the correction (_psHeld →
-        // SetPSRunCal(0)): calcc is parked on purpose, info5 frozen by design.
-        // Run the info5 freeze CLOCK on every armed+keyed tick, INDEPENDENT of
-        // CalState. Previously the clock lived inside the `calState in 4..7`
-        // gate with an `else { _lastWedgeCal = -1; }`, so a wedged calcc that
-        // flickered between LCALC(6) and a transient WAIT state reset the clock
-        // on every re-entry to the compute states — the freeze never accumulated
-        // StallThreshold and recovery dragged out (~37 s observed instead of ~5).
+        // WDSP calcc.c: COLLECT (4) fills envelope buckets, MOXCHECK (5)
+        // checks keying, LCALC (6) waits for the fitting worker, and DELAY (7)
+        // waits the configured loop interval. Only time spent continuously
+        // waiting for the same calculation is eligible for wedge recovery.
+        // Clear the clock on other states so a long collection wait cannot
+        // cause an immediate reset when the next healthy calculation starts.
         var calState = stallPsm.CalState;
-        long nowW = Environment.TickCount64;
-        if (stallPsm.CalibrationAttempts != _lastWedgeCal)
+        if (!s.PsAuto || s.PsSingle || _psHeld
+            || stallPsm.CalibrationAttempts <= 0 || calState != 6)
+        {
+            _lastWedgeCal = -1;
+        }
+        else if (stallPsm.CalibrationAttempts != _lastWedgeCal)
         {
             _lastWedgeCal = stallPsm.CalibrationAttempts;
-            _lastWedgeCalChangeMs = nowW;
+            _lastWedgeCalChangeMs = nowMs;
         }
-        // FIRE only in the active compute states (LCOLLECT=4..LDELAY=7). Per
-        // #559, resetting while calcc is parked in a WAIT state (0..3) is futile
-        // (it just re-enters LWAIT) and destructive (tears down the live
-        // correction) — so the clock runs always, but the reset stays gated to
-        // compute states, in auto mode, on a non-zero frozen info5, rate-limited.
-        else if (s.PsAuto && !s.PsSingle && !_psHeld
-                 && stallPsm.CalibrationAttempts > 0
-                 && calState >= 4 && calState <= 7
-                 && nowW - _lastWedgeCalChangeMs >= (long)StallThreshold.TotalMilliseconds
-                 && nowW - _lastWedgeResetMs >= (long)StallThreshold.TotalMilliseconds)
+        else if (nowMs - _lastWedgeCalChangeMs >= (long)StallThreshold.TotalMilliseconds
+                 && nowMs - _lastWedgeResetMs >= (long)StallThreshold.TotalMilliseconds)
         {
-            _lastWedgeResetMs = nowW;
+            _lastWedgeResetMs = nowMs;
             _log.LogWarning(
-                "psAutoAttn.wedge info5 frozen at {Cal} state={State} for {ElapsedMs}ms — calcc stalled (e.g. PS toggled mid-TX); resetting calcc.",
-                stallPsm.CalibrationAttempts, stallPsm.CalState, nowW - _lastWedgeCalChangeMs);
+                "psAutoAttn.wedge info5 frozen at {Cal} state={State} for {ElapsedMs}ms — calculation stalled; resetting calcc.",
+                stallPsm.CalibrationAttempts, calState, nowMs - _lastWedgeCalChangeMs);
             engine.ResetPs();
         }
 
