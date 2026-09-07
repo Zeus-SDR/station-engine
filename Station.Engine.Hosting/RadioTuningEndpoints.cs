@@ -140,9 +140,9 @@ public static class RadioTuningEndpoints
         endpoints.MapPost("/api/rx/diversity", (DiversitySetRequest req, RadioService r) =>
         {
             log.LogInformation(
-                "api.rx.diversity enabled={Enabled} gain={Gain} phaseDeg={PhaseDeg} sourceRx={SourceRx}",
-                req.Enabled, req.Gain, req.PhaseDeg, req.SourceRx);
-            return Results.Ok(r.SetDiversity(req.Enabled, req.Gain, req.PhaseDeg, req.SourceRx));
+                "api.rx.diversity enabled={Enabled} gain={Gain} phaseDeg={PhaseDeg} sourceRx={SourceRx} referenceRx={ReferenceRx} output={Output}",
+                req.Enabled, req.Gain, req.PhaseDeg, req.SourceRx, req.ReferenceRx, req.Output);
+            return Results.Ok(r.SetDiversity(req.Enabled, req.Gain, req.PhaseDeg, req.SourceRx, req.ReferenceRx, req.Output));
         });
 
         // ATU tune request (Thetis ATUTune). Holds the Apollo/Alex auto-tune bit

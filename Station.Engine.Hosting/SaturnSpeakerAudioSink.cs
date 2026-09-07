@@ -584,9 +584,9 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             SocketError.TimedOut)
         {
             Interlocked.Increment(ref _droppedPackets);
-            // A transient full UDP send buffer is a dropped audio packet, not a
-            // dead transport. Advance the codec schedule just as the dedicated
-            // socket did, instead of pausing all audio for a second.
+            // Protocol2Client already exhausted its bounded retry of this exact
+            // packet. Count the remaining pressure as a terminal packet loss,
+            // but do not pause all audio for the hard-failure backoff.
             return true;
         }
         catch (Exception ex) when (ex is SocketException or ObjectDisposedException)

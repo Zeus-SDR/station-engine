@@ -2996,7 +2996,8 @@ public sealed class RadioService : IDisposable
     /// gain/phase null point is best dialed in on a live signal — see the
     /// DiversityForm calibration flow.</para>
     /// </summary>
-    public StateDto SetDiversity(bool? enabled, double? gain, double? phaseDeg, int? sourceRx)
+    public StateDto SetDiversity(bool? enabled, double? gain, double? phaseDeg, int? sourceRx,
+        int? referenceRx = null, DiversityOutput? output = null)
     {
         Mutate(s =>
         {
@@ -3004,9 +3005,13 @@ public sealed class RadioService : IDisposable
             var next = cur with
             {
                 Enabled = enabled ?? cur.Enabled,
-                Gain = gain is double g ? Math.Clamp(g, 0.0, 2.0) : cur.Gain,
-                PhaseDeg = phaseDeg is double p ? Math.Clamp(p, -180.0, 180.0) : cur.PhaseDeg,
-                SourceRx = sourceRx is int sr ? Math.Clamp(sr, 1, WireContract.MaxReceivers - 1) : cur.SourceRx,
+                Gain = gain is double g && double.IsFinite(g) ? Math.Clamp(g, 0.0, 5.0) : cur.Gain,
+                PhaseDeg = phaseDeg is double p && double.IsFinite(p) ? Math.Clamp(p, -180.0, 180.0) : cur.PhaseDeg,
+                ReferenceRx = referenceRx is int rr ? Math.Clamp(rr, 0, 1) : cur.ReferenceRx,
+                Output = output is DiversityOutput mode && Enum.IsDefined(mode) ? mode : cur.Output,
+                // The legacy field is retained on the wire, but diversity always
+                // uses the physical ADC pair. ReferenceRx chooses the phase anchor.
+                SourceRx = 1,
             };
             return s with { Diversity = next };
         });

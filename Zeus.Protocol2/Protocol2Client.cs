@@ -81,6 +81,8 @@ public readonly record struct Protocol2TxIqDiagnostics(
 public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 {
     private const int SharedSendTimeoutMs = 10;
+    private static readonly long SpeakerSendRetryTicks =
+        Math.Max(1, Stopwatch.Frequency / 500); // 2 ms
     private const int BufLen = 1444;
     private const int DiscoverySamplesPerPacket = 238;
     private const int DiscoveryPort = 1024;
@@ -241,10 +243,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _disconnectSignaled;
     private int _sampleRateKhz = 48;
     private uint _rxFreqHz = 14_200_000;
-    // Second DDC path. When RX2 is enabled, this DDC is the user-visible second
-    // receiver. When diversity is enabled while RX2 is off, the same DDC is
-    // requested as a hidden source stream and consumed by the combiner before it
-    // reaches any RX2 audio channel.
+    // RX2 owns its independently tuned DDC. Diversity requests the separate
+    // synchronized DDC0/1 pair shared with keyed PureSignal feedback.
     private int _rx2Enabled;
     private int _diversitySourceEnabled;
     private uint _rx2FreqHz = 7_100_000;
@@ -533,6 +533,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _droppedFrames;
     private uint _lastRxDiagSeq;
     private bool _haveFirstRxDiagSeq;
+    private int _lastRxDiagDdc = -1;
     private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
     // Per-stream sequence counters. The G2 firmware tracks seq per destination
     // port; sharing one counter across CmdGeneral/CmdRx/CmdTx/CmdHighPriority
@@ -563,6 +564,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // sender. 32 packets is about 40 ms at 800 packets/s, enough for normal
     // WDSP bursts but too small to become audible delayed speech.
     private const int TxIqMaxQueuedPackets = 32;
+    // Internal command contention must not discard a 1.25 ms piece of speech
+    // after just 2 ms. Bound lock admission by the existing live-audio backlog,
+    // while polling the TX revision every millisecond so unkey can cancel it.
+    private const int TxIqGateWaitMs = TxIqMaxQueuedPackets * TxIqSamplesPerPacket * 1000 / (int)TxDacSampleRate;
     private readonly float[] _txIqScratch = new float[TxIqSamplesPerPacket * 2];
     private int _txIqScratchCount;
     private long _txIqScratchRevision;
@@ -586,6 +591,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqGateBusy;
     private long _txIqNotWritable;
     private long _txIqSocketErrors;
+    private long _txIqSocketMaxTicks;
     private long _txIqSafetyRejected;
     private long _txIqStaleQueueDrops;
     private long _txIqTimingEpoch;
@@ -669,18 +675,43 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         if (packet.Length != speakerPacketBytes)
             throw new ArgumentException($"Speaker audio packets must be exactly {speakerPacketBytes} bytes.", nameof(packet));
 
-        var testSink = _speakerAudioSinkForTesting;
-        if (testSink is not null)
-        {
-            testSink(speakerAudioPort, packet.ToArray());
-            return packet.Length;
-        }
-
         var socket = _sock;
         var speakerEndpoint = _speakerAudioEndpoint;
-        if (socket is null || speakerEndpoint is null) return 0;
+        var testSink = _speakerAudioSinkForTesting;
+        if (testSink is null && (socket is null || speakerEndpoint is null)) return 0;
 
-        return SendDatagram(packet, speakerEndpoint, requireImmediate: true);
+        // A command or TX-IQ packet can own the shared socket briefly when a
+        // completed codec packet is due. Retry that same payload from the
+        // dedicated speaker worker for a bounded window rather than creating
+        // an audible hole in the stream. Persistent pressure still escapes to
+        // the sink's existing packet-loss handling.
+        long retryDeadline = 0;
+        SpinWait retryWait = default;
+        while (true)
+        {
+            try
+            {
+                if (testSink is not null)
+                {
+                    testSink(speakerAudioPort, packet.ToArray());
+                    return packet.Length;
+                }
+
+                return SendDatagram(packet, speakerEndpoint!, requireImmediate: true);
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode is
+                SocketError.WouldBlock or
+                SocketError.NoBufferSpaceAvailable or
+                SocketError.TimedOut)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (retryDeadline == 0)
+                    retryDeadline = now + SpeakerSendRetryTicks;
+                else if (now >= retryDeadline)
+                    throw;
+                retryWait.SpinOnce(sleep1Threshold: -1);
+            }
+        }
     }
 
     internal int SendDatagram(
@@ -691,6 +722,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         bool gateTaken = false;
         bool txIq = requireImmediate && endpoint.Port == 1029;
         bool admissionRejected = false;
+        long socketStarted = 0;
         try
         {
             // Speaker and TX IQ have dedicated sender workers. Checking socket
@@ -720,6 +752,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             // sparse critical commands may wait up to the bounded SendTimeout.
             // With all Zeus sends serialized by this gate, another sender
             // cannot consume the available buffer between Poll and the write.
+            if (txIq) socketStarted = Stopwatch.GetTimestamp();
             if (requireImmediate && !(DatagramReadyForTesting?.Invoke()
                 ?? socket?.Poll(0, SelectMode.SelectWrite) ?? true))
             {
@@ -738,6 +771,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
         finally
         {
+            if (socketStarted != 0)
+                TxIqSendTiming.RecordMaximum(ref _txIqSocketMaxTicks, Stopwatch.GetTimestamp() - socketStarted);
             if (gateTaken) Monitor.Exit(_udpSendGate);
         }
     }
@@ -1128,6 +1163,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             await ObserveLoopExitAsync(_keepaliveTask, "keepalive").ConfigureAwait(false);
             _keepaliveTask = null;
             _txIqQueue.Writer.TryComplete();
+            SignalTxIqQueue();
             await ObserveLoopExitAsync(_txIqSenderTask, "tx-iq").ConfigureAwait(false);
             _txIqSenderTask = null;
             _txIqPacketPool.Drain(_txIqQueue.Reader, DecrementTxIqQueuedPacketsIfPositive);
@@ -1194,8 +1230,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// The wire DDC index used for the second receiver (RX2): the DDC right
     /// after the primary RX DDC. On Orion-family boards RX1 is DDC2, so RX2 is
     /// DDC3; on Hermes-class RX1 is DDC0, so RX2 is DDC1. The PureSignal
-    /// feedback pair (DDC0/DDC1 on Orion-family) is reserved separately and is
-    /// only active while PS is armed, so it does not collide with RX2's DDC3.
+    /// shared diversity/feedback pair (DDC0/DDC1 on Orion-family) is reserved
+    /// separately, so neither role collides with RX2's DDC3.
     /// </summary>
     public static int Rx2Ddc(HpsdrBoardKind board) => RxBaseDdc(board) + 1;
 
@@ -1293,16 +1329,17 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Request or release the hidden diversity source DDC. This does not change
-    /// user-visible RX2 state; the DSP pipeline consumes receiver-1 IQ as raw
-    /// diversity source material when the combiner is active.
+    /// Request or release synchronized receive diversity on DDC0/1. RX2 keeps
+    /// its independent DDC. Keyed PureSignal feedback takes priority on the pair.
     /// </summary>
     public void SetDiversitySourceEnabled(bool on, byte adcSource)
     {
         int next = on ? 1 : 0;
         bool changed = Interlocked.Exchange(ref _diversitySourceEnabled, next) != next;
-        changed |= Interlocked.Exchange(ref _diversitySourceAdcSource, adcSource) != adcSource;
-        if (changed && _rxTask is not null)
+        bool adcChanged = Interlocked.Exchange(ref _diversitySourceAdcSource, adcSource) != adcSource;
+        changed |= on && adcChanged;
+        if (changed) Interlocked.Exchange(ref _psBlockResetPending, 1);
+        if (changed && (_rxTask is not null || _commandSinkForTesting is not null))
         {
             SendCmdRx();
             SendCmdHighPriority(run: true);
@@ -1320,9 +1357,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
         long corrected = (long)Math.Round(hz * factor, MidpointRounding.AwayFromZero);
         _rx2FreqHz = (uint)Math.Clamp(corrected, 0L, uint.MaxValue);
-        if (_rxTask is not null
-            && (Volatile.Read(ref _rx2Enabled) != 0
-                || Volatile.Read(ref _diversitySourceEnabled) != 0))
+        if (_rxTask is not null && Volatile.Read(ref _rx2Enabled) != 0)
             SendCmdHighPriority(run: true);
     }
 
@@ -1427,9 +1462,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int FirstFreeContiguousUserDdc()
     {
         int occupied = 1; // RX1
-        bool rx2OrDiversity = Volatile.Read(ref _rx2Enabled) != 0
-            || Volatile.Read(ref _diversitySourceEnabled) != 0;
-        if (rx2OrDiversity) occupied++;
+        if (Volatile.Read(ref _rx2Enabled) != 0) occupied++;
         if (Volatile.Read(ref _rx2Enabled) != 0)
             occupied += Math.Max(0, Volatile.Read(ref _extraReceiverCount));
         return RxBaseDdc(_boardKind) + occupied;
@@ -1872,29 +1905,19 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Common MOX/TUNE transmit-edge wire push. For every board this re-pushes
-    /// HighPriority (run + the MOX/PTT bit derived from <c>_moxOn || _tuneActive</c>).
-    ///
-    /// On the single-ADC G2E (issue #960), and ONLY while PS is armed AND the
-    /// burn-zone time-mux interlock is lifted, DDC0's descriptor depends on the
-    /// transmit-burst state, so the edge also re-emits the Receive-Specific
-    /// command to swap DDC0 between the feedback interleave and the user RX:
-    ///   - key-DOWN: SendCmdRx FIRST (arm the DDC0 feedback descriptor,
-    ///     byte 1363 = 0x02) THEN SendCmdHighPriority (assert MOX) — reconfigure
-    ///     the DDC before keying.
-    ///   - key-UP: SendCmdHighPriority FIRST (drop the wire MOX, preserving the
-    ///     #870 kill-RF-before-teardown ordering) THEN SendCmdRx (revert DDC0 to
-    ///     the user-RX descriptor) so RX audio returns promptly.
-    /// <c>_psBlockFill</c> is reset on both edges so a partial feedback block is
-    /// never stitched across a user-RX/feedback transition. The keepalive
-    /// re-emits SendCmdRx ~5 Hz, so a single dropped edge self-heals within
-    /// ~200 ms. For every other board, and on the G2E with the interlock down or
-    /// PS disarmed, this emits NO extra CmdRx — the wire is byte-identical to the
-    /// historical single <c>SendCmdHighPriority(run: true)</c>.
+    /// Common MOX/TUNE transmit-edge wire push. When diversity shares DDC0/1
+    /// with PureSignal, or a single-ADC board uses its existing time-mux path,
+    /// the receive descriptor also changes on a keyed feedback burst.
+    /// Key-down sends the feedback descriptor before asserting wire PTT;
+    /// key-up drops wire PTT before restoring the receive descriptor (#870).
+    /// A reset request is consumed on the RX thread before accumulating new
+    /// feedback, preventing blocks from spanning ownership transitions.
+    /// Other configurations retain the ordinary high-priority-only edge.
     /// </summary>
     private void PushTransmitEdge(bool keyDown)
     {
-        bool timeMuxEdge = _psFeedbackEnabled && TimeMuxesPsFeedbackOnDdc0(_boardKind);
+        bool timeMuxEdge = _psFeedbackEnabled && (TimeMuxesPsFeedbackOnDdc0(_boardKind)
+            || (Volatile.Read(ref _diversitySourceEnabled) != 0 && ReservesPsFeedbackDdcs(_boardKind)));
         if (!timeMuxEdge)
         {
             SendCmdHighPriority(run: true);
@@ -1903,14 +1926,14 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
         if (keyDown)
         {
-            _psBlockFill = 0;
+            Interlocked.Exchange(ref _psBlockResetPending, 1);
             SendCmdRx();                    // arm DDC0 feedback interleave first
             SendCmdHighPriority(run: true); // then assert MOX
         }
         else
         {
             SendCmdHighPriority(run: true); // drop wire MOX first (#870)
-            _psBlockFill = 0;
+            Interlocked.Exchange(ref _psBlockResetPending, 1);
             SendCmdRx();                    // then revert DDC0 to user RX
         }
     }
@@ -2162,6 +2185,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private void ResetTxIq()
     {
         Interlocked.Increment(ref _txIqTimingEpoch);
+        Interlocked.Exchange(ref _txIqSocketMaxTicks, 0);
         lock (_txIqGate)
         {
             _txIqScratchCount = 0;
@@ -2219,6 +2243,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             {
                 p = null!; // ownership transferred to the queue
                 Interlocked.Increment(ref _txIqPacketsQueued);
+                SignalTxIqQueue();
             }
             else
             {
@@ -2254,6 +2279,30 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
     }
 
+    private void SignalTxIqQueue()
+    {
+        lock (_txIqGate) Monitor.PulseAll(_txIqGate);
+    }
+
+    private bool WaitForTxIqPacket(CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return false;
+        if (_txIqQueue.Reader.TryPeek(out _)) return true;
+        // Match the direct producer-to-sender wake-up used by the native mic
+        // worker and pihpsdr's TX semaphore. Channel's asynchronous wait can
+        // need a normal ThreadPool worker even though this thread is promoted.
+        lock (_txIqGate)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                if (_txIqQueue.Reader.TryPeek(out _)) return true;
+                if (_txIqQueue.Reader.Completion.IsCompleted) return false;
+                Monitor.Wait(_txIqGate);
+            }
+            return false;
+        }
+    }
+
     private void TxIqSenderLoop(CancellationToken ct)
     {
         // Promote this dedicated sender to the platform pro-audio class so the
@@ -2280,19 +2329,16 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         int rateCount = 0;
         long lastRateTicks = lastTicks;
         var sendTiming = new TxIqSendTiming();
+        using var cancelWake = ct.UnsafeRegister(
+            static state => ((Protocol2Client)state!).SignalTxIqQueue(), this);
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                try
-                {
-                    // Block this dedicated thread until a packet is queued (or
-                    // the channel completes / we're cancelled). No await → the
-                    // thread keeps its pro-audio promotion across the wait.
-                    if (!reader.WaitToReadAsync(ct).AsTask().GetAwaiter().GetResult()) break;
-                }
-                catch (OperationCanceledException) { break; }
-                catch (ChannelClosedException) { break; }
+                long phaseStarted = Stopwatch.GetTimestamp();
+                if (!WaitForTxIqPacket(ct)) break;
+                long phaseEpoch = Interlocked.Read(ref _txIqTimingEpoch);
+                sendTiming.RecordPhase(TxIqSendTiming.Phase.Input, Stopwatch.GetTimestamp() - phaseStarted, phaseEpoch);
                 if (!reader.TryRead(out var queued)) continue;
                 // Transfer the packet from queued to in-flight without an
                 // observable idle gap. Tail drains must not return while the
@@ -2323,7 +2369,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                         // FIFO's 6.5 ms target headroom, so no underrun risk.
                         if (fifoSamples > TxFifoTargetSamples)
                         {
+                            phaseStarted = Stopwatch.GetTimestamp();
                             Thread.Sleep(1);
+                            sendTiming.RecordPhase(TxIqSendTiming.Phase.Pacing, Stopwatch.GetTimestamp() - phaseStarted, phaseEpoch);
                             if (ct.IsCancellationRequested) break;
                             now = Stopwatch.GetTimestamp();
                             elapsedSec = (now - lastTicks) / ticksPerSecond;
@@ -2337,16 +2385,26 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                             // Decision 12: a packet dequeued before an unkey/trip
                             // must not escape after pacing. Re-check its exact
                             // transition revision immediately before the socket.
+                            phaseStarted = Stopwatch.GetTimestamp();
                             lock (_txIqSendGate)
                             {
+                                sendTiming.RecordPhase(TxIqSendTiming.Phase.SendGate, Stopwatch.GetTimestamp() - phaseStarted, phaseEpoch);
                                 // ArrayPool may return a larger array; send exactly the
                                 // 1444-byte Protocol-2 payload, synchronously, before reuse.
                                 long timingEpoch = Interlocked.Read(ref _txIqTimingEpoch);
-                                if (!SendTxIqDatagram(packet.AsSpan(0, BufLen), ep, ref fifoSamples, queued.SafetyRevision))
+                                phaseStarted = Stopwatch.GetTimestamp();
+                                try
                                 {
-                                    Interlocked.Increment(ref _txIqSendFailures);
-                                    Interlocked.Increment(ref _txIqSafetyRejected);
-                                    continue;
+                                    if (!SendTxIqDatagram(packet.AsSpan(0, BufLen), ep, ref fifoSamples, queued.SafetyRevision))
+                                    {
+                                        Interlocked.Increment(ref _txIqSendFailures);
+                                        Interlocked.Increment(ref _txIqSafetyRejected);
+                                        continue;
+                                    }
+                                }
+                                finally
+                                {
+                                    sendTiming.RecordPhase(TxIqSendTiming.Phase.Datagram, Stopwatch.GetTimestamp() - phaseStarted, timingEpoch);
                                 }
                                 sendTiming.Record(Stopwatch.GetTimestamp(), timingEpoch);
                                 rateCount++;
@@ -2372,12 +2430,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                 Interlocked.Exchange(ref _txIqLastFifoModelSamples, (long)Math.Round(fifoSamples));
                                 Interlocked.Exchange(ref _txIqLastRateUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
                                 var timing = sendTiming.TakeWindow();
-                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps}",
+                                var phases = sendTiming.TakePhases();
+                                long socketUs = TxIqSendTiming.Microseconds(Interlocked.Exchange(ref _txIqSocketMaxTicks, 0));
+                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps} inputWaitUsMax={InputUs} pacingUsMax={PacingUs} sendGateUsMax={SendGateUs} datagramUsMax={DatagramUs} socketUsMax={SocketUs}",
                                     rateCount, fifoSamples, Interlocked.Read(ref _txIqSendFailures),
                                     _txIqSuppressedSendWarnings, Interlocked.Read(ref _txIqGateBusy),
                                     Interlocked.Read(ref _txIqNotWritable), Interlocked.Read(ref _txIqSocketErrors),
                                     Interlocked.Read(ref _txIqSafetyRejected), Interlocked.Read(ref _txIqStaleQueueDrops),
-                                    timing.MaxGapUs, timing.GapsOver10Ms);
+                                    timing.MaxGapUs, timing.GapsOver10Ms,
+                                    phases.InputUs, phases.PacingUs, phases.SendGateUs, phases.DatagramUs, socketUs);
                             }
                             catch { /* never let a diagnostic kill TX */ }
                             rateCount = 0;
@@ -2437,19 +2498,20 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     internal bool SendTxIqDatagram(ReadOnlySpan<byte> packet, IPEndPoint endpoint, ref double fifoSamples,
         long safetyRevision = 0)
     {
-        // A control packet can briefly own the shared socket while this TX
-        // packet is ready. Keep the same samples/sequence for a short retry
-        // window instead of punching a hole in the waveform. Revalidate the
-        // exact TX revision on every attempt so an unkey/trip cancels retries.
-        // Persistent congestion remains bounded; speaker sends still drop
-        // immediately. Socket SendTimeout independently bounds each write.
+        // Wait for internal serialization without throwing on each lock miss.
+        // The short retry below is reserved for actual socket backpressure;
+        // a control thread being descheduled is not a failed network write.
         long retryDeadline = 0;
         SpinWait retryWait = default;
         while (true)
         {
             if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
+            if (!EnterTxDatagramGate(safetyRevision)) return false;
             try
             {
+                // Unkey may have invalidated the packet while the command
+                // owned the gate. Recheck after admission, before Poll/SendTo.
+                if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
                 SendDatagram(packet, endpoint, requireImmediate: true);
                 break;
             }
@@ -2461,13 +2523,28 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                     retryDeadline = now + Stopwatch.Frequency / 500; // 2 ms
                 else if (now >= retryDeadline)
                     throw;
-                retryWait.SpinOnce(sleep1Threshold: -1);
             }
+            finally { Monitor.Exit(_udpSendGate); }
+            retryWait.SpinOnce(sleep1Threshold: -1);
         }
         // Failed sends leave the radio FIFO unchanged. Counting dropped
         // packets would delay recovery while waiting on imaginary samples.
         fifoSamples += TxIqSamplesPerPacket;
         return true;
+    }
+
+    private bool EnterTxDatagramGate(long safetyRevision)
+    {
+        if (Monitor.TryEnter(_udpSendGate)) return true;
+        Interlocked.Increment(ref _txIqGateBusy);
+        long started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
+            if (Stopwatch.GetElapsedTime(started).TotalMilliseconds >= TxIqGateWaitMs)
+                throw new SocketException((int)SocketError.WouldBlock);
+            if (Monitor.TryEnter(_udpSendGate, millisecondsTimeout: 1)) return true;
+        }
     }
 
     private void SendCmdGeneral()
@@ -3236,10 +3313,20 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public static bool RoutesDdc0ToPsFeedback(
         bool psFeedbackEnabled, int ddcIndex, HpsdrBoardKind board,
-        bool txKeyed, bool timeMuxOnDdc0)
+        bool txKeyed, bool timeMuxOnDdc0, bool diversityEnabled = false)
         => psFeedbackEnabled && ddcIndex == 0
-           && (ReservesPsFeedbackDdcs(board)
+           && ((ReservesPsFeedbackDdcs(board) && (!diversityEnabled || txKeyed))
                || (timeMuxOnDdc0 && txKeyed));
+
+    // Thetis shares DDC0/1 between receive diversity and keyed PS feedback.
+    // The ordinary RX2 DDC remains independent in either role.
+    internal static bool UsesDiversityPair(bool enabled, bool psEnabled, bool txKeyed,
+        HpsdrBoardKind board, byte numAdc = 2) =>
+        enabled && numAdc > 1 && ReservesPsFeedbackDdcs(board) && !(psEnabled && txKeyed);
+
+    private bool DiversityPairActive => UsesDiversityPair(
+        Volatile.Read(ref _diversitySourceEnabled) != 0, _psFeedbackEnabled,
+        _moxOn || _tuneActive, _boardKind, _numAdc);
 
     /// <summary>
     /// Back-compat overload (dual-ADC semantics): no time-mux, not keyed. Equal
@@ -3328,7 +3415,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         bool g2eFeedbackBurst = false,
         byte rx1AdcSource = 0,
         byte? rx2AdcSource = null,
-        byte? diversitySourceAdcSource = null)
+        byte? diversitySourceAdcSource = null,
+        bool txKeyed = false)
     {
         var p = new byte[BufLen];
         WriteBeU32(p, 0, seq);
@@ -3400,10 +3488,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // Second receiver (RX2): enable its own DDC (RxBaseDdc + 1) so it
         // streams an independent IQ flow we can tune to a different band. Skip
         // if it would collide with the primary RX DDC. The PS feedback pair
-        // (DDC0/1 on Orion-family) is only armed during PureSignal, so RX2 on
-        // DDC3 doesn't conflict with it.
+        // (DDC0/1 on Orion-family) is separate from RX2's DDC3.
         int rx2Ddc = Rx2Ddc(boardKind);
-        bool rx2Active = (rx2Enabled || diversitySourceEnabled) && rx2Ddc != rxDdc;
+        bool rx2Active = rx2Enabled && rx2Ddc != rxDdc;
         if (rx2Active) ddcEnable |= (byte)(1 << rx2Ddc);
 
         p[7] = ddcEnable;
@@ -3419,13 +3506,24 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             // same feedline — see Rx2AdcSource. Sourcing ADC1 fed the empty
             // RX2/EXT jack and produced a silent DDC on a normal station.
             int off2 = 17 + rx2Ddc * 6;
-            p[off2 + 0] = diversitySourceEnabled
-                ? diversitySourceAdcSource ?? rx2AdcSource ?? Rx2AdcSource(numAdc, boardKind)
-                : rx2AdcSource ?? Rx2AdcSource(numAdc, boardKind);
+            p[off2 + 0] = rx2AdcSource ?? Rx2AdcSource(numAdc, boardKind);
             WriteBeU16(p, off2 + 1, sampleRateKhz);
             p[off2 + 5] = 24;
         }
+        if (UsesDiversityPair(diversitySourceEnabled, psEnabled, txKeyed, boardKind, numAdc))
+            ConfigureSynchronizedDiversityPair(p, boardKind, sampleRateKhz, diversitySourceAdcSource ?? 1);
         return p;
+    }
+
+    // All supported dual-ADC P2 radios synchronize DDC0/1. The packet carries
+    // ADC0 then ADC1; DDC1 is enabled by sync, not as a separate stream.
+    internal static void ConfigureSynchronizedDiversityPair(byte[] packet, HpsdrBoardKind board,
+        ushort sampleRateKhz, byte sourceAdc)
+    {
+        packet[7] = (byte)((packet[7] | 0x01) & ~0x02 & ~(1 << RxBaseDdc(board)));
+        WriteDdcConfigBlock(packet, 0, 0, sampleRateKhz);
+        WriteDdcConfigBlock(packet, 1, sourceAdc, sampleRateKhz);
+        packet[1363] = 0x02;
     }
 
     /// <summary>
@@ -3530,7 +3628,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         //   192 kHz / 24-bit, and sets byte 1363 = 0x02 to sync DDC1→DDC0
         //   (pihpsdr new_protocol.c:1611-1630).
         int extras = Volatile.Read(ref _extraReceiverCount);
-        bool diversitySource = Volatile.Read(ref _diversitySourceEnabled) != 0;
+        bool psEnabled = _psFeedbackEnabled;
+        bool txKeyed = _moxOn || _tuneActive;
+        bool diversityPair = UsesDiversityPair(Volatile.Read(ref _diversitySourceEnabled) != 0,
+            psEnabled, txKeyed, _boardKind, _numAdc);
         // G2E single-ADC time-mux PS (#960): during a TX burst with PS armed,
         // DDC0 carries the coupler+TX-DAC-reference interleave instead of the
         // user RX. Derived fresh, nothing persisted; dark in production until the
@@ -3538,9 +3639,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // re-emits this command ~5 Hz, so a dropped MOX edge self-heals from the
         // live state. The user RX (incl. RX2/extras) is relinquished for the
         // burst, so the feedback descriptor takes priority over the extras path.
-        bool g2eFeedbackBurst = _psFeedbackEnabled
+        bool g2eFeedbackBurst = psEnabled
             && TimeMuxesPsFeedbackOnDdc0(_boardKind)
-            && (_moxOn || _tuneActive);
+            && txKeyed;
         byte[] p;
         if (extras > 0 && !g2eFeedbackBurst)
         {
@@ -3563,7 +3664,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 _seqCmdRx++,
                 _numAdc,
                 specs,
-                _psFeedbackEnabled,
+                psEnabled,
                 _boardKind,
                 _adcDitherEnabled,
                 _adcRandomEnabled);
@@ -3574,17 +3675,22 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 _seqCmdRx++,
                 _numAdc,
                 (ushort)_sampleRateKhz,
-                _psFeedbackEnabled,
+                psEnabled,
                 _boardKind,
                 _adcDitherEnabled,
                 _adcRandomEnabled,
                 Volatile.Read(ref _rx2Enabled) != 0,
-                diversitySource,
+                false, // Both composer paths apply the shared pair below.
                 g2eFeedbackBurst,
                 (byte)Volatile.Read(ref _rx1AdcSource),
                 (byte)Volatile.Read(ref _rx2AdcSource),
-                (byte)Volatile.Read(ref _diversitySourceAdcSource));
+                (byte)Volatile.Read(ref _diversitySourceAdcSource),
+                txKeyed: txKeyed);
         }
+        // Apply to both composers; RX2, extras and the display retain their DDCs.
+        if (diversityPair)
+            ConfigureSynchronizedDiversityPair(p, _boardKind, (ushort)_sampleRateKhz,
+                (byte)Volatile.Read(ref _diversitySourceAdcSource));
         int displayDdc = EffectiveDisplayDdcIndex();
         if (displayDdc is >= 2 and < MaxRxDdc)
         {
@@ -3821,6 +3927,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         WriteBeU32(p, 0, _seqCmdHp++);
         bool moxOn = _moxOn;
         bool tuneActive = _tuneActive;
+        bool psEnabled = _psFeedbackEnabled;
+        bool diversityPair = UsesDiversityPair(Volatile.Read(ref _diversitySourceEnabled) != 0,
+            psEnabled, moxOn || tuneActive, _boardKind, _numAdc);
         // PureSignal feedback bytes (DDC0/DDC1 phase mirror + ALEX_PS / bypass
         // coupler bits) may go on the wire ONLY when Zeus reserves the front
         // DDCs for feedback on this board (issue #960). On the single-ADC
@@ -3832,7 +3941,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // the dual-ADC OrionMkII/Saturn/G2 family this is identical to the bare
         // `_psFeedbackEnabled` it replaces, so the wire is byte-for-byte
         // unchanged there.
-        bool psWire = ComposesPsFeedbackWire(_psFeedbackEnabled, _boardKind);
+        bool psWire = ComposesPsFeedbackWire(psEnabled, _boardKind);
         // Byte 4 bit 0 = run, bit 1 = PTT. Thetis network.c:924-925 and
         // pihpsdr new_protocol.c:746-757 both set bit 1 whenever the radio
         // should key — covers both mic-MOX and TUN. Without this bit the
@@ -3861,8 +3970,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // bytes 9 + ddc*4 (DDC3 -> 21..24 on Orion-family). Only written when
         // RX2 is enabled; otherwise the slot stays zero like the other unused
         // DDCs on the non-PS path.
-        if (Volatile.Read(ref _rx2Enabled) != 0
-            || Volatile.Read(ref _diversitySourceEnabled) != 0)
+        if (Volatile.Read(ref _rx2Enabled) != 0)
         {
             int rx2Ddc = Rx2Ddc(_boardKind);
             uint rx2Phase = FrequencyHzToPhaseWord(_rx2FreqHz);
@@ -3894,7 +4002,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // HermesC10/HermesII boards time-multiplex the keyed feedback pair on
         // DDC0, then restore that slot to the parked user RX at key-up (#960).
         bool txKeyed = moxOn || tuneActive;
-        bool timeMuxPsBurst = _psFeedbackEnabled
+        bool timeMuxPsBurst = psEnabled
             && TimeMuxesPsFeedbackOnDdc0(_boardKind)
             && txKeyed;
         if ((psWire && txKeyed) || timeMuxPsBurst)
@@ -3903,6 +4011,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             WriteBeU32(p, 9, txPhase);     // DDC0 = TX freq
             if (psWire)
                 WriteBeU32(p, 13, txPhase); // dual-ADC DDC1 = TX freq
+        }
+
+        if (diversityPair)
+        {
+            WriteBeU32(p, 9, rxPhase);
+            WriteBeU32(p, 13, rxPhase);
         }
 
         // Drive level (0..255) at byte 345. Set by RadioService after applying
@@ -4767,7 +4881,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         var buf = new byte[2048];
         var sock = _sock!;
         sock.ReceiveTimeout = 500;
-        int rxDdc = RxDiagDdc(_boardKind);
+        int rxDdc = DiversityPairActive ? 0 : RxDiagDdc(_boardKind);
         // Reuse the receive address storage. The EndPoint overload constructs a
         // fresh IPEndPoint on every datagram; the SocketAddress overload updates
         // this instance in place. IPv4 source port bytes are network-order 2..3.
@@ -4923,7 +5037,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                     long nowMs = Environment.TickCount64;
                     if (nowMs - lastPortRollMs >= 1000)
                     {
-                        rxDdc = RxDiagDdc(_boardKind);
+                        rxDdc = DiversityPairActive ? 0 : RxDiagDdc(_boardKind);
                         long rxPkts = portPkts[rxDdc];
                         lock (_rxPortRateLock)
                         {
@@ -4970,33 +5084,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 if (srcPort >= RxDataPortBase && srcPort < RxDataPortBase + MaxRxDdc && n == BufLen)
                 {
                     int ddcIndex = srcPort - RxDataPortBase;
-                    if (RoutesDdc0ToPsFeedback(_psFeedbackEnabled, ddcIndex, _boardKind,
-                            txKeyed: _moxOn || _tuneActive,
-                            timeMuxOnDdc0: TimeMuxesPsFeedbackOnDdc0(_boardKind)))
-                    {
-                        // PS-armed paired-DDC packet: 6B DDC0 (TX-mod-IQ) + 6B
-                        // DDC1 (feedback) interleaved per sample. pihpsdr
-                        // process_ps_iq_data, new_protocol.c:2463-2510. On the
-                        // single-ADC G2E (time-mux) the same paired layout arrives
-                        // on DDC0 ONLY during a TX burst; at rest this predicate is
-                        // false and the packet stays user RX (and the burn-zone
-                        // interlock keeps it dark in production entirely).
-                        HandlePsPairedPacket(buf);
-                    }
-                    else
-                    {
-                        HandleDdcPacket(buf, ddcIndex);
-                        // Keyed heartbeat: on the G2E, if PS is armed + keyed but the
-                        // DDC0 packet did NOT route to the paired-feedback path (burst
-                        // not forming, wrong rate, or reverted to plain RX), still tick
-                        // the ~1 Hz diagnostic so the bench sees an explicit frames=0
-                        // line instead of silence. Inert on every other board.
-                        if (ddcIndex == 0 && ShouldLogSingleAdcPsWireDiag(
-                                _boardKind, _psFeedbackEnabled, _moxOn || _tuneActive))
-                        {
-                            MaybeEmitSingleAdcPsDiag();
-                        }
-                    }
+                    HandleRxDdcPacket(buf, ddcIndex);
                 }
                 else
                 {
@@ -5165,22 +5253,49 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     internal void HandleWidebandPacketForTest(byte[] packet, int adcIndex = 0) =>
         HandleWidebandPacket(packet, packet.Length, adcIndex);
 
-    private void HandleDdcPacket(byte[] buf, int ddcIndex)
+    internal void HandleRxDdcPacket(byte[] buf, int ddcIndex)
+    {
+        bool psEnabled = _psFeedbackEnabled;
+        bool txKeyed = _moxOn || _tuneActive;
+        bool requested = Volatile.Read(ref _diversitySourceEnabled) != 0;
+        bool diversity = UsesDiversityPair(requested, psEnabled, txKeyed, _boardKind, _numAdc);
+        if (diversity && (ddcIndex == 1 || ddcIndex == RxBaseDdc(_boardKind))) return;
+        if (diversity && ddcIndex == 0)
+        {
+            HandleDdcPacket(buf, ddcIndex, paired: true);
+            return;
+        }
+        if (RoutesDdc0ToPsFeedback(psEnabled, ddcIndex, _boardKind,
+                txKeyed: txKeyed,
+                timeMuxOnDdc0: TimeMuxesPsFeedbackOnDdc0(_boardKind),
+                diversityEnabled: requested))
+        {
+            HandlePsPairedPacket(buf);
+            return;
+        }
+        // Discard in-flight paired data after diversity/feedback releases DDC0.
+        if (ddcIndex < RxBaseDdc(_boardKind)) return;
+        HandleDdcPacket(buf, ddcIndex, paired: false);
+        if (ddcIndex == 0 && ShouldLogSingleAdcPsWireDiag(
+                _boardKind, _psFeedbackEnabled, _moxOn || _tuneActive))
+            MaybeEmitSingleAdcPsDiag();
+    }
+
+    private void HandleDdcPacket(byte[] buf, int ddcIndex, bool paired)
     {
         var seq = BinaryPrimitives.ReadUInt32BigEndian(buf);
-        if (ddcIndex == RxDiagDdc(_boardKind))
+        if (paired || ddcIndex == RxDiagDdc(_boardKind))
         {
-            if (_haveFirstRxDiagSeq && seq != _lastRxDiagSeq + 1)
-            {
+            if (_haveFirstRxDiagSeq && _lastRxDiagDdc == ddcIndex && seq != unchecked(_lastRxDiagSeq + 1))
                 Interlocked.Increment(ref _droppedFrames);
-            }
             _haveFirstRxDiagSeq = true;
+            _lastRxDiagDdc = ddcIndex;
             _lastRxDiagSeq = seq;
         }
 
-        // 238 complex samples: I (int24 BE) + Q (int24 BE), starting at byte 16.
-        const int samplesPerPacket = DiscoverySamplesPerPacket;
-        int sampleDoubles = samplesPerPacket * 2;
+        // 238 complex words hold either one ADC or 119 simultaneous ADC pairs.
+        int samplesPerPacket = paired ? DiscoverySamplesPerPacket / 2 : DiscoverySamplesPerPacket;
+        int sampleDoubles = DiscoverySamplesPerPacket * 2;
         // Pool the IQ buffer when a synchronous sink is attached (the normal DSP
         // path): OnIqFrame copies the samples inline (engine.FeedIq) and the
         // RxIqAvailable contract requires subscribers to copy, so the array is
@@ -5199,13 +5314,23 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         double scale = (1.0 / 8388608.0) * IqGainCorrection(_boardKind, _sampleRateKhz);
         for (int i = 0; i < samplesPerPacket; i++)
         {
-            int off = 16 + i * 6;
+            int off = 16 + i * (paired ? 12 : 6);
             int iRaw = (buf[off] << 16) | (buf[off + 1] << 8) | buf[off + 2];
             if ((iRaw & 0x800000) != 0) iRaw |= unchecked((int)0xFF000000);
             int qRaw = (buf[off + 3] << 16) | (buf[off + 4] << 8) | buf[off + 5];
             if ((qRaw & 0x800000) != 0) qRaw |= unchecked((int)0xFF000000);
             samples[i * 2] = iRaw * scale;
             samples[i * 2 + 1] = qRaw * scale;
+            if (paired)
+            {
+                int sourceOffset = off + 6;
+                int si = (buf[sourceOffset] << 16) | (buf[sourceOffset + 1] << 8) | buf[sourceOffset + 2];
+                int sq = (buf[sourceOffset + 3] << 16) | (buf[sourceOffset + 4] << 8) | buf[sourceOffset + 5];
+                if ((si & 0x800000) != 0) si |= unchecked((int)0xFF000000);
+                if ((sq & 0x800000) != 0) sq |= unchecked((int)0xFF000000);
+                samples[samplesPerPacket * 2 + i * 2] = si * scale;
+                samples[samplesPerPacket * 2 + i * 2 + 1] = sq * scale;
+            }
         }
 
         // Map the incoming RX IQ stream to a logical receiver so the DSP can
@@ -5217,7 +5342,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             _boardKind,
             Volatile.Read(ref _rx2Enabled) != 0,
             Volatile.Read(ref _extraReceiverCount),
-            Volatile.Read(ref _diversitySourceEnabled) != 0,
+            diversitySourceEnabled: false,
             EffectiveDisplayDdcIndex());
 
         var frame = new IqFrame(
@@ -5226,7 +5351,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             SampleRateHz: _sampleRateKhz * 1000,
             Sequence: seq,
             TimestampNs: _stopwatch.ElapsedTicks * 1_000_000_000L / Stopwatch.Frequency,
-            ReceiverIndex: receiverIndex);
+            ReceiverIndex: paired ? 0 : receiverIndex,
+            DiversitySourceSamples: paired
+                ? new ReadOnlyMemory<double>(samples, samplesPerPacket * 2, samplesPerPacket * 2)
+                : default);
 
         Interlocked.Increment(ref _totalFrames);
         // iter5: prefer the synchronous sink (snapshotted above) — bypasses the

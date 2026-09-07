@@ -62,4 +62,7 @@ public readonly record struct IqFrame(
     // maps the wire DDC index to this so consumers route to the right DSP
     // channel without knowing per-board DDC numbering. Defaults to 0, so every
     // existing single-receiver path is unchanged.
-    int ReceiverIndex = 0);
+    int ReceiverIndex = 0,
+    // Optional second ADC from the SAME synchronized packet. It shares the
+    // producer-owned lifetime of InterleavedSamples and must not be retained.
+    ReadOnlyMemory<double> DiversitySourceSamples = default);

@@ -1577,17 +1577,21 @@ public sealed record AtuTuneRequest(int DurationMs = 1000);
 
 /// <summary>Diversity-combiner configuration. Two phase-synchronous ADC streams
 /// are combined as <c>out = rx[Reference] + r·e^{jθ}·rx[Source]</c>, where
-/// <c>r = Gain</c> (magnitude, 0..2, 1.0 = unity) and <c>θ = PhaseDeg</c> in
-/// degrees (−180..180). The reference receiver (RX1/ADC0) is the phase anchor;
-/// <c>SourceRx</c> selects the background source DDC (default index 1, the
-/// RX2/DDC1 path on most boards). It is not the user-visible RX2 enable state.
+/// <c>r = Gain</c> (magnitude, 0..5, 1.0 = unity) and <c>θ = PhaseDeg</c> in
+/// degrees (−180..180). ReferenceRx chooses ADC0 or ADC1 as the phase anchor;
+/// the other input is scaled and rotated. SourceRx is a legacy wire field
+/// normalized to 1 for the physical ADC pair, independent of visible RX2 state.
 /// Mirrors Thetis DiversityForm's I/Q rotate (Irotate=r·cosθ, Qrotate=r·sinθ)
 /// fed to WDSP <c>SetEXTDIVRotate</c>.</summary>
 public sealed record DiversityConfig(
     bool Enabled = false,
     double Gain = 1.0,
     double PhaseDeg = 0.0,
-    int SourceRx = 1);
+    int SourceRx = 1,
+    int ReferenceRx = 0,
+    DiversityOutput Output = DiversityOutput.Combined);
+
+public enum DiversityOutput { Combined, Reference, Source }
 
 /// <summary>Body of <c>POST /api/rx/diversity</c>. Every field optional; only
 /// the supplied ones change.</summary>
@@ -1595,7 +1599,9 @@ public sealed record DiversitySetRequest(
     bool? Enabled = null,
     double? Gain = null,
     double? PhaseDeg = null,
-    int? SourceRx = null);
+    int? SourceRx = null,
+    int? ReferenceRx = null,
+    DiversityOutput? Output = null);
 
 public enum Rx2AudioMode
 {

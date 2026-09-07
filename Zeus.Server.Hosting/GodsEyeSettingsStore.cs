@@ -41,7 +41,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
         new Dictionary<string, GodsEyeLayerSettings>(StringComparer.Ordinal)
         {
             [GodsEyeLayerNames.Earthquakes] = new(GodsEyeLayerNames.Earthquakes, true, 300, 5_000, 500, ""),
-            [GodsEyeLayerNames.Launches] = new(GodsEyeLayerNames.Launches, true, 21_600, 20_000, 100, ""),
+            [GodsEyeLayerNames.Launches] = new(GodsEyeLayerNames.Launches, false, 21_600, 20_000, 100, ""),
             [GodsEyeLayerNames.Aircraft] = new(GodsEyeLayerNames.Aircraft, false, 900, 500, 250, ""),
             [GodsEyeLayerNames.Vessels] = new(GodsEyeLayerNames.Vessels, false, 30, 500, 500, ""),
             [GodsEyeLayerNames.Fires] = new(GodsEyeLayerNames.Fires, false, 900, 2_500, 500, ""),
@@ -97,7 +97,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
         }
     }
 
-    public GodsEyeSettingsResponse GetPublic(string? fallbackGrid = null)
+    public GodsEyeSettingsResponse GetPublic(string? fallbackGrid = null, GodsEyeObserverSettings? home = null)
     {
         var values = GetInternal();
         return new GodsEyeSettingsResponse(
@@ -109,7 +109,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
             Public(values[GodsEyeLayerNames.MilitaryFlights]), Public(values[GodsEyeLayerNames.Radio]),
             Public(values[GodsEyeLayerNames.Bikeshare]), Public(values[GodsEyeLayerNames.Traffic]),
             Public(values[GodsEyeLayerNames.MappedInstallations]),
-            GetLogbook(), GetObserverSettings(), GetProviderSettings(), GetResolvedObserver(fallbackGrid));
+            GetLogbook(), GetObserverSettings(), GetProviderSettings(), GetResolvedObserver(fallbackGrid, home));
     }
 
     public GodsEyeObserverSettings GetObserverSettings()
@@ -131,21 +131,27 @@ public sealed class GodsEyeSettingsStore : IDisposable
     /// Returns null only when no locator is known anywhere, which is what leaves the
     /// QTH-anchored layers reporting that they have nowhere to look.
     /// </summary>
-    public GodsEyeObserver? GetObserver(string? fallbackGrid = null)
+    public GodsEyeObserver? GetObserver(string? fallbackGrid = null, GodsEyeObserverSettings? home = null)
     {
-        var resolved = GetResolvedObserver(fallbackGrid);
+        var resolved = GetResolvedObserver(fallbackGrid, home);
         return resolved is null ? null : new GodsEyeObserver(resolved.LatitudeDeg, resolved.LongitudeDeg);
     }
 
-    public GodsEyeResolvedObserver? GetResolvedObserver(string? fallbackGrid = null)
+    public GodsEyeResolvedObserver? GetResolvedObserver(string? fallbackGrid = null, GodsEyeObserverSettings? home = null)
     {
         var settings = GetObserverSettings();
         if (settings.LatitudeDeg is { } latitude && settings.LongitudeDeg is { } longitude)
             return new GodsEyeResolvedObserver(latitude, longitude, "explicit");
         if (TryMaidenhead(settings.Grid, out var grid))
             return new GodsEyeResolvedObserver(grid.LatitudeDeg, grid.LongitudeDeg, "grid");
-        return TryMaidenhead(fallbackGrid, out var stationGrid)
-            ? new GodsEyeResolvedObserver(stationGrid.LatitudeDeg, stationGrid.LongitudeDeg, "station-grid")
+        if (TryMaidenhead(fallbackGrid, out var stationGrid))
+            return new GodsEyeResolvedObserver(stationGrid.LatitudeDeg, stationGrid.LongitudeDeg, "station-grid");
+        if (home?.LatitudeDeg is double lat && home.LongitudeDeg is double lon
+            && double.IsFinite(lat) && lat is >= -90 and <= 90
+            && double.IsFinite(lon) && lon is >= -180 and <= 180 && !(lat == 0 && lon == 0))
+            return new GodsEyeResolvedObserver(lat, lon, "qrz");
+        return TryMaidenhead(home?.Grid, out var homeGrid)
+            ? new GodsEyeResolvedObserver(homeGrid.LatitudeDeg, homeGrid.LongitudeDeg, "qrz")
             : null;
     }
 
@@ -292,6 +298,7 @@ public sealed class GodsEyeSettingsStore : IDisposable
 
     private static GodsEyeLayerSettings Normalize(GodsEyeLayerSettings value, GodsEyeLayerSettings fallback) => value with
     {
+        Enabled = value.Layer != GodsEyeLayerNames.Launches && value.Enabled,
         CadenceSeconds = Math.Clamp(value.CadenceSeconds, MinimumCadence(value.Layer), 7 * 24 * 60 * 60),
         RadiusKm = Math.Clamp(double.IsFinite(value.RadiusKm) ? value.RadiusKm : fallback.RadiusKm, 25, 20_050),
         MaxCount = Math.Clamp(value.MaxCount, 1, 2_000),

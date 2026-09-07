@@ -15,9 +15,10 @@ namespace Zeus.Server;
 #endif
 
 /// <summary>Carries the host's station-grid accessor to the settings endpoint.</summary>
-public sealed class GodsEyeFallbackGrid(Func<string?> get)
+public sealed class GodsEyeFallbackGrid(Func<string?> get, Func<GodsEyeObserverSettings?>? home = null)
 {
     public string? Get() => get();
+    public GodsEyeObserverSettings? Home() => home?.Invoke();
 }
 
 /// <summary>Registers and maps the radio-independent Gods Eye feature.</summary>
@@ -33,7 +34,8 @@ public static class GodsEyeHosting
         this IServiceCollection services,
         string preferencesDatabasePath,
         Func<IServiceProvider, bool>? featureEnabled = null,
-        Func<IServiceProvider, string?>? fallbackGrid = null)
+        Func<IServiceProvider, string?>? fallbackGrid = null,
+        Func<IServiceProvider, GodsEyeObserverSettings?>? fallbackHome = null)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(preferencesDatabasePath);
@@ -89,7 +91,7 @@ public static class GodsEyeHosting
                 settings,
                 provider.GetRequiredService<IAisStreamClient>(),
                 provider.GetRequiredService<GodsEyeViewerRegistry>(),
-                _ => Task.FromResult(settings.GetObserver(fallbackGrid?.Invoke(provider))),
+                _ => Task.FromResult(settings.GetObserver(fallbackGrid?.Invoke(provider), fallbackHome?.Invoke(provider))),
                 provider.GetRequiredService<ILogger<GodsEyeFeedsService>>());
         });
         services.AddSingleton(provider =>
@@ -100,10 +102,12 @@ public static class GodsEyeHosting
                 settings,
                 provider.GetRequiredService<GodsEyeViewerRegistry>(),
                 provider.GetRequiredService<ILogger<CameraFeedService>>());
-            cameras.SetObserverResolver(() => settings.GetObserver(fallbackGrid?.Invoke(provider)));
+            cameras.SetObserverResolver(() => settings.GetObserver(fallbackGrid?.Invoke(provider), fallbackHome?.Invoke(provider)));
             return cameras;
         });
-        services.AddSingleton(provider => new GodsEyeFallbackGrid(() => fallbackGrid?.Invoke(provider)));
+        services.AddSingleton(provider => new GodsEyeFallbackGrid(
+            () => fallbackGrid?.Invoke(provider),
+            () => fallbackHome?.Invoke(provider)));
         services.AddHostedService(provider => provider.GetRequiredService<SatelliteTrackingService>());
         services.AddHostedService(provider => provider.GetRequiredService<GodsEyeFeedsService>());
         services.AddHostedService(provider => provider.GetRequiredService<CameraFeedService>());
@@ -115,15 +119,15 @@ public static class GodsEyeHosting
         ArgumentNullException.ThrowIfNull(endpoints);
 
         endpoints.MapGet("/api/godseye/satellites",
-            (SatelliteTrackingService satellites, GodsEyeSettingsStore settings) =>
+            (SatelliteTrackingService satellites, GodsEyeSettingsStore settings, [FromServices] GodsEyeFallbackGrid fallback) =>
                 Results.Ok(satellites.GetPositions(
                     DateTimeOffset.UtcNow,
-                    SatelliteTrackingService.ResolveObserver(settings.GetObserver()))));
+                    SatelliteTrackingService.ResolveObserver(settings.GetObserver(fallback.Get(), fallback.Home())))));
         endpoints.MapGet("/api/godseye/satellites/passes",
-            async (SatelliteTrackingService satellites, GodsEyeSettingsStore settings) =>
+            async (SatelliteTrackingService satellites, GodsEyeSettingsStore settings, [FromServices] GodsEyeFallbackGrid fallback) =>
                 Results.Ok(await satellites.GetPassesAsync(
                     DateTimeOffset.UtcNow,
-                    SatelliteTrackingService.ResolveObserver(settings.GetObserver())).ConfigureAwait(false)));
+                    SatelliteTrackingService.ResolveObserver(settings.GetObserver(fallback.Get(), fallback.Home()))).ConfigureAwait(false)));
         endpoints.MapGet("/api/godseye/satellites/settings",
             (SatelliteSettingsStore store) => Results.Ok(store.Get()));
         endpoints.MapGet("/api/godseye/satellites/track/{noradId:int}",
@@ -172,7 +176,7 @@ public static class GodsEyeHosting
                     store.Set(request);
                     feeds.SettingsChanged();
                     cameras.SettingsChanged();
-                    return Results.Ok(store.GetPublic(fallback.Get()));
+                    return Results.Ok(store.GetPublic(fallback.Get(), fallback.Home()));
                 }
                 catch (ArgumentException exception)
                 {
@@ -205,12 +209,12 @@ public static class GodsEyeHosting
     {
         var observer = lat is >= -90 and <= 90 && lon is >= -180 and <= 180
             ? new GodsEyeObserver(lat.Value, lon.Value)
-            : settings.GetObserver(fallback.Get());
+            : settings.GetObserver(fallback.Get(), fallback.Home());
         return cameras.GetSnapshot(observer);
     }
 
     internal static GodsEyeSettingsResponse SettingsSnapshot(GodsEyeSettingsStore store, GodsEyeFallbackGrid fallback) =>
-        store.GetPublic(fallback.Get());
+        store.GetPublic(fallback.Get(), fallback.Home());
 
     public static IEndpointRouteBuilder MapGodsEyeProviderCredentialsEndpoint(this IEndpointRouteBuilder endpoints)
     {

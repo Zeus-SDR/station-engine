@@ -146,6 +146,7 @@ public partial class Program
         // otherwise has no log to send. Best-effort: the sink never throws into
         // logging, so an unwritable log dir degrades to in-memory-only rather
         // than blocking launch.
+        AudioDiagnosticLogging.Configure(builder.Logging);
         var diagnosticLogBuffer = new DiagnosticLogBuffer();
         builder.Services.AddSingleton(diagnosticLogBuffer);
         var sink = diagnosticLogFileSink ?? new DiagnosticLogFileSink(PrefsDbPath.AppLogPath());
