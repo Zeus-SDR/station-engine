@@ -224,6 +224,23 @@ internal static class ControlFrame
         // Honoured by HL2 only; harmless on legacy boards (it still maps to
         // the obsolete DITHER bit there, but Zeus never sets it for them).
         bool EnableHl2BandVolts,
+        // HL2+ AK4951 companion board fitted. Rides the SAME Config-frame bit
+        // as Band Volts (C3 bit 3) — the HL2+ gateware reads that bit as
+        // "an audio codec is present" where mi0bot's fork reads it as the
+        // Band Volts PWM enable. One bit, two gateware meanings, so the two
+        // features are mutually exclusive by construction and the hosting
+        // layer refuses to arm both. deskHPSDR sets the same bit via its
+        // LT2208_DITHER_ON alias (old_protocol.c).
+        bool EnableHl2PlusCodec,
+        // Let the EP2 L/R slots carry audio while MOX is asserted, so a codec
+        // board's headphone/speaker jacks hear the CW sidetone as it is keyed.
+        // deskHPSDR does exactly this — its CW sample path writes `side` into
+        // both audio slots alongside the CW I/Q (old_protocol.c) — and it is
+        // the whole point of the HL2+ for CW: the sidetone reaches the
+        // operator's ears from the radio, not around the host audio loop.
+        // The host decides what is in the ring (sidetone only, in CW); the
+        // wire layer just stops refusing to carry it.
+        bool CodecAudioWhileMox,
         HpsdrBoardKind Board,
         bool HasN2adr = false,
         // Raw DriveFilter C1 payload byte (0..255). This is the transmitter
@@ -510,7 +527,16 @@ internal static class ControlFrame
                 // key-to-RF timing host-side. Issue #1783.
                 cc[1] = state.CwKeyerEnabled ? (byte)0x01 : (byte)0x00;
                 cc[2] = state.CwSidetoneLevel;
-                cc[3] = 0;
+                // RF_delay. This was 0 on the reasoning that Zeus owns the
+                // key-to-RF timing host-side, which is true for host-driven
+                // keying but not for the FPGA's own iambic keyer: piHPSDR
+                // sends a non-zero delay here and calls it out as "a quirk
+                // working around a bug in the FPGA iambic keyer"
+                // (old_protocol.c). Its default is 30 ms, clamped to
+                // 900/wpm so the delay can never swallow an element at speed.
+                // Only meaningful while the internal keyer is armed; stays 0
+                // otherwise, so host-keyed operation is byte-identical.
+                cc[3] = state.CwKeyerEnabled ? CwKeyerRfDelay(state.CwKeyerSpeedWpm) : (byte)0;
                 cc[4] = 0;
                 break;
 
@@ -548,6 +574,21 @@ internal static class ControlFrame
         }
 
         return 5;
+    }
+
+    // piHPSDR's cw_keyer_ptt_delay default (radio.c: "0-255ms").
+    internal const int CwKeyerRfDelayMs = 30;
+
+    /// <summary>
+    /// RF delay for the internal keyer, in the gateware's milliseconds.
+    /// Clamped to 900/wpm exactly as piHPSDR does: at 30 wpm a dit is 40 ms,
+    /// so an unclamped 30 ms delay would eat most of one.
+    /// </summary>
+    internal static byte CwKeyerRfDelay(int wpm)
+    {
+        if (wpm <= 0) return (byte)CwKeyerRfDelayMs;
+        int max = 900 / wpm;
+        return (byte)Math.Clamp(CwKeyerRfDelayMs, 0, Math.Max(max, 0));
     }
 
     private static bool IsHl2Vna(in CcState state) =>
@@ -849,7 +890,7 @@ internal static class ControlFrame
                 // normal relay/aux contribution while the sweep is active.
                 if (s.VnaFixedRxGainHigh) c3 |= 1 << 2;
             }
-            else if (s.EnableHl2BandVolts) c3 |= 1 << 3;
+            else if (s.EnableHl2BandVolts || s.EnableHl2PlusCodec) c3 |= 1 << 3;
         }
         else
         {
@@ -1073,7 +1114,8 @@ internal static class ControlFrame
         CcRegister oddRegister,
         in CcState state,
         ITxIqSource? iqSource = null,
-        IRxAudioSource? rxAudioSource = null)
+        IRxAudioSource? rxAudioSource = null,
+        Hl2I2cOp? rawOddCc = null)
     {
         if (packet.Length != PacketLength)
             throw new ArgumentException("packet span must be 1032 bytes", nameof(packet));
@@ -1088,7 +1130,11 @@ internal static class ControlFrame
         BinaryPrimitives.WriteUInt32BigEndian(packet[4..8], sendSequence);
 
         WriteUsbFrame(packet.Slice(8, UsbFrameLength), evenRegister, in state, iqSource, rxAudioSource);
-        WriteUsbFrame(packet.Slice(8 + UsbFrameLength, UsbFrameLength), oddRegister, in state, iqSource, rxAudioSource);
+        // The odd frame is the injection point for the HL2 IO board's
+        // tunnelled I2C traffic. It displaces one rotation slot rather than
+        // adding a packet, so the EP2 cadence the TX FIFO depends on is
+        // untouched; the displaced register comes round again next turn.
+        WriteUsbFrame(packet.Slice(8 + UsbFrameLength, UsbFrameLength), oddRegister, in state, iqSource, rxAudioSource, rawOddCc);
     }
 
     /// <summary>
@@ -1107,12 +1153,22 @@ internal static class ControlFrame
     /// <summary>Number of IQ samples per 504-byte EP2 USB-frame payload (63 × 8 bytes).</summary>
     internal const int IqSamplesPerUsbFrame = 63;
 
-    private static void WriteUsbFrame(Span<byte> frame, CcRegister register, in CcState state, ITxIqSource? source, IRxAudioSource? rxAudioSource = null)
+    private static void WriteUsbFrame(Span<byte> frame, CcRegister register, in CcState state, ITxIqSource? source, IRxAudioSource? rxAudioSource = null, Hl2I2cOp? rawCc = null)
     {
         frame[0] = 0x7F;
         frame[1] = 0x7F;
         frame[2] = 0x7F;
-        WriteCcBytes(frame.Slice(3, 5), register, in state);
+        if (rawCc is { } op)
+        {
+            // HL2 extended command set: the control block carries a tunnelled
+            // I2C transaction instead of a register address, so the normal
+            // register encoder must not run over it.
+            op.WriteTo(frame.Slice(3, 5), state.Mox);
+        }
+        else
+        {
+            WriteCcBytes(frame.Slice(3, 5), register, in state);
+        }
 
         // Surface the current commanded drive byte for the 1 Hz p1.tx.rate log
         // regardless of which payload path runs below. The actual register
@@ -1149,7 +1205,16 @@ internal static class ControlFrame
             return;
         }
 
-        // From here MOX is engaged; the TX I/Q path needs a real source.
+        // MOX is engaged. On a codec board the L/R slots carry the host audio
+        // bus, which while keying holds the CW sidetone (the MOX fade has
+        // already silenced the band-RX contribution upstream). Written before
+        // the I/Q early-returns below so the sidetone survives a null TX source
+        // or DriveLevel 0 — an operator keying with drive at zero still expects
+        // to hear themselves.
+        if (state.CodecAudioWhileMox && rxAudioSource is not null)
+            WriteRxAudioLr(frame[8..], rxAudioSource);
+
+        // From here the TX I/Q path needs a real source.
         if (source is null) return;
 
         // The HL2's TXG stage (DriveFilter C1 = DriveLevel byte) scales the
@@ -1179,7 +1244,7 @@ internal static class ControlFrame
             if (aq > peak) peak = aq;
             sumAbs += ai + aq;
             int off = s * 8;
-            // Audio L/R stay zero (payload was cleared).
+            // Audio L/R were written above for codec boards, else stay zero.
             payload[off + 4] = (byte)((iSample >> 8) & 0xFF);
             payload[off + 5] = (byte)(iSample & 0xFE);
             payload[off + 6] = (byte)((qSample >> 8) & 0xFF);
