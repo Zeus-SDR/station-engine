@@ -189,6 +189,55 @@ public static partial class RealtimeThreadPriority
         TrySetThreadPriorityHighest(log);
     }
 
+    /// <summary>
+    /// Promote the calling thread with a <b>bounded</b> policy — no hard mach
+    /// real-time reservation. Use this for self-paced pumps whose block cadence
+    /// is far slower than the RX/TX protocol threads (e.g. the TUN / TwoTone
+    /// pump at ~47 Hz). Windows and Linux behave exactly as
+    /// <see cref="PromoteCallingThreadToProAudio"/>; only macOS differs.
+    /// </summary>
+    public static void PromoteCallingThreadBounded(ILogger log)
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                PromoteMacOsBounded(log);
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                PromoteWindows(log);
+            else
+                PromoteFallback(log);
+        }
+        catch (DllNotFoundException ex)
+        {
+            log.LogWarning(ex, "thread.priority native library not found — leaving thread at default priority");
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "thread.priority promotion threw — leaving thread at default priority");
+        }
+    }
+
+    private static void PromoteMacOsBounded(ILogger log)
+    {
+        // Bounded QoS promotion — deliberately NO mach THREAD_TIME_CONSTRAINT
+        // reservation. The tune pump paces itself against a monotonic block
+        // deadline (~21 ms per block at 48 kHz, i.e. ~47 Hz), so it does not
+        // need — and must not declare — the hard 1 ms/5 ms real-time reservation
+        // that PromoteMacOs applies for the RX/TX protocol threads. That
+        // reservation over-declares this ~47 Hz pump as a 200 Hz real-time
+        // thread; on macOS it drove the system load average to pathological
+        // levels (observed >280 on a 4-core Mac) during TX/Tune (#2069). QoS
+        // plus a managed-priority floor is sufficient — the deadline pacing in
+        // TxTuneDriver does the actual timing.
+        int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        if (rc != 0) rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        if (rc == 0)
+            log.LogInformation("thread.priority promoted via bounded QoS (macOS, no mach RT reservation)");
+        else
+            log.LogWarning("thread.priority bounded QoS rc={Rc} — using ThreadPriority.Highest floor", rc);
+        TrySetThreadPriorityHighest(log);
+    }
+
     // ---- Windows -----------------------------------------------------------
     [LibraryImport("avrt.dll", EntryPoint = "AvSetMmThreadCharacteristicsW",
                    StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]

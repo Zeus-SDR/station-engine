@@ -85,6 +85,16 @@ internal sealed class TxTuneDriver : BackgroundService
     private readonly TxIqRing _ring;
     private readonly ILogger<TxTuneDriver> _log;
     private readonly Func<long> _stopwatchTicks;
+    private readonly Action<ILogger> _promoteThread;
+
+    // Scheduling policy for the dedicated pump thread. Bounded (QoS + managed
+    // priority floor) rather than the hard 1 ms/5 ms mach real-time reservation
+    // the protocol RX/TX threads use: this pump wakes only ~47 Hz (one block per
+    // ~21 ms at 48 kHz) and paces itself against a monotonic deadline, so the
+    // hard reservation grossly over-declared it and drove the macOS load average
+    // to pathological levels during TX/Tune (#2069).
+    internal static readonly Action<ILogger> DefaultThreadPromotion =
+        Zeus.Protocol2.RealtimeThreadPriority.PromoteCallingThreadBounded;
 
     public TxTuneDriver(TxService tx, DspPipelineService pipeline, TxIqRing ring, ILogger<TxTuneDriver> log)
         : this(tx, pipeline, ring, log, System.Diagnostics.Stopwatch.GetTimestamp)
@@ -96,19 +106,23 @@ internal sealed class TxTuneDriver : BackgroundService
         DspPipelineService pipeline,
         TxIqRing ring,
         ILogger<TxTuneDriver> log,
-        Func<long> stopwatchTicks)
+        Func<long> stopwatchTicks,
+        Action<ILogger>? promoteThread = null)
     {
         _tx = tx;
         _pipeline = pipeline;
         _ring = ring;
         _log = log;
         _stopwatchTicks = stopwatchTicks;
+        _promoteThread = promoteThread ?? DefaultThreadPromotion;
     }
 
     protected override Task ExecuteAsync(CancellationToken ct)
     {
-        // Run the pump on a DEDICATED thread promoted to the platform pro-audio /
-        // real-time class. The deadline pacing below keeps TX-IQ production locked
+        // Run the pump on a DEDICATED thread promoted to a bounded platform
+        // priority class (QoS + managed floor, NOT a hard mach RT reservation —
+        // see DefaultThreadPromotion / #2069). The deadline pacing below keeps
+        // TX-IQ production locked
         // to the DAC block clock — but only if this thread isn't preempted. In
         // desktop mode the native-audio (CoreAudio) device threads run at RT and
         // starve a normal-priority ThreadPool pump, so production comes in bursts:
@@ -123,7 +137,7 @@ internal sealed class TxTuneDriver : BackgroundService
 
     private void PumpLoop(CancellationToken ct)
     {
-        Zeus.Protocol2.RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
+        _promoteThread(_log);
         float[]? micScratch = null;
         float[]? iqScratch = null;
         // Drift-free pacing state. `clock` is the monotonic reference; pacing is
