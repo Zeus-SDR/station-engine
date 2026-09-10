@@ -65,6 +65,7 @@ public sealed class TciServer : IHostedService, IDisposable
 {
     private readonly ILogger<TciServer> _log;
     private readonly TciOptions _options;
+    private readonly TciListenerBinding _listener;
     private readonly RadioService _radio;
     private readonly TxService _tx;
     private readonly DspPipelineService _pipeline;
@@ -123,6 +124,7 @@ public sealed class TciServer : IHostedService, IDisposable
 
     public TciServer(
         IOptions<TciOptions> options,
+        TciListenerBinding listener,
         RadioService radio,
         TxService tx,
         DspPipelineService pipeline,
@@ -137,6 +139,7 @@ public sealed class TciServer : IHostedService, IDisposable
     {
         _log = loggerFactory.CreateLogger<TciServer>();
         _options = options.Value;
+        _listener = listener;
         _radio = radio;
         _tx = tx;
         _pipeline = pipeline;
@@ -154,9 +157,12 @@ public sealed class TciServer : IHostedService, IDisposable
 
     public Task StartAsync(CancellationToken ct)
     {
-        if (!_options.Enabled)
+        if (!_listener.IsActive)
         {
-            _log.LogInformation("tci.disabled (set Tci:Enabled=true to enable)");
+            if (_listener.Error is null)
+                _log.LogInformation("tci.disabled (set Tci:Enabled=true to enable)");
+            else
+                _log.LogWarning("tci.listener.inactive error={Error}", _listener.Error);
             return Task.CompletedTask;
         }
 
@@ -174,7 +180,7 @@ public sealed class TciServer : IHostedService, IDisposable
         _layouts.ActiveTransverterEnabledChanged += OnActiveTransverterEnabledChanged;
         _subscribed = true;
 
-        _log.LogInformation("tci.listening bind={Bind} port={Port}", _options.BindAddress, _options.Port);
+        _log.LogInformation("tci.listening bind={Bind} port={Port}", _listener.BindAddress, _listener.Port);
         return Task.CompletedTask;
     }
 

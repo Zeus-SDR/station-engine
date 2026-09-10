@@ -54,6 +54,7 @@ public sealed class TciManagementService
 {
     private readonly ILogger<TciManagementService> _log;
     private readonly TciServer _tciServer;
+    private readonly TciListenerBinding _listener;
     private readonly TciOptions _startupOptions;
     private readonly TciConfigStore _store;
 
@@ -63,11 +64,13 @@ public sealed class TciManagementService
     public TciManagementService(
         ILogger<TciManagementService> log,
         TciServer tciServer,
+        TciListenerBinding listener,
         IOptions<TciOptions> options,
         TciConfigStore store)
     {
         _log = log;
         _tciServer = tciServer;
+        _listener = listener;
         _startupOptions = options.Value;
         _store = store;
 
@@ -82,23 +85,20 @@ public sealed class TciManagementService
 
     public TciStatus GetStatus()
     {
-        var currentlyEnabled = _startupOptions.Enabled;
+        var currentlyEnabled = _listener.IsActive;
         var currentPort = _startupOptions.Port;
         var currentBindAddress = _startupOptions.BindAddress;
         var clientCount = _tciServer.ClientCount;
 
-        // The (single) TciServer is the listener for this port — when it is
-        // running, probe-binding the same port from this status method always
-        // fails with "address already in use" and surfaces a false-positive
-        // warning in the UI. Skip the probe; report port-availability as true
-        // whenever startup is configured to enable TCI. The "is this port free
-        // to switch to?" question is handled separately by TestPort, which the
-        // settings panel calls before saving a new bindAddress/port.
-        bool portAvailable = true;
-        string? error = null;
+        // The listener binding is decided once during host construction. Reuse
+        // that outcome here: probing would report an active listener's own port
+        // as occupied, while deriving status from Enabled alone falsely reports
+        // a rejected stale address as running.
+        var portAvailable = !_startupOptions.Enabled || _listener.IsActive;
+        var error = _listener.Error;
 
         // Check if pending config differs from startup config (requires restart)
-        var requiresRestart = _pendingConfig.Enabled != currentlyEnabled
+        var requiresRestart = _pendingConfig.Enabled != _startupOptions.Enabled
                             || _pendingConfig.Port != currentPort
                             || _pendingConfig.BindAddress != currentBindAddress;
 

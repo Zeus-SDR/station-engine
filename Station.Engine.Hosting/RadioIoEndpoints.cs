@@ -67,6 +67,24 @@ public static class RadioIoEndpoints
     public static IEndpointRouteBuilder MapRadioAudioEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
+        endpoints.MapGet("/api/radio/hl2-codec", (RadioService radio, AudioSettingsStore store) =>
+            Results.Ok(new
+            {
+                Supported = radio.EffectiveBoardKind == HpsdrBoardKind.HermesLite2,
+                Enabled = store.Hl2PlusCodecEnabled,
+            }));
+
+        endpoints.MapPut("/api/radio/hl2-codec", (Hl2CodecSetRequest req, RadioService radio, AudioSettingsStore store) =>
+        {
+            if (req is null) return Results.BadRequest(new { error = "body required" });
+            if (radio.EffectiveBoardKind != HpsdrBoardKind.HermesLite2)
+                return Results.Conflict(new { error = "HL2+ codec requires a Hermes-Lite 2" });
+            if (radio.IsTxActive())
+                return Results.Conflict(new { error = "Stop transmitting before changing installed audio hardware" });
+            store.SetHl2PlusCodecEnabled(req.Enabled);
+            return Results.Ok(new { Supported = true, Enabled = store.Hl2PlusCodecEnabled });
+        });
+
         // Global (per-radio) TX-audio source (external-audio-jacks re-port). GET
         // surfaces the per-board capability gates + the RESOLVED (board-clamped)
         // source so the single-select picker shows only the jacks the connected
@@ -75,7 +93,7 @@ public static class RadioIoEndpoints
         // false and the panel shows nothing.
         endpoints.MapGet("/api/radio/audio", (RadioService radio, AudioSettingsStore store) =>
         {
-            var caps = BoardCapabilitiesTable.For(radio.EffectiveBoardKind, radio.EffectiveOrionMkIIVariant);
+            var caps = radio.AudioCapabilities;
             var resolved = RadioService.ClampAudioSource(store.Get(), caps);
             return Results.Ok(new AudioFrontEndDto(
                 HasOnboardCodec: caps.HasOnboardCodec,
@@ -104,7 +122,7 @@ public static class RadioIoEndpoints
             if (req is null)
                 return Results.BadRequest(new { error = "body required" });
 
-            var caps = BoardCapabilitiesTable.For(radio.EffectiveBoardKind, radio.EffectiveOrionMkIIVariant);
+            var caps = radio.AudioCapabilities;
             bool audioCapable = caps.HasOnboardCodec || caps.HermesLite2MicFrontEnd;
             if (!audioCapable)
                 return Results.Conflict(new { error = $"board {radio.EffectiveBoardKind} has no audio front-end" });
@@ -159,3 +177,5 @@ public static class RadioIoEndpoints
         return endpoints;
     }
 }
+
+public sealed record Hl2CodecSetRequest(bool Enabled);

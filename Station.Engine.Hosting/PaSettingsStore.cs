@@ -49,6 +49,7 @@ public sealed class PaSettingsStore : IDisposable
     // overlay is visible to GetAll (and therefore RadioService) but never
     // touches LiteDB; ClearCalibrationOverlay provides atomic rollback.
     private PaSettingsDto? _calibrationOverlay;
+    private Dictionary<string, CalibrationGainCurve>? _calibrationGainOverlay;
     private bool _calibrationCommitInProgress;
     // Dedup key for the cross-board PA-gain substitution warning (issue #1180).
     // PaBandEntry rows are not board-scoped, so a value stored under one board
@@ -343,9 +344,13 @@ public sealed class PaSettingsStore : IDisposable
         }
     }
 
-    public void Save(PaSettingsDto dto) => Save(dto, calibrationCommit: false);
+    public void Save(PaSettingsDto dto) =>
+        Save(dto, calibrationCommit: false, calibrationGains: null);
 
-    private void Save(PaSettingsDto dto, bool calibrationCommit)
+    private void Save(
+        PaSettingsDto dto,
+        bool calibrationCommit,
+        IReadOnlyDictionary<string, CalibrationGainCurve>? calibrationGains)
     {
         lock (_sync)
         {
@@ -371,39 +376,45 @@ public sealed class PaSettingsStore : IDisposable
                 foreach (var band in dto.Bands)
                 {
                     if (!BandUtils.HfBands.Contains(band.Band)) continue;
-                    var existing = _bands.FindOne(x => x.Band == band.Band);
+                    var saved = _bands.FindOne(x => x.Band == band.Band);
+                    bool isNew = saved is null;
+                    saved ??= new PaBandEntry { Band = band.Band };
                     byte dxTx = (byte)(band.OcDxTx & 0x0F);
                     byte dxRx = (byte)(band.OcDxRx & 0x0F);
                     byte tune = (byte)(band.OcTune & 0x7F);
                     byte tx = (byte)(band.OcTx & 0x7F);
                     byte rx = (byte)(band.OcRx & 0x7F);
-                    if (existing is null)
+                    bool gainChanged = !isNew &&
+                        Math.Abs(saved.PaGainDb - band.PaGainDb) >= 0.0001;
+                    saved.PaGainDb = band.PaGainDb;
+                    saved.DisablePa = band.DisablePa;
+                    saved.OcTx = tx;
+                    saved.OcRx = rx;
+                    saved.OcDxTx = dxTx;
+                    saved.OcDxRx = dxRx;
+                    saved.OcTune = tune;
+                    if (!calibrationCommit && gainChanged)
+                        ClearCalibrationGains(saved);
+                    if (calibrationCommit)
                     {
-                        _bands.Insert(new PaBandEntry
+                        if (calibrationGains is not null &&
+                            calibrationGains.TryGetValue(band.Band, out var curve))
                         {
-                            Band = band.Band,
-                            PaGainDb = band.PaGainDb,
-                            DisablePa = band.DisablePa,
-                            OcTx = tx,
-                            OcRx = rx,
-                            OcDxTx = dxTx,
-                            OcDxRx = dxRx,
-                            OcTune = tune,
-                            UpdatedUtc = DateTime.UtcNow,
-                        });
+                            saved.CalibrationGain10W = curve.Gain10W;
+                            saved.CalibrationGain25W = curve.Gain25W;
+                            saved.CalibrationGain50W = curve.Gain50W;
+                            saved.CalibrationBoardKind = (int)curve.Board;
+                            saved.CalibrationVariant = (int)curve.Variant;
+                            saved.CalibrationMaxPowerWatts = curve.MaxPowerWatts;
+                        }
+                        else
+                        {
+                            ClearCalibrationGains(saved);
+                        }
                     }
-                    else
-                    {
-                        existing.PaGainDb = band.PaGainDb;
-                        existing.DisablePa = band.DisablePa;
-                        existing.OcTx = tx;
-                        existing.OcRx = rx;
-                        existing.OcDxTx = dxTx;
-                        existing.OcDxRx = dxRx;
-                        existing.OcTune = tune;
-                        existing.UpdatedUtc = DateTime.UtcNow;
-                        _bands.Update(existing);
-                    }
+                    saved.UpdatedUtc = DateTime.UtcNow;
+                    if (isNew) _bands.Insert(saved);
+                    else _bands.Update(saved);
                 }
                 _db.Commit();
             }
@@ -428,6 +439,7 @@ public sealed class PaSettingsStore : IDisposable
                     "PA calibration overlay is already active.");
             snapshot = GetAll(board, variant);
             _calibrationOverlay = snapshot;
+            _calibrationGainOverlay = new(StringComparer.Ordinal);
         }
         Changed?.Invoke();
         return snapshot;
@@ -440,8 +452,80 @@ public sealed class PaSettingsStore : IDisposable
             if (_calibrationOverlay is not null || _calibrationCommitInProgress)
                 throw new InvalidOperationException("PA calibration overlay is already active.");
             _calibrationOverlay = snapshot;
+            _calibrationGainOverlay = new(StringComparer.Ordinal);
         }
         Changed?.Invoke();
+    }
+
+    internal void CaptureCalibrationGain(
+        string band,
+        int targetWatts,
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant,
+        int maxPowerWatts)
+    {
+        lock (_sync)
+        {
+            var current = _calibrationOverlay
+                ?? throw new InvalidOperationException("PA calibration overlay is not active.");
+            var curves = _calibrationGainOverlay
+                ?? throw new InvalidOperationException("PA calibration gain overlay is not active.");
+            double gain = current.Bands.First(row => row.Band == band).PaGainDb;
+            curves.TryGetValue(band, out var existing);
+            curves[band] = targetWatts switch
+            {
+                10 => new CalibrationGainCurve(
+                    gain, existing.Gain25W, existing.Gain50W,
+                    board, variant, maxPowerWatts),
+                25 => new CalibrationGainCurve(
+                    existing.Gain10W, gain, existing.Gain50W,
+                    board, variant, maxPowerWatts),
+                50 => new CalibrationGainCurve(
+                    existing.Gain10W, existing.Gain25W, gain,
+                    board, variant, maxPowerWatts),
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(targetWatts), targetWatts,
+                    "PA calibration only records the 10, 25, and 50 W targets."),
+            };
+        }
+    }
+
+    internal double ResolveCalibrationGain(
+        string band,
+        int drivePercent,
+        int maxPowerWatts,
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant,
+        double fallbackGain)
+    {
+        lock (_sync)
+        {
+            // During calibration, SetCalibrationGain is the live controller
+            // output. Applying a previously persisted curve here would hide
+            // the gain the controller is trying to test.
+            if (_calibrationOverlay is not null)
+                return fallbackGain;
+
+            PaBandEntry? entry = _bands.FindOne(x => x.Band == band);
+            if (entry?.CalibrationGain10W is not double gain10W ||
+                entry.CalibrationGain25W is not double gain25W ||
+                entry.CalibrationGain50W is not double gain50W ||
+                entry.CalibrationBoardKind != (int)board ||
+                entry.CalibrationVariant != (int)variant ||
+                entry.CalibrationMaxPowerWatts != maxPowerWatts)
+            {
+                return fallbackGain;
+            }
+
+            double requestedWatts = maxPowerWatts *
+                Math.Clamp(drivePercent, 0, 100) / 100d;
+            if (requestedWatts <= 10d) return gain10W;
+            if (requestedWatts <= 25d)
+                return InterpolateGain(requestedWatts, 10d, gain10W, 25d, gain25W);
+            if (requestedWatts <= 50d)
+                return InterpolateGain(requestedWatts, 25d, gain25W, 50d, gain50W);
+            return gain50W;
+        }
     }
 
     public void SetCalibrationGain(string band, double paGainDb)
@@ -461,18 +545,21 @@ public sealed class PaSettingsStore : IDisposable
     public void CompleteCalibrationOverlay(bool persist)
     {
         PaSettingsDto? completed;
+        IReadOnlyDictionary<string, CalibrationGainCurve>? calibrationGains;
         bool refreshAfterFailedCommit = false;
         lock (_sync)
         {
             completed = _calibrationOverlay;
             _calibrationOverlay = null;
+            calibrationGains = _calibrationGainOverlay;
+            _calibrationGainOverlay = null;
             _calibrationCommitInProgress = persist && completed is not null;
         }
 
         try
         {
             if (persist && completed is not null)
-                Save(completed, calibrationCommit: true);
+                Save(completed, calibrationCommit: true, calibrationGains);
             else
                 Changed?.Invoke();
         }
@@ -497,6 +584,27 @@ public sealed class PaSettingsStore : IDisposable
                 }
             }
         }
+    }
+
+    private static double InterpolateGain(
+        double watts,
+        double lowerWatts,
+        double lowerGain,
+        double upperWatts,
+        double upperGain)
+    {
+        double position = (watts - lowerWatts) / (upperWatts - lowerWatts);
+        return lowerGain + ((upperGain - lowerGain) * position);
+    }
+
+    private static void ClearCalibrationGains(PaBandEntry entry)
+    {
+        entry.CalibrationGain10W = null;
+        entry.CalibrationGain25W = null;
+        entry.CalibrationGain50W = null;
+        entry.CalibrationBoardKind = null;
+        entry.CalibrationVariant = null;
+        entry.CalibrationMaxPowerWatts = null;
     }
 
     internal static int NormalizeCalibrationSafetyPercent(int percent) =>
@@ -552,6 +660,15 @@ public sealed class PaBandEntry
     public int Id { get; set; }
     public string Band { get; set; } = string.Empty;
     public double PaGainDb { get; set; }
+    // Automatic calibration records three points because a single dB gain
+    // cannot describe a nonlinear PA. PaGainDb remains the 50 W point for
+    // DTO/storage compatibility; RadioService selects from this curve.
+    public double? CalibrationGain10W { get; set; }
+    public double? CalibrationGain25W { get; set; }
+    public double? CalibrationGain50W { get; set; }
+    public int? CalibrationBoardKind { get; set; }
+    public int? CalibrationVariant { get; set; }
+    public int? CalibrationMaxPowerWatts { get; set; }
     public bool DisablePa { get; set; }
     public byte OcTx { get; set; }
     public byte OcRx { get; set; }
@@ -567,6 +684,14 @@ public sealed class PaBandEntry
     public byte OcTune { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
+
+internal readonly record struct CalibrationGainCurve(
+    double Gain10W,
+    double Gain25W,
+    double Gain50W,
+    HpsdrBoardKind Board,
+    OrionMkIIVariant Variant,
+    int MaxPowerWatts);
 
 public sealed class PaBandDriveEntry
 {

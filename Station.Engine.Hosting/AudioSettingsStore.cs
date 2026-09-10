@@ -40,6 +40,7 @@ public sealed class AudioSettingsStore : IDisposable
     private readonly ILiteCollection<AudioFrontEndEntry> _rows;
     private readonly ILogger<AudioSettingsStore> _log;
     private readonly object _sync = new();
+    private bool _hl2PlusCodecEnabled;
 
     // Fired on any write so RadioService can re-push the audio state to the
     // live client — same pattern as AntennaSettingsStore.Changed.
@@ -56,6 +57,7 @@ public sealed class AudioSettingsStore : IDisposable
         _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
         _db = _dbLease.Database;
         _rows = _db.GetCollection<AudioFrontEndEntry>("audio_frontend");
+        _hl2PlusCodecEnabled = _rows.FindAll().FirstOrDefault()?.Hl2PlusCodecEnabled ?? false;
 
         _log.LogInformation("AudioSettingsStore initialized at {Path}", dbPath);
     }
@@ -95,12 +97,40 @@ public sealed class AudioSettingsStore : IDisposable
             _rows.DeleteMany(_ => true);
             _rows.Insert(new AudioFrontEndEntry
             {
+                Hl2PlusCodecEnabled = _hl2PlusCodecEnabled,
                 Source = (byte)ClampSource((byte)sel.Source),
                 MicBoost = sel.MicBoost,
                 MicBias = sel.MicBias,
                 LineInGain = ClampGain(sel.LineInGain),
                 UpdatedUtc = DateTime.UtcNow,
             });
+        }
+        Changed?.Invoke();
+    }
+
+    /// <summary>Explicit companion-board opt-in; ordinary HL2 hardware defaults off.</summary>
+    public bool Hl2PlusCodecEnabled
+    {
+        get { lock (_sync) return _hl2PlusCodecEnabled; }
+    }
+
+    public void SetHl2PlusCodecEnabled(bool enabled)
+    {
+        lock (_sync)
+        {
+            if (_hl2PlusCodecEnabled == enabled) return;
+            var entry = _rows.FindAll().FirstOrDefault() ?? new AudioFrontEndEntry();
+            entry.Hl2PlusCodecEnabled = enabled;
+            // A hardware change requires a fresh source choice. Do not revive
+            // a radio-mic setting left by a different previously used board.
+            entry.Source = (byte)TxAudioSource.Host;
+            entry.MicBoost = false;
+            entry.MicBias = false;
+            entry.LineInGain = 0;
+            entry.UpdatedUtc = DateTime.UtcNow;
+            _rows.DeleteMany(_ => true);
+            _rows.Insert(entry);
+            _hl2PlusCodecEnabled = enabled;
         }
         Changed?.Invoke();
     }
@@ -156,6 +186,7 @@ public sealed record AudioFrontEndPush(
 
 public sealed class AudioFrontEndEntry
 {
+    public bool Hl2PlusCodecEnabled { get; set; }
     public int Id { get; set; }
     // The persisted TX-audio source (TxAudioSource as byte). LiteDB is
     // schema-less, so a legacy four-bool row that predates this field hydrates

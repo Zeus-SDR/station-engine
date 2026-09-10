@@ -1370,6 +1370,7 @@ public sealed class TxService
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
                 _radio.SetMox(true);
                 _pipeline.CommitTxEgress(revision);
+                _pipeline.SetPsMox(true);
                 CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, revision, armPreKey: false);
                 _log.LogInformation(
                     "tx.twoTone on=true f1={F1} f2={F2} mag={Mag} revision={Revision}",

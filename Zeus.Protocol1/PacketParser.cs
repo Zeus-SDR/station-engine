@@ -132,6 +132,13 @@ internal static class PacketParser
         byte c0Frame0 = packet[MetisHeaderLength + 3];
         byte c0Frame1 = packet[MetisHeaderLength + UsbFrameLength + 3];
         byte keyMask = board == HpsdrBoardKind.HermesLite2 ? (byte)0x04 : (byte)0x06;
+        if (board == HpsdrBoardKind.HermesLite2)
+        {
+            // ACK frames carry a six-bit response address in C0[6:1],
+            // not dot/dash status. C0[0] remains a valid PTT echo.
+            if ((c0Frame0 & 0x80) != 0) c0Frame0 = 0;
+            if ((c0Frame1 & 0x80) != 0) c0Frame1 = 0;
+        }
         return ((c0Frame0 | c0Frame1) & keyMask) != 0;
     }
 

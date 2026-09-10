@@ -341,13 +341,15 @@ public sealed class PaCalibrationService
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
-                        bool calibratingGain = targetWatts == firstTargetWatts;
-                        if (!calibratingGain)
+                        bool firstTarget = targetWatts == firstTargetWatts;
+                        if (!firstTarget)
                         {
-                            // Arm the higher target before raising TUN drive so a
-                            // fresh raw meter sample is checked against the right
-                            // limit throughout the live transition.
+                            // Arm the higher target, then restore maximum attenuation
+                            // before raising TUN drive. The PA response between targets
+                            // is not necessarily linear, so the preceding gain does not
+                            // prove that the nominal higher drive is safe.
                             ArmSafetyTarget(targetWatts, expectedVfoHz, expectedMode);
+                            _pa.SetCalibrationGain(band, ConservativeStartGainDb);
                             int requestedTunePct = Math.Clamp(
                                 (int)Math.Round(targetWatts * 100d /
                                     originalSettings.Global.PaMaxPowerWatts), 1, 100);
@@ -357,7 +359,7 @@ public sealed class PaCalibrationService
                             currentTune = _radio.Snapshot().TunePct;
                             while (samples.Reader.TryRead(out _)) { }
                             Update("running", band, targetWatts, null, completed,
-                                $"Holding {band} shared gain; checking {targetWatts:0.0} W");
+                                $"Calibrating {band} shared gain at {targetWatts:0.0} W");
                         }
 
                         await ConvergeAsync(
@@ -367,11 +369,17 @@ public sealed class PaCalibrationService
                             safetyPercent,
                             ratedOutputWatts,
                             samples.Reader,
-                            calibratingGain,
-                            calibratingGain
+                            firstTarget
                                 ? TimeSpan.FromMilliseconds(700)
                                 : TimeSpan.FromMilliseconds(350),
                             cancellationToken).ConfigureAwait(false);
+
+                        _pa.CaptureCalibrationGain(
+                            band,
+                            targetWatts,
+                            _radio.EffectiveBoardKind,
+                            _radio.EffectiveOrionMkIIVariant,
+                            originalSettings.Global.PaMaxPowerWatts);
 
                         completed++;
                         Update("running", band, targetWatts, null, completed,
@@ -474,7 +482,6 @@ public sealed class PaCalibrationService
         int safetyPercent,
         double ratedOutputWatts,
         ChannelReader<ForwardPowerSample> samples,
-        bool allowGainAdjustment,
         TimeSpan initialSettleDelay,
         CancellationToken cancellationToken)
     {
@@ -565,10 +572,6 @@ public sealed class PaCalibrationService
                 .ElementAt(adjustmentSamples.Count / 2);
             adjustmentSamples.Clear();
             lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
-
-            if (!allowGainAdjustment)
-                throw new InvalidOperationException(
-                    $"{band} has one shared PA gain setting and could not hold {targetWatts:0.0} W after the {TargetsWatts[0]:0.0} W calibration.");
 
             PaBandSettingsDto row = _pa.GetAll(
                     _radio.EffectiveBoardKind,

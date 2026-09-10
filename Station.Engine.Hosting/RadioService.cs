@@ -4947,7 +4947,7 @@ public sealed class RadioService : IDisposable
         return _rfFilterStore.Reset(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
     }
 
-    private bool IsTxActive()
+    internal bool IsTxActive()
     {
         lock (_sync) return _mox || _tunActive;
     }
@@ -4959,12 +4959,17 @@ public sealed class RadioService : IDisposable
     // Mirrors the PA RecomputePaAndPush discipline but for the GLOBAL (not
     // per-band) audio state. Defaults (Host, no boost/bias, gain 0) reproduce
     // today's wire output bit-for-bit on every board.
+    internal BoardCapabilities AudioCapabilities => BoardCapabilitiesTable.ForAudio(
+        EffectiveBoardKind, EffectiveOrionMkIIVariant, _audioStore?.Hl2PlusCodecEnabled == true);
+
     private void PushAudioFrontEnd()
     {
         var sel = _audioStore?.Get() ?? AudioSourceSelection.Default;
         var board = EffectiveBoardKind;
         var variant = EffectiveOrionMkIIVariant;
-        var caps = BoardCapabilitiesTable.For(board, variant);
+        var caps = AudioCapabilities;
+        if (ActiveClient is { } audioClient)
+            audioClient.Hl2CodecInstalled = board == HpsdrBoardKind.HermesLite2 && caps.HasOnboardCodec;
 
         // CLAMP the persisted source against the connected board's capabilities
         // (external-audio-jacks re-port, safety invariant 5). Any source the
@@ -5002,11 +5007,13 @@ public sealed class RadioService : IDisposable
             LineInGain: resolved.LineInGain);
 
         // P1 codec boards (Hermes-class): mic_boost / mic_linein on the 0x12
-        // frame. HL2 is Host-only in v1 — the encoder returns all-clear, and
-        // ControlFrame's read-modify-write keeps the PS bit + C4 PGA intact.
-        // mic_trs / mic_bias / line_in_gain (HL2 0x14) stay clear in v1 (the HL2
-        // mic front-end is inert plumbing), so the host pipeline is unchanged.
+        // frame. The optional HL2+ AK4951 uses the same mic-boost bit,
+        // selected only after the installed-hardware capability clamp.
+        // Its microphone bias is hardware-configured; the legacy 0x14
+        // mic_trs / mic_bias / line_in_gain fields remain clear.
         var (p1Boost, p1LineIn) = encoder.EncodeP1CodecAudioBits(in portState);
+        if (board == HpsdrBoardKind.HermesLite2 && caps.HasOnboardCodec)
+            (p1Boost, p1LineIn) = ExternalPortAudio.P1CodecAudioBits(resolved.Source, resolved.MicBoost);
         // ANAN-10E line-in (issue #667): when the encoder selected line-in
         // (HermesII only — p1LineIn is false on every other P1 board), forward
         // the 0..31 gain so ControlFrame can place it on the 0x14 frame. The gain
@@ -5059,8 +5066,8 @@ public sealed class RadioService : IDisposable
         switch (sel.Source)
         {
             case TxAudioSource.RadioMic:
-                // RadioMic needs the stream codec (HL2's mic front-end is inert
-                // plumbing in v1). Drop bias on non-bias boards.
+                // RadioMic needs a stream codec, including an explicitly
+                // configured HL2+ companion. Drop bias on non-bias boards.
                 if (!caps.HasOnboardCodec) return AudioSourceSelection.Default;
                 return sel with { MicBias = sel.MicBias && caps.HasMicBias };
 
@@ -5407,10 +5414,19 @@ public sealed class RadioService : IDisposable
             ?? EngineTransmitSafetyModule.ResolveEffectiveDrive(activePct, connectedBoard, variant);
         bool safetyAuthorized = Volatile.Read(ref _txSafetyAuthority) != 0;
         var driveProfile = RadioDriveProfiles.For(connectedBoard);
+        double calibratedGain = bandName is null
+            ? bandCfg.PaGainDb
+            : _paStore.ResolveCalibrationGain(
+                bandName,
+                decision.EffectiveDrivePercent,
+                cfg.Global.PaMaxPowerWatts,
+                connectedBoard,
+                variant,
+                bandCfg.PaGainDb);
         byte driveByte = decision.Allowed && safetyAuthorized && !safetyInhibit
             ? driveProfile.EncodeDriveByte(
                 decision.EffectiveDrivePercent,
-                bandCfg.PaGainDb,
+                calibratedGain,
                 cfg.Global.PaMaxPowerWatts)
             : (byte)0;
         bool paEnabled = decision.Allowed && safetyAuthorized && !safetyInhibit
@@ -5419,7 +5435,7 @@ public sealed class RadioService : IDisposable
 
         _log.LogInformation(
             "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, bandName ?? "?", bandCfg.PaGainDb, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
+            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, bandName ?? "?", calibratedGain, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
         ActiveClient?.SetDriveByte(driveByte);

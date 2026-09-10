@@ -11,6 +11,37 @@ public static class RadioHardwareEndpoints
     public static IEndpointRouteBuilder MapRadioHardwareEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
+        endpoints.MapGet("/api/radio/hl2-io-board", (Hl2IoBoardService board) => Results.Ok(board.Get()));
+        endpoints.MapPut("/api/radio/hl2-io-board/antenna", (Hl2IoBoardBand band, Hl2IoBoardSettingsStore settings, TxService tx) =>
+        {
+            try
+            {
+                IReadOnlyList<Hl2IoBoardBand>? saved = null;
+                if (!tx.TryRunWithTransmitIdle(() =>
+                {
+                    settings.SetBand(band);
+                    saved = settings.GetAll();
+                }, out var error)) return Results.Conflict(new { error });
+                return Results.Ok(saved);
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+        endpoints.MapPost("/api/radio/hl2-io-board/command", async (Hl2IoBoardCommandRequest request, Hl2IoBoardService board, CancellationToken ct) =>
+        {
+            if (request.Action == "outputs" && !request.ManualOutputs)
+                return Results.BadRequest(new { error = "Explicit manual-output control is required." });
+            try
+            {
+                await board.ExecuteCommandAsync(request.Action, request.Outputs, ct);
+                return Results.Ok(board.Get());
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
         // Operator-selected variant for the 0x0A wire-byte alias family
         // (issue #218). Routes calibration / PA gain / rated-watts dispatch
         // when the connected board is OrionMkII. Default G2 preserves
@@ -321,3 +352,5 @@ public static class RadioHardwareEndpoints
     };
 
 }
+
+public sealed record Hl2IoBoardCommandRequest(string Action, byte Outputs = 0, bool ManualOutputs = false);

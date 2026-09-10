@@ -280,6 +280,10 @@ public interface IProtocol1Client : IDisposable
     /// </summary>
     bool EnableHl2BandVolts { get; set; }
 
+    /// <summary>HL2+ speaker amplifier request; shares the gateware Band Volts bit.</summary>
+    bool EnableHl2CodecSpeaker { get => false; set { } }
+    bool Hl2CodecInstalled { get => false; set { } }
+
     /// <summary>
     /// Arm or disarm PureSignal predistortion on the wire. HL2-only effect:
     /// flips bit 22 of register 0x0a (= C2 bit 6 of the C0=0x14 frame), adds

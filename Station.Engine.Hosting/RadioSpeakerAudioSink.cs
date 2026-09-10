@@ -32,7 +32,7 @@ namespace Zeus.Server;
 /// transition takes effect immediately):
 ///   • operator opted in (RadioSpeakerSettingsStore.Enabled, default off)
 ///   • a Protocol-1 client is connected (so the ring is actually drained)
-///   • the board has an onboard codec and is not the codec-less HL2
+///   • the board has a codec (including an explicitly configured HL2+)
 ///   • not transmitting (don't push TX-monitor audio to the radio speaker)
 ///   • the frame is the expected 48 kHz mono RX audio
 /// When any check fails the frame is dropped and the ring is left to drain to
@@ -63,6 +63,9 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         // later re-enable starts clean rather than replaying stale audio.
         _settings.Changed += OnSettingsChanged;
         _muteState.Changed += OnMuteChanged;
+        _radio.Connected += OnConnected;
+        _radio.AudioFrontEndChanged += OnAudioFrontEndChanged;
+        UpdateCodecSpeaker();
     }
 
     /// <summary>True when a codec-equipped radio is currently connected (P1 or P2),
@@ -73,9 +76,7 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
     public bool AvailableForConnectedBoard()
     {
         if (!_radio.IsConnected) return false;
-        var board = _radio.ConnectedBoardKind;
-        if (board == HpsdrBoardKind.HermesLite2) return false;
-        return BoardCapabilitiesTable.For(board, _radio.EffectiveOrionMkIIVariant).HasOnboardCodec;
+        return _radio.AudioCapabilities.HasOnboardCodec;
     }
 
     public void Publish(in AudioFrame frame)
@@ -103,9 +104,7 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
             _ring.Clear();
             return;
         }
-        var board = _radio.ConnectedBoardKind;
-        if (board == HpsdrBoardKind.HermesLite2) return;
-        if (!BoardCapabilitiesTable.For(board, _radio.EffectiveOrionMkIIVariant).HasOnboardCodec) return;
+        if (!_radio.AudioCapabilities.HasOnboardCodec) return;
 
         _ring.Write(frame.Samples.Span);
     }
@@ -113,6 +112,23 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
     private void OnSettingsChanged()
     {
         if (!_settings.Enabled) _ring.Clear();
+        UpdateCodecSpeaker();
+    }
+
+    private void OnConnected(IProtocol1Client client) => UpdateCodecSpeaker();
+
+    private void OnAudioFrontEndChanged(AudioFrontEndPush state)
+    {
+        if (!_radio.AudioCapabilities.HasOnboardCodec) _ring.Clear();
+        UpdateCodecSpeaker();
+    }
+
+    private void UpdateCodecSpeaker()
+    {
+        var client = _radio.ActiveClient;
+        if (client is not null)
+            client.EnableHl2CodecSpeaker = _radio.ConnectedBoardKind == HpsdrBoardKind.HermesLite2
+                && _radio.AudioCapabilities.HasOnboardCodec && _settings.Enabled;
     }
 
     private void OnMuteChanged()
@@ -126,5 +142,7 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
     {
         _settings.Changed -= OnSettingsChanged;
         _muteState.Changed -= OnMuteChanged;
+        _radio.Connected -= OnConnected;
+        _radio.AudioFrontEndChanged -= OnAudioFrontEndChanged;
     }
 }

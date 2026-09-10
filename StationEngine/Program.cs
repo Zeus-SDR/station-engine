@@ -171,6 +171,11 @@ public partial class Program
             tciBindAddress = persistedTci.BindAddress;
             tciPort = persistedTci.Port;
         }
+        var tciListener = TciHostingExtensions.ResolveTciListener(
+            tciEnabled,
+            tciBindAddress,
+            tciPort);
+        builder.Services.AddSingleton(tciListener);
 
         var persistedCat = LoadPersistedCat();
         builder.Host.UseDefaultServiceProvider(options =>
@@ -188,7 +193,7 @@ public partial class Program
                 server.Listen(IPAddress.Loopback, port);
             if (options.LanHttpsPort is { } httpsPort && lanCertificate is not null)
                 server.ListenAnyIP(httpsPort, listener => listener.UseHttps(lanCertificate));
-            server.ConfigureTciListener(tciEnabled, tciBindAddress, tciPort);
+            server.ConfigureTciListener(tciListener);
         });
 
         builder.Services.Configure<JsonOptions>(options =>
@@ -269,7 +274,7 @@ public partial class Program
         {
             KeepAliveInterval = TimeSpan.FromSeconds(20),
         });
-        app.UseTciServer(tciEnabled, tciPort);
+        app.UseTciServer(tciListener.IsActive, tciPort);
 
         AnchorWdspDataFiles(app);
         WireEngineBroadcasts(app);

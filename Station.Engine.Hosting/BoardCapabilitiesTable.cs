@@ -34,6 +34,12 @@ internal static class BoardCapabilitiesTable
     /// Falls back to <see cref="BoardCapabilities.UnknownDefaults"/> for
     /// any future enum value that hasn't been wired yet.
     /// </summary>
+    /// <summary>Audio-only capability overlay for the optional HL2+ AK4951 board.</summary>
+    public static BoardCapabilities ForAudio(HpsdrBoardKind board, OrionMkIIVariant variant, bool hl2PlusCodecEnabled) =>
+        board == HpsdrBoardKind.HermesLite2 && hl2PlusCodecEnabled
+            ? HermesLite2PlusAudio
+            : For(board, variant);
+
     public static BoardCapabilities For(HpsdrBoardKind board) =>
         For(board, OrionMkIIVariant.G2);
 
@@ -385,4 +391,11 @@ internal static class BoardCapabilitiesTable
         // front-end, exposed only as inert plumbing in v1 (default Host); the
         // frontend surfaces nothing for it until confirmed on hardware.
         HermesLite2MicFrontEnd: true);
+
+    // AK4951 firmware supplies a mono microphone and stereo playback. Its
+    // input bias is hardware-configured; no host-selectable line-in or XLR.
+    private static readonly BoardCapabilities HermesLite2PlusAudio = HermesLite2 with
+    {
+        HasOnboardCodec = true,
+    };
 }

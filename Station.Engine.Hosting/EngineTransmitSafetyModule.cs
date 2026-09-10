@@ -29,6 +29,7 @@ internal enum TransmitSafetyReasonCode
     FaultLatched,
     SwrTrip,
     TxTimeout,
+    ExternalHardwareFault,
 }
 
 internal enum ProtectionEvidenceState
@@ -131,6 +132,68 @@ internal sealed class EngineTransmitSafetyModule
     private DateTime? _timeoutWarningForKeyedAt;
     private long _faultEpoch;
     private bool _faultLatched;
+    private string? _hl2IoBoardInhibit;
+    private bool _hl2IoBoardRequired;
+    private long? _hl2IoBoardFrequencyHz;
+    private RxMode _hl2IoBoardMode;
+    private long _hl2IoBoardRevision;
+
+    public long InvalidateHl2IoBoard()
+    {
+        lock (_sync)
+        {
+            _hl2IoBoardRequired = true;
+            _hl2IoBoardFrequencyHz = null;
+            return ++_hl2IoBoardRevision;
+        }
+    }
+
+    public void ClearHl2IoBoard()
+    {
+        lock (_sync)
+        {
+            _hl2IoBoardRequired = false;
+            _hl2IoBoardFrequencyHz = null;
+            _hl2IoBoardInhibit = null;
+            _hl2IoBoardRevision++;
+        }
+    }
+
+    public void SynchronizeHl2IoBoard(long revision, long frequencyHz, RxMode mode)
+    {
+        lock (_sync)
+        {
+            if (revision != _hl2IoBoardRevision) return;
+            _hl2IoBoardFrequencyHz = frequencyHz;
+            _hl2IoBoardMode = mode;
+        }
+    }
+
+    public bool Hl2IoBoardNeedsSync(StateDto state)
+    {
+        lock (_sync)
+            return _hl2IoBoardRequired && (_hl2IoBoardFrequencyHz != RadioFrequencyResolver.TxFrequencyHz(state)
+                || _hl2IoBoardMode != RadioFrequencyResolver.TxMode(state));
+    }
+
+    public void SetHl2IoBoardInhibit(string? reason)
+    {
+        lock (_sync) _hl2IoBoardInhibit = reason;
+    }
+
+    private TransmitSafetyDecision? Hl2IoBoardDecision(TransmitSafetySnapshot snapshot)
+    {
+        lock (_sync)
+        {
+            if (snapshot.Board != HpsdrBoardKind.HermesLite2) return null;
+            if (_hl2IoBoardInhibit is { } reason)
+                return TransmitSafetyDecision.Deny(TransmitSafetyReasonCode.ExternalHardwareFault, reason);
+            if (Hl2IoBoardNeedsSync(snapshot.State))
+                return TransmitSafetyDecision.Deny(TransmitSafetyReasonCode.ExternalHardwareFault,
+                    "TX blocked: waiting for HL2 IO Board band and mode synchronization");
+            return null;
+        }
+    }
 
     public long FaultEpoch { get { lock (_sync) return _faultEpoch; } }
     public bool FaultLatched { get { lock (_sync) return _faultLatched; } }
@@ -139,6 +202,7 @@ internal sealed class EngineTransmitSafetyModule
 
     public TransmitSafetyDecision EvaluateKeyOn(TransmitIntent intent, TransmitSafetySnapshot snapshot)
     {
+        if (Hl2IoBoardDecision(snapshot) is { } inhibit) return inhibit;
         var envelope = TxEmissionEnvelopeResolver.Resolve(intent, snapshot.State, snapshot.Source);
 
         if (!snapshot.Connected)
@@ -224,6 +288,7 @@ internal sealed class EngineTransmitSafetyModule
     /// </summary>
     public TransmitSafetyDecision ResolveEffectiveDrive(int requestedPercent, TransmitSafetySnapshot snapshot)
     {
+        if (Hl2IoBoardDecision(snapshot) is { } inhibit) return inhibit;
         var decision = ResolveEffectiveDrive(requestedPercent, snapshot.Board, snapshot.Variant);
         if (!decision.Allowed || snapshot.TransverterBand is not { } xvtr)
             return decision;

@@ -7406,8 +7406,8 @@ public class DspPipelineService : BackgroundService,
     // is zero added RX cost while Host is selected. P1 codec radios (ANAN-10E /
     // Hermes / ANAN-100D/200D) carry the codec samples inline in EP6, so the P1
     // path also attaches a per-packet mic extractor on the active P1 client
-    // (issue #992); gated on HasOnboardCodec so HL2 (no stream codec) stays a
-    // no-op.
+    // (issue #992); the audio capability overlay also admits an explicitly
+    // installed HL2+ codec while ordinary HL2 stays host-only.
     private void ApplyRadioMicRouting(TxAudioSource source)
     {
         var ingest = ResolveTxIngest();
@@ -7438,10 +7438,10 @@ public class DspPipelineService : BackgroundService,
                 p2.AttachRadioMicHandler(rb.Accept);
                 _radioMicAttached = true;
             }
-            // P1 codec mic extraction — only on codec boards (ANAN-10E et al);
-            // HL2 has no stream codec so its EP6 mic slots carry no audio.
+            // P1 codec mic extraction, including the optional HL2+ AK4951.
+            // Ordinary HL2 still has no codec and does not attach a handler.
             if (!_p1RadioMicAttached && p1 is not null && _p1RadioMicReceiver is not null
-                && BoardCapabilitiesTable.For(_radio.EffectiveBoardKind, _radio.EffectiveOrionMkIIVariant).HasOnboardCodec)
+                && _radio.AudioCapabilities.HasOnboardCodec)
             {
                 var rb = _p1RadioMicReceiver;
                 p1.AttachRadioMicHandler(rb.Accept);

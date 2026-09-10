@@ -58,6 +58,9 @@ namespace Zeus.Protocol1;
 
 public sealed class Protocol1Client : IProtocol1Client
 {
+    private readonly Hl2I2cTransport _hl2I2c = new();
+    public IHl2I2cTransport Hl2I2c => _hl2I2c;
+
     private const int DefaultFrameChannelCapacity = 64;
     private const int RxSocketTimeoutMs = 100;
     private const int ConsecutiveTimeoutsBeforeGiveUp = 10;
@@ -529,6 +532,7 @@ public sealed class Protocol1Client : IProtocol1Client
 
     private void SignalDisconnected()
     {
+        _hl2I2c.SetAvailable(false);
         if (Interlocked.Exchange(ref _disconnectSignaled, 1) != 0) return;
 
         try { Disconnected?.Invoke(); }
@@ -968,6 +972,20 @@ public sealed class Protocol1Client : IProtocol1Client
         HpsdrSampleRate.Rate384k => 384_000,
         _ => 48_000,
     };
+
+    private int _hl2CodecInstalled;
+    public bool Hl2CodecInstalled
+    {
+        get => Volatile.Read(ref _hl2CodecInstalled) != 0;
+        set => Interlocked.Exchange(ref _hl2CodecInstalled, value ? 1 : 0);
+    }
+
+    private int _enableHl2CodecSpeaker;
+    public bool EnableHl2CodecSpeaker
+    {
+        get => Volatile.Read(ref _enableHl2CodecSpeaker) != 0;
+        set => Interlocked.Exchange(ref _enableHl2CodecSpeaker, value ? 1 : 0);
+    }
 
     public bool EnableHl2BandVolts
     {
@@ -1419,6 +1437,7 @@ public sealed class Protocol1Client : IProtocol1Client
         // session to RequestAborted lets a browser navigation silently kill
         // RX/TX after the endpoint has already returned Connected.
         _loopCts = new CancellationTokenSource();
+        _hl2I2c.SetAvailable(BoardKind == HpsdrBoardKind.HermesLite2);
 
         // A vanished prior host can leave Hermes streaming to a closed UDP
         // port. Windows then returns ICMP port-unreachable, which Hermes
@@ -1503,6 +1522,7 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public async Task StopAsync(CancellationToken ct)
     {
+        _hl2I2c.SetAvailable(false);
         bool wasVnaEnabled = VnaEnabled;
         // Never carry an armed VNA configuration into a later connection.
         // _mox is already held low for the whole VNA lifetime, so publishing
@@ -1583,6 +1603,7 @@ public sealed class Protocol1Client : IProtocol1Client
 
     public Task DisconnectAsync(CancellationToken ct)
     {
+        _hl2I2c.SetAvailable(false);
         bool wasVnaEnabled = VnaEnabled;
         ClearVna();
         // Direct disconnect without StopAsync is discouraged, but still make
@@ -1696,6 +1717,7 @@ public sealed class Protocol1Client : IProtocol1Client
     }
     public void SetBoardKind(HpsdrBoardKind board)
     {
+        if (board != BoardKind) _hl2I2c.SetAvailable(false);
         Interlocked.Exchange(ref _boardKind, (int)board);
         if (board != HpsdrBoardKind.HermesLite2) ClearVna();
         Interlocked.Increment(ref _boardKindSetCount);
@@ -2505,6 +2527,8 @@ public sealed class Protocol1Client : IProtocol1Client
             RxAntenna: (HpsdrAntenna)Volatile.Read(ref _antenna),
             Mox: moxOn,
             EnableHl2BandVolts: Volatile.Read(ref _enableHl2BandVolts) != 0,
+            EnableHl2CodecSpeaker: EnableHl2CodecSpeaker,
+            Hl2CodecInstalled: Hl2CodecInstalled,
             AdcDitherEnabled: Volatile.Read(ref _adcDither) != 0,
             AdcRandomEnabled: Volatile.Read(ref _adcRandom) != 0,
             Board: board,
@@ -2675,6 +2699,9 @@ public sealed class Protocol1Client : IProtocol1Client
                     Ps4DdcHousekeeping();
                     continue;
                 }
+
+                if (BoardKind == HpsdrBoardKind.HermesLite2)
+                    _hl2I2c.AcceptPacket(buffer.AsSpan(0, n));
 
                 // PS-armed paired-DDC layouts. The radio emits
                 // the 26-byte-per-slot 4-DDC packet shape only when the last
@@ -3482,6 +3509,10 @@ public sealed class Protocol1Client : IProtocol1Client
                 phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 7);
                 bool pacedAudioSend = !state.Mox && _audioEgressPacer.Active;
                 ControlFrame.BuildDataPacket(buf, NextEp2Seq(), first, second, in state, _txIqSource, _rxAudioSource);
+                // Borrow a repeated frequency slot; preserve configuration,
+                // drive, keyer, and every second-frame register in the rotation.
+                if (BoardKind == HpsdrBoardKind.HermesLite2)
+                    _hl2I2c.TryWritePacket(buf, first, Environment.TickCount64);
                 rateWindowPkts++;
                 var nowUtc = DateTime.UtcNow;
                 var elapsed = nowUtc - rateWindowStart;

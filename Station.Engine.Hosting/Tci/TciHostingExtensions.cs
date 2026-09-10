@@ -3,6 +3,7 @@
 
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 
 namespace Zeus.Server.Tci;
@@ -10,58 +11,89 @@ namespace Zeus.Server.Tci;
 /// <summary>Shared Kestrel binding and request branch for the TCI listener.</summary>
 public static class TciHostingExtensions
 {
+    internal static TciListenerBinding ResolveTciListener(
+        bool enabled,
+        string bindAddress,
+        int port,
+        Func<IReadOnlyCollection<IPAddress>>? getLocalAddresses = null)
+    {
+        if (!enabled)
+            return new(false, bindAddress, port, Address: null, Error: null);
+
+        if (bindAddress is "0.0.0.0" or "*" or "")
+            return new(true, bindAddress, port, IPAddress.Any, Error: null);
+
+        if (string.Equals(bindAddress, "localhost", StringComparison.OrdinalIgnoreCase))
+            return new(true, bindAddress, port, IPAddress.Loopback, Error: null);
+
+        if (!IPAddress.TryParse(bindAddress, out var tciIp))
+        {
+            return new(
+                false,
+                bindAddress,
+                port,
+                Address: null,
+                Error: $"Bind address '{bindAddress}' is not a valid IP address, localhost, or *. TCI listener is inactive.");
+        }
+
+        IReadOnlyCollection<IPAddress> localAddresses;
+        try
+        {
+            localAddresses = (getLocalAddresses ?? GetLocalAddresses)();
+        }
+        catch (Exception ex)
+        {
+            return new(
+                false,
+                bindAddress,
+                port,
+                Address: null,
+                Error: $"Could not verify whether bind address {bindAddress} is available on this computer: {ex.Message}. TCI listener is inactive.");
+        }
+
+        if (IsLocalOrLoopback(tciIp, localAddresses))
+            return new(true, bindAddress, port, tciIp, Error: null);
+
+        return new(
+            false,
+            bindAddress,
+            port,
+            Address: null,
+            Error: PortBindDiagnostics.Describe(SocketError.AddressNotAvailable, bindAddress, port, "TCP")
+                + " TCI listener is inactive; fix the bind address in Settings > TCI.");
+    }
+
     public static void ConfigureTciListener(
         this KestrelServerOptions kestrel,
         bool enabled,
         string bindAddress,
         int port)
+        => ConfigureTciListener(kestrel, ResolveTciListener(enabled, bindAddress, port));
+
+    internal static void ConfigureTciListener(
+        this KestrelServerOptions kestrel,
+        TciListenerBinding listener)
     {
         ArgumentNullException.ThrowIfNull(kestrel);
-        if (!enabled)
-            return;
-
-        if (bindAddress is "0.0.0.0" or "*" or "")
-            kestrel.ListenAnyIP(port);
-        else if (string.Equals(bindAddress, "localhost", StringComparison.OrdinalIgnoreCase))
-            kestrel.ListenLocalhost(port);
-        else if (IPAddress.TryParse(bindAddress, out var tciIp))
+        ArgumentNullException.ThrowIfNull(listener);
+        if (!listener.IsActive)
         {
-            // A specific persisted IP can go stale (DHCP renumber, new
-            // router): Kestrel would then throw WSAEADDRNOTAVAIL at host
-            // start and the app would never open. Validate it against the
-            // machine's current addresses; on any doubt, leave TCI off and
-            // let the operator fix the setting — never bind wider than the
-            // address they chose (TCI has no auth; transport is the
-            // security boundary), and never take the host down for it.
-            IPAddress[]? localAddresses = null;
-            try
-            {
-                localAddresses = NetworkInterface.GetAllNetworkInterfaces()
-                    .SelectMany(networkInterface => networkInterface.GetIPProperties().UnicastAddresses)
-                    .Select(unicastAddress => unicastAddress.Address)
-                    .Where(address => address is not null)
-                    .ToArray();
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(
-                    $"tci.bind.local-address-enumeration.failed address={tciIp}: {ex.Message} — TCI not started");
-            }
+            if (listener.Error is not null)
+                Console.Error.WriteLine($"tci.bind.rejected error={listener.Error}");
+            return;
+        }
 
-            if (localAddresses is not null && IsLocalOrLoopback(tciIp, localAddresses))
-            {
-                kestrel.Listen(tciIp, port);
-            }
-            else if (localAddresses is not null)
-            {
-                Console.Error.WriteLine(
-                    $"tci.bind.stale address={tciIp} not on any local interface — TCI not started; fix the bind address in Settings > TCI");
-            }
+        if (listener.BindAddress is "0.0.0.0" or "*" or "")
+        {
+            kestrel.ListenAnyIP(listener.Port);
+        }
+        else if (string.Equals(listener.BindAddress, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            kestrel.ListenLocalhost(listener.Port);
         }
         else
         {
-            Console.Error.WriteLine(
-                $"tci.bind.invalid address={bindAddress} — TCI not started; fix the bind address in Settings > TCI");
+            kestrel.Listen(listener.Address!, listener.Port);
         }
     }
 
@@ -94,4 +126,17 @@ public static class TciHostingExtensions
         IPAddress.IsLoopback(candidate) ||
         localAddresses.Any(localAddress =>
             candidate.GetAddressBytes().SequenceEqual(localAddress.GetAddressBytes()));
+
+    private static IReadOnlyCollection<IPAddress> GetLocalAddresses() =>
+        NetworkInterface.GetAllNetworkInterfaces()
+            .SelectMany(networkInterface => networkInterface.GetIPProperties().UnicastAddresses)
+            .Select(unicastAddress => unicastAddress.Address)
+            .ToArray();
 }
+
+public sealed record TciListenerBinding(
+    bool IsActive,
+    string BindAddress,
+    int Port,
+    IPAddress? Address,
+    string? Error);

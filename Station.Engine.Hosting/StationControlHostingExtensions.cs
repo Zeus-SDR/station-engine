@@ -5,6 +5,7 @@ using Zeus.Server.Cat;
 using Zeus.Server.SpeTaurus;
 using Zeus.Server.Tci;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace Zeus.Server;
 
@@ -15,6 +16,14 @@ public static class StationControlHostingExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        services.TryAddSingleton(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<TciOptions>>().Value;
+            return TciHostingExtensions.ResolveTciListener(
+                options.Enabled,
+                options.BindAddress,
+                options.Port);
+        });
         services.AddSingleton<TciConfigStore>();
         services.AddSingleton<TransverterSettingsStore>();
         services.AddSingleton<SpotManager>();

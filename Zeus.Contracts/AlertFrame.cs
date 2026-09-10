@@ -103,4 +103,5 @@ public enum AlertKind : byte
     TxTimeout = 1,
     OutOfBand = 2,
     TxTimeoutWarning = 3,
+    ExternalHardwareFault = 4,
 }

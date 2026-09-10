@@ -392,7 +392,9 @@ internal static class ControlFrame
         bool VnaFixedRxGainHigh = false,
         // Separate from normal transmitter drive so an operator's calibrated
         // PA drive setting cannot leak into the low-power VNA path.
-        byte VnaDriveLevel = 0);
+        byte VnaDriveLevel = 0,
+        bool EnableHl2CodecSpeaker = false,
+        bool Hl2CodecInstalled = false);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -463,12 +465,15 @@ internal static class ControlFrame
                 if (state.Board == HpsdrBoardKind.HermesLite2)
                 {
                     if (state.PaEnabled) cc[2] |= 0x08;
+                    // MI0BOT WriteMainLoop_HL2 case 10; AK4951 i2c_bus2.v
+                    // consumes register 0x09 DATA[16] as microphone boost.
+                    if (state.Hl2CodecInstalled && state.MicBoost) cc[2] |= 0x01;
                 }
                 // Hermes-class codec boards carry mic_boost (C2[0]) and
                 // mic_linein (C2[1]) on this 0x12 frame — Thetis
-                // networkproto1.c:581, piHPSDR old_protocol.c:2154-2156. HL2
-                // has no stream codec and routes mic/line through the 0x14
-                // frame instead, so it is excluded here. Both default false so
+                // networkproto1.c:581, piHPSDR old_protocol.c:2154-2156. HL2+
+                // mic boost is handled above; its AK4951 has no host-selectable
+                // line input. Both default false so
                 // an operator who never touches the audio panel emits the same
                 // bytes as today (byte-identical default-unsent).
                 else if (state.Board != HpsdrBoardKind.HermesLite2)
@@ -849,7 +854,10 @@ internal static class ControlFrame
                 // normal relay/aux contribution while the sweep is active.
                 if (s.VnaFixedRxGainHigh) c3 |= 1 << 2;
             }
-            else if (s.EnableHl2BandVolts) c3 |= 1 << 3;
+            // AK4951 gateware reuses DATA[11] for the speaker amplifier.
+            // Preserve the independent Band Volts request; PCM routing/mute
+            // remains authoritative when this shared bit keeps the amp on.
+            else if (s.EnableHl2BandVolts || (s.Hl2CodecInstalled && s.EnableHl2CodecSpeaker)) c3 |= 1 << 3;
         }
         else
         {
@@ -1124,8 +1132,8 @@ internal static class ControlFrame
         // EP2 504-byte payload = 63 groups × 8 bytes, each group =
         // [L_audio s16 BE][R_audio s16 BE][I s16 BE][Q s16 BE]
         // (both the audio ring fill and the IQ ring fill write into the same
-        // 8-byte slot). HL2 has no audio codec in the MVP target, so audio
-        // bytes stay zero. The LSB of I and Q low bytes is masked off
+        // 8-byte slot). Ordinary HL2 has no codec; the optional HL2+ uses
+        // these same L/R slots. The LSB of I and Q low bytes is masked off
         // (`isample & 0xFE`) — originally an HL2 CWX workaround; harmless
         // ≤1 LSB precision loss on other Protocol-1 boards.
         //
@@ -1143,8 +1151,8 @@ internal static class ControlFrame
             // jacks (faithful to Thetis, which sends RX audio inline on EP2).
             // When no RX-audio source is plumbed, or the ring is empty, the L/R
             // slots stay zero — byte-identical to a radio that carries no audio.
-            // HL2 has no codec and ignores L/R; the host simply never feeds the
-            // ring for it, so this branch leaves the frame all-zero there too.
+            // The host feeds this ring for HL2 only when its optional HL2+
+            // codec is configured; ordinary HL2 keeps zero audio slots.
             if (rxAudioSource is not null) WriteRxAudioLr(frame[8..], rxAudioSource);
             return;
         }

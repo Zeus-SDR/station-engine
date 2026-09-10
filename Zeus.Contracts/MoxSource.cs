@@ -91,4 +91,6 @@ public enum MoxSource : byte
     /// and releases only its own carrier, preserving UI as the master
     /// override and keeping CAT/TCI/hardware keying isolated.</summary>
     Analyzer = 11,
+    /// <summary>An explicitly requested HL2 IO Board antenna-tuner cycle.</summary>
+    Hl2IoBoard = 12,
 }

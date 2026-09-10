@@ -247,6 +247,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<CwEngine>();
         services.AddSingleton<CwDecoderService>();
         services.AddSingleton<ExternalPttService>();
+        services.AddHl2IoBoard();
         services.AddSingleton<SerialPttService>();
         services.AddSingleton<NativeMicCapture>();
         services.AddSingleton<IAsioSessionFactory, AsioSessionFactory>();
