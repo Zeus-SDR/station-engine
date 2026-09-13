@@ -82,7 +82,14 @@ public static class ReplyParser
         var numReceivers = raw[20];
         var betaVersion = raw.Length > 23 ? raw[23] : (byte)0;
 
-        var board = MapBoard(rawBoardId);
+        // EU1SW's published Brick 2 16-bit v12.0 uses the 0x06 identifier
+        // with a separate DAC, onboard codec, and DDC0/1. Match its documented
+        // signature only; other 0x06 firmware and P1 classification stay intact.
+        // Source and archive checksum: docs/research/brick2-support-audit.md.
+        bool publishedBrick2 = rawBoardId == 0x06 && protocolSupported == 38
+            && codeVersion == 120 && numReceivers == 2
+            && raw[21] == 1 && raw[22] == 0 && betaVersion == 0;
+        var board = publishedBrick2 ? HpsdrBoardKind.Hermes : MapBoard(rawBoardId);
         var firmwareString = FormatFirmware(codeVersion, betaVersion);
 
         var details = new DiscoveryDetails(

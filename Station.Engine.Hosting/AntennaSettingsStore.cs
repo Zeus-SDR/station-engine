@@ -33,6 +33,13 @@ namespace Zeus.Server;
 
 public sealed class AntennaSettingsStore : IDisposable
 {
+    /// <summary>
+    /// Dedicated antenna route used whenever a transverter profile is active.
+    /// It is deliberately not an HF band: every transverter profile shares
+    /// this one physical IF route.
+    /// </summary>
+    public const string XvtrBand = "Xvtr";
+
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<AntennaBandEntry> _bands;
@@ -74,7 +81,10 @@ public sealed class AntennaSettingsStore : IDisposable
         }
     }
 
-    /// <summary>All HF bands, missing rows defaulting to ANT1/ANT1/None.</summary>
+    /// <summary>
+    /// All HF bands plus the dedicated transverter route, with missing rows
+    /// defaulting to ANT1/ANT1/None.
+    /// </summary>
     public IReadOnlyList<AntennaBandSelection> GetAll()
     {
         lock (_sync)
@@ -84,9 +94,15 @@ public sealed class AntennaSettingsStore : IDisposable
                 .Select(b => existing.TryGetValue(b, out var e)
                     ? new AntennaBandSelection(b, ClampAnt(e.TxAnt), ClampAnt(e.RxAnt), ClampAux(e.RxAux))
                     : new AntennaBandSelection(b, HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None))
+                .Append(existing.TryGetValue(XvtrBand, out var xvtr)
+                    ? new AntennaBandSelection(XvtrBand, ClampAnt(xvtr.TxAnt), ClampAnt(xvtr.RxAnt), ClampAux(xvtr.RxAux))
+                    : new AntennaBandSelection(XvtrBand, HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None))
                 .ToArray();
         }
     }
+
+    public static bool IsConfigurableBand(string band) =>
+        BandUtils.HfBands.Contains(band) || string.Equals(band, XvtrBand, StringComparison.Ordinal);
 
     /// <summary>Upsert one band's antenna selection. Invalid band names are
     /// rejected by the caller; here we narrow to the HF set defensively.</summary>
@@ -100,7 +116,7 @@ public sealed class AntennaSettingsStore : IDisposable
     /// hydrate RxAux as 0 = None.</summary>
     public void SetBand(string band, HpsdrAntenna txAnt, HpsdrAntenna rxAnt, RxAuxInputSel rxAux)
     {
-        if (!BandUtils.HfBands.Contains(band)) return;
+        if (!IsConfigurableBand(band)) return;
         lock (_sync)
         {
             var existing = _bands.FindOne(x => x.Band == band);

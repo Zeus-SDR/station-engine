@@ -223,9 +223,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private Socket? _sock;
     private string _boundNicDisplay = "(none)";
     private string _rejectedBindNicDisplays = "(none)";
-    // One gate for every datagram written through the shared P2 socket. Besides
-    // preserving packet boundaries, this makes Poll(write) + SendTo atomic with
-    // respect to the command, TX-IQ, and speaker sender threads.
+    // Serialize command and speaker datagrams so their Poll(write) + SendTo
+    // pairs remain atomic. The 800 Hz TX-IQ stream bypasses this gate: waiting
+    // behind a descheduled control sender can drain the radio's small TX FIFO.
+    // UDP SendTo preserves each datagram boundary, and TX-IQ retries actual
+    // socket backpressure in SendTxIqDatagram.
     private readonly object _udpSendGate = new();
     internal delegate int DatagramSink(ReadOnlySpan<byte> packet, IPEndPoint endpoint, bool requireImmediate);
     internal DatagramSink? DatagramSinkForTesting { get; set; }
@@ -564,10 +566,6 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // sender. 32 packets is about 40 ms at 800 packets/s, enough for normal
     // WDSP bursts but too small to become audible delayed speech.
     private const int TxIqMaxQueuedPackets = 32;
-    // Internal command contention must not discard a 1.25 ms piece of speech
-    // after just 2 ms. Bound lock admission by the existing live-audio backlog,
-    // while polling the TX revision every millisecond so unkey can cancel it.
-    private const int TxIqGateWaitMs = TxIqMaxQueuedPackets * TxIqSamplesPerPacket * 1000 / (int)TxDacSampleRate;
     private readonly float[] _txIqScratch = new float[TxIqSamplesPerPacket * 2];
     private int _txIqScratchCount;
     private long _txIqScratchRevision;
@@ -588,7 +586,6 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqPacketsInFlight;
     private long _txIqQueueWriteFailures;
     private long _txIqSendFailures;
-    private long _txIqGateBusy;
     private long _txIqNotWritable;
     private long _txIqSocketErrors;
     private long _txIqSocketMaxTicks;
@@ -725,20 +722,19 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         long socketStarted = 0;
         try
         {
-            // Speaker and TX IQ have dedicated sender workers. Checking socket
-            // readiness only after waiting for another sender still stalls
-            // those workers during command/socket congestion.
-            if (requireImmediate)
+            // Speaker egress has a dedicated worker but remains serialized with
+            // commands. TX IQ has only about 6.5 ms of modeled radio-FIFO
+            // headroom, so it cannot wait behind this control-plane gate.
+            if (!txIq && requireImmediate)
             {
                 if (!Monitor.TryEnter(_udpSendGate))
                 {
-                    if (txIq) Interlocked.Increment(ref _txIqGateBusy);
                     admissionRejected = true;
                     throw new SocketException((int)SocketError.WouldBlock);
                 }
                 gateTaken = true;
             }
-            else
+            else if (!txIq)
             {
                 Monitor.Enter(_udpSendGate, ref gateTaken);
             }
@@ -750,8 +746,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             // the whole shared socket non-blocking just for speaker egress.
             // High-rate speaker/TX-IQ writers require immediate readiness;
             // sparse critical commands may wait up to the bounded SendTimeout.
-            // With all Zeus sends serialized by this gate, another sender
-            // cannot consume the available buffer between Poll and the write.
+            // The TX-IQ retry loop handles backpressure if a concurrent command
+            // consumes socket capacity between this Poll and the write.
             if (txIq) socketStarted = Stopwatch.GetTimestamp();
             if (requireImmediate && !(DatagramReadyForTesting?.Invoke()
                 ?? socket?.Poll(0, SelectMode.SelectWrite) ?? true))
@@ -2434,7 +2430,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                 long socketUs = TxIqSendTiming.Microseconds(Interlocked.Exchange(ref _txIqSocketMaxTicks, 0));
                                 _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps} inputWaitUsMax={InputUs} pacingUsMax={PacingUs} sendGateUsMax={SendGateUs} datagramUsMax={DatagramUs} socketUsMax={SocketUs}",
                                     rateCount, fifoSamples, Interlocked.Read(ref _txIqSendFailures),
-                                    _txIqSuppressedSendWarnings, Interlocked.Read(ref _txIqGateBusy),
+                                    _txIqSuppressedSendWarnings, 0L,
                                     Interlocked.Read(ref _txIqNotWritable), Interlocked.Read(ref _txIqSocketErrors),
                                     Interlocked.Read(ref _txIqSafetyRejected), Interlocked.Read(ref _txIqStaleQueueDrops),
                                     timing.MaxGapUs, timing.GapsOver10Ms,
@@ -2498,20 +2494,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     internal bool SendTxIqDatagram(ReadOnlySpan<byte> packet, IPEndPoint endpoint, ref double fifoSamples,
         long safetyRevision = 0)
     {
-        // Wait for internal serialization without throwing on each lock miss.
-        // The short retry below is reserved for actual socket backpressure;
-        // a control thread being descheduled is not a failed network write.
+        // TX IQ bypasses command serialization so a descheduled control sender
+        // cannot empty the radio FIFO. Retry only actual socket backpressure.
         long retryDeadline = 0;
         SpinWait retryWait = default;
         while (true)
         {
             if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
-            if (!EnterTxDatagramGate(safetyRevision)) return false;
             try
             {
-                // Unkey may have invalidated the packet while the command
-                // owned the gate. Recheck after admission, before Poll/SendTo.
-                if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
                 SendDatagram(packet, endpoint, requireImmediate: true);
                 break;
             }
@@ -2524,27 +2515,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 else if (now >= retryDeadline)
                     throw;
             }
-            finally { Monitor.Exit(_udpSendGate); }
             retryWait.SpinOnce(sleep1Threshold: -1);
         }
         // Failed sends leave the radio FIFO unchanged. Counting dropped
         // packets would delay recovery while waiting on imaginary samples.
         fifoSamples += TxIqSamplesPerPacket;
         return true;
-    }
-
-    private bool EnterTxDatagramGate(long safetyRevision)
-    {
-        if (Monitor.TryEnter(_udpSendGate)) return true;
-        Interlocked.Increment(ref _txIqGateBusy);
-        long started = Stopwatch.GetTimestamp();
-        while (true)
-        {
-            if (!(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return false;
-            if (Stopwatch.GetElapsedTime(started).TotalMilliseconds >= TxIqGateWaitMs)
-                throw new SocketException((int)SocketError.WouldBlock);
-            if (Monitor.TryEnter(_udpSendGate, millisecondsTimeout: 1)) return true;
-        }
     }
 
     private void SendCmdGeneral()
@@ -3725,7 +3701,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // the non-PS path even when PS is "armed" upstream. Byte-for-byte
         // unchanged on the dual-ADC OrionMkII/Saturn/G2 family.
         bool psWire = ComposesPsFeedbackWire(_psFeedbackEnabled, _boardKind);
-        var p = ComposeCmdTxBuffer(_seqCmdTx++, (ushort)_sampleRateKhz, _txStepAttnDb, _paEnabled, psWire, _micControl, _lineInGain, cw);
+        // The TX IQ sender runs at a fixed DAC rate, independently of RX decimation.
+        var p = ComposeCmdTxBuffer(_seqCmdTx++, (ushort)(TxDacSampleRate / 1000), _txStepAttnDb, _paEnabled, psWire, _micControl, _lineInGain, cw);
         SendCommandPacket(p, 1026);
     }
 
@@ -3777,7 +3754,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // saturnmain.c::saturn_handle_duc_specific:
     //   bytes 0..3   : sequence (BE)
     //   byte  4      : num_dac (1 on G2)
-    //   bytes 14..15 : DAC sample rate kHz (BE) — Zeus-only; Saturn ignores
+    //   bytes 14..15 : DAC sample rate kHz (BE), as in Thetis; Saturn ignores
     //   byte  57     : reserved on Saturn (FPGA does not read)
     //   byte  58     : ADC1 TX step attenuator (TX-DAC reference loopback)
     //   byte  59     : ADC0 TX step attenuator (PA-coupler feedback)

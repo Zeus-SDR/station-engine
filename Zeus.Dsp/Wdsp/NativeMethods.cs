@@ -532,6 +532,30 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int RNNRmodelLoaded();
 
+    // NNR — neural noise reduction added upstream in WDSP 2.10.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRPosition(int channel, int position);
+
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int SetRXANNRModel(int channel, int slot);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRMaskFloor(int channel, double floorDb);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRAlpha(int channel, double alpha);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRAlphaKnee(int channel, double kneeDb);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRTau(int channel, double tauSeconds);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRMaxGain(int channel, double maxGainDb);
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXANNRSmooth(int channel, double attackMs, double releaseMs);
+
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXASNBARun(int channel, int run);

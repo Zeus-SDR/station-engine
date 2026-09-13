@@ -144,8 +144,9 @@ public static class RadioHardwareEndpoints
             Results.Ok(radio.ResetRfFilterSettings()));
 
         // External antenna ports (external-ports plan — antenna slice, #804).
-        // GET returns the per-band TX/RX antenna + RX-aux selection plus the
-        // board-capability gates the frontend renders the right selectors from.
+        // GET returns the per-band and shared-transverter TX/RX antenna + RX-aux
+        // selections plus the board-capability gates the frontend renders the
+        // right selectors from.
         // Antenna state is server-authoritative and NEVER enters StateDto.
         endpoints.MapGet("/api/radio/antenna", (RadioService radio, AntennaSettingsStore store) =>
         {
@@ -175,7 +176,7 @@ public static class RadioHardwareEndpoints
         {
             if (req is null || string.IsNullOrWhiteSpace(req.Band))
                 return Results.BadRequest(new { error = "band required" });
-            if (!BandUtils.HfBands.Contains(req.Band))
+            if (!AntennaSettingsStore.IsConfigurableBand(req.Band))
                 return Results.BadRequest(new { error = $"unknown band '{req.Band}'" });
             if (!Enum.TryParse<HpsdrAntenna>(req.TxAnt, ignoreCase: true, out var txAnt))
                 return Results.BadRequest(new { error = $"unknown txAnt '{req.TxAnt}'" });

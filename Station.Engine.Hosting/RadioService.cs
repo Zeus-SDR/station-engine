@@ -1748,6 +1748,41 @@ public sealed class RadioService : IDisposable
 
     internal bool IsTransverterActive => ActiveTransverterSettings().Enabled;
 
+    private long _productPluginNativeFrequencyHz;
+    private readonly object _productPluginFrequencyConfigSync = new();
+
+    // Constrained native-channel TX must not translate its NCO using a
+    // transverter setting concurrently saved before its change callback runs.
+    // Held from admission through wire unkey; never persisted.
+    internal void SetProductPluginNativeFrequencyHold(long? frequencyHz)
+    {
+        if (frequencyHz is null)
+        {
+            // Clearing follows wire unkey and never competes with calibration
+            // admission. Do not acquire the config lock here: an ordinary TX
+            // trip can already hold radio state while calibration waits for it.
+            lock (_sync) Interlocked.Exchange(ref _productPluginNativeFrequencyHz, 0);
+            return;
+        }
+        lock (_productPluginFrequencyConfigSync)
+        lock (_sync) Interlocked.Exchange(ref _productPluginNativeFrequencyHz, frequencyHz.Value);
+    }
+
+    internal StateDto ReconcileProductPluginTxState(StateDto state) =>
+        Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0 ? Snapshot() : state;
+
+    // Zeus P1 shares its primary host frequency slot with TX. Serialize the final write with the
+    // channel hold, so a delayed RX setter cannot overwrite the admitted TX
+    // carrier after key-on. P2 has a separate DUC and reconciles its snapshot.
+    internal void PushPrimaryRadioFrequency(long frequencyHz)
+    {
+        lock (_sync)
+        {
+            long held = Interlocked.Read(ref _productPluginNativeFrequencyHz);
+            ActiveClient?.SetVfoAHz(held > 0 && _mox ? held : ToHardwareFrequencyHz(frequencyHz));
+        }
+    }
+
     internal bool TryResolveTransverterBand(long rfHz, out TransverterBandDto band)
     {
         var settings = ActiveTransverterSettings();
@@ -1764,6 +1799,8 @@ public sealed class RadioService : IDisposable
     /// </summary>
     internal long ToHardwareFrequencyHz(long rfHz)
     {
+        if (Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
+            return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
         var settings = ActiveTransverterSettings();
         if (!settings.Enabled)
             return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
@@ -1821,12 +1858,14 @@ public sealed class RadioService : IDisposable
     private void OnTransverterSettingsChanged()
     {
         var current = Snapshot();
+        RevalidateTransverterChange(current);
+        current = Snapshot();
         if (!IsExternalFrequencyAvailable(current.VfoHz, allowZero: true))
         {
             SetVfo(current.VfoHz, fromExternal: true);
             return;
         }
-        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(current.RadioLoHz));
+        PushPrimaryRadioFrequency(current.RadioLoHz);
         RecomputePaAndPush();
         StateChanged?.Invoke(current);
     }
@@ -1835,6 +1874,8 @@ public sealed class RadioService : IDisposable
     {
         if (!string.Equals(radioKey, ConnectedBoardKind.ToString(), StringComparison.Ordinal))
             return;
+        var before = Snapshot();
+        RevalidateTransverterChange(before);
         if (enabled && TryPromoteActiveTransverterIfToRf())
             return;
         var current = Snapshot();
@@ -1843,9 +1884,29 @@ public sealed class RadioService : IDisposable
             SetVfo(current.VfoHz, fromExternal: true);
             return;
         }
-        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(current.RadioLoHz));
+        PushPrimaryRadioFrequency(current.RadioLoHz);
         RecomputePaAndPush();
         StateChanged?.Invoke(current);
+    }
+
+    private void RevalidateTransverterChange(StateDto state)
+    {
+        bool constrained = Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0;
+        try { TransmitSafetyStateChanging?.Invoke(state, state); }
+        catch (TransmitSafetyRejectedException ex)
+        {
+            ex.CompleteAfterStateUnlock();
+            // The settings were already saved before their change notification.
+            // Once the fixed-channel key is fully down, finish applying those
+            // settings to RX. A contested/pending transition still throws.
+            if (!constrained || !CanApplyTransverterAfterChannelTrip()) throw;
+        }
+    }
+
+    private bool CanApplyTransverterAfterChannelTrip()
+    {
+        lock (_sync)
+            return _productPluginNativeFrequencyHz == 0 && !_mox && !_tunActive;
     }
 
     /// <summary>
@@ -1938,7 +1999,7 @@ public sealed class RadioService : IDisposable
             out bool applied);
         if (applied)
         {
-            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(radioLoHz));
+            PushPrimaryRadioFrequency(radioLoHz);
             RecomputePaAndPush();
         }
         return applied;
@@ -2030,7 +2091,7 @@ public sealed class RadioService : IDisposable
                 ThrowIfPaCalibrationInvariantMutation("RX1 DDS");
                 return s with { VfoHz = vfoHz, RadioLoHz = ddsHz };
             });
-            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(ddsHz));
+            PushPrimaryRadioFrequency(ddsHz);
             if (RuntimeBandKey(before.VfoHz) != RuntimeBandKey(vfoHz))
                 RecomputePaAndPush();
             return Snapshot();
@@ -2403,7 +2464,7 @@ public sealed class RadioService : IDisposable
                 },
                 r => r with { VfoHz = oldA });
         });
-        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(CwOffset.EffectiveLoHz(mode, newA)));
+        PushPrimaryRadioFrequency(CwOffset.EffectiveLoHz(mode, newA));
         if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
         {
             RecomputePaAndPush();
@@ -2519,7 +2580,7 @@ public sealed class RadioService : IDisposable
                 ThrowIfPaCalibrationInvariantMutation("VFO");
             return s with { VfoHz = clamped, RadioLoHz = radioLoNew };
         });
-        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(radioLoNew));
+        PushPrimaryRadioFrequency(radioLoNew);
         // Band edge crossed? Per-band PA gain / OC bits may have swapped — push
         // the new snapshot before the next TX frame ships. Cheap when no
         // crossing occurred (same bytes re-pushed). Also recall the new band's
@@ -2546,11 +2607,19 @@ public sealed class RadioService : IDisposable
 
     internal bool RestoreVfoIfCurrent(long hz, long expectedCurrent)
     {
-        lock (_sync)
+        try
         {
-            if (_state.VfoHz != expectedCurrent) return false;
-            SetPaCalibrationVfo(hz);
-            return true;
+            lock (_sync)
+            {
+                if (_state.VfoHz != expectedCurrent) return false;
+                SetPaCalibrationVfo(hz);
+                return true;
+            }
+        }
+        catch (TransmitSafetyRejectedException ex)
+        {
+            CompleteRejectedStateChange(ex);
+            throw;
         }
     }
 
@@ -2735,7 +2804,7 @@ public sealed class RadioService : IDisposable
         long previous;
         lock (_sync) { previous = _state.RadioLoHz; }
         Mutate(s => s with { RadioLoHz = clamped });
-        ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(clamped));
+        PushPrimaryRadioFrequency(clamped);
         if (RuntimeBandKey(previous) != RuntimeBandKey(clamped))
         {
             RecomputePaAndPush();
@@ -3105,14 +3174,22 @@ public sealed class RadioService : IDisposable
 
     internal bool RestoreModeIfCurrent(RxMode mode, RxMode expectedCurrent)
     {
-        lock (_sync)
+        try
         {
-            if (_state.Mode != expectedCurrent) return false;
-            long preservedVfoHz = _state.VfoHz;
-            SetPaCalibrationMode(mode);
-            if (_state.VfoHz != preservedVfoHz)
-                SetPaCalibrationVfo(preservedVfoHz);
-            return true;
+            lock (_sync)
+            {
+                if (_state.Mode != expectedCurrent) return false;
+                long preservedVfoHz = _state.VfoHz;
+                SetPaCalibrationMode(mode);
+                if (_state.VfoHz != preservedVfoHz)
+                    SetPaCalibrationVfo(preservedVfoHz);
+                return true;
+            }
+        }
+        catch (TransmitSafetyRejectedException ex)
+        {
+            CompleteRejectedStateChange(ex);
+            throw;
         }
     }
 
@@ -3235,7 +3312,7 @@ public sealed class RadioService : IDisposable
         // pushed via DspPipelineService.OnRadioStateChanged.
         if (!targetBAtSet)
         {
-            ActiveClient?.SetVfoAHz(ToHardwareFrequencyHz(CwOffset.EffectiveLoHz(mode, newVfoAHz)));
+            PushPrimaryRadioFrequency(CwOffset.EffectiveLoHz(mode, newVfoAHz));
             // Entering/leaving CW toggles the P2 internal keyer (TxSpecific
             // byte-5 CW-select). Re-push so a paddle keys the radio the moment
             // the operator is in CW, and the bit clears on the way back to
@@ -4394,6 +4471,8 @@ public sealed class RadioService : IDisposable
             }
         }
         if (on) AlignLoForTx();
+        if (on && Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
+            PushPrimaryRadioFrequency(Interlocked.Read(ref _productPluginNativeFrequencyHz));
         ActiveClient?.SetMox(on);
         MoxChanged?.Invoke(on);
         if (!on) RestoreLoAfterTx();
@@ -5308,6 +5387,20 @@ public sealed class RadioService : IDisposable
     /// </summary>
     public double SetFrequencyCorrectionFactor(double factor)
     {
+        // Clock calibration changes the NCO even though no dial/mode state
+        // changes. Serialize the entire write-through with fixed-channel
+        // admission, and refuse before touching storage or either protocol.
+        lock (_productPluginFrequencyConfigSync)
+        {
+            if (Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
+                throw new TransmitSafetyRejectedException(
+                    "Frequency calibration cannot change during a fixed-channel audio transmission.");
+            return SetFrequencyCorrectionFactorCore(factor);
+        }
+    }
+
+    private double SetFrequencyCorrectionFactorCore(double factor)
+    {
         if (double.IsNaN(factor) || double.IsInfinity(factor))
             throw new ArgumentException("factor must be a finite real number", nameof(factor));
         double clamped = Math.Clamp(factor, 0.9999, 1.0001);
@@ -5378,7 +5471,7 @@ public sealed class RadioService : IDisposable
         var cfg = _paStore.GetAll(EffectiveBoardKind, EffectiveOrionMkIIVariant);
         var txHz = RadioFrequencyResolver.TxFrequencyHz(stateSnap);
         bool txThroughTransverter = TryResolveTransverterBand(txHz, out var txXvtrBand);
-        bool rxThroughTransverter = TryResolveTransverterBand(stateSnap.VfoHz, out var rxXvtrBand);
+        bool rxThroughTransverter = TryResolveTransverterBand(stateSnap.VfoHz, out _);
         bool xvtrOutputEnabled = txThroughTransverter && txXvtrBand.DisablePa;
         long hardwareTxHz = ToHardwareFrequencyHz(txHz);
         var bandName = BandUtils.FreqToBand(hardwareTxHz);
@@ -5444,8 +5537,8 @@ public sealed class RadioService : IDisposable
         ActiveClient?.SetXvtrEnabled(xvtrOutputEnabled);
 
         // ---- External-antenna resolution (antenna slice — #804) ----
-        // Server-authoritative: resolve the active band's persisted TX/RX
-        // antenna + RX-aux, gate the aux against the connected board's
+        // Server-authoritative: resolve the active HF band's or shared
+        // transverter route's persisted TX/RX antenna + RX-aux, gate the aux against the connected board's
         // capability set (HL2's None collapses any stale value), and push.
         // P1 RX-antenna goes straight to the active client; P2 (TX antenna +
         // RX-aux state-mux) rides the PaRuntimeSnapshot into
@@ -5453,31 +5546,27 @@ public sealed class RadioService : IDisposable
         // and defers any mid-key relay change to the unkey edge; PS owns the
         // K36/BYPASS relay while armed regardless of an aux=BYPASS pick.
         var caps = BoardCapabilitiesTable.For(ConnectedBoardKind, EffectiveOrionMkIIVariant);
-        var txAntSel = (_antennaStore is not null && bandName is not null)
-            ? _antennaStore.GetBand(bandName)
-            : new AntennaBandSelection(bandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+        var defaultAntSel = new AntennaBandSelection(
+            bandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+        var xvtrAntSel = _antennaStore?.GetBand(AntennaSettingsStore.XvtrBand) ?? defaultAntSel;
+        var txAntSel = txThroughTransverter
+            ? xvtrAntSel
+            : (_antennaStore is not null && bandName is not null
+                ? _antennaStore.GetBand(bandName)
+                : defaultAntSel);
         long hardwareRxHz = ToHardwareFrequencyHz(stateSnap.VfoHz);
         string? rxBandName = BandUtils.FreqToBand(hardwareRxHz);
-        var rxAntSel = (_antennaStore is not null && rxBandName is not null)
-            ? _antennaStore.GetBand(rxBandName)
-            : new AntennaBandSelection(rxBandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+        var rxAntSel = rxThroughTransverter
+            ? xvtrAntSel
+            : (_antennaStore is not null && rxBandName is not null
+                ? _antennaStore.GetBand(rxBandName)
+                : new AntennaBandSelection(
+                    rxBandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None));
         var antSel = txAntSel with
         {
             RxAnt = rxAntSel.RxAnt,
             RxAux = rxAntSel.RxAux,
         };
-        if (rxThroughTransverter && rxXvtrBand.RxAntenna != TransverterRxAntenna.Default)
-        {
-            antSel = antSel with
-            {
-                RxAnt = rxXvtrBand.RxAntenna switch
-                {
-                    TransverterRxAntenna.Ant2 => HpsdrAntenna.Ant2,
-                    TransverterRxAntenna.Ant3 => HpsdrAntenna.Ant3,
-                    _ => HpsdrAntenna.Ant1,
-                },
-            };
-        }
         int rxAuxWire = GateRxAux(antSel.RxAux, caps.RxAuxInputs);
         // P1: RX-antenna relay (C3[7:5], HL2-clamped at the wire). ActiveClient
         // is null on P2 — the P2 RX-antenna rides the SetAntennas path below.
@@ -5698,7 +5787,7 @@ public sealed class RadioService : IDisposable
         IsSupportedNrMode(cfg.NrMode) ? cfg : cfg with { NrMode = NrMode.Off };
 
     private static bool IsSupportedNrMode(NrMode mode) =>
-        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr;
+        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr or NrMode.Nnr;
 
     // AGC mode + custom/fixed params. Replace-style like SetNr; the engine apply
     // happens in DspPipelineService via the _appliedAgc latch. The separate AGC
@@ -6445,31 +6534,47 @@ public sealed class RadioService : IDisposable
     private void Mutate(Func<StateDto, StateDto?> fn, out bool applied)
     {
         StateDto? next;
-        lock (_sync)
+        try
         {
-            next = fn(_state);
-            if (next is null)
+            lock (_sync)
             {
-                applied = false;
-                return;
+                next = fn(_state);
+                if (next is null)
+                {
+                    applied = false;
+                    return;
+                }
+                // Project the canonical per-receiver array from the flat RX1/RX2
+                // fields on every mutation so StateChanged subscribers and the
+                // SignalR broadcast always carry an up-to-date Receivers[] (wire
+                // v2). Pure function of the flat fields — cheap (1–2 elements).
+                next = next with
+                {
+                    Receivers = ProjectReceivers(next),
+                    MaxReceivers = EffectiveMaxReceivers,
+                    ConnectedProtocol = ConnectedProtocolLocked(),
+                };
+                TransmitSafetyStateChanging?.Invoke(_state, next);
+                _state = next;
+                _currentMode = (int)next.Mode;
             }
-            // Project the canonical per-receiver array from the flat RX1/RX2
-            // fields on every mutation so StateChanged subscribers and the
-            // SignalR broadcast always carry an up-to-date Receivers[] (wire
-            // v2). Pure function of the flat fields — cheap (1–2 elements).
-            next = next with
-            {
-                Receivers = ProjectReceivers(next),
-                MaxReceivers = EffectiveMaxReceivers,
-                ConnectedProtocol = ConnectedProtocolLocked(),
-            };
-            TransmitSafetyStateChanging?.Invoke(_state, next);
-            _state = next;
-            _currentMode = (int)next.Mode;
+        }
+        catch (TransmitSafetyRejectedException ex)
+        {
+            CompleteRejectedStateChange(ex);
+            throw;
         }
         applied = true;
         _stateDirty = true;
         StateChanged?.Invoke(next);
+    }
+
+    private void CompleteRejectedStateChange(TransmitSafetyRejectedException rejection)
+    {
+        // Conditional VFO/mode restores hold an outer state lock around their
+        // setters. Let that outer caller finish unwinding before running DSP
+        // teardown; completion is consumed once at the outermost boundary.
+        if (!Monitor.IsEntered(_sync)) rejection.CompleteAfterStateUnlock();
     }
 
     // Patch the authoritative RX2 (index 1) entry inside a StateDto's Receivers

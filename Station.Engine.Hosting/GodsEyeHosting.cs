@@ -6,10 +6,12 @@ using Microsoft.AspNetCore.Mvc;
 
 #if ZEUS_PRODUCT_HOST
 using Zeus.Product.Hosting.GodsEye;
+using Zeus.Product.Hosting.Aprs;
 using SharedDatabase = Zeus.Product.Hosting.Data.SharedLiteDatabase;
 namespace Zeus.Product.Hosting;
 #else
 using Zeus.Server.GodsEye;
+using Zeus.Server.Aprs;
 using SharedDatabase = Zeus.Data.SharedLiteDatabase;
 namespace Zeus.Server;
 #endif
@@ -78,6 +80,14 @@ public static class GodsEyeHosting
         services.AddSingleton(provider => new GodsEyeFeatureGate(
             () => featureEnabled?.Invoke(provider) ?? false));
         services.AddSingleton<IAisStreamClient, AisStreamClient>();
+        services.AddSingleton(provider => new AprsSettingsStore(provider.GetRequiredService<GodsEyeDatabaseLease>().Database));
+        services.AddSingleton<IAprsConnector, AprsConnector>();
+        services.AddSingleton(provider => new AprsTrackingService(
+            provider.GetRequiredService<AprsSettingsStore>(), provider.GetRequiredService<IAprsConnector>(),
+            provider.GetRequiredService<GodsEyeViewerRegistry>(),
+            new GodsEyeFeatureGate(() => featureEnabled?.Invoke(provider) ?? true),
+            provider.GetRequiredService<ILogger<AprsTrackingService>>(), provider.GetService<TimeProvider>()));
+        services.AddHostedService(provider => provider.GetRequiredService<AprsTrackingService>());
         services.AddSingleton(provider => new SatelliteTrackingService(
             provider.GetRequiredService<IHttpClientFactory>(),
             provider.GetRequiredService<SatelliteSettingsStore>(),
@@ -118,6 +128,12 @@ public static class GodsEyeHosting
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
+        endpoints.MapGet("/api/godseye/aprs", (AprsTrackingService aprs, string? track, string? cursor) => Results.Ok(aprs.Snapshot(track, cursor)));
+        endpoints.MapPut("/api/godseye/aprs/settings", (AprsSettings request, AprsSettingsStore store) =>
+        {
+            try { return Results.Ok(store.Set(request)); }
+            catch (ArgumentException exception) { return Results.BadRequest(new { error = exception.Message }); }
+        });
         endpoints.MapGet("/api/godseye/satellites",
             (SatelliteTrackingService satellites, GodsEyeSettingsStore settings, [FromServices] GodsEyeFallbackGrid fallback) =>
                 Results.Ok(satellites.GetPositions(

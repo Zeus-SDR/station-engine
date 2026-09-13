@@ -145,6 +145,19 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         nameof(NativeMethods.RNNRloadModel),
     ];
 
+    private static readonly string[] NnrRequiredExports =
+    [
+        nameof(NativeMethods.SetRXANNRRun),
+        nameof(NativeMethods.SetRXANNRPosition),
+        nameof(NativeMethods.SetRXANNRModel),
+        nameof(NativeMethods.SetRXANNRMaskFloor),
+        nameof(NativeMethods.SetRXANNRAlpha),
+        nameof(NativeMethods.SetRXANNRAlphaKnee),
+        nameof(NativeMethods.SetRXANNRTau),
+        nameof(NativeMethods.SetRXANNRMaxGain),
+        nameof(NativeMethods.SetRXANNRSmooth),
+    ];
+
     private static readonly string[] EngineVersionRequiredExports =
     [
         nameof(NativeMethods.GetWDSPVersion),
@@ -168,6 +181,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public static bool Nr4SbnrAvailable => AllNativeExportsAvailable(SbnrRequiredExports);
 
     public static bool Nr3RnnrAvailable => AllNativeExportsAvailable(Nr3RnnrRequiredExports);
+
+    public static bool NnrAvailable => AllNativeExportsAvailable(NnrRequiredExports);
 
     /// <summary>
     /// The loaded libwdsp exports <c>GetWDSPVersion</c>. Older builds may not,
@@ -1452,6 +1467,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         switch (cfg.NrMode)
         {
             case NrMode.Anr:
+                TrySetNnrRun(channelId, 0);
                 NativeMethods.SetRXAEMNRRun(channelId, 0);
                 TrySetSbnrRun(channelId, 0);
                 TrySetRnnrRun(channelId, 0);
@@ -1461,6 +1477,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 break;
             case NrMode.Emnr:
                 NativeMethods.SetRXAANRRun(channelId, 0);
+                TrySetNnrRun(channelId, 0);
                 TrySetSbnrRun(channelId, 0);
                 TrySetRnnrRun(channelId, 0);
                 // Core EMNR algorithm selectors (gain method, NPE method, AE
@@ -1483,6 +1500,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // pre-dates Phase 1 (no SBNR exports) leaves the channel in
                 // NR-off rather than crashing the worker.
                 NativeMethods.SetRXAANRRun(channelId, 0);
+                TrySetNnrRun(channelId, 0);
                 TrySetEmnrPost2Run(channelId, 0);
                 NativeMethods.SetRXAEMNRRun(channelId, 0);
                 TrySetRnnrRun(channelId, 0);
@@ -1498,11 +1516,22 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // model is loaded, rnnr.c's create_rnnr left rnnoise_create
                 // NULL, so xrnnr passes audio through untouched — inert, safe.
                 NativeMethods.SetRXAANRRun(channelId, 0);
+                TrySetNnrRun(channelId, 0);
                 TrySetEmnrPost2Run(channelId, 0);
                 NativeMethods.SetRXAEMNRRun(channelId, 0);
                 TrySetSbnrRun(channelId, 0);
                 TrySetRnnrPosition(channelId, NrDefaults.Position);
                 TrySetRnnrRun(channelId, 1);
+                break;
+            case NrMode.Nnr:
+                NativeMethods.SetRXAANRRun(channelId, 0);
+                TrySetEmnrPost2Run(channelId, 0);
+                NativeMethods.SetRXAEMNRRun(channelId, 0);
+                TrySetSbnrRun(channelId, 0);
+                TrySetRnnrRun(channelId, 0);
+                TrySetNnrPosition(channelId, NrDefaults.Position);
+                ApplyNnr(channelId, cfg);
+                TrySetNnrRun(channelId, 1);
                 break;
             default:
                 NativeMethods.SetRXAANRRun(channelId, 0);
@@ -1510,6 +1539,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 NativeMethods.SetRXAEMNRRun(channelId, 0);
                 TrySetSbnrRun(channelId, 0);
                 TrySetRnnrRun(channelId, 0);
+                TrySetNnrRun(channelId, 0);
                 break;
         }
         state.CurrentNrMode = cfg.NrMode;
@@ -1767,6 +1797,35 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         try { NativeMethods.SetRXARNNRPosition(channelId, position); }
         catch (EntryPointNotFoundException) { /* libwdsp lacks NR3; position is moot */ }
+    }
+
+    private void TrySetNnrRun(int channelId, int run)
+    {
+        try { NativeMethods.SetRXANNRRun(channelId, run); }
+        catch (EntryPointNotFoundException) { /* pre-2.10 libwdsp; NNR is unavailable */ }
+    }
+
+    private void TrySetNnrPosition(int channelId, int position)
+    {
+        try { NativeMethods.SetRXANNRPosition(channelId, position); }
+        catch (EntryPointNotFoundException) { /* pre-2.10 libwdsp; position is moot */ }
+    }
+
+    private static void ApplyNnr(int channelId, NrConfig cfg)
+    {
+        try
+        {
+            NativeMethods.SetRXANNRModel(channelId, Math.Clamp(cfg.NnrModel ?? 0, 0, 1));
+            NativeMethods.SetRXANNRMaskFloor(channelId, Math.Clamp(cfg.NnrMaskFloorDb ?? -25.0, -60.0, 0.0));
+            NativeMethods.SetRXANNRAlpha(channelId, Math.Clamp(cfg.NnrAlpha ?? 1.0, 0.0, 4.0));
+            NativeMethods.SetRXANNRAlphaKnee(channelId, Math.Clamp(cfg.NnrKneeDb ?? 10.0, 0.0, 40.0));
+            NativeMethods.SetRXANNRTau(channelId, Math.Clamp(cfg.NnrTauSeconds ?? 2.0, 0.05, 30.0));
+            NativeMethods.SetRXANNRMaxGain(channelId, Math.Clamp(cfg.NnrMaxGainDb ?? 12.0, 0.0, 24.0));
+            NativeMethods.SetRXANNRSmooth(channelId,
+                Math.Clamp(cfg.NnrAttackMs ?? 0.0, 0.0, 500.0),
+                Math.Clamp(cfg.NnrReleaseMs ?? 0.0, 0.0, 500.0));
+        }
+        catch (EntryPointNotFoundException) { /* pre-2.10 libwdsp; NNR remains off */ }
     }
 
     // Loads (or, with a null/empty path, clears) the process-global RNNoise
@@ -4918,39 +4977,73 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private static void ApplySquelchLocked(ChannelState state)
     {
         int id = state.Id;
-        var cfg = state.CurrentSquelch;
-        int level = Math.Clamp(cfg.Level, 0, 100);
-        int run = ShouldRunFixedSquelch(cfg) ? 1 : 0;
+        // All squelch decisions (mode resolution, run flag, stage, threshold)
+        // come from the pure PlanFixedSquelch so there is no un-resolved path
+        // here to regress (issue #2101). This method is only native dispatch:
+        // everything off first, then the owning stage on.
+        var plan = PlanFixedSquelch(state.CurrentSquelch, MapRxaToRxMode(state.CurrentMode));
 
-        // Which stage owns this mode? Everything off first, then turn one on.
-        bool isAm = state.CurrentMode is RxaMode.AM or RxaMode.SAM;
-        bool isFm = state.CurrentMode == RxaMode.FM;
-        // SSB/CW family (USB, LSB, CWU, CWL, DIGU, DIGL) + anything else → SSQL.
-
-        if (isAm)
+        switch (plan.Stage)
         {
-            NativeMethods.SetRXASSQLRun(id, 0);
-            NativeMethods.SetRXAFMSQRun(id, 0);
-            NativeMethods.SetRXAAMSQThreshold(id, MapFixedAmsqThresholdDb(level, cfg.FixedSensitivity));
-            NativeMethods.SetRXAAMSQRun(id, run);
-        }
-        else if (isFm)
-        {
-            NativeMethods.SetRXASSQLRun(id, 0);
-            NativeMethods.SetRXAAMSQRun(id, 0);
-            NativeMethods.SetRXAFMSQThreshold(id, MapFixedFmsqThreshold(level, cfg.FixedSensitivity));
-            NativeMethods.SetRXAFMSQRun(id, run);
-        }
-        else
-        {
-            NativeMethods.SetRXAAMSQRun(id, 0);
-            NativeMethods.SetRXAFMSQRun(id, 0);
-            NativeMethods.SetRXASSQLThreshold(id, MapFixedSsqlThreshold(level, cfg.FixedSensitivity));
-            NativeMethods.SetRXASSQLRun(id, run);
+            case FixedSquelchStage.Amsq:
+                NativeMethods.SetRXASSQLRun(id, 0);
+                NativeMethods.SetRXAFMSQRun(id, 0);
+                NativeMethods.SetRXAAMSQThreshold(id, plan.Threshold);
+                NativeMethods.SetRXAAMSQRun(id, plan.Run);
+                break;
+            case FixedSquelchStage.Fmsq:
+                NativeMethods.SetRXASSQLRun(id, 0);
+                NativeMethods.SetRXAAMSQRun(id, 0);
+                NativeMethods.SetRXAFMSQThreshold(id, plan.Threshold);
+                NativeMethods.SetRXAFMSQRun(id, plan.Run);
+                break;
+            default:
+                NativeMethods.SetRXAAMSQRun(id, 0);
+                NativeMethods.SetRXAFMSQRun(id, 0);
+                NativeMethods.SetRXASSQLThreshold(id, plan.Threshold);
+                NativeMethods.SetRXASSQLRun(id, plan.Run);
+                break;
         }
     }
 
     private const double FixedSquelchMinCurve = 0.65;
+
+    // Which native fixed-squelch stage owns a given RX mode.
+    internal enum FixedSquelchStage { Ssql, Amsq, Fmsq }
+
+    // The full fixed-squelch decision ApplySquelchLocked dispatches on. Kept as
+    // a pure, testable function so the production call site (not just the ForMode
+    // seam) is covered: reverting the mode resolution here drops FMSQ on FM and
+    // turns the unit test red.
+    internal readonly record struct FixedSquelchPlan(FixedSquelchStage Stage, int Run, double Threshold);
+
+    // Resolve the effective config for the channel's mode, then pick the owning
+    // stage, run flag, and threshold. FM always uses the fixed FMSQ noise
+    // detector regardless of the stored Adaptive preference (issue #2101) — a
+    // web client that left Adaptive=true still gets a working FM squelch — while
+    // SSB/AM keep the operator's choice. SSB/CW/DIG/DSB families all map to SSQL.
+    internal static FixedSquelchPlan PlanFixedSquelch(SquelchConfig currentSquelch, RxMode mode)
+    {
+        var cfg = ResolveFixedSquelchForMode(currentSquelch, mode);
+        int level = Math.Clamp(cfg.Level, 0, 100);
+        int run = ShouldRunFixedSquelch(cfg) ? 1 : 0;
+        return mode switch
+        {
+            RxMode.AM or RxMode.SAM =>
+                new(FixedSquelchStage.Amsq, run, MapFixedAmsqThresholdDb(level, cfg.FixedSensitivity)),
+            RxMode.FM =>
+                new(FixedSquelchStage.Fmsq, run, MapFixedFmsqThreshold(level, cfg.FixedSensitivity)),
+            _ =>
+                new(FixedSquelchStage.Ssql, run, MapFixedSsqlThreshold(level, cfg.FixedSensitivity)),
+        };
+    }
+
+    // The mode resolution ApplySquelchLocked feeds to the native fixed stages:
+    // FM forces the fixed FMSQ detector regardless of the stored Adaptive
+    // preference (issue #2101), while SSB/AM keep the operator's choice. Exposed
+    // internally so tests exercise this seam instead of re-deriving ForMode.
+    internal static SquelchConfig ResolveFixedSquelchForMode(SquelchConfig currentSquelch, RxMode mode) =>
+        currentSquelch.ForMode(mode);
 
     internal static bool ShouldRunFixedSquelch(SquelchConfig cfg) =>
         cfg.Enabled && !cfg.Adaptive && Math.Clamp(cfg.Level, 0, 100) > 0;

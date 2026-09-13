@@ -718,6 +718,14 @@ public class DspPipelineService : BackgroundService,
 
     internal static double AdaptiveSquelchMarginDb() => AdaptiveSquelchOpenMarginDb;
 
+    // The exact config the managed adaptive gate acts on for a channel. FM must
+    // never run the adaptive audio-RMS gate — open FM hiss reads as high power,
+    // so the gate opens/closes backwards (issue #2101) — so ForMode neutralizes
+    // Adaptive in FM, leaving the managed gate fully open for WDSP's FMSQ to own
+    // the squelch. Exposed internally so this resolution is unit-testable.
+    internal static SquelchConfig ResolveManagedSquelchForMode(SquelchConfig? cfg, RxMode mode) =>
+        (cfg ?? new SquelchConfig()).ForMode(mode);
+
     private static double AdaptiveSquelchCloseHysteresisDb(double marginDb) =>
         Math.Clamp(marginDb * 0.5, 1.5, 4.0);
 
@@ -5117,6 +5125,7 @@ public class DspPipelineService : BackgroundService,
             {
                 NrMode.Rnnr when !wdspNr3RnnrAvailable || !nr3ModelActive => NrMode.Off.ToString(),
                 NrMode.Sbnr when !wdspNr4SbnrAvailable => NrMode.Off.ToString(),
+                NrMode.Nnr when !WdspDspEngine.NnrAvailable => NrMode.Off.ToString(),
                 _ => requestedNrMode,
             }
             : NrMode.Off.ToString();
@@ -5138,7 +5147,7 @@ public class DspPipelineService : BackgroundService,
         IsSupportedNrMode(cfg.NrMode) ? cfg : cfg with { NrMode = NrMode.Off };
 
     internal static bool IsSupportedNrMode(NrMode mode) =>
-        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Rnnr or NrMode.Sbnr;
+        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Rnnr or NrMode.Sbnr or NrMode.Nnr;
 
     internal static double EffectiveAgcGainDb(StateDto state) => Math.Clamp(
         RadioService.AgcBaseline(state) + state.AgcOffsetDb,
@@ -5567,6 +5576,9 @@ public class DspPipelineService : BackgroundService,
     {
         lock (_engineLock)
         {
+        // A queued pre-key snapshot must not retune the TX DUC or restore an
+        // older sideband while a fixed-channel audio lease owns transmission.
+        s = _radio.ReconcileProductPluginTxState(s);
         // FreeDV spec-profile override (see the AGC/TX-leveling pushes below):
         // gates those engine pushes to linear-friendly values while the operator's
         // stored config stays untouched for automatic restore on exit.
@@ -9579,7 +9591,12 @@ public class DspPipelineService : BackgroundService,
             }
             else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly))
             {
-                var squelch = state.Squelch ?? new SquelchConfig();
+                // FM squelch is owned by WDSP's FMSQ noise detector upstream;
+                // the managed adaptive audio-RMS gate is invalid for FM (open-
+                // channel hiss reads as high power). Resolve to the effective
+                // config so the gate stays fully open in FM instead of fighting
+                // FMSQ or gating on hiss.
+                var squelch = ResolveManagedSquelchForMode(state.Squelch, state.Mode);
                 UpdateAdaptiveSquelchMeter(
                     _adaptiveSquelch,
                     squelch,

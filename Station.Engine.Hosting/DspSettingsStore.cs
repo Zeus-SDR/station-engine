@@ -102,7 +102,11 @@ public sealed class DspSettingsStore : IDisposable
             EmnrNpeMethod: e.EmnrNpeMethod,
             EmnrAeRun: e.EmnrAeRun,
             EmnrTrainT1: e.EmnrTrainT1,
-            EmnrTrainT2: e.EmnrTrainT2);
+            EmnrTrainT2: e.EmnrTrainT2,
+            NnrModel: e.NnrModel, NnrMaskFloorDb: e.NnrMaskFloorDb,
+            NnrAlpha: e.NnrAlpha, NnrKneeDb: e.NnrKneeDb,
+            NnrTauSeconds: e.NnrTauSeconds, NnrMaxGainDb: e.NnrMaxGainDb,
+            NnrAttackMs: e.NnrAttackMs, NnrReleaseMs: e.NnrReleaseMs);
     }
 
     // CFC (Continuous Frequency Compressor) — issue #123. Persisted globally
@@ -594,6 +598,10 @@ public sealed class DspSettingsStore : IDisposable
                 Nr4PostFilterThreshold = config.Nr4PostFilterThreshold,
                 Nr4NoiseScalingType = config.Nr4NoiseScalingType,
                 Nr4Position = config.Nr4Position,
+                NnrModel = config.NnrModel, NnrMaskFloorDb = config.NnrMaskFloorDb,
+                NnrAlpha = config.NnrAlpha, NnrKneeDb = config.NnrKneeDb,
+                NnrTauSeconds = config.NnrTauSeconds, NnrMaxGainDb = config.NnrMaxGainDb,
+                NnrAttackMs = config.NnrAttackMs, NnrReleaseMs = config.NnrReleaseMs,
                 UpdatedUtc = DateTime.UtcNow,
             });
         }
@@ -622,6 +630,14 @@ public sealed class DspSettingsStore : IDisposable
             existing.Nr4PostFilterThreshold = config.Nr4PostFilterThreshold;
             existing.Nr4NoiseScalingType = config.Nr4NoiseScalingType;
             existing.Nr4Position = config.Nr4Position;
+            existing.NnrModel = config.NnrModel;
+            existing.NnrMaskFloorDb = config.NnrMaskFloorDb;
+            existing.NnrAlpha = config.NnrAlpha;
+            existing.NnrKneeDb = config.NnrKneeDb;
+            existing.NnrTauSeconds = config.NnrTauSeconds;
+            existing.NnrMaxGainDb = config.NnrMaxGainDb;
+            existing.NnrAttackMs = config.NnrAttackMs;
+            existing.NnrReleaseMs = config.NnrReleaseMs;
             existing.UpdatedUtc = DateTime.UtcNow;
             _entries.Update(existing);
         }
@@ -729,7 +745,7 @@ public sealed class DspSettingsStore : IDisposable
     // must persist every mode RadioService treats as supported, or the live
     // selection (e.g. NR3 / Rnnr) is silently dropped to Off on the next read.
     private static NrMode NormalizeNrMode(NrMode mode) =>
-        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr
+        mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr or NrMode.Nnr
             ? mode
             : NrMode.Off;
 
@@ -769,6 +785,14 @@ public sealed class DspSettingsEntry
     public double? Nr4PostFilterThreshold { get; set; }
     public int? Nr4NoiseScalingType { get; set; }
     public int? Nr4Position { get; set; }
+    public int? NnrModel { get; set; }
+    public double? NnrMaskFloorDb { get; set; }
+    public double? NnrAlpha { get; set; }
+    public double? NnrKneeDb { get; set; }
+    public double? NnrTauSeconds { get; set; }
+    public double? NnrMaxGainDb { get; set; }
+    public double? NnrAttackMs { get; set; }
+    public double? NnrReleaseMs { get; set; }
     // CFC (Continuous Frequency Compressor) — issue #123. Master flags are
     // nullable so legacy rows (pre-CFC) load with CfcEnabled=null and
     // GetCfc() returns null → operator gets CfcConfig.Default. Per-band

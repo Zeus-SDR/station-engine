@@ -210,7 +210,13 @@ public sealed record WorkedCallsignSummary(
     string? LastComment,
     IReadOnlyList<string> Bands,
     IReadOnlyList<string> Modes,
-    IReadOnlyList<WorkedCallsignRecentQso> RecentQsos);
+    IReadOnlyList<WorkedCallsignRecentQso> RecentQsos)
+{
+    public bool? CountryWorked { get; init; }
+    public bool? StateWorked { get; init; }
+    public bool? CountryQrzConfirmed { get; init; }
+    public bool? StateQrzConfirmed { get; init; }
+}
 
 public sealed record WorkedCallsignRecentQso(
     DateTime QsoDateTimeUtc,

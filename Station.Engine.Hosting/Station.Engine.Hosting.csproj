@@ -75,6 +75,7 @@
     <Compile Include="..\Zeus.Server.Hosting\GodsEye\GodsEyeViewerRegistry.cs" Link="GodsEye\GodsEyeViewerRegistry.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEyeFeedsService.cs" Link="GodsEye\GodsEyeFeedsService.cs" />
     <Compile Include="..\Zeus.Server.Hosting\GodsEyeSettingsStore.cs" Link="GodsEye\GodsEyeSettingsStore.cs" />
+    <Compile Include="..\Zeus.Server.Hosting\Aprs\*.cs" Link="Aprs\%(Filename)%(Extension)" />
     <Compile Include="..\Zeus.Server.Hosting\SatelliteSettingsStore.cs" Link="GodsEye\SatelliteSettingsStore.cs" />
     <Compile Include="..\Zeus.Server.Hosting\SatelliteTrackingService.cs" Link="GodsEye\SatelliteTrackingService.cs" />
     <Compile Include="..\Zeus.Server.Hosting\Satellites\*.cs" Link="GodsEye\Satellites\%(Filename)%(Extension)" />

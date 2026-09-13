@@ -510,7 +510,16 @@ internal static class TxEmissionEnvelopeResolver
     }
 }
 
-internal sealed class TransmitSafetyRejectedException(string message) : InvalidOperationException(message);
+internal sealed class TransmitSafetyRejectedException(string message, Action? afterStateUnlock = null)
+    : InvalidOperationException(message)
+{
+    private Action? _afterStateUnlock = afterStateUnlock;
+
+    // A rejected state must not commit, but its TX teardown may enter DSP.
+    // The radio invokes this once, after releasing its mutation lock.
+    internal void CompleteAfterStateUnlock() =>
+        Interlocked.Exchange(ref _afterStateUnlock, null)?.Invoke();
+}
 
 /// <summary>
 /// Revision token checked at the common P2/P3 egress and again immediately

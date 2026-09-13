@@ -140,7 +140,13 @@ public sealed record LogbookWorkedSummary(
     string? LastComment,
     IReadOnlyList<string> Bands,
     IReadOnlyList<string> Modes,
-    IReadOnlyList<LogbookWorkedRecentQso> RecentQsos);
+    IReadOnlyList<LogbookWorkedRecentQso> RecentQsos)
+{
+    public bool? CountryWorked { get; init; }
+    public bool? StateWorked { get; init; }
+    public bool? CountryQrzConfirmed { get; init; }
+    public bool? StateQrzConfirmed { get; init; }
+}
 
 public sealed record LogbookWorkedRecentQso(
     DateTime QsoDateTimeUtc,

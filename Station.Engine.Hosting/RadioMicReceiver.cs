@@ -81,13 +81,15 @@ internal sealed class RadioMicReceiver
     /// <summary>
     /// Decode one UDP-1026 packet (4-byte BE seq + 64 × int16 BE @ 48 kHz),
     /// append the 64 mono samples to the re-block accumulator, and forward every
-    /// full 960-sample block. The sequence header is skipped — gap detection is
-    /// not needed for TX audio (a dropped packet is a 1.3 ms silence the
-    /// accumulator simply doesn't see).
+    /// full 960-sample block. The sequence header is currently skipped;
+    /// missing packets are omitted from the reconstructed audio, without
+    /// inserting silence or detecting repeated and reordered packets.
     /// </summary>
     public void Accept(ReadOnlySpan<byte> packet)
     {
-        if (packet.Length < PacketBytes)
+        // Thetis network.c rejects any microphone datagram other than 132
+        // bytes. An oversized payload must not append its prefix to speech.
+        if (packet.Length != PacketBytes)
         {
             lock (_sync) _totalPacketsDropped++;
             return;

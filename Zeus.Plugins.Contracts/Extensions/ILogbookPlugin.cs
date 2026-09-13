@@ -38,3 +38,18 @@ public interface ILogbookPluginV2 : ILogbookPlugin
 /// <see cref="LogbookNewEntry.Lon"/> as an exact pair.
 /// </summary>
 public interface ILogbookPluginV3 : ILogbookPluginV2;
+
+/// <summary>
+/// Logbook SDK 1.6 award-opportunity provider. The DXCC and state inputs describe
+/// the current lookup target; implementations compare them with every local
+/// QSO, independently of QSL confirmation.
+/// </summary>
+public interface ILogbookPluginV4 : ILogbookPluginV3
+{
+    Task<LogbookWorkedSummary?> GetWorkedSummaryAsync(
+        string callsign,
+        int recentTake,
+        int? dxcc,
+        string? state,
+        CancellationToken ct = default);
+}

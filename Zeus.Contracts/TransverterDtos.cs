@@ -37,6 +37,8 @@ public sealed record TransverterBandDto(
     bool RxOnly = false,
     int Power = 100,
     bool DisablePa = true,
+    // Retained for persisted-settings compatibility. The shared Xvtr antenna
+    // route controls antenna selection for every active profile.
     TransverterRxAntenna RxAntenna = TransverterRxAntenna.Default);
 
 [JsonConverter(typeof(TransverterRxAntennaJsonConverter))]

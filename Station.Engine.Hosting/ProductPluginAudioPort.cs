@@ -182,6 +182,12 @@ public sealed class ProductPluginAudioPort : IDisposable
             error = "driveCapPct must be between 0 and 100";
             return false;
         }
+        if (request.TxChannelConstraint is { } channel
+            && (destination != ProductPluginInjectionDestination.Tx || !channel.IsValid))
+        {
+            error = "txChannelConstraint requires a tx destination, a native dial frequency and USB, LSB, DIGU or DIGL mode";
+            return false;
+        }
         if (destination == ProductPluginInjectionDestination.LocalMonitor
             && request.DriveCapPct is not null)
         {
@@ -205,7 +211,8 @@ public sealed class ProductPluginAudioPort : IDisposable
                 AudioRingOwner.Create(), destination,
                 request.BypassSpeechProcessing,
                 request.ReplayLastBlockOnUnderflow,
-                request.DriveCapPct);
+                request.DriveCapPct,
+                request.TxChannelConstraint);
             AddPendingLocked(session);
             if (destination == ProductPluginInjectionDestination.LocalMonitor)
                 Volatile.Write(ref _localMonitorInjection, session);
@@ -217,7 +224,8 @@ public sealed class ProductPluginAudioPort : IDisposable
                 new ProductPluginAppliedInjectionOptions(
                     session.BypassSpeechProcessing,
                     session.ReplayLastBlockOnUnderflow,
-                    session.DriveCapPct));
+                    session.DriveCapPct,
+                    session.TxChannelConstraint));
             error = null;
             return true;
         }
@@ -259,7 +267,8 @@ public sealed class ProductPluginAudioPort : IDisposable
                     // Either way the revoke has already dropped key and arm and
                     // released RF, and PumpInjection stays silent until the
                     // plugin explicitly re-arms.
-                    if (injection.IsRevoked && !injection.ReplayLastBlockOnUnderflow) break;
+                    if (injection.IsRevoked
+                        && (!injection.ReplayLastBlockOnUnderflow || injection.TxChannelConstraint is not null)) break;
                     PumpInjection(injection, force: false);
                 }
 
@@ -325,6 +334,12 @@ public sealed class ProductPluginAudioPort : IDisposable
 
             if (request.Armed)
             {
+                if (session.IsRevoked && session.TxChannelConstraint is not null)
+                {
+                    response = CurrentStateLocked();
+                    error = "the fixed-channel lease was revoked; attach a new lease before transmitting again";
+                    return false;
+                }
                 if (session.Armed && !string.Equals(session.PluginId, request.PluginId, StringComparison.Ordinal))
                 {
                     response = CurrentStateLocked();
@@ -400,45 +415,62 @@ public sealed class ProductPluginAudioPort : IDisposable
             SubscribeToTxLocked(tx);
             _keyedSession = session;
             session.Keyed = true;
+            session.KeyAdmissionPending = true;
             generation = ++_keyGeneration;
             session.KeyGeneration = generation;
             session.ExpectedSequence = 0;
             session.HasPendingBlock = false;
-            session.NextDeliveryTicks = Stopwatch.GetTimestamp() + BlockTicks;
+            session.NextDeliveryTicks = 0;
         }
-        KeyReservedForTest?.Invoke();
-
         bool moxGranted = false;
         string? requestError = null;
-        bool transitionAdmitted = tx.TryRunWithTransmitIdle(
-            () =>
+        bool transitionAdmitted;
+        string? transitionError;
+        try
+        {
+            KeyReservedForTest?.Invoke();
+            transitionAdmitted = tx.TryRunWithTransmitIdle(
+                () =>
+                {
+                    KeyActionEnteredForTest?.Invoke();
+                    if (!OwnsKeyGeneration(session, generation))
+                    {
+                        requestError = "the product key request was preempted before keying";
+                        return;
+                    }
+
+                    tx.SetProductPluginDriveCap(generation, session.DriveCapPct);
+                    if (session.BypassSpeechProcessing
+                        && !TryNotifyTxSpeechBypass(generation, bypass: true))
+                    {
+                        requestError = "the requested linear TX audio bypass could not be applied";
+                        return;
+                    }
+                    if (!OwnsKeyGeneration(session, generation))
+                    {
+                        requestError = "the product key request was preempted before keying";
+                        return;
+                    }
+
+                    moxGranted = tx.TrySetProductPluginMox(generation, out requestError, session.TxChannelConstraint)
+                        && tx.MoxOwner == MoxSource.ProductPlugin;
+                    if (!moxGranted)
+                        requestError ??= "the transmit safety interlock refused the product key";
+                },
+                out transitionError);
+        }
+        catch
+        {
+            KeyRelease? release = null;
+            lock (_gate)
             {
-                KeyActionEnteredForTest?.Invoke();
-                if (!OwnsKeyGeneration(session, generation))
-                {
-                    requestError = "the product key request was preempted before keying";
-                    return;
-                }
-
-                tx.SetProductPluginDriveCap(generation, session.DriveCapPct);
-                if (session.BypassSpeechProcessing
-                    && !TryNotifyTxSpeechBypass(generation, bypass: true))
-                {
-                    requestError = "the requested linear TX audio bypass could not be applied";
-                    return;
-                }
-                if (!OwnsKeyGeneration(session, generation))
-                {
-                    requestError = "the product key request was preempted before keying";
-                    return;
-                }
-
-                moxGranted = tx.TrySetProductPluginMox(generation, out requestError)
-                    && tx.MoxOwner == MoxSource.ProductPlugin;
-                if (!moxGranted)
-                    requestError ??= "the transmit safety interlock refused the product key";
-            },
-            out var transitionError);
+                if (ReferenceEquals(_keyedSession, session)
+                    && session.KeyGeneration == generation)
+                    release = ClearKeyLocked(session, disarm: false);
+            }
+            CompleteRelease(release);
+            throw;
+        }
 
         bool granted;
         lock (_gate)
@@ -448,6 +480,13 @@ public sealed class ProductPluginAudioPort : IDisposable
                 && ReferenceEquals(_keyedSession, session)
                 && session.Keyed
                 && session.KeyGeneration == generation;
+            if (granted)
+            {
+                // Key-up can take longer than an audio block. Start the first
+                // producer deadline only after the radio has accepted the key.
+                session.NextDeliveryTicks = Stopwatch.GetTimestamp() + BlockTicks;
+                session.KeyAdmissionPending = false;
+            }
             if (!granted
                 && ReferenceEquals(_keyedSession, session)
                 && session.KeyGeneration == generation)
@@ -621,6 +660,7 @@ public sealed class ProductPluginAudioPort : IDisposable
                     return;
                 armed = session.Armed;
                 keyed = ReferenceEquals(_keyedSession, session) && session.Keyed;
+                if (keyed && session.KeyAdmissionPending) return;
             }
 
             // Frames written while the destination is not eligible are
@@ -891,7 +931,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         lock (_gate)
         {
             if (_keyedSession is null) return;
-            release = ClearKeyLocked(_keyedSession, disarm: false);
+            release = ClearInterruptedKeyLocked(_keyedSession);
         }
         NotifyTxActive(false);
         CompleteRelease(release, notifyInactive: false);
@@ -904,7 +944,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         lock (_gate)
         {
             if (_keyedSession is null) return;
-            release = ClearKeyLocked(_keyedSession, disarm: false);
+            release = ClearInterruptedKeyLocked(_keyedSession);
         }
         CompleteRelease(release);
     }
@@ -914,6 +954,16 @@ public sealed class ProductPluginAudioPort : IDisposable
         session.Armed = false;
         session.PluginId = null;
         return ClearKeyLocked(session, disarm: true);
+    }
+
+    private KeyRelease? ClearInterruptedKeyLocked(InjectionSession session)
+    {
+        if (session.TxChannelConstraint is null)
+            return ClearKeyLocked(session, disarm: false);
+        // Fixed-channel packets cannot resume after an interlock or another
+        // source interrupts RF. End liveness so the producer detects truncation.
+        session.Revoke();
+        return ClearKeyAndArmLocked(session);
     }
 
     private KeyRelease? ClearKeyLocked(InjectionSession session, bool disarm)
@@ -927,6 +977,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         session.PendingCount = 0;
         session.HasPendingBlock = false;
         session.NextDeliveryTicks = 0;
+        session.KeyAdmissionPending = false;
         if (!ReferenceEquals(_keyedSession, session))
         {
             session.Keyed = false;
@@ -1122,7 +1173,8 @@ public sealed class ProductPluginAudioPort : IDisposable
         ProductPluginInjectionDestination destination,
         bool bypassSpeechProcessing,
         bool replayLastBlockOnUnderflow,
-        int? driveCapPct) : Session(leaseId, name, version, owner)
+        int? driveCapPct,
+        ProductPluginTxChannelConstraint? txChannelConstraint) : Session(leaseId, name, version, owner)
     {
         public override string Kind => Destination == ProductPluginInjectionDestination.Tx
             ? "tx" : "local-monitor";
@@ -1130,10 +1182,12 @@ public sealed class ProductPluginAudioPort : IDisposable
         public bool BypassSpeechProcessing { get; } = bypassSpeechProcessing;
         public bool ReplayLastBlockOnUnderflow { get; } = replayLastBlockOnUnderflow;
         public int? DriveCapPct { get; } = driveCapPct;
+        public ProductPluginTxChannelConstraint? TxChannelConstraint { get; } = txChannelConstraint;
         public float[] Scratch { get; } = new float[AudioRingProtocol.MaxSamplesPerBlock];
         public string? PluginId;
         public bool Armed;
         public bool Keyed;
+        public bool KeyAdmissionPending;
         public long KeyGeneration;
         public long ExpectedSequence;
         public int PendingCount;
@@ -1171,12 +1225,14 @@ public sealed record ProductPluginInjectionAttachRequest(
     string Destination,
     bool BypassSpeechProcessing = false,
     bool ReplayLastBlockOnUnderflow = true,
-    int? DriveCapPct = null);
+    int? DriveCapPct = null,
+    ProductPluginTxChannelConstraint? TxChannelConstraint = null);
 
 public sealed record ProductPluginAppliedInjectionOptions(
     bool BypassSpeechProcessing,
     bool ReplayLastBlockOnUnderflow,
-    int? DriveCapPct);
+    int? DriveCapPct,
+    ProductPluginTxChannelConstraint? TxChannelConstraint = null);
 
 public sealed record ProductPluginAudioAttachResponse(
     string LeaseId,

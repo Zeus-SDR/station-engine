@@ -105,7 +105,8 @@ public enum ConnectionStatus { Disconnected, Connecting, Connected, Error }
 
 // Thetis NR-button state: Off = no NR, Anr = NR1 (time-domain LMS),
 // Emnr = NR2 (Ephraim-Malah), Sbnr = NR4 (libspecbleach, issue #79),
-// Rnnr = NR3 (RNNoise). Zeus ships a bundled default RNNoise model so NR3 is
+// Rnnr = NR3 (RNNoise), Nnr = the neural NR added in WDSP 2.10. Zeus ships a
+// bundled default RNNoise model so NR3 is
 // selectable out of the box; the operator can override it by installing their
 // own weights file via the DSP menu. NR3 is selectable whenever the loaded
 // libwdsp exports the RNNR symbols and a model (default or operator) is active.
@@ -120,6 +121,7 @@ public enum NrMode : byte
     Emnr,
     Sbnr = 3,
     Rnnr = 4,
+    Nnr = 5,
 }
 
 public sealed class NrModeJsonConverter : JsonConverter<NrMode>
@@ -127,7 +129,7 @@ public sealed class NrModeJsonConverter : JsonConverter<NrMode>
     public override NrMode Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType == JsonTokenType.Number && reader.TryGetByte(out var numericValue))
-            return numericValue <= (byte)NrMode.Rnnr ? (NrMode)numericValue : NrMode.Off;
+            return numericValue <= (byte)NrMode.Nnr ? (NrMode)numericValue : NrMode.Off;
 
         if (reader.TokenType == JsonTokenType.String)
         {
@@ -136,6 +138,7 @@ public sealed class NrModeJsonConverter : JsonConverter<NrMode>
             if (string.Equals(stringValue, nameof(NrMode.Emnr), StringComparison.OrdinalIgnoreCase)) return NrMode.Emnr;
             if (string.Equals(stringValue, nameof(NrMode.Sbnr), StringComparison.OrdinalIgnoreCase)) return NrMode.Sbnr;
             if (string.Equals(stringValue, nameof(NrMode.Rnnr), StringComparison.OrdinalIgnoreCase)) return NrMode.Rnnr;
+            if (string.Equals(stringValue, nameof(NrMode.Nnr), StringComparison.OrdinalIgnoreCase)) return NrMode.Nnr;
         }
 
         return NrMode.Off;
@@ -149,6 +152,7 @@ public sealed class NrModeJsonConverter : JsonConverter<NrMode>
             NrMode.Emnr => nameof(NrMode.Emnr),
             NrMode.Sbnr => nameof(NrMode.Sbnr),
             NrMode.Rnnr => nameof(NrMode.Rnnr),
+            NrMode.Nnr => nameof(NrMode.Nnr),
             _ => nameof(NrMode.Off),
         });
     }
@@ -209,7 +213,15 @@ public sealed record NrConfig(
     int? EmnrNpeMethod = null,
     bool? EmnrAeRun = null,
     double? EmnrTrainT1 = null,
-    double? EmnrTrainT2 = null);
+    double? EmnrTrainT2 = null,
+    int? NnrModel = null,
+    double? NnrMaskFloorDb = null,
+    double? NnrAlpha = null,
+    double? NnrKneeDb = null,
+    double? NnrTauSeconds = null,
+    double? NnrMaxGainDb = null,
+    double? NnrAttackMs = null,
+    double? NnrReleaseMs = null);
 
 // Direct Smart NR diagnostic surface. The Smart NR analyzer still lives in
 // the frontend DSP-scene path; this DTO exposes that live condition together
@@ -900,6 +912,16 @@ public sealed record SquelchConfig(
     public const int MinFixedSensitivity = 0;
     public const int MaxFixedSensitivity = 100;
     public const int DefaultFixedSensitivity = 70;
+
+    // FM squelch is ALWAYS WDSP's FMSQ discriminator-noise detector — the
+    // managed adaptive audio-RMS gate is meaningless in FM: an open FM channel
+    // is loud hiss, so a post-demod power gate reads backwards and never
+    // squelches (this is the "FM SQL doesn't work" symptom). Resolve the
+    // effective config for the current RX mode so FM forces fixed regardless of
+    // the operator's stored Adaptive preference, which stays intact for the
+    // SSB/AM modes that actually use the adaptive gate.
+    public SquelchConfig ForMode(RxMode mode) =>
+        Adaptive && mode == RxMode.FM ? this with { Adaptive = false } : this;
 }
 
 // Operator-facing TX leveling configuration (issue: DSP controls Thetis parity
@@ -3030,8 +3052,9 @@ public sealed record AntennaBandDto(string Band, string TxAnt, string RxAnt, str
 
 // GET /api/radio/antenna response. HasTxAntennaRelays / HasRxAntennaRelays are
 // the board-capability gates the frontend renders the right selectors from; the
-// per-band rows list every HF band. AvailableRxAux is the set of aux-input
-// strings the connected board exposes (empty on HL2 — no aux). AlexRevision is
+// per-band rows list every HF band plus one shared "Xvtr" route, used for all
+// active transverter profiles. AvailableRxAux is the set of aux-input strings
+// the connected board exposes (empty on HL2 — no aux). AlexRevision is
 // always "Modern" in this slice: the wire path routes PureSignal external
 // feedback to the BYPASS/K36 bit (Rev 24+ behaviour), and the operator-set
 // legacy Rev15/16 EXT1 routing is not wire-discoverable so it is deferred.
@@ -3042,8 +3065,8 @@ public sealed record AntennaSettingsDto(
     IReadOnlyList<string>? AvailableRxAux = null,
     string AlexRevision = "Modern");
 
-// PUT /api/radio/antenna — sets ONE band's antenna + RX-aux selection. Band must
-// be a known HF band; TxAnt/RxAnt must parse to HpsdrAntenna; RxAux to the
+// PUT /api/radio/antenna — sets ONE HF band or the shared "Xvtr" route's
+// antenna + RX-aux selection. TxAnt/RxAnt must parse to HpsdrAntenna; RxAux to the
 // server-side RxAuxInputSel. The server returns 409 for a relay/aux the
 // connected board lacks (non-ANT1 on a relay-less board, an aux the board does
 // not expose), 400 on a malformed body / unknown band / unparseable value.
