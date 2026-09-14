@@ -27,7 +27,11 @@ public static class OperatorSettingsEndpoints
                 return Results.NotFound(new { error = "unknown operator settings family" });
             try
             {
-                return Results.Ok(store.Save(family, request.Value, request.UpdatedUtcMs));
+                return Results.Ok(store.Save(family, request.Value, request.UpdatedUtcMs, request.ExpectedUpdatedUtcMs));
+            }
+            catch (OperatorSettingsConflictException)
+            {
+                return Results.Conflict(new { error = "operator settings changed; reload before saving" });
             }
             catch (ArgumentException ex)
             {

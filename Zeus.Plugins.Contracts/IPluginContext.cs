@@ -96,9 +96,29 @@ public interface IRadioStateReader
     string Band { get; }
     bool Mox { get; }
 
+    /// <summary>Operator's normal transmit drive setting, from 0 through 100 percent.</summary>
+    int DrivePercent => 0;
+
+    /// <summary>Operator's independent tune drive setting, from 0 through 100 percent.</summary>
+    int TuneDrivePercent => 0;
+
     event Action<long> FrequencyChanged;
     event Action<string> ModeChanged;
     event Action<bool> MoxChanged;
+
+    /// <summary>Raised when <see cref="DrivePercent"/> changes.</summary>
+    event Action<int> DrivePercentChanged
+    {
+        add { }
+        remove { }
+    }
+
+    /// <summary>Raised when <see cref="TuneDrivePercent"/> changes.</summary>
+    event Action<int> TuneDrivePercentChanged
+    {
+        add { }
+        remove { }
+    }
 }
 
 /// <summary>Mutating radio controller. Granted by ControlRadio.</summary>

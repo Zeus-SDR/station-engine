@@ -438,6 +438,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // keyed so an edited range cannot hot-switch the filter board under power.
     private RfFilterRuntimeSettings? _rfFilters;
     private RfFilterRuntimeSettings? _pendingRfFilters;
+    private HpsdrBoardKind? _rfFilterBoardKind;
+    private HpsdrBoardKind? _pendingRfFilterBoardKind;
+    private int _pendingOrionMkIIVariant = -1;
     private bool _hasPendingRfFilters;
 
     // TX audio front-end (external-audio-jacks re-port). Wire-encoded into the
@@ -1549,6 +1552,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetOrionMkIIVariant(OrionMkIIVariant variant)
     {
+        // Variant changes can enable different external control outputs.
+        // Apply them with the filter/antenna edits once fully unkeyed.
+        if (_moxOn || _tuneActive)
+        {
+            Volatile.Write(ref _pendingOrionMkIIVariant, (int)variant);
+            return;
+        }
+        Interlocked.Exchange(ref _pendingOrionMkIIVariant, -1);
+        if (_variant == variant) return;
         var previousGeometry = WidebandGeometryFor(_boardKind, _variant);
         _variant = variant;
         if (_rxTask is not null)
@@ -1810,19 +1822,24 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// bypass policies are resolved inside <see cref="ComputeAlexWord"/> so the
     /// wire path remains the single source of Alex bit truth. Mid-key edits are
     /// deferred with the antenna relays and flushed on the next unkey edge.
+    /// An explicit filter board selects the physical PA/filter layout without
+    /// changing the discovered transport board; null follows discovery.
     /// </summary>
-    public void SetRfFilters(RfFilterRuntimeSettings? settings)
+    public void SetRfFilters(RfFilterRuntimeSettings? settings, HpsdrBoardKind? filterBoardKind = null)
     {
         if (_moxOn || _tuneActive)
         {
             _pendingRfFilters = settings;
+            _pendingRfFilterBoardKind = filterBoardKind;
             _hasPendingRfFilters = true;
             return;
         }
 
-        bool changed = !Equals(_rfFilters, settings);
+        bool changed = !Equals(_rfFilters, settings) || _rfFilterBoardKind != filterBoardKind;
         _rfFilters = settings;
+        _rfFilterBoardKind = filterBoardKind;
         _pendingRfFilters = null;
+        _pendingRfFilterBoardKind = null;
         _hasPendingRfFilters = false;
         if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
     }
@@ -1837,6 +1854,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             && _pendingRxAntenna < 0
             && _pendingRxAuxInput < 0
             && Volatile.Read(ref _pendingXvtrEnabled) < 0
+            && Volatile.Read(ref _pendingOrionMkIIVariant) < 0
             && !_hasPendingRfFilters)
             return false;
         int tx = _pendingTxAntenna >= 0 ? _pendingTxAntenna : _txAntenna;
@@ -1856,10 +1874,19 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         _pendingRxAuxInput = -1;
         if (_hasPendingRfFilters)
         {
-            changed |= !Equals(_rfFilters, _pendingRfFilters);
+            changed |= !Equals(_rfFilters, _pendingRfFilters)
+                || _rfFilterBoardKind != _pendingRfFilterBoardKind;
             _rfFilters = _pendingRfFilters;
+            _rfFilterBoardKind = _pendingRfFilterBoardKind;
             _pendingRfFilters = null;
+            _pendingRfFilterBoardKind = null;
             _hasPendingRfFilters = false;
+        }
+        int pendingVariant = Interlocked.Exchange(ref _pendingOrionMkIIVariant, -1);
+        if (pendingVariant >= 0)
+        {
+            changed |= _variant != (OrionMkIIVariant)pendingVariant;
+            SetOrionMkIIVariant((OrionMkIIVariant)pendingVariant);
         }
         return changed;
     }
@@ -4079,11 +4106,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // the VFO-B carrier, so there was NO RF output on a different band.
         uint txLpfFreqHz = xmit ? _txDucFreqHz : _rxFreqHz;
         // alex0 BPF follows RX1 (_rxFreqHz); LPF follows the TX freq.
+        // A DIY radio can retain OrionMkII gateware while driving a classic
+        // ANAN-200D filter board. Honor the operator's filter profile without
+        // changing the discovered transport's DDC or feedback layout.
+        var filterBoard = _rfFilterBoardKind ?? _boardKind;
         uint alex0Common = ComputeAlexWord(
             _rxFreqHz,
             txLpfFreqHz,
             txAnt: txAntWire,
-            board: _boardKind,
+            board: filterBoard,
             rfFilters: _rfFilters,
             xmit: xmit,
             psEnabled: psWire);
@@ -4098,7 +4129,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             rx2Enabled,
             xmit,
             psWire,          // board-gated PS arm (#960): no ALEX_PS on single-ADC
-            _boardKind,
+            filterBoard,
             txAntWire,
             _rfFilters);
         // RX auxiliary input select (external-ports plan — antenna slice, #804).

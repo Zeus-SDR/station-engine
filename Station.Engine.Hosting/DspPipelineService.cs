@@ -7364,6 +7364,10 @@ public class DspPipelineService : BackgroundService,
     {
         var p2 = _p2Client;
         if (p2 is null) return;
+        // The operator can select Anvelina after connecting. Keep the live
+        // variant in step with the profile that supplied this snapshot.
+        var variant = _radio.EffectiveOrionMkIIVariant;
+        p2.SetOrionMkIIVariant(variant);
         p2.SetDriveByte(snap.DriveByte);
         p2.SetOcMasks(snap.OcTxMask, snap.OcRxMask, snap.OcTuneMask);
         // Anvelina-PRO3 DX OC masks (#407). Always forwarded; Protocol2Client
@@ -7373,7 +7377,17 @@ public class DspPipelineService : BackgroundService,
         p2.SetOcDxMasks(snap.OcDxTxMask, snap.OcDxRxMask);
         p2.SetPaEnabled(snap.PaEnabled);
         p2.SetXvtrEnabled(snap.XvtrEnabled);
-        p2.SetRfFilters(snap.RfFilters);
+        // Limit the hybrid PA/filter correction to a selected Anvelina on its
+        // discovered transport. Other profiles retain their existing encoding;
+        // an incomplete connection must not replace discovery with Unknown.
+        var connectedBoard = _radio.ConnectedBoardKind;
+        HpsdrBoardKind? filterBoard =
+            _radio.DiscoveredBoardKind == HpsdrBoardKind.OrionMkII
+            && variant == OrionMkIIVariant.AnvelinaPro3
+            && connectedBoard != HpsdrBoardKind.Unknown
+                ? connectedBoard
+                : null;
+        p2.SetRfFilters(snap.RfFilters, filterBoard);
         // External antenna (antenna slice — #804). HpsdrAntenna.Ant1=0 → wire 1
         // → ALEX_TX_ANTENNA_1, so the +1 maps the 0-based enum to the 1-based
         // wire selector. SetAntennas gates the TX-antenna emission on

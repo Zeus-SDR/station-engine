@@ -31,6 +31,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["connect"] = "connect_settings",
             ["chat"] = "chat_settings",
             ["lightning"] = "lightning_alert_settings",
+            ["tuner-companion"] = "tuner_companion",
             ["notepad"] = "notepad_content",
             ["rx-wf-windows"] = "display_aux_settings",
             ["spectrum-view-scope"] = "display_aux_settings",
@@ -67,7 +68,8 @@ public sealed class OperatorSettingsStore : IDisposable
     public OperatorSettingsDto Save(
         string family,
         JsonElement value,
-        long? updatedUtcMs = null)
+        long? updatedUtcMs = null,
+        long? expectedUpdatedUtcMs = null)
     {
         var collection = Collection(family);
         var json = value.GetRawText();
@@ -80,6 +82,12 @@ public sealed class OperatorSettingsStore : IDisposable
         lock (_gate)
         {
             var current = collection.FindById(family);
+            if (expectedUpdatedUtcMs.HasValue)
+            {
+                if (expectedUpdatedUtcMs.Value != (current?.UpdatedUtcMs ?? 0))
+                    throw new OperatorSettingsConflictException();
+                timestamp = Math.Max(timestamp, (current?.UpdatedUtcMs ?? 0) + 1);
+            }
             // Saved connect endpoints hydrate before a radio connection and
             // retain a local offline cache. Its client supplies the cache write
             // timestamp, so a stale browser cannot overwrite a newer server
@@ -132,4 +140,7 @@ public sealed record OperatorSettingsDto(
 
 public sealed record OperatorSettingsSetRequest(
     JsonElement Value,
-    long? UpdatedUtcMs = null);
+    long? UpdatedUtcMs = null,
+    long? ExpectedUpdatedUtcMs = null);
+
+public sealed class OperatorSettingsConflictException : Exception { }
