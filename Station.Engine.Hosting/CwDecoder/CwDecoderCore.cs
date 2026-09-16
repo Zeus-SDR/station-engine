@@ -25,6 +25,7 @@ internal sealed class CwDecoderCore
     public int SampleRateHz { get; }
     public double Wpm => _timing.Wpm;
     public double SnrDb => _threshold.SnrDb;
+    internal double TrackedToneHz => _detector.TrackedFrequencyHz;
 
     public void Retune(double centerFrequencyHz) => _detector.Retune(centerFrequencyHz);
 
@@ -53,6 +54,7 @@ internal sealed class CwDecoderCore
     public void Reset()
     {
         _blockFill = 0;
+        _detector.Reset();
         _threshold.Reset();
         _timing.Reset();
         _fsm.Reset();

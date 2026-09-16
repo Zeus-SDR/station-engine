@@ -22,8 +22,7 @@ namespace Zeus.Contracts;
 /// page existed (auto-sequence on, RR73 ack, disable-after-73 on, 3 decode
 /// passes) — nothing an operator already feels changes until they touch a
 /// control. Most flags are wired to the auto-sequence controller / macros / log
-/// path; a couple (SkipGrid, ClearDxAfterLog) are persisted but not yet consumed
-/// and are surfaced disabled ("coming soon") on the page. TX still requires an
+/// path; ClearDxAfterLog is persisted but still awaits sequence integration. TX still requires an
 /// explicit arm; none of these flags transmit on their own.
 /// </summary>
 public sealed record Ft8Settings(
@@ -82,7 +81,11 @@ public sealed record Ft8Settings(
     /// <summary>Auto CQ: resume calling CQ after a completed QSO (frontend keeps
     /// the operator-armed session; never transmits on its own). Appended last so
     /// evolving this positional record never shifts existing parameters.</summary>
-    bool AutoCq = false)
+    bool AutoCq = false,
+    /// <summary>Worked/confirmed lookup scope: all, band, mode, or band-mode.</summary>
+    string WorkedScope = "all",
+    /// <summary>Use received paper QSL, LoTW or QRZ confirmation for worked filters.</summary>
+    bool WorkedConfirmedOnly = false)
 {
     public const int MinOffsetHz = 200;
     public const int MaxTxOffsetHz = 4000;
@@ -120,6 +123,7 @@ public sealed record Ft8Settings(
     /// </summary>
     public Ft8Settings Normalized()
     {
+        var workedScope = WorkedScope?.Trim().ToLowerInvariant();
         var (wfMin, wfMax) = SanitizeDbRange(WfDbMin, WfDbMax);
         return this with
         {
@@ -127,6 +131,7 @@ public sealed record Ft8Settings(
             DefaultTxOffsetHz = Math.Clamp(DefaultTxOffsetHz, MinOffsetHz, MaxTxOffsetHz),
             CallerMaxRetries = Math.Max(0, CallerMaxRetries),
             DecodePasses = Math.Clamp(DecodePasses, MinPasses, MaxPasses),
+            WorkedScope = workedScope is "band" or "mode" or "band-mode" ? workedScope : "all",
             CqMessage = Cap(CqMessage, 32),
             CqDxMessage = Cap(CqDxMessage, 32),
             FreeTextMacro = Cap(FreeTextMacro, MaxMacroLength),

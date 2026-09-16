@@ -35,6 +35,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["notepad"] = "notepad_content",
             ["rx-wf-windows"] = "display_aux_settings",
             ["spectrum-view-scope"] = "display_aux_settings",
+            ["surface-opacity"] = "display_aux_settings",
         };
 
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;

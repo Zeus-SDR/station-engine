@@ -125,7 +125,7 @@ public sealed class PaSettingsStore : IDisposable
                     NormalizeCalibrationSafetyPercent(g.PaCalibrationSafetyPercent));
 
             var existing = _bands.FindAll().ToDictionary(e => e.Band, e => e);
-            var bands = BandUtils.HfBands
+            var bands = BandUtils.PaBands
                 .Select(b =>
                 {
                     var auto = AutoOcMaskFor(board, b);
@@ -155,7 +155,7 @@ public sealed class PaSettingsStore : IDisposable
             PaEnabled: true,
             PaMaxPowerWatts: PaDefaults.GetMaxPowerWatts(board, variant),
             PaCalibrationSafetyPercent: DefaultCalibrationSafetyPercent);
-        var bands = BandUtils.HfBands
+        var bands = BandUtils.PaBands
             .Select(b => new PaBandSettingsDto(
                 b,
                 PaGainDb: PaDefaults.GetPaGainDb(board, b, variant),
@@ -375,7 +375,7 @@ public sealed class PaSettingsStore : IDisposable
 
                 foreach (var band in dto.Bands)
                 {
-                    if (!BandUtils.HfBands.Contains(band.Band)) continue;
+                    if (!BandUtils.IsPaBand(band.Band)) continue;
                     var saved = _bands.FindOne(x => x.Band == band.Band);
                     bool isNew = saved is null;
                     saved ??= new PaBandEntry { Band = band.Band };

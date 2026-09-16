@@ -285,7 +285,29 @@ public sealed class TciServer : IHostedService, IDisposable
 
     private int _lastBroadcastAttenDb = int.MinValue;
     private StateDto? _lastBroadcastState;
+    private FrequencyBroadcast? _lastFrequencyBroadcast;
     private readonly object _broadcastDiffSync = new();
+
+    // Snapshot of the frequency frames last pushed to TCI clients. RadioService
+    // raises StateChanged for any state mutation — including an idempotent
+    // external VFO set that lands on the frequency the radio is already on —
+    // and every raise previously re-emitted the full vfo/dds/tx_frequency
+    // block. A logger that echoes the frequency back (Log4OM, N1MM+ in TCI
+    // control mode) then sees Zeus resend it, resends its own copy, and the two
+    // ping-pong: the client's frequency field flickers and the session floods.
+    // Suppress unchanged frequency frames on the ordinary StateChanged path so
+    // an unchanged frequency never leaves the server. Transverter / layout
+    // changes (includeVfoLimits:true) still force a full re-broadcast.
+    private readonly record struct FrequencyBroadcast(
+        long Vfo00,
+        long Vfo01,
+        long Dds0,
+        long Vfo10,
+        long Vfo11,
+        long Dds1,
+        long TxFrequency,
+        bool Rx2Enabled,
+        bool TxUsesVfoB);
 
     private void OnRadioStateChanged(StateDto state)
     {
@@ -338,44 +360,54 @@ public sealed class TciServer : IHostedService, IDisposable
     {
         var transverter = _transverterSettings.GetForConnectedRadio(_layouts, _radio);
 
-        // VFO/DDS events can fire rapidly during tuning, so retain the existing
-        // per-session coalescing. State is already operator-facing external RF;
-        // IF translation belongs exclusively to the hardware egress seam.
-        BroadcastRateLimited(
-            "vfo:0,0",
-            TciProtocol.Command(
-                "vfo", 0, 0, state.VfoHz));
-        BroadcastRateLimited(
-            "vfo:0,1",
-            TciProtocol.Command(
-                "vfo",
-                0,
-                1,
-                RadioFrequencyResolver.TxDialFrequencyHz(state)));
-        BroadcastRateLimited(
-            "dds:0",
-            TciProtocol.Command(
-                "dds",
-                0,
-                TciSession.EffectiveReceiverLoHz(state, 0)));
-        BroadcastRateLimited(
-            "vfo:1,0",
-            TciProtocol.Command(
-                "vfo", 1, 0, TciSession.ResolveVfoChannelHz(state, 1, 0)));
-        BroadcastRateLimited(
-            "vfo:1,1",
-            TciProtocol.Command(
-                "vfo", 1, 1, TciSession.ResolveVfoChannelHz(state, 1, 1)));
-        BroadcastRateLimited(
-            "dds:1",
-            TciProtocol.Command(
-                "dds", 1, TciSession.EffectiveReceiverLoHz(state, 1)));
-        var txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(state);
-        Broadcast(TciProtocol.Command("tx_frequency", txFrequencyHz));
-        Broadcast(TciExtendedFrequency.Command(
-            txFrequencyHz,
-            state.Rx2Enabled,
-            TciExtendedFrequency.TxUsesVfoB(state)));
+        var next = new FrequencyBroadcast(
+            Vfo00: state.VfoHz,
+            Vfo01: RadioFrequencyResolver.TxDialFrequencyHz(state),
+            Dds0: TciSession.EffectiveReceiverLoHz(state, 0),
+            Vfo10: TciSession.ResolveVfoChannelHz(state, 1, 0),
+            Vfo11: TciSession.ResolveVfoChannelHz(state, 1, 1),
+            Dds1: TciSession.EffectiveReceiverLoHz(state, 1),
+            TxFrequency: RadioFrequencyResolver.TxFrequencyHz(state),
+            Rx2Enabled: state.Rx2Enabled,
+            TxUsesVfoB: TciExtendedFrequency.TxUsesVfoB(state));
+
+        // Transverter / layout switches (includeVfoLimits:true) intentionally
+        // re-affirm the dial under the new profile context, so force a full
+        // re-broadcast. Otherwise only emit the frames whose value actually
+        // changed, so an idempotent StateChanged doesn't echo the frequency
+        // back to loggers (see FrequencyBroadcast).
+        lock (_broadcastDiffSync)
+        {
+            var last = _lastFrequencyBroadcast;
+            bool force = includeVfoLimits || last is null;
+
+            // VFO/DDS events can fire rapidly during tuning, so retain the
+            // existing per-session coalescing. State is already operator-facing
+            // external RF; IF translation belongs exclusively to the hardware
+            // egress seam.
+            if (force || last!.Value.Vfo00 != next.Vfo00)
+                BroadcastRateLimited("vfo:0,0", TciProtocol.Command("vfo", 0, 0, next.Vfo00));
+            if (force || last!.Value.Vfo01 != next.Vfo01)
+                BroadcastRateLimited("vfo:0,1", TciProtocol.Command("vfo", 0, 1, next.Vfo01));
+            if (force || last!.Value.Dds0 != next.Dds0)
+                BroadcastRateLimited("dds:0", TciProtocol.Command("dds", 0, next.Dds0));
+            if (force || last!.Value.Vfo10 != next.Vfo10)
+                BroadcastRateLimited("vfo:1,0", TciProtocol.Command("vfo", 1, 0, next.Vfo10));
+            if (force || last!.Value.Vfo11 != next.Vfo11)
+                BroadcastRateLimited("vfo:1,1", TciProtocol.Command("vfo", 1, 1, next.Vfo11));
+            if (force || last!.Value.Dds1 != next.Dds1)
+                BroadcastRateLimited("dds:1", TciProtocol.Command("dds", 1, next.Dds1));
+            if (force || last!.Value.TxFrequency != next.TxFrequency)
+                Broadcast(TciProtocol.Command("tx_frequency", next.TxFrequency));
+            if (force
+                || last!.Value.TxFrequency != next.TxFrequency
+                || last!.Value.Rx2Enabled != next.Rx2Enabled
+                || last!.Value.TxUsesVfoB != next.TxUsesVfoB)
+                Broadcast(TciExtendedFrequency.Command(
+                    next.TxFrequency, next.Rx2Enabled, next.TxUsesVfoB));
+
+            _lastFrequencyBroadcast = next;
+        }
 
         if (includeVfoLimits)
         {
@@ -403,11 +435,15 @@ public sealed class TciServer : IHostedService, IDisposable
 
     private void OnRadioConnected(Protocol1.IProtocol1Client client)
     {
+        // A new radio session may re-affirm the same dial; clear the frequency
+        // diff so the first post-connect StateChanged re-broadcasts in full.
+        lock (_broadcastDiffSync) _lastFrequencyBroadcast = null;
         Broadcast(TciProtocol.Command("start"));
     }
 
     private void OnRadioDisconnected()
     {
+        lock (_broadcastDiffSync) _lastFrequencyBroadcast = null;
         Broadcast(TciProtocol.Command("stop"));
     }
 

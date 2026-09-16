@@ -53,3 +53,13 @@ public interface ILogbookPluginV4 : ILogbookPluginV3
         string? state,
         CancellationToken ct = default);
 }
+
+/// <summary>
+/// Logbook SDK 1.8 trusted QRZ FETCH import. Implementations may apply
+/// QRZ-owned confirmation revocations and conservative metadata enrichment;
+/// ordinary <see cref="ILogbookPlugin.ImportAdifAsync"/> remains untrusted.
+/// </summary>
+public interface ILogbookPluginV5 : ILogbookPluginV4
+{
+    Task<LogbookImportResult> ImportQrzFetchAdifAsync(string adifText, CancellationToken ct = default);
+}

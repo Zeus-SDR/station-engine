@@ -35,6 +35,27 @@ public static class BandUtils
     };
 
     /// <summary>
+    /// Stable PA-setting keys for the fourteen transverter profile slots.
+    /// The key follows the profile slot, rather than its editable button text,
+    /// so a calibration survives a renamed or temporarily disabled profile.
+    /// </summary>
+    public static readonly IReadOnlyList<string> XvtrBands = Enumerable
+        .Range(TransverterFrequencyConverter.MinimumBandId, TransverterFrequencyConverter.BandCount)
+        .Select(XvtrBandKey)
+        .ToArray();
+
+    /// <summary>All band keys accepted by PA settings persistence.</summary>
+    public static readonly IReadOnlyList<string> PaBands = HfBands
+        .Concat(XvtrBands)
+        .ToArray();
+
+    public static string XvtrBandKey(int id) => $"xvtr:{id}";
+
+    public static bool IsXvtrBand(string? band) => band is not null && XvtrBands.Contains(band);
+
+    public static bool IsPaBand(string? band) => band is not null && PaBands.Contains(band);
+
+    /// <summary>
     /// SSB sideband convention per band (issue #185). ITU/ham-radio convention
     /// used by Thetis: 160m/80m/40m are LSB voice bands; 60m and everything
     /// above 10 MHz are USB (60m is USB by regulation despite sitting below

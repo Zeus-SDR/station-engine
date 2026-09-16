@@ -5474,9 +5474,18 @@ public sealed class RadioService : IDisposable
         bool rxThroughTransverter = TryResolveTransverterBand(stateSnap.VfoHz, out _);
         bool xvtrOutputEnabled = txThroughTransverter && txXvtrBand.DisablePa;
         long hardwareTxHz = ToHardwareFrequencyHz(txHz);
-        var bandName = BandUtils.FreqToBand(hardwareTxHz);
-        var bandCfg = bandName is not null
-            ? cfg.Bands.FirstOrDefault(b => b.Band == bandName) ?? new PaBandSettingsDto(bandName)
+        var hardwareBandName = BandUtils.FreqToBand(hardwareTxHz);
+        var paBandName = txThroughTransverter
+            ? BandUtils.XvtrBandKey(txXvtrBand.Id)
+            : hardwareBandName;
+        var paBandCfg = paBandName is not null
+            ? cfg.Bands.FirstOrDefault(b => b.Band == paBandName) ?? new PaBandSettingsDto(paBandName)
+            : new PaBandSettingsDto("unknown");
+        // Transverter PA calibration follows its stable profile slot. Relay
+        // masks, RF filtering, and antenna routing remain tied to the
+        // translated hardware IF band so existing safe routing is unchanged.
+        var bandCfg = hardwareBandName is not null
+            ? cfg.Bands.FirstOrDefault(b => b.Band == hardwareBandName) ?? new PaBandSettingsDto(hardwareBandName)
             : new PaBandSettingsDto("unknown");
 
         bool tunActive;
@@ -5507,15 +5516,15 @@ public sealed class RadioService : IDisposable
             ?? EngineTransmitSafetyModule.ResolveEffectiveDrive(activePct, connectedBoard, variant);
         bool safetyAuthorized = Volatile.Read(ref _txSafetyAuthority) != 0;
         var driveProfile = RadioDriveProfiles.For(connectedBoard);
-        double calibratedGain = bandName is null
-            ? bandCfg.PaGainDb
+        double calibratedGain = paBandName is null
+            ? paBandCfg.PaGainDb
             : _paStore.ResolveCalibrationGain(
-                bandName,
+                paBandName,
                 decision.EffectiveDrivePercent,
                 cfg.Global.PaMaxPowerWatts,
                 connectedBoard,
                 variant,
-                bandCfg.PaGainDb);
+                paBandCfg.PaGainDb);
         byte driveByte = decision.Allowed && safetyAuthorized && !safetyInhibit
             ? driveProfile.EncodeDriveByte(
                 decision.EffectiveDrivePercent,
@@ -5528,7 +5537,7 @@ public sealed class RadioService : IDisposable
 
         _log.LogInformation(
             "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, bandName ?? "?", calibratedGain, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
+            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", calibratedGain, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
         ActiveClient?.SetDriveByte(driveByte);
@@ -5547,12 +5556,12 @@ public sealed class RadioService : IDisposable
         // K36/BYPASS relay while armed regardless of an aux=BYPASS pick.
         var caps = BoardCapabilitiesTable.For(ConnectedBoardKind, EffectiveOrionMkIIVariant);
         var defaultAntSel = new AntennaBandSelection(
-            bandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
+            hardwareBandName ?? "unknown", HpsdrAntenna.Ant1, HpsdrAntenna.Ant1, RxAuxInputSel.None);
         var xvtrAntSel = _antennaStore?.GetBand(AntennaSettingsStore.XvtrBand) ?? defaultAntSel;
         var txAntSel = txThroughTransverter
             ? xvtrAntSel
-            : (_antennaStore is not null && bandName is not null
-                ? _antennaStore.GetBand(bandName)
+            : (_antennaStore is not null && hardwareBandName is not null
+                ? _antennaStore.GetBand(hardwareBandName)
                 : defaultAntSel);
         long hardwareRxHz = ToHardwareFrequencyHz(stateSnap.VfoHz);
         string? rxBandName = BandUtils.FreqToBand(hardwareRxHz);

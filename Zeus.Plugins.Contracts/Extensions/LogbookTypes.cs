@@ -112,7 +112,10 @@ public sealed record LogbookImportResult(
     int ImportedCount,
     int DuplicateCount,
     int SkippedCount,
-    IReadOnlyList<LogbookImportError> Errors);
+    IReadOnlyList<LogbookImportError> Errors)
+{
+    public int MetadataConflictCount { get; init; }
+}
 
 public sealed record LogbookImportError(
     int RecordNumber,

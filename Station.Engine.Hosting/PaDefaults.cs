@@ -31,9 +31,9 @@ namespace Zeus.Server;
 // connect so "5 W target" doesn't emit µW (too much default gain) or blow the
 // PA (too little).
 //
-// Band names must match BandUtils.HfBands. Any band not listed falls back to
-// 0.0 dB, which short-circuits PaSettingsStore to the legacy percent→byte
-// path and preserves pre-calibration behavior.
+// Band names must match BandUtils.HfBands and BandUtils.XvtrBands. Any band
+// not listed falls back to 0.0 dB, which short-circuits PaSettingsStore to
+// the legacy percent→byte path and preserves pre-calibration behavior.
 internal static class PaDefaults
 {
     // Thetis HERMES / HPSDR / ORIONMKII / ANAN10 / ANAN10E bracket
@@ -93,6 +93,13 @@ internal static class PaDefaults
         ["12m"] = 100.0, ["10m"] = 100.0, ["6m"] = 38.8,
     };
 
+    // Thetis stores one VHF/XVTR PA seed for every transverter band. The
+    // regular 8-bit-drive families use 56.2 dB; the 7000D/G2/Saturn bracket
+    // uses 63.1 dB. These are starting points only — every profile has its
+    // own operator calibration row in pa_bands.
+    private const double StandardXvtrGainDb = 56.2;
+    private const double SaturnXvtrGainDb = 63.1;
+
     private static IReadOnlyDictionary<string, double> TableFor(HpsdrBoardKind board) =>
         TableFor(board, OrionMkIIVariant.G2);
 
@@ -138,10 +145,28 @@ internal static class PaDefaults
     /// </summary>
     public static double GetPaGainDb(HpsdrBoardKind board, string band, OrionMkIIVariant variant)
     {
+        if (BandUtils.IsXvtrBand(band))
+            return GetXvtrPaGainDb(board, variant);
         if (board == HpsdrBoardKind.HermesLite2)
             return Hl2OutputPct.TryGetValue(band, out var pct) ? pct : 100.0;
         return TableFor(board, variant).TryGetValue(band, out var v) ? v : 0.0;
     }
+
+    private static double GetXvtrPaGainDb(HpsdrBoardKind board, OrionMkIIVariant variant) => board switch
+    {
+        // HL2 uses its PA field as an output percentage. Its XVTR output
+        // therefore starts unattenuated, just like its HF profiles.
+        HpsdrBoardKind.HermesLite2 => 100.0,
+        HpsdrBoardKind.HermesC10 => SaturnXvtrGainDb,
+        HpsdrBoardKind.OrionMkII => variant switch
+        {
+            OrionMkIIVariant.Anan8000DLE or OrionMkIIVariant.OrionMkII => StandardXvtrGainDb,
+            _ => SaturnXvtrGainDb,
+        },
+        HpsdrBoardKind.Hermes or HpsdrBoardKind.Metis or HpsdrBoardKind.HermesII
+            or HpsdrBoardKind.Angelia or HpsdrBoardKind.Orion => StandardXvtrGainDb,
+        _ => 0.0,
+    };
 
     // Rated PA output in watts per board class. Used as the default for
     // PaGlobalSettingsDto.PaMaxPowerWatts when no operator-entered value is

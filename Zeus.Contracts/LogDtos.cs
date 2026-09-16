@@ -105,7 +105,12 @@ public sealed record QrzSyncResponse(
     int PageCount,
     bool FullSync,
     string? Error = null,
-    int SkippedCount = 0);
+    int SkippedCount = 0)
+{
+    public DateTime? LastSuccessfulPullUtc { get; init; }
+    public int MetadataConflictCount { get; init; }
+    public bool TrustedAwardSyncAvailable { get; init; } = true;
+}
 
 /// <summary>
 /// Partial QSO update. Null leaves a field unchanged; empty strings and empty
@@ -159,7 +164,11 @@ public sealed record QrzPublishResponse(
     int TotalCount,
     int SuccessCount,
     int FailedCount,
-    IEnumerable<QrzPublishResult> Results);
+    IEnumerable<QrzPublishResult> Results)
+{
+    public string? SyncError { get; init; }
+    public QrzSyncResponse? SyncResult { get; init; }
+}
 
 public sealed record QrzPublishResult(
     string LogEntryId,
