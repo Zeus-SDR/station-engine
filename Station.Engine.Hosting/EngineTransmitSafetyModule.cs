@@ -256,7 +256,7 @@ internal sealed class EngineTransmitSafetyModule
         {
             return TransmitSafetyDecision.Deny(
                 TransmitSafetyReasonCode.OutOfBand,
-                $"TX blocked: {envelope.LowHz / 1_000_000.0:F6}-{envelope.HighHz / 1_000_000.0:F6} MHz emission envelope is not allowed for mode {snapshot.State.Mode} in region {snapshot.Region.DisplayName}",
+                $"TX blocked: {envelope.LowHz / 1_000_000.0:F6}-{envelope.HighHz / 1_000_000.0:F6} MHz emission envelope is not allowed for mode {RadioFrequencyResolver.TxMode(snapshot.State)} in region {snapshot.Region.DisplayName}",
                 envelope);
         }
 
@@ -292,10 +292,15 @@ internal sealed class EngineTransmitSafetyModule
         var decision = ResolveEffectiveDrive(requestedPercent, snapshot.Board, snapshot.Variant);
         if (!decision.Allowed || snapshot.TransverterBand is not { } xvtr)
             return decision;
-        return decision with
-        {
-            EffectiveDrivePercent = Math.Min(decision.EffectiveDrivePercent, xvtr.Power),
-        };
+        // A dBm rating defines the Xvtr's full slider scale. Keep the legacy
+        // percentage ceiling intact for rollback, but apply it only while no
+        // dBm rating is configured.
+        return xvtr.MaxPowerDbm is null
+            ? decision with
+            {
+                EffectiveDrivePercent = Math.Min(decision.EffectiveDrivePercent, xvtr.Power),
+            }
+            : decision;
     }
 
     internal static TransmitSafetyDecision ResolveEffectiveDrive(
@@ -447,10 +452,11 @@ internal sealed class EngineTransmitSafetyModule
     private static bool EnvelopeAllowed(TransmitSafetySnapshot snapshot, TxEmissionEnvelope rawEnvelope)
     {
         var envelope = rawEnvelope.Normalize();
+        var txMode = RadioFrequencyResolver.TxMode(snapshot.State);
         foreach (var segment in snapshot.Plan)
         {
             if (segment.Allocation != BandAllocation.Amateur) continue;
-            if (!BandPlanService.ModeMatchesRestriction(snapshot.State.Mode, segment.ModeRestriction)) continue;
+            if (!BandPlanService.ModeMatchesRestriction(txMode, segment.ModeRestriction)) continue;
 
             // Internal half-open form adapts the present inclusive contract by
             // making HighHz+1 the exclusive end. This gives exact integer-Hz

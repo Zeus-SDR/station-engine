@@ -39,22 +39,26 @@ public sealed class TransverterSettingsStore : IDisposable
         var entry = _rows.FindAll().FirstOrDefault();
         bool migrateLegacy = entry is not null
             && (entry.Bands is null || entry.Bands.Count == 0);
+        bool migratePresetTemplates = entry?.Bands?.Any(IsEmptyBand) == true;
+        bool migrateLegacySlotLabel = entry?.Bands?.Any(band => band.Id == 0
+            && IsPlaceholderLabel(band.ButtonText, band.Id)
+            && PresetLabelForRfHz(entry.RfFrequencyHz) is not null) == true;
         TransverterSettingsDto loaded;
         try
         {
             loaded = entry is null
-                ? CreateLegacySettings(28_000_000, 144_000_000)
+                ? CreatePresetSettings()
                 : FromEntry(entry);
         }
         catch (OverflowException)
         {
-            loaded = CreateLegacySettings(28_000_000, 144_000_000);
+            loaded = CreatePresetSettings();
         }
         _current = TransverterFrequencyConverter.TryValidate(loaded, out _)
             ? loaded with { Enabled = false, ActiveBandId = null }
-            : CreateLegacySettings(28_000_000, 144_000_000);
+            : CreatePresetSettings();
 
-        if (migrateLegacy)
+        if (migrateLegacy || migratePresetTemplates || migrateLegacySlotLabel)
             Persist(_current, entry!);
 
         log.LogInformation("TransverterSettingsStore initialized at {Path}", dbPath);
@@ -151,7 +155,7 @@ public sealed class TransverterSettingsStore : IDisposable
     private static TransverterSettingsDto Normalize(TransverterSettingsDto settings)
     {
         if (settings.Bands is not null)
-            return settings with { Bands = settings.Bands.OrderBy(item => item.Id).ToArray() };
+            return settings with { Bands = ApplyPresetTemplates(settings.Bands) };
 
         var migrated = CreateLegacySettings(settings.IfFrequencyHz, settings.RfFrequencyHz);
         return migrated with
@@ -169,26 +173,112 @@ public sealed class TransverterSettingsStore : IDisposable
                 ? new TransverterBandDto(
                     Id: 0,
                     Enabled: true,
+                    ButtonText: PresetLabelForRfHz(rfHz) ?? "XVTR0",
                     LoOffsetHz: offset,
                     BeginFrequencyHz: checked(offset + TransverterFrequencyConverter.MinimumRadioFrequencyHz),
                     EndFrequencyHz: checked(offset + TransverterFrequencyConverter.MaximumTransverterIfFrequencyHz))
-                : new TransverterBandDto(id))
+                : CreatePresetBand(id))
             .ToArray();
         return new TransverterSettingsDto(false, ifHz, rfHz, bands, null);
     }
+
+    private static TransverterSettingsDto CreatePresetSettings() => new(
+        Enabled: false,
+        IfFrequencyHz: 28_000_000,
+        RfFrequencyHz: 144_000_000,
+        Bands: Enumerable.Range(0, TransverterFrequencyConverter.BandCount)
+            .Select(CreatePresetBand)
+            .ToArray(),
+        ActiveBandId: null);
 
     private static TransverterSettingsDto FromEntry(TransverterSettingsEntry entry)
     {
         if (entry.Bands is null || entry.Bands.Count == 0)
             return CreateLegacySettings(entry.IfFrequencyHz, entry.RfFrequencyHz);
 
+        var bands = ApplyLegacySlotLabel(
+            ApplyPresetTemplates(entry.Bands.Select(FromEntry)),
+            entry.RfFrequencyHz);
         return new TransverterSettingsDto(
             Enabled: false,
             entry.IfFrequencyHz,
             entry.RfFrequencyHz,
-            entry.Bands.Select(FromEntry).OrderBy(item => item.Id).ToArray(),
+            bands,
             ActiveBandId: null);
     }
+
+    // Disabled templates make the common bands discoverable without routing
+    // RF or enabling TX before the operator has matched the actual converter.
+    private static TransverterBandDto CreatePresetBand(int id) => id switch
+    {
+        0 => CreatePresetBand(0, "2m", 144_000_000, 148_000_000),
+        1 => CreatePresetBand(1, "70cm", 420_000_000, 450_000_000),
+        2 => CreatePresetBand(2, "1.25m", 222_000_000, 225_000_000),
+        3 => CreatePresetBand(3, "33cm", 902_000_000, 928_000_000),
+        4 => CreatePresetBand(4, "23cm", 1_240_000_000, 1_300_000_000),
+        5 => CreatePresetBand(5, "4m", 70_000_000, 71_000_000),
+        _ => new TransverterBandDto(id),
+    };
+
+    private static TransverterBandDto CreatePresetBand(int id, string label, long beginHz, long endHz) => new(
+        Id: id,
+        ButtonText: label,
+        LoOffsetHz: beginHz - 28_000_000,
+        BeginFrequencyHz: beginHz,
+        EndFrequencyHz: endHz);
+
+    private static IReadOnlyList<TransverterBandDto> ApplyPresetTemplates(
+        IEnumerable<TransverterBandDto> bands) => bands
+        .OrderBy(item => item.Id)
+        .Select(item => IsEmptyBand(item) ? CreatePresetBand(item.Id) : item)
+        .ToArray();
+
+    private static IReadOnlyList<TransverterBandDto> ApplyLegacySlotLabel(
+        IReadOnlyList<TransverterBandDto> bands,
+        long rfHz)
+    {
+        var label = PresetLabelForRfHz(rfHz);
+        if (label is null) return bands;
+        return bands.Select(band => band.Id == 0 && IsPlaceholderLabel(band.ButtonText, band.Id)
+            ? band with { ButtonText = label }
+            : band).ToArray();
+    }
+
+    private static bool IsEmptyBand(TransverterBandEntry band) =>
+        !band.Enabled
+        && IsPlaceholderLabel(band.ButtonText, band.Id)
+        && band.LoOffsetHz == 0
+        && band.LoErrorHz == 0
+        && band.BeginFrequencyHz == 0
+        && band.EndFrequencyHz == 0;
+
+    private static bool IsEmptyBand(TransverterBandDto band) =>
+        !band.Enabled
+        && IsPlaceholderLabel(band.ButtonText, band.Id)
+        && band.LoOffsetHz == 0
+        && band.LoErrorHz == 0
+        && band.BeginFrequencyHz == 0
+        && band.EndFrequencyHz == 0;
+
+    private static bool IsPlaceholderLabel(string? value, int id)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return true;
+        var label = value.Trim();
+        return label == id.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            || string.Equals(label, $"XVTR {id}", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(label, $"XVTR{id}", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? PresetLabelForRfHz(long rfHz) => rfHz switch
+    {
+        >= 70_000_000 and <= 71_000_000 => "4m",
+        >= 144_000_000 and <= 148_000_000 => "2m",
+        >= 222_000_000 and <= 225_000_000 => "1.25m",
+        >= 420_000_000 and <= 450_000_000 => "70cm",
+        >= 902_000_000 and <= 928_000_000 => "33cm",
+        >= 1_240_000_000 and <= 1_300_000_000 => "23cm",
+        _ => null,
+    };
 
     private static TransverterBandDto FromEntry(TransverterBandEntry entry) => new(
         entry.Id,
@@ -202,7 +292,8 @@ public sealed class TransverterSettingsStore : IDisposable
         entry.RxOnly,
         entry.Power,
         entry.DisablePa,
-        entry.RxAntenna);
+        entry.RxAntenna,
+        entry.MaxPowerDbm);
 
     private void Persist(
         TransverterSettingsDto settings,
@@ -226,6 +317,7 @@ public sealed class TransverterSettingsStore : IDisposable
             Power = item.Power,
             DisablePa = item.DisablePa,
             RxAntenna = item.RxAntenna,
+            MaxPowerDbm = item.MaxPowerDbm,
         }).ToList();
         entry.UpdatedUtc = DateTime.UtcNow;
         if (insert) _rows.Insert(entry);
@@ -265,4 +357,5 @@ public sealed class TransverterBandEntry
     public int Power { get; set; } = 100;
     public bool DisablePa { get; set; } = true;
     public TransverterRxAntenna RxAntenna { get; set; }
+    public double? MaxPowerDbm { get; set; }
 }

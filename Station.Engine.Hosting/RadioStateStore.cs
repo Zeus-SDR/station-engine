@@ -168,6 +168,7 @@ public sealed class RadioStateEntry
     // RadioService's historical startup state.
     public bool PreampOn { get; set; }
     public double RxAfGainDb { get; set; }
+    public double Rx1AfGainDb { get; set; }
     // TX mic gain in dB, range [-40, +10]. Default 0 ≡ unity panel-gain (mirrors
     // WdspDspEngine TXA fresh-open). The endpoint accepted this value but didn't
     // save it; lived only in frontend localStorage and reverted on every restart

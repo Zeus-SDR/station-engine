@@ -158,17 +158,23 @@ public class DspPipelineService : BackgroundService,
     /// safe from the request thread.</summary>
     public void SetTxMonitorMeterOnly(bool on) => _txMonitorMeterOnly = on;
     public bool TxMonitorMeterOnly => _txMonitorMeterOnly;
-    public const double MinTxMonitorVolumeDb = -60.0;
-    public const double MaxTxMonitorVolumeDb = 0.0;
+    public const double MinTxMonitorVolumeDb = TxMonitorSettingsStore.MinVolumeDb;
+    public const double MaxTxMonitorVolumeDb = TxMonitorSettingsStore.MaxVolumeDb;
+    private readonly TxMonitorSettingsStore? _txMonitorSettingsStore;
+    private readonly object _txMonitorVolumeSync = new();
     private double _txMonitorVolumeDb;
     public double TxMonitorVolumeDb => Volatile.Read(ref _txMonitorVolumeDb);
 
     public double SetTxMonitorVolumeDb(double db)
     {
-        if (!double.IsFinite(db)) db = 0.0;
-        double applied = Math.Clamp(db, MinTxMonitorVolumeDb, MaxTxMonitorVolumeDb);
-        Volatile.Write(ref _txMonitorVolumeDb, applied);
-        return applied;
+        lock (_txMonitorVolumeSync)
+        {
+            if (!double.IsFinite(db)) db = TxMonitorSettingsStore.DefaultVolumeDb;
+            double applied = Math.Clamp(db, MinTxMonitorVolumeDb, MaxTxMonitorVolumeDb);
+            _txMonitorSettingsStore?.SetVolumeDb(applied);
+            Volatile.Write(ref _txMonitorVolumeDb, applied);
+            return applied;
+        }
     }
 
     internal struct RxAudioLevelerState
@@ -1808,9 +1814,13 @@ public class DspPipelineService : BackgroundService,
         IConfiguration? configuration = null,
         IProductTxAudioPort? productAudio = null,
         ProductPluginAudioPort? productPluginAudio = null,
-        SMeterCalibrationStore? sMeterCalibrationStore = null)
+        SMeterCalibrationStore? sMeterCalibrationStore = null,
+        TxMonitorSettingsStore? txMonitorSettingsStore = null)
     {
         _radio = radio;
+        _txMonitorSettingsStore = txMonitorSettingsStore;
+        _txMonitorVolumeDb = txMonitorSettingsStore?.VolumeDb
+            ?? TxMonitorSettingsStore.DefaultVolumeDb;
         _sMeterCalibrationStore = sMeterCalibrationStore;
         if (_sMeterCalibrationStore is not null)
         {
@@ -5154,6 +5164,9 @@ public class DspPipelineService : BackgroundService,
         RadioService.MinAgcFixedGainDb,
         RadioService.MaxAgcTopDb);
 
+    internal static double EffectiveAfGainDb(double masterAfGainDb, double ownAfGainDb) =>
+        Math.Clamp(masterAfGainDb + ownAfGainDb, -50.0, 20.0);
+
     internal static AgcConfig EffectiveAgcConfig(AgcConfig configured, double effectiveGainDb) =>
         configured.Mode == AgcMode.Fixed
             ? configured with
@@ -5887,7 +5900,9 @@ public class DspPipelineService : BackgroundService,
         // re-apply the operator's AF on the decoded speech in the audio tick
         // (ApplyFreeDvAfGain / _freeDvAfGainLinear). On exit the latch re-slews
         // the WDSP panel back to s.RxAfGainDb automatically.
-        double afTargetDb = rxFreeDvMode ? 0.0 : s.RxAfGainDb;
+        double afTargetDb = rxFreeDvMode
+            ? 0.0
+            : EffectiveAfGainDb(s.RxAfGainDb, s.Rx1AfGainDb);
         if (afTargetDb != _appliedRxAfGainDb)
         {
             _appliedRxAfGainDb = StepTowardCappedDb(
@@ -6575,7 +6590,7 @@ public class DspPipelineService : BackgroundService,
         int ctunShiftHz = (int)(CwOffset.EffectiveLoHz(s.Mode, s.VfoHz) - s.RadioLoHz) + ritHz;
         engine.SetCtunShift(channelId, ctunShiftHz);
         engine.SetAgcTop(channelId, effectiveAgc);
-        engine.SetRxAfGainDb(channelId, s.RxAfGainDb);
+        engine.SetRxAfGainDb(channelId, EffectiveAfGainDb(s.RxAfGainDb, s.Rx1AfGainDb));
         // Re-push TX mic gain + Leveler on every fresh engine so the channel
         // doesn't sit at the WDSP open-time defaults when the operator's last
         // values differ. The engine's TXA reopen path resets PanelGain1=1.0 and
@@ -6632,7 +6647,7 @@ public class DspPipelineService : BackgroundService,
         _appliedTxLowHz = txOpenLow;
         _appliedTxHighHz = txOpenHigh;
         _appliedAgcCeilingDb = effectiveAgc;
-        _appliedRxAfGainDb = s.RxAfGainDb;
+        _appliedRxAfGainDb = EffectiveAfGainDb(s.RxAfGainDb, s.Rx1AfGainDb);
         // Reset every secondary's per-RX AF-gain slew state — the engine has
         // just opened a fresh RX1 channel (full engine swap or reconnect), so
         // any RX2..N channels will be reopened too and need to snap to their
@@ -6933,9 +6948,10 @@ public class DspPipelineService : BackgroundService,
         // (Receivers[i].AfGainDb) so the rate-cap state is per-SecondaryRx.
         // NaN sentinel = "no value applied yet" — snaps on the first push
         // after a fresh channel-open so we don't drag from a stale 0 dB.
+        double afTarget = EffectiveAfGainDb(s.RxAfGainDb, afGainDb);
         double afNext = double.IsNaN(rx.AppliedAfGainDb)
-            ? afGainDb
-            : StepTowardCappedDb(rx.AppliedAfGainDb, afGainDb, AfGainSlewMaxDbPerTick);
+            ? afTarget
+            : StepTowardCappedDb(rx.AppliedAfGainDb, afTarget, AfGainSlewMaxDbPerTick);
         if (rx.AppliedAfGainDb != afNext)
         {
             engine.SetRxAfGainDb(channelId, afNext);
@@ -9641,7 +9657,8 @@ public class DspPipelineService : BackgroundService,
                         // before the RX audio plugin + squelch to match normal-mode
                         // ordering (WDSP applies AF before those managed inserts).
                         ApplyFreeDvAfGain(
-                            audioBuf.AsSpan(0, audioSampleCount), state.RxAfGainDb);
+                            audioBuf.AsSpan(0, audioSampleCount),
+                            EffectiveAfGainDb(state.RxAfGainDb, state.Rx1AfGainDb));
                     }
                 }
 

@@ -67,6 +67,8 @@ internal enum MicBlockSource
     BrowserMic,
     /// <summary>Radio-digitised jack audio (Saturn mic/line-in/XLR via UDP 1026).</summary>
     RadioMic,
+    /// <summary>Dedicated test-tools virtual cable capture.</summary>
+    VirtualCable,
     /// <summary>TCI client TX audio (MSHV / WSJT-X …). Operator-explicit override.</summary>
     Tci,
     /// <summary>WAV-recording playback to the air. Operator-explicit override.</summary>
@@ -214,6 +216,11 @@ public sealed class TxAudioIngest : IDisposable
     // Default Host so a fresh / un-switched ingest is byte/behaviour-identical
     // to today.
     private MicBlockSource _activeSource = MicBlockSource.Host;
+    // The normal operator-selected source is retained while the separately
+    // managed virtual-cable test route is active. Disabling that route restores
+    // this source without changing the radio's audio-source setting.
+    private MicBlockSource _normalActiveSource = MicBlockSource.Host;
+    private bool _virtualCableEnabled;
     // Source whose samples currently occupy the WDSP accumulator. Read/written
     // ONLY under _sync. Enforces that a partially-filled accumulator is NEVER
     // topped up by a different source: between the cheap top-of-method gate and
@@ -240,12 +247,38 @@ public sealed class TxAudioIngest : IDisposable
             : MicBlockSource.RadioMic;
         lock (_sync)
         {
-            if (_activeSource == mapped) return;
-            _activeSource = mapped;
+            _normalActiveSource = mapped;
+            if (_virtualCableEnabled || _activeSource == mapped) return;
+            SetActiveSourceLocked(mapped);
+        }
+    }
+
+    /// <summary>
+    /// Enables the test-tools virtual cable as an independent live TX source.
+    /// This only selects audio; it never changes MOX or PTT. The ordinary
+    /// Host/Radio source selection is preserved and restored when disabled.
+    /// </summary>
+    internal void SetVirtualCableEnabled(bool enabled)
+    {
+        lock (_sync)
+        {
+            if (_virtualCableEnabled == enabled) return;
+            _virtualCableEnabled = enabled;
+            // A browser/mobile stream may have owned the ordinary live source
+            // immediately before the cable was selected. Clear its recency
+            // stamp while holding the same gate so it cannot delay the cable.
+            if (enabled) Volatile.Write(ref _lastBrowserMicTickMs, 0);
+            SetActiveSourceLocked(enabled ? MicBlockSource.VirtualCable : _normalActiveSource);
+        }
+    }
+
+    private void SetActiveSourceLocked(MicBlockSource source)
+    {
+        if (_activeSource == source) return;
+        _activeSource = source;
             // Quiesce: drop any partially-accumulated old-source audio so it
             // can't stitch onto the post-switch source mid-WDSP-block.
-            _accumulatorFill = 0;
-        }
+        _accumulatorFill = 0;
     }
 
     /// <summary>Current armed source for the host/radio gate (test/diagnostic).</summary>
@@ -875,8 +908,15 @@ public sealed class TxAudioIngest : IDisposable
     /// </summary>
     internal void OnMicPcmBytesFromBrowserMic(ReadOnlyMemory<byte> f32lePayload)
     {
+        // A test-tools cable is an explicit exclusive source. Do not stamp the
+        // browser recency clock here: doing so would both admit this frame and
+        // suppress the cable for its hysteresis window.
         long now = Environment.TickCount64;
-        Volatile.Write(ref _lastBrowserMicTickMs, now);
+        lock (_sync)
+        {
+            if (_activeSource == MicBlockSource.VirtualCable) return;
+            Volatile.Write(ref _lastBrowserMicTickMs, now);
+        }
         if (ShouldSuppressForAuthoritativeSource(now)) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.BrowserMic);
     }
@@ -924,6 +964,25 @@ public sealed class TxAudioIngest : IDisposable
         long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
         if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.RadioMic);
+    }
+
+    /// <summary>
+    /// Source-tagged entry point for the independently managed TX Testing
+    /// Tools virtual-cable capture. Like other live sources it yields to a
+    /// current TCI/WAV override and never changes MOX/PTT state itself.
+    /// </summary>
+    internal void OnMicPcmBytesFromVirtualCable(
+        ReadOnlyMemory<byte> f32lePayload,
+        MicBlockValidity validity)
+    {
+        long now = Environment.TickCount64;
+        if (ShouldSuppressForAuthoritativeSource(now)) return;
+        if (ActiveSource != MicBlockSource.VirtualCable)
+        {
+            long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
+            if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
+        }
+        OnMicPcmBytes(f32lePayload, MicBlockSource.VirtualCable, validity);
     }
 
     private bool ShouldSuppressForAuthoritativeSource(long now)
@@ -976,11 +1035,13 @@ public sealed class TxAudioIngest : IDisposable
         // accumulator gate remains authoritative for the separate WDSP append,
         // since _activeSource can flip again after this lock is released. TCI/WAV
         // bypass both the live-mic bridge and this compare.
-        if (source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic)
+        if (source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable)
         {
             lock (_sync)
             {
-                if (source != MicBlockSource.BrowserMic && source != _activeSource)
+                if ((source == MicBlockSource.BrowserMic
+                        && _activeSource == MicBlockSource.VirtualCable)
+                    || (source != MicBlockSource.BrowserMic && source != _activeSource))
                 {
                     _droppedFrames++;
                     return;
@@ -1149,7 +1210,7 @@ public sealed class TxAudioIngest : IDisposable
         // leveler cannot raise a tone out of exact zeros, so the gate's original
         // purpose is preserved.
         if (monitorOn && !moxNow
-            && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic
+            && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable
             && ShouldSuppressIdleMonitorPreviewBlock(samples))
         {
             samples = SilentMicBlock;
@@ -1175,7 +1236,8 @@ public sealed class TxAudioIngest : IDisposable
             // block — no double-feed. TCI/WAV bypass this (operator-explicit
             // overrides; recency-gated above). Under Host with a Host block this
             // is a pure no-op → host path byte/behaviour-identical to today.
-            if (source is MicBlockSource.Host or MicBlockSource.RadioMic
+            if ((source is MicBlockSource.Host or MicBlockSource.RadioMic or MicBlockSource.VirtualCable
+                 || (source == MicBlockSource.BrowserMic && _activeSource == MicBlockSource.VirtualCable))
                 && source != _activeSource)
             {
                 _droppedFrames++;

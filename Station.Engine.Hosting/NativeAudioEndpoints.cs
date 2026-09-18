@@ -52,6 +52,11 @@ public static class NativeAudioEndpoints
         });
         endpoints.MapGet("/api/audio/devices", GetNativeAudioDevices);
         endpoints.MapPut("/api/audio/devices", SetNativeAudioDevices);
+        // TX Testing Tools uses a second, deliberately independent capture
+        // route for a virtual audio cable. It must not write the normal mic
+        // device selection or change MOX/PTT state.
+        endpoints.MapGet("/api/tx/testing/virtual-cable", GetVirtualCable);
+        endpoints.MapPut("/api/tx/testing/virtual-cable", SetVirtualCable);
         endpoints.MapPost("/api/audio/asio/control-panel", async (
             IServiceProvider sp,
             CancellationToken ct) =>
@@ -116,6 +121,69 @@ public static class NativeAudioEndpoints
                 error: ex.Message,
                 coordinator));
         }
+    }
+
+    private static IResult GetVirtualCable(IServiceProvider sp)
+    {
+        var capture = sp.GetService<VirtualCableTxCapture>();
+        if (capture is null)
+        {
+            return Results.Ok(new VirtualCableTxResponse(
+                Supported: false, Enabled: false, InputDeviceId: null,
+                ActiveInputDeviceId: null, Inputs: [], Error: null));
+        }
+        try
+        {
+            return Results.Ok(new VirtualCableTxResponse(
+                Supported: true,
+                Enabled: capture.Enabled,
+                InputDeviceId: capture.ConfiguredInputDeviceId,
+                ActiveInputDeviceId: capture.ActiveInputDeviceId,
+                Inputs: EnumerateDevices(sp).Inputs
+                    .Select(ToNativeAudioDeviceDto)
+                    .Where(device => device.VirtualCable is not null)
+                    .ToArray(),
+                Error: capture.Error));
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            return Results.Ok(new VirtualCableTxResponse(
+                Supported: false, Enabled: false,
+                InputDeviceId: capture.ConfiguredInputDeviceId,
+                ActiveInputDeviceId: capture.ActiveInputDeviceId,
+                Inputs: [], Error: ex.Message));
+        }
+    }
+
+    private static async Task<IResult> SetVirtualCable(
+        VirtualCableTxSetRequest body,
+        IServiceProvider sp,
+        CancellationToken ct)
+    {
+        var capture = sp.GetService<VirtualCableTxCapture>();
+        if (capture is null)
+            return Results.NotFound(new { error = "virtual cable capture is not available in this host mode" });
+
+        string? inputDeviceId = NormalizeDeviceId(body?.InputDeviceId);
+        if (body?.Enabled == true)
+        {
+            if (inputDeviceId is null)
+                return Results.BadRequest(new { error = "select a virtual cable input first" });
+            try
+            {
+                var selected = EnumerateDevices(sp).Inputs.FirstOrDefault(
+                    device => string.Equals(device.Id, inputDeviceId, StringComparison.Ordinal));
+                if (selected is null || VirtualAudioCableCatalog.Match(selected.Name) is null)
+                    return Results.BadRequest(new { error = "selected input is not a recognized virtual audio cable" });
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+            {
+                return Results.BadRequest(new { error = $"native audio device enumeration unavailable: {ex.Message}" });
+            }
+        }
+
+        await capture.ConfigureAsync(body?.Enabled == true, inputDeviceId, ct);
+        return GetVirtualCable(sp);
     }
 
     internal static async Task<IResult> SetNativeAudioDevices(
@@ -390,6 +458,14 @@ internal sealed record VirtualAudioCableMatchDto(
     string Vendor,
     string Product,
     string InstallUrl);
+internal sealed record VirtualCableTxSetRequest(bool Enabled, string? InputDeviceId);
+internal sealed record VirtualCableTxResponse(
+    bool Supported,
+    bool Enabled,
+    string? InputDeviceId,
+    string? ActiveInputDeviceId,
+    IReadOnlyList<NativeAudioDeviceDto> Inputs,
+    string? Error);
 internal sealed record NativeAudioDevicesResponse(
     bool Supported,
     string? InputDeviceId,

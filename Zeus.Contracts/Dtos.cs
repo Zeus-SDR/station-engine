@@ -1177,13 +1177,12 @@ public sealed record StateDto(
     // for legacy state frames and settings rows; Minimum is explicitly opt-in.
     FilterPhaseMode RxFilterPhase = FilterPhaseMode.Linear,
     FilterPhaseMode TxFilterPhase = FilterPhaseMode.Linear,
-    // Master RX AF gain in dB. 0 dB ≡ WDSP SetRXAPanelGain1(1.0), the
-    // engine's open-time default — a fresh session that never touches this
-    // field is audibly identical to pre-#77 builds. Operator slider range
-    // is −50..+20 dB (see RadioService.SetRxAfGain). Per-RX not supported
-    // yet; when multi-RX lands this becomes the master and the per-RX
-    // values layer on top.
+    // Station-wide master AF gain in dB, composed with every receiver's own
+    // AF trim at the DSP boundary. Operator slider range is −50..+20 dB.
     double RxAfGainDb = 0.0,
+    // RX1's own AF gain in dB, independent of the master above. RX2 and later
+    // receivers carry their equivalent trim in Receivers[i].AfGainDb.
+    double Rx1AfGainDb = 0.0,
     // TX mic gain in dB. WDSP applies via SetTXAPanelGain1(10^(db/20)); the
     // server stores the operator-friendly dB and converts at the engine seam.
     // Range matches the /api/mic-gain endpoint clamp ([-40, +10]) which in

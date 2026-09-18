@@ -1094,7 +1094,7 @@ public sealed class TciSession : IDisposable
         0 => new ReceiverDto(
             0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
             state.Mode, state.FilterLowHz, state.FilterHighHz,
-            state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+            state.FilterPresetName, state.Rx1AfGainDb, state.SampleRate,
             state.Rx1Muted, SplitEnabled: state.SplitEnabled, TxVfoHz: state.SplitTxHz),
         1 => state.Rx2(),
         _ => throw new ArgumentOutOfRangeException(nameof(receiver)),
@@ -1826,20 +1826,21 @@ public sealed class TciSession : IDisposable
     {
         // SunSDR TCI spec §5.4 — per-RX volume in dB.
         //   rx_volume:<trx>,<rx>          GET → echo current dB
-        //   rx_volume:<trx>,<rx>,<dB>     SET → route through SetRxAfGain
-        // Zeus has a single shared AF bus today, so all (trx,rx) combos
-        // mirror RxAfGainDb. RadioService clamps to [-50, +20] dB.
+        //   rx_volume:<trx>,<rx>,<dB>     SET → address that receiver's trim
         if (args.Length < 2) return;
         if (!TciProtocol.TryParseInt(args[0], out int trx)) return;
         if (!TciProtocol.TryParseInt(args[1], out int rx)) return;
+        if (rx is not (0 or 1)) return;
         if (args.Length == 2)
         {
             var state = _radio.Snapshot();
-            Send(TciProtocol.Command("rx_volume", trx, rx, (int)Math.Round(state.RxAfGainDb)));
+            Send(TciProtocol.Command(
+                "rx_volume", trx, rx, (int)Math.Round(ReceiverState(state, rx).AfGainDb)));
             return;
         }
-        if (TciProtocol.TryParseDouble(args[2], out double db))
-            _radio.SetRxAfGain(db);
+        if (TciProtocol.TryParseDouble(args[2], out double db)
+            && (rx == 0 || _radio.Snapshot().Rx2Enabled))
+            _radio.SetReceiver(rx, afGainDb: db);
     }
 
     private void HandleTxProfileEx(string[] args)

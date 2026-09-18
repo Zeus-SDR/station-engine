@@ -77,6 +77,7 @@ internal static class EnginePrefsDbMigration
             StationFavoriteStore.CollectionName,
             "transverter_settings",
             "tx_fidelity_policy",
+            "tx_monitor_settings",
             "cfc_presets",
             "hf_auto_config",
             "spe_taurus_config",

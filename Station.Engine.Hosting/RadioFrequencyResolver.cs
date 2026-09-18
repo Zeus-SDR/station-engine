@@ -22,7 +22,7 @@ public static class RadioFrequencyResolver
             return new ReceiverDto(
                 0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
                 state.Mode, state.FilterLowHz, state.FilterHighHz,
-                state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+                state.FilterPresetName, state.Rx1AfGainDb, state.SampleRate,
                 state.Rx1Muted, SplitEnabled: state.SplitEnabled,
                 TxVfoHz: state.SplitTxHz);
 
@@ -39,7 +39,7 @@ public static class RadioFrequencyResolver
         return new ReceiverDto(
             0, true, RadioService.ReceiverAdcSource(state, 0), state.VfoHz,
             state.Mode, state.FilterLowHz, state.FilterHighHz,
-            state.FilterPresetName, state.RxAfGainDb, state.SampleRate,
+            state.FilterPresetName, state.Rx1AfGainDb, state.SampleRate,
             state.Rx1Muted, SplitEnabled: state.SplitEnabled,
             TxVfoHz: state.SplitTxHz);
     }

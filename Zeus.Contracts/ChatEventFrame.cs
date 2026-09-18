@@ -18,7 +18,7 @@ namespace Zeus.Contracts;
 /// {"kind":"roster","roster":[{...ChatOperator...}, ...]}
 /// {"kind":"message","message":{...ChatMessage...}}
 /// {"kind":"attachmentDownloaded","receipt":{...ChatAttachmentDownloadReceipt...}}
-/// {"kind":"history","room":"lobby","messages":[{...ChatMessage...}, ...]}
+/// {"kind":"history","room":"lobby","messages":[{...ChatMessage...}],"nextBefore":"...","hasMore":true}
 /// {"kind":"friends","friends":{...ChatFriendsDto...}}
 /// {"kind":"ptt","ptt":{...ChatPttSignal...}}
 /// {"kind":"tdoa","tdoa":{...ChatTdoaSignal...}}
@@ -59,9 +59,17 @@ public static class ChatEventFrame
     public static byte[] AttachmentDownloaded(ChatAttachmentDownloadReceipt receipt) =>
         Encode(new AttachmentDownloadedEnvelope(receipt));
 
-    /// <summary>Encodes a history (message list) envelope for a room into a 0x35 frame.</summary>
-    public static byte[] History(string room, IReadOnlyList<ChatMessage> messages) =>
-        Encode(new HistoryEnvelope(room, messages));
+    /// <summary>
+    /// Encodes one bounded history page for a room into a 0x35 frame.
+    /// <paramref name="nextBefore"/> is an opaque relay cursor for the next
+    /// older page and is emitted only when <paramref name="hasMore"/> is true.
+    /// </summary>
+    public static byte[] History(
+        string room,
+        IReadOnlyList<ChatMessage> messages,
+        string? nextBefore = null,
+        bool hasMore = false) =>
+        Encode(new HistoryEnvelope(room, messages, nextBefore, hasMore ? true : null));
 
     /// <summary>Encodes a friend-graph envelope into a 0x35 frame.</summary>
     public static byte[] Friends(ChatFriendsDto friends) =>
@@ -146,7 +154,11 @@ public static class ChatEventFrame
         public string Kind => "attachmentDownloaded";
     }
 
-    public sealed record HistoryEnvelope(string Room, IReadOnlyList<ChatMessage> Messages)
+    public sealed record HistoryEnvelope(
+        string Room,
+        IReadOnlyList<ChatMessage> Messages,
+        string? NextBefore = null,
+        bool? HasMore = null)
     {
         public string Kind => "history";
     }

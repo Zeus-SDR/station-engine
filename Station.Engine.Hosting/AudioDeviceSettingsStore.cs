@@ -100,6 +100,27 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Persists the TX Testing Tools virtual-cable selection independently of
+    /// the normal microphone device. Its enabled state is intentionally not
+    /// persisted: a restart must never unexpectedly select test audio.
+    /// </summary>
+    public void SetVirtualCableInputDeviceId(string? inputDeviceId)
+    {
+        lock (_sync)
+        {
+            var e = GetOrCreateEntry();
+            e.VirtualCableInputDeviceId = Normalize(inputDeviceId);
+            SaveEntry(e);
+        }
+    }
+
+    public string? GetVirtualCableInputDeviceId()
+    {
+        lock (_sync)
+            return Normalize(_docs.FindAll().FirstOrDefault()?.VirtualCableInputDeviceId);
+    }
+
     public void Set(string? inputDeviceId, string? outputDeviceId)
     {
         lock (_sync)
@@ -163,5 +184,6 @@ public sealed class AudioDeviceSettingsEntry
     public string? AsioDriverId { get; set; }
     public int AsioInputChannel { get; set; }
     public int AsioOutputChannel { get; set; }
+    public string? VirtualCableInputDeviceId { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

@@ -832,6 +832,7 @@ public sealed class RadioService : IDisposable
             RxFilterPhase: persistedRxFilterPhase,
             TxFilterPhase: persistedTxFilterPhase,
             RxAfGainDb: rsSnap?.RxAfGainDb ?? 0.0,
+            Rx1AfGainDb: Math.Clamp(rsSnap?.Rx1AfGainDb ?? 0.0, -50.0, 20.0),
             // 0 dB unity matches the engine's TXA fresh-open default; legacy
             // rows missing the field hydrate to that same default. A last-loaded
             // TX Audio Profile overlays its mic gain ahead of the snapshot.
@@ -918,7 +919,7 @@ public sealed class RadioService : IDisposable
                 new(Index: 0, Enabled: true, AdcSource: 0,
                     VfoHz: _state.VfoHz, Mode: _state.Mode,
                     FilterLowHz: _state.FilterLowHz, FilterHighHz: _state.FilterHighHz,
-                    FilterPresetName: _state.FilterPresetName, AfGainDb: _state.RxAfGainDb,
+                    FilterPresetName: _state.FilterPresetName, AfGainDb: _state.Rx1AfGainDb,
                     SampleRateHz: _state.SampleRate, Muted: _state.Rx1Muted),
                 new(Index: 1, Enabled: _state.Rx2Enabled, AdcSource: 0,
                     VfoHz: hydVfoB, Mode: hydModeB,
@@ -2169,7 +2170,7 @@ public sealed class RadioService : IDisposable
             if (afGainDb is double af)
             {
                 if (index == 1) SetRx2(new Rx2SetRequest(AfGainDb: af));
-                else SetRxAfGain(af);
+                else SetRx1AfGain(af);
             }
             if (adcSource is byte a)
             {
@@ -5501,7 +5502,7 @@ public sealed class RadioService : IDisposable
         int productCap = Volatile.Read(ref _productPluginDriveCapPct);
         if (!tunActive && productCap >= 0)
             activePct = Math.Min(activePct, productCap);
-        if (txThroughTransverter)
+        if (txThroughTransverter && txXvtrBand.MaxPowerDbm is null)
             activePct = Math.Min(activePct, txXvtrBand.Power);
         // Route through the per-board drive-profile so HL2's 4-bit drive
         // register is respected (bottom nibble ignored by gateware). See
@@ -5516,6 +5517,13 @@ public sealed class RadioService : IDisposable
             ?? EngineTransmitSafetyModule.ResolveEffectiveDrive(activePct, connectedBoard, variant);
         bool safetyAuthorized = Volatile.Read(ref _txSafetyAuthority) != 0;
         var driveProfile = RadioDriveProfiles.For(connectedBoard);
+        // Xvtr ratings are low-level RF drive specifications. At 100%, target
+        // the selected profile's configured dBm rating rather than the radio
+        // PA's full-scale wattage, preserving the entire slider range for the
+        // Xvtr. Missing values retain the legacy PA-target behaviour.
+        double maxPowerWatts = txThroughTransverter && txXvtrBand.MaxPowerDbm is double maxPowerDbm
+            ? DriveByteMath.WattsFromDbm(maxPowerDbm)
+            : cfg.Global.PaMaxPowerWatts;
         double calibratedGain = paBandName is null
             ? paBandCfg.PaGainDb
             : _paStore.ResolveCalibrationGain(
@@ -5525,11 +5533,14 @@ public sealed class RadioService : IDisposable
                 connectedBoard,
                 variant,
                 paBandCfg.PaGainDb);
+        double driveGain = txThroughTransverter && txXvtrBand.MaxPowerDbm is not null
+            ? driveProfile.ResolveXvtrGain(calibratedGain, maxPowerWatts, cfg.Global.PaMaxPowerWatts)
+            : calibratedGain;
         byte driveByte = decision.Allowed && safetyAuthorized && !safetyInhibit
             ? driveProfile.EncodeDriveByte(
                 decision.EffectiveDrivePercent,
-                calibratedGain,
-                cfg.Global.PaMaxPowerWatts)
+                driveGain,
+                maxPowerWatts)
             : (byte)0;
         bool paEnabled = decision.Allowed && safetyAuthorized && !safetyInhibit
             && cfg.Global.PaEnabled && !bandCfg.DisablePa
@@ -5537,7 +5548,7 @@ public sealed class RadioService : IDisposable
 
         _log.LogInformation(
             "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", calibratedGain, cfg.Global.PaMaxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
+            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
         ActiveClient?.SetDriveByte(driveByte);
@@ -5704,6 +5715,14 @@ public sealed class RadioService : IDisposable
     {
         double clamped = Math.Clamp(db, -50.0, 20.0);
         Mutate(s => s with { RxAfGainDb = clamped });
+        return Snapshot();
+    }
+
+    /// <summary>Sets RX1's AF trim independently of the station-wide master.</summary>
+    public StateDto SetRx1AfGain(double db)
+    {
+        double clamped = Math.Clamp(db, -50.0, 20.0);
+        Mutate(s => s with { Rx1AfGainDb = clamped });
         return Snapshot();
     }
 
@@ -6614,7 +6633,7 @@ public sealed class RadioService : IDisposable
         VfoHz: s.VfoHz, Mode: s.Mode,
         FilterLowHz: s.FilterLowHz, FilterHighHz: s.FilterHighHz,
         FilterPresetName: s.FilterPresetName,
-        AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
+        AfGainDb: s.Rx1AfGainDb, SampleRateHz: s.SampleRate,
         Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled, TxVfoHz: s.SplitTxHz,
         // Read-only mirror of the legacy global zoom — RX1 is still SET only via
         // StateDto.ZoomLevel / SetZoom, never through this projection.
@@ -6710,7 +6729,7 @@ public sealed class RadioService : IDisposable
                 VfoHz: s.VfoHz, Mode: s.Mode,
                 FilterLowHz: s.FilterLowHz, FilterHighHz: s.FilterHighHz,
                 FilterPresetName: s.FilterPresetName,
-                AfGainDb: s.RxAfGainDb, SampleRateHz: s.SampleRate,
+                AfGainDb: s.Rx1AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
                 TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
@@ -6809,6 +6828,7 @@ public sealed class RadioService : IDisposable
                 RxLevelerHangMs = rxLeveler.HangMs,
                 PreampOn = snap.PreampOn,
                 RxAfGainDb = snap.RxAfGainDb,
+                Rx1AfGainDb = snap.Rx1AfGainDb,
                 MicGainDb = snap.MicGainDb,
                 LevelerMaxGainDb = snap.LevelerMaxGainDb,
                 ZoomLevel = snap.ZoomLevel,

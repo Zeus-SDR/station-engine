@@ -82,8 +82,14 @@ public sealed class TdoaSolver
         double latStep = search.LatitudeStep;
         double lonStep = search.LongitudeStep;
 
-        var ellipse = EstimateUncertainty(best, solvePairs, out double geometryCondition);
-        double? closureRmsNs = ComputeClosureRms(stations, analyses);
+        double[] modeLikelihoods = refined.Select(candidate => RelativeLikelihood(candidate, best)).ToArray();
+        double modeConcentration = modeLikelihoods[0] / Math.Max(modeLikelihoods.Sum(), 1e-12);
+        var ellipse = IncludeMaterialModes(EstimateUncertainty(best, solvePairs, out double geometryCondition),
+            best, refined, modeLikelihoods);
+        // Closure intentionally stays tied to the independently measured primary
+        // pair delays. Selecting whatever secondary peak is nearest to a proposed
+        // position would make this clock/path-bias diagnostic self-fulfilling.
+        double? closureRmsNs = ComputeClosureRms(stations, solvePairs);
         var warnings = new List<string>
         {
             "Groundwave-only estimate: ionospheric/skywave paths and unmodelled receiver delays can create convincing false modes.",
@@ -101,8 +107,10 @@ public sealed class TdoaSolver
             warnings.Add("Station-cycle delay closure exceeds the declared timing uncertainty; clock or path bias is likely.");
         if (closureRmsNs is null)
             warnings.Add("No complete usable station triplet is available; station-cycle delay closure cannot be evaluated.");
-        if (refined.Count > 1 && Math.Exp(-0.5 * (refined[1].Score - best.Score)) > 0.35)
+        if (refined.Count > 1 && modeLikelihoods[1] > 0.35)
             warnings.Add("Multiple geographic modes have material likelihood.");
+        if (modeConcentration < 0.8)
+            warnings.Add("Competing geographic modes reduce confidence; the uncertainty region includes their separation.");
         warnings.AddRange(analyses.SelectMany(a => a.Result.Warnings.Select(w => $"{a.A.Id}/{a.B.Id}: {w}")));
 
         double residualNs = best.ResidualNanoseconds;
@@ -123,11 +131,12 @@ public sealed class TdoaSolver
         }
         if (rejectedStation is not null) quality *= 0.75;
         if (search.Clipped) quality *= 0.05;
+        quality *= modeConcentration;
         quality = Math.Clamp(quality, 0, 1);
         double radius = Math.Sqrt(ellipse.SemiMajorKm * ellipse.SemiMinorKm);
         var estimate = new TdoaEstimate(best.Latitude, best.Longitude, ellipse, radius);
-        var modes = refined.Select(c => new TdoaMode(c.Latitude, c.Longitude,
-            Math.Exp(-0.5 * Math.Min(100, c.Score - best.Score)), c.ResidualNanoseconds)).ToArray();
+        var modes = refined.Select((c, index) => new TdoaMode(c.Latitude, c.Longitude,
+            modeLikelihoods[index], c.ResidualNanoseconds)).ToArray();
         var heatmap = candidates.Take(120).Select(c => new TdoaHeatmapPoint(c.Latitude, c.Longitude,
             Math.Exp(-0.5 * Math.Min(100, c.Score - best.Score)))).ToArray();
         var diagnostics = new TdoaDiagnostics(closureRmsNs, residualNs, geometryCondition,
@@ -155,9 +164,7 @@ public sealed class TdoaSolver
             double distanceB = TdoaGeodesy.SurfaceDistanceMeters(latitude, longitude, pair.B.LatitudeDeg, pair.B.LongitudeDeg);
             double predictedNs = (distanceB - distanceA) / LightSpeedMetersPerSecond * 1e9;
             double likelihood = pair.LikelihoodAt(predictedNs);
-            double nearestPeakNs = pair.Peaks.Count == 0
-                ? pair.Result.DelayNanoseconds
-                : pair.Peaks.MinBy(peak => Math.Abs(predictedNs - peak.DelayNanoseconds))!.DelayNanoseconds;
+            double nearestPeakNs = pair.PeakFor(predictedNs).DelayNanoseconds;
             double residual = predictedNs - nearestPeakNs;
             double weight = Math.Max(0.05, pair.Result.QualityScore);
             // The geographic objective is driven only by the full pair-delay likelihood.
@@ -186,15 +193,37 @@ public sealed class TdoaSolver
         foreach (PairAnalysis pair in pairs)
         {
             double predicted = PredictedDelay(candidate.Latitude, candidate.Longitude, pair);
-            double peak = pair.Peaks.Count == 0
-                ? pair.Result.DelayNanoseconds
-                : pair.Peaks.MinBy(value => Math.Abs(predicted - value.DelayNanoseconds))!.DelayNanoseconds;
+            double peak = pair.PeakFor(predicted).DelayNanoseconds;
             double normalized = (predicted - peak) / Math.Max(pair.Result.UncertaintyNanoseconds, 1);
             double pairWeight = Math.Max(0.05, pair.Result.QualityScore);
             sum += pairWeight * normalized * normalized;
             weight += pairWeight;
         }
         return Math.Sqrt(sum / Math.Max(weight, 1e-12));
+    }
+
+    private static double RelativeLikelihood(Candidate candidate, Candidate best) =>
+        Math.Exp(-0.5 * Math.Min(100, Math.Max(0, candidate.Score - best.Score)));
+
+    private static TdoaUncertaintyEllipse IncludeMaterialModes(TdoaUncertaintyEllipse localEllipse,
+        Candidate best, IReadOnlyList<Candidate> modes, IReadOnlyList<double> likelihoods)
+    {
+        double furthestMaterialModeKm = 0;
+        for (int i = 1; i < modes.Count; i++)
+        {
+            // A mode whose support is this close to the primary cannot be hidden
+            // behind a local-curvature ellipse. Use a circular envelope because
+            // the alternate may lie in any direction from the primary.
+            if (likelihoods[i] < 0.15) continue;
+            furthestMaterialModeKm = Math.Max(furthestMaterialModeKm,
+                TdoaGeodesy.SurfaceDistanceMeters(best.Latitude, best.Longitude,
+                    modes[i].Latitude, modes[i].Longitude) / 1_000);
+        }
+        if (furthestMaterialModeKm <= 0) return localEllipse;
+
+        double envelopeKm = Math.Max(localEllipse.SemiMajorKm,
+            furthestMaterialModeKm + localEllipse.SemiMajorKm);
+        return new TdoaUncertaintyEllipse(envelopeKm, envelopeKm, localEllipse.BearingDeg);
     }
 
     private static SearchResult SearchAdaptive(IReadOnlyList<ValidatedTdoaCapture> stations,

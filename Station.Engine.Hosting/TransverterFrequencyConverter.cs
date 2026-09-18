@@ -30,6 +30,8 @@ public static class TransverterFrequencyConverter
     public const long MaximumAbsoluteLoErrorHz = 1_000_000;
     public const double MinimumRxGainDb = -100;
     public const double MaximumRxGainDb = 100;
+    public const double MinimumMaxPowerDbm = -100;
+    public const double MaximumMaxPowerDbm = 60;
 
     /// <summary>Legacy additive anchor offset retained for old callers.</summary>
     public static long OffsetHz(TransverterSettingsDto settings)
@@ -222,6 +224,13 @@ public static class TransverterFrequencyConverter
             if (band.Power is < 0 or > 100)
             {
                 error = $"band {band.Id} power must be between 0 and 100";
+                return false;
+            }
+            if (band.MaxPowerDbm is double maxPowerDbm
+                && (!double.IsFinite(maxPowerDbm)
+                    || maxPowerDbm is < MinimumMaxPowerDbm or > MaximumMaxPowerDbm))
+            {
+                error = $"band {band.Id} maxPowerDbm must be between {MinimumMaxPowerDbm} and {MaximumMaxPowerDbm}";
                 return false;
             }
             if (!Enum.IsDefined(band.RxAntenna))

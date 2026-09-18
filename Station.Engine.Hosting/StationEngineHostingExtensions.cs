@@ -136,6 +136,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<SerialPttSettingsStore>();
         services.AddSingleton<AudioDeviceSettingsStore>();
         services.AddSingleton<RadioSpeakerSettingsStore>();
+        services.AddSingleton<TxMonitorSettingsStore>();
         services.AddSingleton<TxFidelityPolicyStore>();
         services.AddSingleton<BandPlanStore>();
         services.AddSingleton<BandPrefsStore>();
@@ -250,6 +251,7 @@ public static class StationEngineHostingExtensions
         services.AddHl2IoBoard();
         services.AddSingleton<SerialPttService>();
         services.AddSingleton<NativeMicCapture>();
+        services.AddSingleton<VirtualCableTxCapture>();
         services.AddSingleton<IAsioSessionFactory, AsioSessionFactory>();
         services.AddSingleton<NativeHostAudioCoordinator>();
         services.AddSingleton<EngineCacheJanitor>();
@@ -289,6 +291,7 @@ public static class StationEngineHostingExtensions
         services.AddHostedService(sp => sp.GetRequiredService<SerialPttService>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeAudioSink>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeMicCapture>());
+        services.AddHostedService(sp => sp.GetRequiredService<VirtualCableTxCapture>());
         services.AddHostedService(sp => sp.GetRequiredService<NativeHostAudioCoordinator>());
 
         services.AddTciServices();

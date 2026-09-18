@@ -75,7 +75,13 @@ public interface IRadioDriveProfile
     /// straight-percent-to-byte mapping that pre-dates the PA math on
     /// FullByte profiles. Ignored on HL2 — percentage-based math doesn't
     /// consult rated watts.</param>
-    byte EncodeDriveByte(int drivePct, double paGainDb, int maxWatts);
+    byte EncodeDriveByte(int drivePct, double paGainDb, double maxWatts);
+
+    /// <summary>
+    /// Resolves an Xvtr dBm rating into the profile's PA-gain domain. Most
+    /// radios use dB gain and need no adjustment; HL2 uses output percent.
+    /// </summary>
+    double ResolveXvtrGain(double paGainDb, double maxWatts, int radioMaxWatts);
 }
 
 /// <summary>
@@ -88,7 +94,7 @@ public interface IRadioDriveProfile
 /// </summary>
 internal static class DriveByteMath
 {
-    public static byte ComputeFullByte(int drivePct, double paGainDb, int maxWatts)
+    public static byte ComputeFullByte(int drivePct, double paGainDb, double maxWatts)
     {
         drivePct = Math.Clamp(drivePct, 0, 100);
         if (maxWatts <= 0)
@@ -104,6 +110,12 @@ internal static class DriveByteMath
         double norm = Math.Clamp(sourceVolts / 0.8, 0.0, 1.0);
         return (byte)Math.Round(norm * 255.0);
     }
+
+    /// <summary>
+    /// Converts an RF level in dBm to watts without discarding sub-watt Xvtr
+    /// ratings through integer rounding.
+    /// </summary>
+    public static double WattsFromDbm(double dbm) => Math.Pow(10.0, (dbm - 30.0) / 10.0);
 }
 
 /// <summary>
@@ -118,8 +130,15 @@ public sealed class FullByteDriveProfile : IRadioDriveProfile
 
     public string BoardLabel => "FullByte (8-bit)";
 
-    public byte EncodeDriveByte(int drivePct, double paGainDb, int maxWatts)
+    public byte EncodeDriveByte(int drivePct, double paGainDb, double maxWatts)
         => DriveByteMath.ComputeFullByte(drivePct, paGainDb, maxWatts);
+
+    public double ResolveXvtrGain(double paGainDb, double maxWatts, int radioMaxWatts)
+    {
+        _ = maxWatts;
+        _ = radioMaxWatts;
+        return paGainDb;
+    }
 }
 
 /// <summary>
@@ -163,7 +182,7 @@ public sealed class HermesLite2DriveProfile : IRadioDriveProfile
 
     public string BoardLabel => "HermesLite2 (%-scale, 4-bit)";
 
-    public byte EncodeDriveByte(int drivePct, double paGainDb, int maxWatts)
+    public byte EncodeDriveByte(int drivePct, double paGainDb, double maxWatts)
     {
         // On HL2 "paGainDb" is a percentage, not decibels (see class-level
         // comment). Clamp to the percentage domain; maxWatts is ignored
@@ -182,6 +201,12 @@ public sealed class HermesLite2DriveProfile : IRadioDriveProfile
         int nibble = (int)Math.Round(raw / 16.0);
         if (nibble > 15) nibble = 15;
         return (byte)(nibble * 16);
+    }
+
+    public double ResolveXvtrGain(double paGainDb, double maxWatts, int radioMaxWatts)
+    {
+        if (radioMaxWatts <= 0) return paGainDb;
+        return Math.Min(paGainDb, maxWatts * 100.0 / radioMaxWatts);
     }
 }
 

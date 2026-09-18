@@ -396,8 +396,12 @@ public sealed record ChatRoomMemberRequest(string Room, string Callsign);
 /// <summary>Admin: enable or disable room-wide PTT for a private group.</summary>
 public sealed record ChatRoomNetRequest(string Room, bool Enabled);
 
-/// <summary>Admin: delete a private group, or request history for a room.</summary>
-public sealed record ChatRoomRequest(string Room);
+/// <summary>
+/// Admin: delete a private group, or request one bounded history page for a
+/// room. <paramref name="Before"/> is an opaque relay cursor from the prior
+/// page; the relay validates that it belongs to <paramref name="Room"/>.
+/// </summary>
+public sealed record ChatRoomRequest(string Room, string? Before = null);
 
 /// <summary>Toggle whether this operator's frequency may be shared (eye toggle).</summary>
 public sealed record ChatFreqVisibilityRequest(bool Public);

@@ -24,6 +24,15 @@ internal sealed record PairAnalysis(
         double f = index - lo;
         return Math.Max(1e-9, Likelihood[lo] * (1 - f) + Likelihood[hi] * f);
     }
+
+    /// <summary>
+    /// Selects the delay mode that is compatible with a geographic hypothesis.
+    /// The largest correlation peak is intentionally not assumed to be the right
+    /// one: a repeated or multipath signal can produce an equally convincing peak.
+    /// </summary>
+    public PairPeak PeakFor(double predictedDelayNanoseconds) => Peaks.Count == 0
+        ? new PairPeak(Result.DelayNanoseconds, 1)
+        : Peaks.MinBy(peak => Math.Abs(predictedDelayNanoseconds - peak.DelayNanoseconds))!;
 }
 
 internal static class TdoaPairAnalyzer
@@ -93,9 +102,15 @@ internal static class TdoaPairAnalyzer
             + b.ClockUncertaintyNanoseconds * b.ClockUncertaintyNanoseconds
             + a.ResamplingUncertaintyNanoseconds * a.ResamplingUncertaintyNanoseconds
             + b.ResamplingUncertaintyNanoseconds * b.ResamplingUncertaintyNanoseconds);
-        double quality = Math.Clamp(0.45 * correlation.Coherence
-            + 0.35 * Math.Clamp((psr - 1) / 4, 0, 1)
-            + 0.20 * Math.Clamp(curvature * 5, 0, 1), 0, 1);
+        // Coherence says that the two recordings contain related energy. It does
+        // not say that the strongest delay is unique. Keep ambiguous pairs in the
+        // likelihood map so a multi-station solution can resolve them, but reduce
+        // their influence until that happens instead of letting a strong repeated
+        // waveform masquerade as a precise timing measurement.
+        double signalQuality = Math.Clamp(0.60 * correlation.Coherence
+            + 0.40 * Math.Clamp(curvature * 5, 0, 1), 0, 1);
+        double peakDistinctness = Math.Clamp((psr - 1) / (psr + 1), 0, 1);
+        double quality = signalQuality * (0.25 + 0.75 * peakDistinctness);
         var warnings = new List<string>();
         if (Math.Abs(a.SampleRateCorrectionPpm) > 0.001 || Math.Abs(b.SampleRateCorrectionPpm) > 0.001)
             warnings.Add(FormattableString.Invariant(
