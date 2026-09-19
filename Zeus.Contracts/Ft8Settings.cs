@@ -85,7 +85,11 @@ public sealed record Ft8Settings(
     /// <summary>Worked/confirmed lookup scope: all, band, mode, or band-mode.</summary>
     string WorkedScope = "all",
     /// <summary>Use received paper QSL, LoTW or QRZ confirmation for worked filters.</summary>
-    bool WorkedConfirmedOnly = false)
+    bool WorkedConfirmedOnly = false,
+    /// <summary>Combine the final acknowledgment with the next queued FT8 report.</summary>
+    bool CombinedHandoff = false,
+    /// <summary>Use the active QSO callsigns to assist weak FT8 decoding.</summary>
+    bool ApDecoding = false)
 {
     public const int MinOffsetHz = 200;
     public const int MaxTxOffsetHz = 4000;

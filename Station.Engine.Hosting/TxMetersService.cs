@@ -561,6 +561,28 @@ public sealed class TxMetersService : BackgroundService
                     if (!_radio.IsProtocol3Active
                         && EvaluateSwrTrip(swr, DateTime.UtcNow, isTun, keyedAt, fwdW, tuneDrivePct) is { } tripReason)
                     {
+                        // Log the inputs the trip decision was actually made on.
+                        // The operator-facing alert text carries only the SWR and
+                        // the sustain window, and TxService's tx.trip line adds
+                        // only kind/reason/faultEpoch — so when issue #1659 and
+                        // then #2275 arrived from the same operator on the same
+                        // radio, neither report could say which guard rejected the
+                        // tune cycle, and the root cause had to be inferred twice.
+                        // These are the four values that decide it. Keep them on
+                        // the WARN ring so they survive to the next bug report.
+                        _log.LogWarning(
+                            "tx.trip.swr.inputs intent={Intent} swr={Swr:F2} fwdW={FwdWatts:F2} " +
+                            "refW={RefWatts:F2} tunePct={TuneDrivePercent} board={Board} " +
+                            "bypassMaxW={BypassMax:F1} bypassMaxDrive={BypassDrive}",
+                            isTun ? "TUN" : "MOX",
+                            swr,
+                            fwdW,
+                            refW,
+                            tuneDrivePct,
+                            _radio.ConnectedBoardKind,
+                            EngineTransmitSafetyModule.SwrTripTunBypassMaxFwdWatts,
+                            EngineTransmitSafetyModule.SwrTripTunBypassMaxDrivePercent);
+
                         // TryTripForAlert is idempotent — a second caller on the
                         // same tick (e.g. timeout firing concurrently) finds MOX
                         // already off and no-ops.

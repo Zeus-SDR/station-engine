@@ -5165,7 +5165,10 @@ public class DspPipelineService : BackgroundService,
         RadioService.MaxAgcTopDb);
 
     internal static double EffectiveAfGainDb(double masterAfGainDb, double ownAfGainDb) =>
-        Math.Clamp(masterAfGainDb + ownAfGainDb, -50.0, 20.0);
+        Math.Clamp(
+            masterAfGainDb + ownAfGainDb,
+            RadioService.MinRxAfGainDb,
+            RadioService.MaxRxAfGainDb);
 
     internal static AgcConfig EffectiveAgcConfig(AgcConfig configured, double effectiveGainDb) =>
         configured.Mode == AgcMode.Fixed

@@ -123,9 +123,9 @@ internal sealed class EngineTransmitSafetyModule
     // Above either limit the normal 6.0:1 / 500 ms TUN trip still applies, MOX
     // protection is untouched, and the overall TX timeout always bounds the
     // transmission. This is NOT a blanket time grace — extreme SWR at real
-    // power still drops the PA immediately.
-    internal const double SwrTripTunBypassMaxFwdWatts = 25.0;
-    internal const int SwrTripTunBypassMaxDrivePercent = 25;
+    // power still drops the PA on the normal 500 ms sustain window.
+    internal const double SwrTripTunBypassMaxFwdWatts = 35.0;
+    internal const int SwrTripTunBypassMaxDrivePercent = 70;
 
     private readonly object _sync = new();
     private DateTime? _swrAboveThresholdSince;
@@ -365,6 +365,35 @@ internal sealed class EngineTransmitSafetyModule
         // external ATU at low power, let the tuner hunt through a bad match
         // without dropping the PA. The TX-timeout guard (already evaluated
         // above) remains the sole bound on transmission length here.
+        //
+        // NOTE THE ABSENCE OF A LOWER BOUND. Thetis expresses this as two
+        // conditions that only make sense together: a bypass window
+        // `alex_fwd >= 1.0f && alex_fwd <= 35.0f && tune <= 70`
+        // (console.cs:26032), and, quite separately, a trip that cannot arm at
+        // all below 5 W forward, `alex_fwd > alex_fwd_limit` (console.cs:26046).
+        // For any drive request inside the limit those two reduce to a single
+        // bound: suppress at or below 35 W. The `>= 1.0f` never decides
+        // anything, because everything it excludes is caught by the 5 W floor
+        // behind it.
+        //
+        // Transcribing the window alone is therefore not a faithful port, it is
+        // a bug, and it was one: a lower bound copied here in isolation refused
+        // the bypass below 1 W and left nothing holding the trip off. These
+        // constants are board-agnostic, and a limit read off 100 W ANAN hardware
+        // governs a 5 W Hermes-Lite 2 too, where an ordinary external-ATU tune
+        // at the default 10 % drive sits under 1 W. Zeus implements the reduced
+        // rule directly so that trap cannot be reintroduced by reading one
+        // Thetis line and not the other. Pinned by
+        // EvaluateSwrTrip_Tun_SubWattBoard_DoesNotTrip_Hl2ExternalAtuRegression.
+        //
+        // The drive limit is the one place Zeus is deliberately STRICTER than
+        // Thetis. Thetis suppresses below 5 W whatever the operator asked for;
+        // Zeus does not trust a low forward reading when a high tune power was
+        // requested, because that combination can mean the board is making its
+        // power and the telemetry is under-reading. Zeus drops TX where Thetis
+        // only folds power back, so it errs toward protecting. That backstop
+        // predates this bypass and is pinned by
+        // EvaluateSwrTrip_Tun_HighTuneDrive_StillTripsAt8To1.
         if (isTun
             && sample.FwdWatts <= SwrTripTunBypassMaxFwdWatts
             && sample.TuneDrivePercent <= SwrTripTunBypassMaxDrivePercent)

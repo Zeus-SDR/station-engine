@@ -157,7 +157,19 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<BottomPinStore>();
         services.AddSingleton<PanWfSplitStore>();
         services.AddSingleton<OperatorIdentityStore>();
+        // God's Eye on the engine surface is enabled unconditionally. The
+        // Features-menu gate lives in the product host, which owns the
+        // entitlement registry the predicate reads; the engine has no such
+        // registry, and every other part of its God's Eye surface (layers,
+        // settings, the APRS tracker) already behaves as enabled. Leaving the
+        // predicate null instead fell through to the fail-closed default in
+        // AddGodsEyeServices, which /api/godseye/provider-credentials consults
+        // — so an engine in attach mode served empty provider keys while
+        // /api/godseye/settings reported the same keys as configured. The
+        // APRS tracker reads the same predicate through its own gate, which
+        // already defaulted fail-open, so it is unaffected either way.
         services.AddGodsEyeServices(options.GodsEyeDatabasePath ?? PrefsDbPath.EngineGet(),
+            featureEnabled: _ => true,
             fallbackGrid: provider => provider.GetService<OperatorIdentityStore>()?.Get().Grid);
         // Zeus Link bundle settings mirror (feature toggles + amplifier
         // configs as one opaque product JSON document). Product database, same

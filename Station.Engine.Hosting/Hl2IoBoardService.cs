@@ -36,6 +36,8 @@ public sealed class Hl2IoBoardService : BackgroundService
     private long _foreignIntent;
     private long _tuneIntentEpoch;
     private string? _inhibit;
+    private int _deferLogged;
+    private int _lastLoggedInputs = -1;
     internal Func<Protocol1Client, IHl2I2cTransport> TransportFactory { get; set; } = client => client.Hl2I2c;
     internal Func<Protocol1Client, bool>? ConnectionCurrentOverrideForTests { get; set; }
 
@@ -121,6 +123,7 @@ public sealed class Hl2IoBoardService : BackgroundService
                     {
                         await session.PollAsync(stoppingToken).ConfigureAwait(false);
                         if (!IsCurrent(client)) continue;
+                        NoteInputs(session.Status.Inputs, client.HardwarePtt);
                         if (session.Status.Fault != 0)
                         {
                             SetInhibit($"HL2 IO Board fault {session.Status.Fault}; transmit is inhibited");
@@ -250,19 +253,70 @@ public sealed class Hl2IoBoardService : BackgroundService
         }
     }
 
+    // Accessory writes reach relays: SynchronizeAsync programs the antenna
+    // ports (register 31) and the RF frequency (registers 0-4) that drive the
+    // amplifier's band outputs, and SetOutputsAsync drives the output pins.
+    // None of them may be issued while RF is on the line, so they are deferred
+    // whenever the radio reports it is keyed.
+    //
+    // That "is it keyed?" question is answered from the WIRE, not from the IO
+    // Board's own EXTTR sense. The board senses a line the radio itself drives
+    // (HL2 gateware: `assign pa_exttr = int_tx_on`), and that line is open
+    // collector: the vendor specifies an external pull-up, so with no amplifier
+    // attached it can read low while the radio sits in receive. Trusting the
+    // sensed bit alone made a floating input indistinguishable from a live
+    // transmit, and because the required-sync latch can only be cleared by a
+    // successful synchronization, it stayed set forever and denied every key
+    // request (issue #2256). C0[0] of every received packet reports the same
+    // fact, fresher and without a pull-up to lose, so it is the authority here.
+    // Deliberately not an AND with the sensed bit: a bit stuck HIGH would then
+    // defeat the guard during a real transmit.
     private async Task<bool> MutateAccessoryAsync(Protocol1Client client, Hl2IoBoardSession session, Func<Task> mutation)
     {
         long? revision = null;
+        bool keyed = false;
         if (!_tx.TryRunWithTransmitIdle(() =>
         {
-            if (!IsCurrent(client) || (session.Status.Inputs & 1) == 0) return;
+            if (!IsCurrent(client)) return;
+            if (client.HardwarePtt) { keyed = true; return; }
             revision = _tx.Safety.InvalidateHl2IoBoard();
-        }, out _) || revision is null) return false;
+        }, out _) || revision is null)
+        {
+            NoteAccessoryDeferred(keyed, session.Status.Inputs);
+            return false;
+        }
+        Volatile.Write(ref _deferLogged, 0);
         await mutation().ConfigureAwait(false);
         if (!IsCurrent(client)) return false;
         if (session.Status.FrequencyHz is { } frequency && session.SynchronizedMode is { } mode)
             _tx.Safety.SynchronizeHl2IoBoard(revision.Value, frequency, mode);
         return true;
+    }
+
+    /// <summary>
+    /// Report the board's input byte whenever it changes, alongside the radio's
+    /// own keyed state from the wire. Diagnosing issue #2256 was guesswork
+    /// precisely because no operator log ever carried this byte; a change-gated
+    /// line keeps it cheap while a band change rewrites the Pico constantly.
+    /// </summary>
+    private void NoteInputs(byte inputs, bool keyed)
+    {
+        if (Interlocked.Exchange(ref _lastLoggedInputs, inputs) == inputs) return;
+        _log.LogInformation("hl2.io.inputs 0x{Inputs:X2} extTrSense={Sense} radioKeyed={Keyed}",
+            inputs, (inputs & 1) != 0 ? "high" : "low", keyed);
+    }
+
+    /// <summary>
+    /// Record a refused accessory write once per keyed episode. A silent refusal
+    /// is what let the required-sync latch look like a mystery instead of a
+    /// keyed radio, so a stuck rear KEY/PTT input has to be nameable from a log.
+    /// </summary>
+    private void NoteAccessoryDeferred(bool keyed, byte inputs)
+    {
+        if (!keyed || Interlocked.Exchange(ref _deferLogged, 1) == 1) return;
+        _log.LogWarning(
+            "hl2.io.accessory deferred: radio reports PTT asserted (inputs=0x{Inputs:X2}); "
+            + "if transmit stays blocked, check the rear KEY/PTT input", inputs);
     }
 
     private void OnTransmitRequested(MoxSource source)

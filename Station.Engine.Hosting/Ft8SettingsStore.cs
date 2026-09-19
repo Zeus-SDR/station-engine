@@ -132,6 +132,8 @@ public sealed class Ft8SettingsStore : IDisposable
         HoldTxFreq: e.HoldTxFreq,
         DisableTxAfter73: e.DisableTxAfter73,
         AutoCq: e.AutoCq,
+        CombinedHandoff: e.CombinedHandoff,
+        ApDecoding: e.ApDecoding,
         WorkedScope: e.WorkedScope ?? "all",
         WorkedConfirmedOnly: e.WorkedConfirmedOnly,
         DefaultTxSlot: e.DefaultTxSlot,
@@ -164,6 +166,8 @@ public sealed class Ft8SettingsStore : IDisposable
         e.HoldTxFreq = s.HoldTxFreq;
         e.DisableTxAfter73 = s.DisableTxAfter73;
         e.AutoCq = s.AutoCq;
+        e.CombinedHandoff = s.CombinedHandoff;
+        e.ApDecoding = s.ApDecoding;
         e.WorkedScope = s.WorkedScope;
         e.WorkedConfirmedOnly = s.WorkedConfirmedOnly;
         e.DefaultTxSlot = s.DefaultTxSlot;
@@ -210,6 +214,8 @@ public sealed class Ft8SettingsEntry
     public bool HoldTxFreq { get; set; }
     public bool DisableTxAfter73 { get; set; } = true;
     public bool AutoCq { get; set; }
+    public bool CombinedHandoff { get; set; }
+    public bool ApDecoding { get; set; }
     public string? WorkedScope { get; set; } = "all";
     public bool WorkedConfirmedOnly { get; set; }
     public int DefaultTxSlot { get; set; }

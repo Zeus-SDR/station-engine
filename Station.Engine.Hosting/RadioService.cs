@@ -788,7 +788,7 @@ public sealed class RadioService : IDisposable
         int hydFilterLowB = rsSnap?.FilterLowHzB ?? rsSnap?.FilterLowHz ?? 100;
         int hydFilterHighB = rsSnap?.FilterHighHzB ?? rsSnap?.FilterHighHz ?? 2850;
         string? hydPresetB = rsSnap?.FilterPresetNameB ?? rsSnap?.FilterPresetName ?? "VAR1";
-        double hydAfGainB = Math.Clamp(rsSnap?.Rx2AfGainDb ?? 0.0, -50.0, 20.0);
+        double hydAfGainB = SanitizeAfGainDb(rsSnap?.Rx2AfGainDb);
 
         _state = new(
             Status: ConnectionStatus.Disconnected,
@@ -831,8 +831,8 @@ public sealed class RadioService : IDisposable
             TxFilterWindow: persistedTxFilterWindow,
             RxFilterPhase: persistedRxFilterPhase,
             TxFilterPhase: persistedTxFilterPhase,
-            RxAfGainDb: rsSnap?.RxAfGainDb ?? 0.0,
-            Rx1AfGainDb: Math.Clamp(rsSnap?.Rx1AfGainDb ?? 0.0, -50.0, 20.0),
+            RxAfGainDb: SanitizeAfGainDb(rsSnap?.RxAfGainDb),
+            Rx1AfGainDb: SanitizeAfGainDb(rsSnap?.Rx1AfGainDb),
             // 0 dB unity matches the engine's TXA fresh-open default; legacy
             // rows missing the field hydrate to that same default. A last-loaded
             // TX Audio Profile overlays its mic gain ahead of the snapshot.
@@ -908,6 +908,43 @@ public sealed class RadioService : IDisposable
             AmTxProfile = persistedAmTxProfile,
         };
 
+        // One-time repair for the master/RX1 AF split. Before the split the
+        // station-wide master WAS the operator's AF slider; the split shipped
+        // with no UI control bound to the master, so a saved level was stranded
+        // in a field nothing could reach while it still biased every receiver
+        // through EffectiveAfGainDb(master, trim). Fold it into RX1's own trim
+        // and zero the master exactly once:
+        //   * RX1's effective gain (master + trim) is preserved to the dB, and
+        //     the trim the operator can actually reach regains its full travel.
+        //   * RX2..N stop inheriting the stranded bias, which is the pre-split
+        //     behaviour their own sliders have always claimed.
+        // A deliberate master set after the fold is never re-folded: the marker
+        // rides along on every later snapshot write.
+        bool afMasterFolded = false;
+        if (rsSnap is not null && !rsSnap.AfMasterSplitMigrated && _state.RxAfGainDb != 0.0)
+        {
+            double strandedMasterDb = _state.RxAfGainDb;
+            _state = _state with
+            {
+                Rx1AfGainDb = Math.Clamp(
+                    strandedMasterDb + _state.Rx1AfGainDb, MinRxAfGainDb, MaxRxAfGainDb),
+                RxAfGainDb = 0.0,
+            };
+            // RX2 takes the master only if the operator's last session actually
+            // heard it there. A row with no Rx1AfGainDb predates the split, so
+            // RX2 ran on its own slider alone and its stored value is already
+            // the level to keep; a split-era row has been composing
+            // master + trim into RX2's audio, so fold the master in to hold
+            // that level. Either way RX2 neither jumps nor drops here, and its
+            // slider starts telling the truth about what it produces.
+            if (rsSnap.Rx1AfGainDb is not null)
+            {
+                hydAfGainB = Math.Clamp(
+                    strandedMasterDb + hydAfGainB, MinRxAfGainDb, MaxRxAfGainDb);
+            }
+            afMasterFolded = true;
+        }
+
         // Seed the canonical Receivers[] so RX2's hydrated tuning is the live
         // source of truth from the very first snapshot. RX1 (index 0) is rebuilt
         // from the flat RX1 fields by ProjectReceivers on every later Mutate;
@@ -928,6 +965,18 @@ public sealed class RadioService : IDisposable
                     SampleRateHz: _state.SampleRate, Muted: _state.Rx2Muted),
             },
         };
+
+        // Persist the fold immediately. A crash before the next natural flush
+        // would otherwise re-run it on the following start; the fold is applied
+        // to the same stored values either way, so a lost flush is harmless,
+        // but writing now keeps the stored row and the live state in agreement.
+        if (afMasterFolded)
+        {
+            // The fold assigns _state directly rather than going through
+            // Mutate(), so mark the row dirty for FlushState()'s own guard.
+            _stateDirty = true;
+            FlushState();
+        }
 
         // Upgrade state written by the old symmetric DIGU/DIGL preset table.
         // Mutating once here makes the persisted command, StateDto/UI/TCI view,
@@ -5711,9 +5760,21 @@ public sealed class RadioService : IDisposable
     // 0 dB matches the fresh-open default, +20 dB is a 10× linear boost for
     // quiet signals. Range mirrors Thetis's ptbAF (console.cs:4312-4313:
     // tbAF.Minimum = -50, Maximum = 20).
+    public const double MinRxAfGainDb = -50.0;
+    public const double MaxRxAfGainDb = 20.0;
+
+    /// <summary>Coerces a persisted AF-gain field into the operator range.
+    /// A missing, non-finite or out-of-range stored value must never reach the
+    /// dB to linear conversion at the engine seam, and the fold below adds
+    /// two of these together.</summary>
+    private static double SanitizeAfGainDb(double? db) =>
+        db is double v && double.IsFinite(v)
+            ? Math.Clamp(v, MinRxAfGainDb, MaxRxAfGainDb)
+            : 0.0;
+
     public StateDto SetRxAfGain(double db)
     {
-        double clamped = Math.Clamp(db, -50.0, 20.0);
+        double clamped = Math.Clamp(db, MinRxAfGainDb, MaxRxAfGainDb);
         Mutate(s => s with { RxAfGainDb = clamped });
         return Snapshot();
     }
@@ -5721,7 +5782,7 @@ public sealed class RadioService : IDisposable
     /// <summary>Sets RX1's AF trim independently of the station-wide master.</summary>
     public StateDto SetRx1AfGain(double db)
     {
-        double clamped = Math.Clamp(db, -50.0, 20.0);
+        double clamped = Math.Clamp(db, MinRxAfGainDb, MaxRxAfGainDb);
         Mutate(s => s with { Rx1AfGainDb = clamped });
         return Snapshot();
     }
@@ -6829,6 +6890,10 @@ public sealed class RadioService : IDisposable
                 PreampOn = snap.PreampOn,
                 RxAfGainDb = snap.RxAfGainDb,
                 Rx1AfGainDb = snap.Rx1AfGainDb,
+                // Always true once this build has written the row: the fold is a
+                // one-shot upgrade step, and a master the operator sets after it
+                // must survive the next start untouched.
+                AfMasterSplitMigrated = true,
                 MicGainDb = snap.MicGainDb,
                 LevelerMaxGainDb = snap.LevelerMaxGainDb,
                 ZoomLevel = snap.ZoomLevel,

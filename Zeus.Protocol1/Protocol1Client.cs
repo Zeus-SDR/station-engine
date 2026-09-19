@@ -425,6 +425,13 @@ public sealed class Protocol1Client : IProtocol1Client
     }
 
     /// <summary>
+    /// Drive the hardware-PTT level directly so socket-free tests can model a
+    /// radio that is keyed by its rear KEY/PTT input. Goes through the same
+    /// update path as the RX loop, so the change event fires identically.
+    /// </summary>
+    internal void SetHardwarePttForTest(bool ptt) => UpdateHardwarePtt(ptt);
+
+    /// <summary>
     /// Update the cached CW key-down level (C0[2] / cw_key_status) and fire
     /// <see cref="CwKeyDownChanged"/> on the edge. Single-writer (RX loop),
     /// same contract as <see cref="UpdateHardwarePtt"/>. (zeus-cl2)

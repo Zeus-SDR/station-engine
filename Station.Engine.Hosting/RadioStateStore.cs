@@ -168,7 +168,17 @@ public sealed class RadioStateEntry
     // RadioService's historical startup state.
     public bool PreampOn { get; set; }
     public double RxAfGainDb { get; set; }
-    public double Rx1AfGainDb { get; set; }
+    // Nullable on purpose: null means the row was written before the
+    // master/RX1 AF split existed, which is also the only way to know whether
+    // the operator's last session composed the master into RX2's level. A
+    // split-era row always carries a value, even 0.
+    public double? Rx1AfGainDb { get; set; }
+    // True once the pre-split single AF slider has been folded out of the
+    // station-wide master and into RX1's own trim. Rows written before the
+    // master/RX1 split -- and rows written by the builds that shipped the split
+    // with no UI control bound to the master -- default to false and are folded
+    // once on hydration.
+    public bool AfMasterSplitMigrated { get; set; }
     // TX mic gain in dB, range [-40, +10]. Default 0 ≡ unity panel-gain (mirrors
     // WdspDspEngine TXA fresh-open). The endpoint accepted this value but didn't
     // save it; lived only in frontend localStorage and reverted on every restart

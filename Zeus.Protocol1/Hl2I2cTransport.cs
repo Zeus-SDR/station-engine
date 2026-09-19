@@ -95,7 +95,9 @@ internal sealed class Hl2I2cTransport : IHl2I2cTransport
         if (control.Length < 5) return false;
         lock (_sync)
         {
-            if (!_available || _pending is not { Sent: false } request) return false;
+            // The completed check is deliberately redundant with the one in AcceptControl:
+            // either alone keeps an answered command off the wire. Keep both.
+            if (!_available || _pending is not { Sent: false } request || request.Completion.Task.IsCompleted) return false;
             if (_lastSendMs != long.MinValue && nowMs - _lastSendMs < 10) return false;
             control[0] = (byte)(0xFA | (control[0] & 1)); // RQST, bus 2, preserve MOX.
             BinaryPrimitives.WriteUInt32BigEndian(control[1..], request.Command);
@@ -125,7 +127,11 @@ internal sealed class Hl2I2cTransport : IHl2I2cTransport
         {
             if (!_available || _pending is not { Sent: true } request) return;
             if (address == 0x3F && data == request.Command)
-                request.Completion.TrySetException(new IOException("HL2 I²C bus was busy."));
+            {
+                // A busy echo may re-arm only a live request; never resend a completed one.
+                // A late echo can share a packet with the answer that retired the request.
+                if (!request.Completion.Task.IsCompleted) request.Sent = false;
+            }
             else if (address == 0x3D && ((request.Command >> 24) == 7 || data == request.Command))
                 request.Completion.TrySetResult(data);
         }
