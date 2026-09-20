@@ -58,7 +58,8 @@ public static class OperatorUiSettingsEndpoints
                     req.GlobeCustomImageryJson,
                     req.FilterPanelBgMode,
                     req.FilterPanelBgColor,
-                    req.FilterPanelBgBrightness);
+                    req.FilterPanelBgBrightness,
+                    req.RxDisplayFftSize);
             }
             catch (System.Text.Json.JsonException ex)
             {

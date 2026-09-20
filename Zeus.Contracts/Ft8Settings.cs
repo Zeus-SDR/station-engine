@@ -23,7 +23,8 @@ namespace Zeus.Contracts;
 /// passes) — nothing an operator already feels changes until they touch a
 /// control. Most flags are wired to the auto-sequence controller / macros / log
 /// path; ClearDxAfterLog is persisted but still awaits sequence integration. TX still requires an
-/// explicit arm; none of these flags transmit on their own.
+/// explicit operator arm (ENABLE TX, or an opted-in decode-row click); none of these flags
+/// transmit on their own.
 /// </summary>
 public sealed record Ft8Settings(
     // ── TX & auto-sequence ──────────────────────────────────────────────────
@@ -89,7 +90,15 @@ public sealed record Ft8Settings(
     /// <summary>Combine the final acknowledgment with the next queued FT8 report.</summary>
     bool CombinedHandoff = false,
     /// <summary>Use the active QSO callsigns to assist weak FT8 decoding.</summary>
-    bool ApDecoding = false)
+    bool ApDecoding = false,
+    /// <summary>
+    /// When true, a deliberate operator click on a valid decoded station selects
+    /// that station and arms TX for the next eligible slot. Off by default so
+    /// existing select-then-ENABLE-TX behaviour is unchanged. Appended last so
+    /// evolving this positional record never shifts existing parameters. Does
+    /// not arm inbound replies, queue, macros, hydration, or mode switches.
+    /// </summary>
+    bool ArmTxOnClick = false)
 {
     public const int MinOffsetHz = 200;
     public const int MaxTxOffsetHz = 4000;

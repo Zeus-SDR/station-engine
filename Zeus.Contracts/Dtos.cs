@@ -2613,6 +2613,10 @@ public sealed record DisplaySettingsDto(
     int? TxDisplayFftSize = null,
     int? TxDisplayWindow = null,
     double? TxDisplayAvgTauMs = null,
+    // RX display analyzer FFT size (power of two, up to 262144). Display-only:
+    // it sets panadapter/waterfall bin width. Null on legacy rows / requests
+    // → the engine keeps its profile/config size, unchanged from before.
+    int? RxDisplayFftSize = null,
     bool WidebandDisplayEnabled = false,
     double DisplayMaxFrameRateHz = 30.0,
     int DisplayDecimation = 1,
@@ -2652,6 +2656,7 @@ public sealed record DisplaySettingsSetRequest(
     int? TxDisplayFftSize = null,
     int? TxDisplayWindow = null,
     double? TxDisplayAvgTauMs = null,
+    int? RxDisplayFftSize = null,
     bool? WidebandDisplayEnabled = null,
     double? DisplayMaxFrameRateHz = null,
     int? DisplayDecimation = null,

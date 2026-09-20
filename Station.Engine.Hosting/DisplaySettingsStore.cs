@@ -94,6 +94,11 @@ public sealed class DisplaySettingsStore : IDisposable
 
     private static bool IsValidFftSize(int? v) => v.HasValue && Array.IndexOf(TxFftSizes, v.Value) >= 0;
 
+    // RX analyzer FFT sizes are owned by DisplayPerformanceOptions (the same
+    // list config/env accept), so the store and the engine can never disagree
+    // about what is selectable.
+    private static bool IsValidRxFftSize(int? v) => DisplayPerformanceOptions.IsValidRxAnalyzerFftSize(v);
+
     // WDSP win_type values 0..11 (analyzer.c). Keep the accept range generous;
     // the frontend only surfaces a friendly subset.
     private static bool IsValidWindow(int? v) => v.HasValue && v.Value >= 0 && v.Value <= 11;
@@ -107,6 +112,7 @@ public sealed class DisplaySettingsStore : IDisposable
     private readonly ILiteCollection<DisplaySettingsEntry> _docs;
     private readonly ILogger<DisplaySettingsStore> _log;
     private readonly double _defaultDisplayMaxFrameRateHz;
+    private readonly bool _lowPowerDisplay;
     private readonly object _sync = new();
 
     public DisplaySettingsStore(
@@ -115,7 +121,9 @@ public sealed class DisplaySettingsStore : IDisposable
         IConfiguration? configuration = null)
     {
         _log = log;
-        _defaultDisplayMaxFrameRateHz = DisplayPerformanceOptions.Resolve(configuration).MaxFrameRateHz;
+        var displayPerformance = DisplayPerformanceOptions.Resolve(configuration);
+        _defaultDisplayMaxFrameRateHz = displayPerformance.MaxFrameRateHz;
+        _lowPowerDisplay = displayPerformance.LowPower;
         var dbPath = dbPathOverride ?? PrefsDbPath.Get();
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -155,6 +163,7 @@ public sealed class DisplaySettingsStore : IDisposable
                     TxDisplayFftSize: null,
                     TxDisplayWindow: null,
                     TxDisplayAvgTauMs: null,
+                    RxDisplayFftSize: null,
                     WidebandDisplayEnabled: false,
                     DisplayMaxFrameRateHz: _defaultDisplayMaxFrameRateHz,
                     DisplayDecimation: DisplayPerformanceOptions.DefaultDisplayDecimation,
@@ -197,6 +206,9 @@ public sealed class DisplaySettingsStore : IDisposable
                 TxDisplayFftSize: e.TxDisplayFftSize,
                 TxDisplayWindow: e.TxDisplayWindow,
                 TxDisplayAvgTauMs: e.TxDisplayAvgTauMs,
+                // Re-validated on read so a hand-edited or future-version row
+                // can never push an unsupported size into the analyzer.
+                RxDisplayFftSize: IsValidRxFftSize(e.RxDisplayFftSize) ? e.RxDisplayFftSize : null,
                 WidebandDisplayEnabled: e.WidebandDisplayEnabled,
                 DisplayMaxFrameRateHz: DisplayPerformanceOptions.NormalizeFrameRate(
                     e.DisplayMaxFrameRateHz,
@@ -258,7 +270,8 @@ public sealed class DisplaySettingsStore : IDisposable
         string? globeCustomImageryJson = null,
         string? filterPanelBgMode = null,
         string? filterPanelBgColor = null,
-        int? filterPanelBgBrightness = null)
+        int? filterPanelBgBrightness = null,
+        int? rxDisplayFftSize = null)
     {
         lock (_sync)
         {
@@ -285,6 +298,13 @@ public sealed class DisplaySettingsStore : IDisposable
             if (IsValidFftSize(txDisplayFftSize)) e.TxDisplayFftSize = txDisplayFftSize;
             if (IsValidWindow(txDisplayWindow)) e.TxDisplayWindow = txDisplayWindow;
             if (IsValidAvgTauMs(txDisplayAvgTauMs)) e.TxDisplayAvgTauMs = txDisplayAvgTauMs;
+            // Persist what will actually run, so the setting never shows a
+            // size a low-power host is clamped away from.
+            if (IsValidRxFftSize(rxDisplayFftSize))
+            {
+                e.RxDisplayFftSize = DisplayPerformanceOptions.ClampRxAnalyzerFftSizeForProfile(
+                    rxDisplayFftSize!.Value, _lowPowerDisplay);
+            }
             if (widebandDisplayEnabled.HasValue) e.WidebandDisplayEnabled = widebandDisplayEnabled.Value;
             if (widebandSignalMarkersEnabled.HasValue) e.WidebandSignalMarkersEnabled = widebandSignalMarkersEnabled.Value;
             if (displayMaxFrameRateHz.HasValue && double.IsFinite(displayMaxFrameRateHz.Value))
@@ -512,6 +532,9 @@ public sealed class DisplaySettingsEntry
     // smoothing, 0 dB cal offset).
     public double? TxDisplayCalOffsetDb { get; set; }
     public int? TxDisplayFftSize { get; set; }
+    // RX display analyzer FFT size. Null = never chosen: the engine keeps its
+    // profile/config size (16384 stock / 8192 low-power).
+    public int? RxDisplayFftSize { get; set; }
     public int? TxDisplayWindow { get; set; }
     public double? TxDisplayAvgTauMs { get; set; }
     // Protocol-2 ADC snapshot display mode. False on legacy rows because bool

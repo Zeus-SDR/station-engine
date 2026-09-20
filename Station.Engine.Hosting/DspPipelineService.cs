@@ -92,7 +92,12 @@ public class DspPipelineService : BackgroundService,
     private readonly ILogger<DspPipelineService> _log;
     private readonly ExternalDspEngineProviderLoader _externalDspProvider;
     private Protocol3TxEngineConnection? _protocol3TxEngineConnection;
-    private readonly int _rxAnalyzerFftSize;
+    // Live RX analyzer FFT size. Seeded from the profile/config snapshot and
+    // replaced only by an explicit operator selection (SetRxAnalyzerFftSize).
+    // Read with Volatile.Read: the settings endpoint thread writes it while
+    // the DSP/state threads read it.
+    private int _rxAnalyzerFftSize;
+    private readonly DisplayPerformanceSnapshot _displayPerformance;
     private readonly int _panadapterWidth;
     private double _displayMaxFrameRateHz;
     private int _displayDecimation = DisplayPerformanceOptions.DefaultDisplayDecimation;
@@ -994,6 +999,7 @@ public class DspPipelineService : BackgroundService,
         public BandpassWindow? AppliedBandpassWindow;
         public FilterPhaseMode? AppliedFilterPhase;
         public int AppliedZoom = int.MinValue;
+        public int AppliedAnalyzerFftSize = int.MinValue;
         // Slewed AF-gain dB last pushed to this secondary's WDSP channel.
         // NaN sentinel = "no value applied yet" — used at channel-open so
         // the freshly-opened channel snaps to the operator's target instead
@@ -1015,6 +1021,7 @@ public class DspPipelineService : BackgroundService,
             AppliedBandpassWindow = null;
             AppliedFilterPhase = null;
             AppliedZoom = int.MinValue;
+            AppliedAnalyzerFftSize = int.MinValue;
         }
     }
     private readonly SecondaryRx[] _secondaryRx;
@@ -1382,6 +1389,9 @@ public class DspPipelineService : BackgroundService,
     private FilterPhaseMode _appliedRxFilterPhase = FilterPhaseMode.Linear;
     private FilterPhaseMode _appliedTxFilterPhase = FilterPhaseMode.Linear;
     private int _appliedZoomLevel = 1;
+    // FFT size the RX1 analyzer is known to be running at. Seeded in the
+    // constructor with the size engines are built at.
+    private int _appliedRxAnalyzerFftSize;
     // PureSignal latched values — same change-detect pattern as the others
     // so OnRadioStateChanged only fires PS setters when values move.
     private bool _appliedPsEnabled;
@@ -1851,7 +1861,11 @@ public class DspPipelineService : BackgroundService,
         var displayPerformance = DisplayPerformanceOptions.Resolve(
             configuration,
             hardware: displayHardware);
+        _displayPerformance = displayPerformance;
         _rxAnalyzerFftSize = displayPerformance.RxAnalyzerFftSize;
+        // Engines are constructed at this size, so RX1 already matches it:
+        // an install with no operator selection never issues an FFT-size call.
+        _appliedRxAnalyzerFftSize = displayPerformance.RxAnalyzerFftSize;
         // WDSP's AGC threshold→max-gain conversion needs the FFT size of the
         // analyzer the noise floor is measured from (wcpAGC.c:482) — give the
         // auto-AGC servo the REAL analyzer size, not the WDSP channel block
@@ -2119,12 +2133,57 @@ public class DspPipelineService : BackgroundService,
     public void ApplyDisplaySettings(DisplaySettingsDto dto)
     {
         ApplyTxDisplaySettings(dto);
+        SetRxAnalyzerFftSize(dto.RxDisplayFftSize);
         SetWidebandDisplayEnabled(dto.WidebandDisplayEnabled);
         SetWidebandSignalMarkersEnabled(dto.WidebandSignalMarkersEnabled);
         SetDisplayPerformance(
             dto.DisplayMaxFrameRateHz,
             dto.DisplayDecimation,
             dto.WaterfallUpdatePeriod);
+    }
+
+    /// <summary>
+    /// Apply the operator's RX display FFT size (null = keep the profile/config
+    /// size). Everything that depends on the analyzer size moves together: the
+    /// live RX analyzers, the auto-AGC floor→threshold conversion, and the
+    /// centre-stamp aperture lookback, which reads the same field.
+    /// </summary>
+    private void SetRxAnalyzerFftSize(int? operatorChoice)
+    {
+        int next = DisplayPerformanceOptions.ResolveOperatorRxAnalyzerFftSize(operatorChoice, _displayPerformance);
+        if (Interlocked.Exchange(ref _rxAnalyzerFftSize, next) == next) return;
+        // The panadapter floor moves 3 dB per FFT doubling; the servo's
+        // conversion must use the size that produced the bins it measures.
+        _radio.SetAutoAgcAnalyzerFftSize(next);
+        _log.LogInformation("dsp.pipeline rxAnalyzerFftSize={FftSize}", next);
+        var engine = CurrentEngine;
+        if (engine is null) return;
+        lock (_engineLock)
+        {
+            ApplyRxAnalyzerFftSize(engine);
+        }
+    }
+
+    // Gated like ApplyVisibleDdcZoom: with the size unchanged this is integer
+    // compares only. Also runs from the state-change path so a channel opened
+    // concurrently with a size change converges on the next tick instead of
+    // staying at the engine's construction size.
+    private void ApplyRxAnalyzerFftSize(IDspEngine engine)
+    {
+        int fftSize = Volatile.Read(ref _rxAnalyzerFftSize);
+        if (fftSize != _appliedRxAnalyzerFftSize)
+        {
+            engine.SetRxDisplayFftSize(Volatile.Read(ref _channelId), fftSize);
+            _appliedRxAnalyzerFftSize = fftSize;
+        }
+        for (int receiverIndex = 1; receiverIndex < MaxReceivers; receiverIndex++)
+        {
+            var rx = _secondaryRx[receiverIndex];
+            int channelId = Volatile.Read(ref rx.ChannelId);
+            if (channelId < 0 || rx.AppliedAnalyzerFftSize == fftSize) continue;
+            engine.SetRxDisplayFftSize(channelId, fftSize);
+            rx.AppliedAnalyzerFftSize = fftSize;
+        }
     }
 
     private void SetWidebandSignalMarkersEnabled(bool enabled)
@@ -2739,6 +2798,9 @@ public class DspPipelineService : BackgroundService,
         // one zoom value, so an unchanged RX1 zoom can no longer short-circuit
         // the whole function the way it used to (a secondary-only zoom change
         // would otherwise be silently dropped).
+        // FFT size first: the zoom reconfig below re-reads the channel's
+        // size, so a simultaneous change costs one coherent analyzer state.
+        ApplyRxAnalyzerFftSize(engine);
         int zoom = DdcZoomLevel(state.ZoomLevel);
         if (zoom != _appliedZoomLevel)
         {
@@ -5413,7 +5475,7 @@ public class DspPipelineService : BackgroundService,
         OfflinePreviewDspEngine? preview = null;
         try
         {
-            preview = new OfflinePreviewDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
+            preview = new OfflinePreviewDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), Volatile.Read(ref _rxAnalyzerFftSize));
             channelId = preview.OpenChannel(SyntheticSampleRateHz, _panadapterWidth);
             SeedTxDisplayConfig(preview);
             preview.OpenTxChannel(outputRateHz: OfflinePreviewTxOutputRateHz);
@@ -5443,7 +5505,7 @@ public class DspPipelineService : BackgroundService,
         var state = _radio.Snapshot();
         int rate = state.SampleRate;
 
-        var wdsp = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
+        var wdsp = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), Volatile.Read(ref _rxAnalyzerFftSize));
         int channelId = wdsp.OpenChannel(rate, _panadapterWidth);
         // Seed the operator's persisted TX display config before TXA opens so
         // the analyzer comes up at their FFT/window/smoothing. Display-only.
@@ -6637,6 +6699,11 @@ public class DspPipelineService : BackgroundService,
         engine.SetNotchTuneFrequencyHz(s.RadioLoHz);
         engine.SetNotches(_radio.Notches);
         int ddcZoomLevel = DdcZoomLevel(s.ZoomLevel);
+        // A re-rate reuses an engine that may predate an operator FFT-size
+        // change; the engine no-ops when the fresh channel already matches.
+        int rxAnalyzerFftSize = Volatile.Read(ref _rxAnalyzerFftSize);
+        engine.SetRxDisplayFftSize(channelId, rxAnalyzerFftSize);
+        _appliedRxAnalyzerFftSize = rxAnalyzerFftSize;
         engine.SetZoom(channelId, ddcZoomLevel);
         _appliedMode = s.Mode;
         _appliedEngineMode = openEngineMode;
@@ -7193,7 +7260,7 @@ public class DspPipelineService : BackgroundService,
         int newChannelId;
         try
         {
-            var wdsp = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
+            var wdsp = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), Volatile.Read(ref _rxAnalyzerFftSize));
             newChannelId = wdsp.OpenChannel(rateHz, _panadapterWidth);
             // Seed the operator's persisted TX display config before TXA opens
             // so the analyzer comes up at their FFT/window/smoothing. Display-only.
@@ -7742,7 +7809,7 @@ public class DspPipelineService : BackgroundService,
         }
         else
         {
-            next = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), _rxAnalyzerFftSize);
+            next = new WdspDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), Volatile.Read(ref _rxAnalyzerFftSize));
             engineName = "WDSP";
             external = false;
         }
@@ -9214,7 +9281,7 @@ public class DspPipelineService : BackgroundService,
                     // 65,536 pts), so its aperture — not the engine default —
                     // sets the lookback for delay-compensated centre stamps.
                     ? Volatile.Read(ref _widebandDetailAnalyzerFftSize)
-                    : _rxAnalyzerFftSize) / (double)sampleRate * 1000.0
+                    : Volatile.Read(ref _rxAnalyzerFftSize)) / (double)sampleRate * 1000.0
                 : 0.0;
             double stampLagMs = 0.5 * fftFillMs
                 + (CenterStampLagOverrideMs

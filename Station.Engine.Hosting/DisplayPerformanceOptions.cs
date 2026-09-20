@@ -160,7 +160,7 @@ public static class DisplayPerformanceOptions
                 MaxFrameRateHz: envFps,
                 LowPower: envFps < DefaultFrameRateHz,
                 PreferWebglWaterfall: forceWebgl || envFps < DefaultFrameRateHz,
-                RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
+                RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, envFps < DefaultFrameRateHz, configuration, environment),
                 PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
                 DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
                 NativeG2: hw.IsNativeG2);
@@ -189,7 +189,7 @@ public static class DisplayPerformanceOptions
                         ? DefaultFrameRateHz : LowPowerFrameRateHz,
                 LowPower: true,
                 PreferWebglWaterfall: true,
-                RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(LowPowerRxAnalyzerFftSize, configuration, environment),
+                RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(LowPowerRxAnalyzerFftSize, lowPower: true, configuration, environment),
                 PanadapterWidth: ResolvePanadapterWidth(LowPowerPanadapterWidth, configuration, environment),
                 DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
                 NativeG2: hw.IsNativeG2);
@@ -200,7 +200,7 @@ public static class DisplayPerformanceOptions
             MaxFrameRateHz: DefaultFrameRateHz,
             LowPower: false,
             PreferWebglWaterfall: forceWebgl,
-            RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, configuration, environment),
+            RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, lowPower: false, configuration, environment),
             PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
             DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
             NativeG2: hw.IsNativeG2);
@@ -244,11 +244,48 @@ public static class DisplayPerformanceOptions
             ? Math.Clamp(raw.Value, MinWaterfallUpdatePeriod, MaxWaterfallUpdatePeriod)
             : DefaultWaterfallUpdatePeriod;
 
-    public static int NormalizeRxAnalyzerFftSize(int? raw) => raw switch
+    // Power-of-two RX analyzer FFT sizes. The ceiling is WDSP's own analyzer
+    // allocation and pre-baked FFTW wisdom limit (MAX_WISDOM_SIZE, comm.h), so
+    // no size here can trigger a runtime planning stall. Larger sizes narrow
+    // the bins (262,144 points = 0.73 Hz at 192 kHz) at the cost of a longer
+    // capture aperture and proportionally more analyzer CPU; the default is
+    // unchanged, so only an operator who selects a larger size pays for it.
+    public const int MaxRxAnalyzerFftSize = 262_144;
+    // Low-power hosts stay at the pre-existing ceiling: a Pi-class board must
+    // never be able to select itself into an analyzer load it could not
+    // reach before.
+    public const int MaxLowPowerRxAnalyzerFftSize = 32_768;
+
+    public static IReadOnlyList<int> RxAnalyzerFftSizes { get; } =
+        [2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072, MaxRxAnalyzerFftSize];
+
+    public static bool IsValidRxAnalyzerFftSize(int? raw) =>
+        raw.HasValue && RxAnalyzerFftSizes.Contains(raw.Value);
+
+    public static int NormalizeRxAnalyzerFftSize(int? raw) =>
+        IsValidRxAnalyzerFftSize(raw) ? raw!.Value : DefaultRxAnalyzerFftSize;
+
+    /// <summary>
+    /// The FFT size the RX analyzer actually runs at. An operator selection
+    /// wins over the profile/config value in <paramref name="snapshot"/>; no
+    /// selection (or a malformed one) leaves the snapshot value untouched, so
+    /// an install that never opens the setting is byte-identical to before.
+    /// Low-power hosts are clamped to <see cref="MaxLowPowerRxAnalyzerFftSize"/>.
+    /// </summary>
+    public static int ResolveOperatorRxAnalyzerFftSize(int? operatorChoice, DisplayPerformanceSnapshot snapshot)
     {
-        2048 or 4096 or 8192 or 16384 or 32768 => raw.Value,
-        _ => DefaultRxAnalyzerFftSize,
-    };
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return IsValidRxAnalyzerFftSize(operatorChoice)
+            ? ClampRxAnalyzerFftSizeForProfile(operatorChoice!.Value, snapshot.LowPower)
+            : snapshot.RxAnalyzerFftSize;
+    }
+
+    /// <summary>
+    /// The single low-power ceiling rule, shared by the settings store (what is
+    /// persisted and shown) and the pipeline (what runs) so they cannot drift.
+    /// </summary>
+    public static int ClampRxAnalyzerFftSizeForProfile(int fftSize, bool lowPower) =>
+        lowPower ? Math.Min(fftSize, MaxLowPowerRxAnalyzerFftSize) : fftSize;
 
     public static int NormalizePanadapterWidth(int? raw) => raw switch
     {
@@ -297,16 +334,20 @@ public static class DisplayPerformanceOptions
          string.Equals(raw, "yes", StringComparison.OrdinalIgnoreCase) ||
          string.Equals(raw, "on", StringComparison.OrdinalIgnoreCase));
 
+    // The low-power ceiling binds the env/config override too: widening the
+    // accepted sizes must not open any path to a heavier analyzer on a
+    // Pi-class host than it could reach before.
     private static int ResolveRxAnalyzerFftSize(
         int profileDefault,
+        bool lowPower,
         IConfiguration? configuration,
         Func<string, string?> environment)
     {
         if (TryParseInt(environment("ZEUS_RX_ANALYZER_FFT"), out var envValue))
-            return NormalizeRxAnalyzerFftSize(envValue);
+            return ClampRxAnalyzerFftSizeForProfile(NormalizeRxAnalyzerFftSize(envValue), lowPower);
 
         if (TryParseInt(configuration?["Zeus:Display:RxAnalyzerFftSize"], out var configValue))
-            return NormalizeRxAnalyzerFftSize(configValue);
+            return ClampRxAnalyzerFftSizeForProfile(NormalizeRxAnalyzerFftSize(configValue), lowPower);
 
         return profileDefault;
     }

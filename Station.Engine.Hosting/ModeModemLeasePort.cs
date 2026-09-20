@@ -54,6 +54,14 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
     private static readonly byte FreeDvModeByte = (byte)RxMode.FreeDv;
     private static readonly TimeSpan LeasePumpPeriod = TimeSpan.FromMilliseconds(2);
     private static readonly TimeSpan LeaseHeartbeatPeriod = TimeSpan.FromMilliseconds(100);
+    // The hold stream is ordinary loopback HTTP, not a realtime audio path.
+    // A write only blocks once the peer's socket buffers are full, so this
+    // bound is a backstop for a long-wedged peer, not a liveness detector.
+    // A dead product resets the connection and tears down immediately through
+    // the request-abort token. Transmit audio safety is owned by the ring
+    // data plane (underflow is silence-filled, malformed output revokes), not
+    // this deadline.
+    private static readonly TimeSpan DefaultLeaseWriteTimeout = TimeSpan.FromSeconds(1);
     private const int InvalidOutputBlockRevokeThreshold = 3;
     private const int LifecycleQueueCapacity = 64;
     private const int LifecycleLogCapacity = 32;
@@ -74,6 +82,7 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
     private readonly ILogger<ModeModemLeasePort> _log;
     private readonly RadioService _radio;
     private readonly Func<TxService?>? _txServiceProvider;
+    private readonly TimeSpan _leaseWriteTimeout;
     private readonly ConcurrentQueue<string> _lifecycleLog = new();
     private Session? _session;
     private long _droppedRxInputBlocks;
@@ -87,16 +96,20 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
     public ModeModemLeasePort(
         RadioService radio,
         ILogger<ModeModemLeasePort> log,
-        Func<TxService?>? txServiceProvider = null)
+        Func<TxService?>? txServiceProvider = null,
+        TimeSpan? leaseWriteTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(radio);
         ArgumentNullException.ThrowIfNull(log);
+        if (leaseWriteTimeout is { } timeout && timeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseWriteTimeout));
         _radio = radio;
         _log = log;
         // Lazy TX-service lookup: TxService depends on DspPipelineService,
         // which consumes IAudioModemPort, so a constructor dependency would
         // cycle. Resolved only on the teardown path when a key must drop.
         _txServiceProvider = txServiceProvider;
+        _leaseWriteTimeout = leaseWriteTimeout ?? DefaultLeaseWriteTimeout;
         // Initial registration: unavailable until a lease activates and the
         // product reports ready. RadioService polls this provider on mode
         // entry; eager receiver coercion happens on every teardown below.
@@ -217,6 +230,7 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
         using var holdCancellation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
         Interlocked.Exchange(ref session.HoldCancellation, holdCancellation);
         var nextHeartbeat = Stopwatch.GetTimestamp();
+        string? teardownReason = null;
         try
         {
             await WithLeaseWriteDeadlineAsync(
@@ -254,14 +268,24 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
         }
         catch (OperationCanceledException)
         {
+            // Reason is classified in finally. Host abort can surface as an
+            // OCE (e.g. ConnectionAbortedException) before RequestAborted is
+            // observed.
+        }
+        catch (TimeoutException)
+        {
+            teardownReason = "station-protocol lease write timed out";
         }
         catch (IOException)
         {
+            // A client abort can surface as IOException; classify that in finally.
+            if (!context.RequestAborted.IsCancellationRequested)
+                teardownReason = "station-protocol lease write failed";
         }
         finally
         {
             Interlocked.CompareExchange(ref session.HoldCancellation, null, holdCancellation);
-            Teardown(session, "station-protocol lease disconnected");
+            Teardown(session, teardownReason ?? ClassifyHoldEnd(context));
         }
     }
 
@@ -936,13 +960,30 @@ public sealed class ModeModemLeasePort : IAudioModemPort, IDisposable
         _lifecycleLog.Enqueue(record);
     }
 
-    private static async Task WithLeaseWriteDeadlineAsync(
+    private async Task WithLeaseWriteDeadlineAsync(
         CancellationToken holdCancelled,
         Func<CancellationToken, Task> write)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(holdCancelled);
-        deadline.CancelAfter(TimeSpan.FromMilliseconds(AudioRingProtocol.BlockPeriodMilliseconds));
-        await write(deadline.Token).ConfigureAwait(false);
+        deadline.CancelAfter(_leaseWriteTimeout);
+        try
+        {
+            await write(deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (
+            deadline.IsCancellationRequested && !holdCancelled.IsCancellationRequested)
+        {
+            throw new TimeoutException("The mode-modem lease write timed out.", ex);
+        }
+    }
+
+    private static string ClassifyHoldEnd(HttpContext context)
+    {
+        // When another path already started the teardown, that path's reason
+        // is the one logged and this value is ignored.
+        if (context.RequestAborted.IsCancellationRequested)
+            return "station-protocol client disconnected";
+        return "station-protocol lease cancelled";
     }
 
     private static bool ValidateIdentity(string name, string version, out string? error)

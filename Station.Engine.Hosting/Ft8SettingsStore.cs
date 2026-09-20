@@ -12,7 +12,7 @@
 // A legacy single, un-keyed row written before per-mode keying is migrated
 // in place to the FT8 row so no operator config is lost. These are
 // behaviour/UI/display knobs only — none transmit; TX still requires an
-// explicit arm.
+// explicit operator arm (ENABLE TX, or an opted-in decode-row click).
 
 using LiteDB;
 using Zeus.Contracts;
@@ -157,7 +157,8 @@ public sealed class Ft8SettingsStore : IDisposable
         Rbw: e.Rbw ?? Ft8Settings.DefaultRbw,
         Smoothing: e.Smoothing,
         Zoom: e.Zoom,
-        SpanHz: e.SpanHz);
+        SpanHz: e.SpanHz,
+        ArmTxOnClick: e.ArmTxOnClick);
 
     private static Ft8SettingsEntry FromSettings(Ft8SettingsEntry e, Ft8Settings s, DateTime nowUtc)
     {
@@ -192,6 +193,7 @@ public sealed class Ft8SettingsStore : IDisposable
         e.Smoothing = s.Smoothing;
         e.Zoom = s.Zoom;
         e.SpanHz = s.SpanHz;
+        e.ArmTxOnClick = s.ArmTxOnClick;
         e.UpdatedUtc = nowUtc;
         return e;
     }
@@ -244,5 +246,7 @@ public sealed class Ft8SettingsEntry
     public int Smoothing { get; set; } = Ft8Settings.DefaultSmoothing;
     public double Zoom { get; set; } = Ft8Settings.DefaultZoom;
     public int SpanHz { get; set; } = Ft8Settings.DefaultSpanHz;
+    /// <summary>Opt-in decode-row click-to-arm. Missing on legacy rows → false.</summary>
+    public bool ArmTxOnClick { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
