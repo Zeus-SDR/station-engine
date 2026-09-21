@@ -125,6 +125,10 @@ public class DspPipelineService : BackgroundService,
     /// </summary>
     public event Action<int, int, ReadOnlyMemory<float>>? RxAudioAvailable;
 
+    /// <summary>Per-receiver demodulated audio before local speaker mute and mix.
+    /// The buffer is valid only during the synchronous callback.</summary>
+    public event Action<int, int, ReadOnlyMemory<float>>? ReceiverAudioAvailable;
+
     /// <summary>
     /// Raised when TX-monitor audio is available — the processed transmit audio
     /// demodulated back from the TX IQ (post EQ / compressor / leveler / CFC),
@@ -9497,6 +9501,11 @@ public class DspPipelineService : BackgroundService,
         bool allowLocalRxDuringSuppression =
             fullDuplexRxActive && (activelyKeyed || localRxAudioContinuous);
         int audioSampleCount = engine.ReadAudio(channel, audioBuf);
+        bool streamLocalRx = !txMonitorOn &&
+            (!suppressRxAudioForTx || allowLocalRxDuringSuppression);
+        if (streamLocalRx && audioSampleCount > 0)
+            ReceiverAudioAvailable?.Invoke(
+                0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
         // Per-RX mute (Thetis chkMUT): RX1 stays the audio clock-master so the
         // mix/output timing is unchanged, but its samples are zeroed so only the
         // other (unmuted) receivers are heard. TX monitor overrides RX audio
@@ -9558,6 +9567,9 @@ public class DspPipelineService : BackgroundService,
                 }
                 _productPluginAudio?.PublishRxAudio(
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
+                if (streamLocalRx)
+                    ReceiverAudioAvailable?.Invoke(
+                        ri, AudioOutputRateHz, new ReadOnlyMemory<float>(sec.AudioBuf, 0, n));
             }
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor

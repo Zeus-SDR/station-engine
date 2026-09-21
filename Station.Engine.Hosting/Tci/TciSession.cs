@@ -1235,44 +1235,31 @@ public sealed class TciSession : IDisposable
     private void HandleMute(string[] args)
     {
         // mute:<bool>  (SET master mute)  or  mute  (GET)
-        // TCI has no "master audio bus" abstraction in Zeus; per convention
-        // the primary receiver (RX1 / index 0) carries the master mute state
-        // for external clients. StateChanged rebroadcasts to all TCI sessions.
+        // Local speaker mute is independent of TCI audio. Zeus has no TCI
+        // stream-mute control, so report the stream as available.
         if (args.Length == 0)
         {
-            Send(TciProtocol.Command("mute", _radio.Snapshot().Rx1Muted));
+            Send(TciProtocol.Command("mute", false));
             return;
         }
-        if (TciProtocol.TryParseBool(args[0], out bool muted))
-        {
-            _radio.SetReceiverMuted(0, muted);
-        }
+        if (TciProtocol.TryParseBool(args[0], out _))
+            Send(TciProtocol.Command("mute", false));
     }
 
     private void HandleRxMute(string[] args)
     {
         // rx_mute:<rx>,<bool>  (SET)  or  rx_mute:<rx>  (GET)
-        // rx maps directly to the RadioService receiver index (0=RX1, 1=RX2).
-        // Out-of-range indices are ignored so a client can safely probe
-        // beyond the current receiver count.
+        // Speaker mute is local; TCI receiver streams remain available.
         if (args.Length < 1) return;
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
 
         if (args.Length == 1)
         {
-            var state = _radio.Snapshot();
-            bool current = rx switch
-            {
-                0 => state.Rx1Muted,
-                1 => state.Rx2Muted,
-                _ => false,
-            };
-            Send(TciProtocol.Command("rx_mute", rx, current));
+            Send(TciProtocol.Command("rx_mute", rx, false));
             return;
         }
-        if (!TciProtocol.TryParseBool(args[1], out bool muted)) return;
-        try { _radio.SetReceiverMuted(rx, muted); }
-        catch (ArgumentOutOfRangeException) { /* silently drop — client probed past our RX count */ }
+        if (TciProtocol.TryParseBool(args[1], out _))
+            Send(TciProtocol.Command("rx_mute", rx, false));
     }
 
     private void HandleVolume(string[] args)

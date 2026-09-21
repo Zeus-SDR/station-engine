@@ -52,12 +52,8 @@ public static class TciStateBroadcast
     {
         var cmds = new List<string>(12);
 
-        if (Changed(prev, next, static s => s.Rx1Muted))
-            cmds.Add(TciProtocol.Command("mute", next.Rx1Muted));
-        if (Changed(prev, next, static s => s.Rx1Muted))
-            cmds.Add(TciProtocol.Command("rx_mute", 0, next.Rx1Muted));
-        if (Changed(prev, next, static s => s.Rx2Muted))
-            cmds.Add(TciProtocol.Command("rx_mute", 1, next.Rx2Muted));
+        // Receiver mute in StateDto controls only the local speaker mix.
+        // TCI audio streams remain live, so do not tell clients to mute them.
 
         if (Changed(prev, next, static s => s.RitEnabled))
             cmds.Add(TciProtocol.Command("rit_enable", 0, next.RitEnabled));

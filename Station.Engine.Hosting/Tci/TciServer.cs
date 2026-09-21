@@ -173,7 +173,7 @@ public sealed class TciServer : IHostedService, IDisposable
         _radio.MoxChanged += OnMoxChanged;
         _pipeline.RxMeterUpdated += OnRxMeterUpdated;
         _pipeline.RxIqAvailable += OnRxIqAvailable;
-        _pipeline.RxAudioAvailable += OnRxAudioAvailable;
+        _pipeline.ReceiverAudioAvailable += OnRxAudioAvailable;
         _txMeters.TxMetersUpdated += OnTxMetersUpdated;
         _cwEngine.Status += OnCwEngineStatus;
         _transverterSettings.Changed += OnTransverterSettingsChanged;
@@ -195,7 +195,7 @@ public sealed class TciServer : IHostedService, IDisposable
             _radio.MoxChanged -= OnMoxChanged;
             _pipeline.RxMeterUpdated -= OnRxMeterUpdated;
             _pipeline.RxIqAvailable -= OnRxIqAvailable;
-            _pipeline.RxAudioAvailable -= OnRxAudioAvailable;
+            _pipeline.ReceiverAudioAvailable -= OnRxAudioAvailable;
             _txMeters.TxMetersUpdated -= OnTxMetersUpdated;
             _cwEngine.Status -= OnCwEngineStatus;
             _transverterSettings.Changed -= OnTransverterSettingsChanged;
