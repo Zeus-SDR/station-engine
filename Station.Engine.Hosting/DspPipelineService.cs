@@ -3775,7 +3775,7 @@ public class DspPipelineService : BackgroundService,
         bool wdsp = engine is WdspDspEngine or OfflinePreviewDspEngine;
         int txBlock = engine?.TxBlockSamples ?? 0;
         int txOut = engine?.TxOutputSamples ?? 0;
-        int txDspRateHz = txBlock == 256 && txOut == 1024 ? 96_000 : 48_000;
+        int txDspRateHz = ResolveTxDspRateHz(engine);
         string status = engine is OfflinePreviewDspEngine
             ? "offline-preview-tx-profile"
             : wdsp
@@ -3941,7 +3941,13 @@ public class DspPipelineService : BackgroundService,
         };
     }
 
-    private static int ResolveFilterTapCount(BandpassWindow window) => window switch
+    /// <summary>TXA DSP rate implied by the open engine's block geometry:
+    /// the 256-in / 1024-out profile runs TXA at 96 kHz, everything else at
+    /// 48 kHz.</summary>
+    internal static int ResolveTxDspRateHz(IDspEngine? engine) =>
+        engine?.TxBlockSamples == 256 && engine.TxOutputSamples == 1024 ? 96_000 : 48_000;
+
+    internal static int ResolveFilterTapCount(BandpassWindow window) => window switch
     {
         BandpassWindow.Soft => 1024,
         BandpassWindow.Normal => 2048,

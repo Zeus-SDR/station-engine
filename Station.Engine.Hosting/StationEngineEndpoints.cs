@@ -264,6 +264,7 @@ public static class StationEngineEndpoints
         // ring tail when the file itself cannot be written.
         endpoints.MapEngineLogDiagnosticsEndpoint();
         endpoints.MapEngineRadioDiagnosticsEndpoint();
+        endpoints.MapEngineOperatorDiagnosticsEndpoint();
 
         endpoints.Map(
             "/ws",

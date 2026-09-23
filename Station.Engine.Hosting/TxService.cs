@@ -42,7 +42,9 @@
 // Zeus is distributed WITHOUT ANY WARRANTY; see the GNU General Public
 // License for details.
 
+using System.Text;
 using Zeus.Contracts;
+using Zeus.Server.Diagnostics;
 
 namespace Zeus.Server;
 
@@ -75,6 +77,10 @@ public sealed class TxService
     // the owning source can drop MOX, except UI (master override) and
     // <see cref="TryTripForAlert"/> (always wins). Null when MOX is off.
     private MoxSource? _moxOwner;
+    // Stopwatch ticks of the last committed key-up, for the keyed duration in
+    // the release history. Guarded by _sync.
+    private long _keyedAtTicks;
+    private readonly TransmitHistory _history = new();
     private long _productPluginMoxGeneration;
     // Opaque, process-local identity of the authenticated remote session that
     // owns the current TX intent. Null for every local/hardware/plugin source.
@@ -825,6 +831,10 @@ public sealed class TxService
             TxMonitorEnabled: _radio.Snapshot().TxMonitorEnabled,
             MonitorOnTransmit: MonitorOnTransmit));
 
+    /// <summary>Recent key-ups and releases for the Submit-an-Issue report
+    /// (issue #2374). Records only; never gates a transition.</summary>
+    internal TransmitHistory History => _history;
+
     private long NextTransitionRevision()
     {
         lock (_sync) return ++_transitionRevision;
@@ -849,8 +859,15 @@ public sealed class TxService
             _tunOwner = _tunOn ? source : null;
             IsTwoToneOn = intent == TransmitIntent.TwoTone;
             Interlocked.Exchange(ref _preKeyOpenAtTicks, armPreKey ? long.MaxValue : 0);
+            _keyedAtTicks = _stopwatchTicks();
             changed = CaptureTxActiveChangeUnderLock();
         }
+        _history.Record(new TransmitHistoryEntry(
+            DateTimeOffset.UtcNow,
+            "key",
+            intent.ToString(),
+            source?.ToString(),
+            _radio.Snapshot().Mode.ToString()));
         RaiseTxActiveChanged(changed);
     }
 
@@ -902,19 +919,42 @@ public sealed class TxService
     private void ConvergeToSafeIdle(
         bool faultLatched,
         Action? onPostWireIdle = null,
-        bool stopTxMonitor = true)
+        bool stopTxMonitor = true,
+        string? reason = null,
+        TxReleaseTail tail = default)
     {
         long revision = NextTransitionRevision();
+        long releaseStartTs = tail.StartTicks ?? _stopwatchTicks();
+        TransmitIntent? releasedIntent;
+        MoxSource? releasedSource;
+        long keyedAtTs;
+        lock (_sync)
+        {
+            releasedIntent = _activeIntent;
+            releasedSource = _moxOwner ?? _tunOwner;
+            keyedAtTs = _keyedAtTicks;
+        }
+        // Per-step timings only for a real release; an idle converge (e.g. a
+        // disconnect with nothing keyed) is not transmit history.
+        var steps = releasedIntent is null ? null : new StringBuilder(160);
         bool failed = false;
         bool wireDropped = false;
         bool hostClearedEarly = false;
         void Safe(string step, Action action)
         {
+            long stepStartTs = _stopwatchTicks();
             try { action(); }
             catch (Exception ex)
             {
                 failed = true;
                 _log.LogWarning(ex, "tx.safeConverge.failed step={Step} revision={Revision}", step, revision);
+            }
+            if (steps is not null)
+            {
+                if (steps.Length > 0) steps.Append(',');
+                steps.Append(step).Append(':').Append(
+                    TicksToMs(_stopwatchTicks() - stepStartTs).ToString(
+                        "0.#", System.Globalization.CultureInfo.InvariantCulture));
             }
         }
 
@@ -976,14 +1016,67 @@ public sealed class TxService
         if (!faultLatched)
             Safe("hardwareCw.rearm", () => _radio.SetHardwareCwSafetyBlocked(false));
 
-        var teardownMs = (_stopwatchTicks() - wireDroppedTs)
-            * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        long endTs = _stopwatchTicks();
+        var teardownMs = TicksToMs(endTs - wireDroppedTs);
         _log.LogInformation(
             "tx.safeConverge revision={Revision} faultLatched={FaultLatched} afterWireMs={Ms:F1}",
             revision,
             faultLatched,
             teardownMs);
+
+        if (releasedIntent is { } intent)
+        {
+            RecordReleaseTiming(new TransmitHistoryEntry(
+                DateTimeOffset.UtcNow,
+                "release",
+                intent.ToString(),
+                releasedSource?.ToString(),
+                _radio.Snapshot().Mode.ToString(),
+                // Trips and radio disconnects keep their audited literal call
+                // shape, so they report as "fault"; the tx.trip / tx.disconnect
+                // line logged right after names the cause.
+                Reason: reason ?? (faultLatched ? "fault" : "operator"),
+                TailConfiguredMs: tail.ConfiguredMs,
+                TailMs: tail.EndTicks is { } tailEndTs
+                    ? TicksToMs(tailEndTs - releaseStartTs)
+                    : null,
+                WireDropMs: TicksToMs(wireDroppedTs - releaseStartTs),
+                AfterWireMs: teardownMs,
+                TotalMs: TicksToMs(endTs - releaseStartTs),
+                KeyedMs: keyedAtTs > 0 ? TicksToMs(releaseStartTs - keyedAtTs) : null,
+                FaultLatched: faultLatched,
+                Failed: failed,
+                Steps: steps?.ToString()));
+        }
     }
+
+    private void RecordReleaseTiming(TransmitHistoryEntry entry)
+    {
+        _history.Record(entry);
+        _log.LogInformation(
+            "tx.release.timing intent={Intent} source={Source} reason={Reason} mode={Mode} "
+            + "tailCfgMs={TailCfgMs} tailMs={TailMs} wireDropMs={WireDropMs} afterWireMs={AfterWireMs} "
+            + "totalMs={TotalMs} keyedMs={KeyedMs} faultLatched={FaultLatched} failed={Failed} steps={Steps}",
+            entry.Intent,
+            entry.Source ?? "none",
+            entry.Reason,
+            entry.Mode,
+            entry.TailConfiguredMs?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none",
+            FormatMs(entry.TailMs),
+            FormatMs(entry.WireDropMs),
+            FormatMs(entry.AfterWireMs),
+            FormatMs(entry.TotalMs),
+            FormatMs(entry.KeyedMs),
+            entry.FaultLatched,
+            entry.Failed,
+            entry.Steps);
+    }
+
+    private static string FormatMs(double? ms) =>
+        ms?.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) ?? "none";
+
+    private static double TicksToMs(long ticks) =>
+        ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
     /// <summary>Back-compat shim: callers that don't tag a source get
     /// <see cref="MoxSource.UI"/>, the master override. New callers should
@@ -1137,12 +1230,21 @@ public sealed class TxService
             return false;
         }
 
+        var tail = default(TxReleaseTail);
         if (active == TransmitIntent.Mox)
+        {
+            // The same value DrainMoxTailBestEffort reads, reported next to
+            // the measured hold.
+            int tailConfiguredMs = _radio.TxMoxTailDelayMs;
+            long tailStartTs = _stopwatchTicks();
             DrainMoxTailBestEffort();
+            tail = new TxReleaseTail(tailStartTs, _stopwatchTicks(), tailConfiguredMs);
+        }
         ConvergeToSafeIdle(
             faultLatched: false,
             onPostWireIdle: onPostWireIdle,
-            stopTxMonitor: active is not null);
+            stopTxMonitor: active is not null,
+            tail: tail);
         _log.LogInformation("tx.mox on=false");
         BroadcastMoxState(moxOn: false, tunOn: false);
         error = null;
@@ -1179,7 +1281,7 @@ public sealed class TxService
                 return false;
             }
 
-            ConvergeToSafeIdle(faultLatched: false);
+            ConvergeToSafeIdle(faultLatched: false, reason: "dead-man");
             _log.LogInformation("tx.mox dead-man release source={Source}", source);
             BroadcastMoxState(moxOn: false, tunOn: false);
             error = null;
@@ -1218,7 +1320,7 @@ public sealed class TxService
             }
 
             PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
-            ConvergeToSafeIdle(faultLatched: false);
+            ConvergeToSafeIdle(faultLatched: false, reason: "remote-disconnect");
             if (wasActive)
                 _log.LogWarning("tx.remote.disconnect forced safe idle");
             BroadcastMoxState(moxOn: false, tunOn: false);
@@ -1588,6 +1690,13 @@ public sealed class TxService
         }
     }
 }
+
+/// <summary>Voice-tail hold that preceded a release: when it started and
+/// ended, and the configured tail. Default means no tail ran.</summary>
+internal readonly record struct TxReleaseTail(
+    long? StartTicks,
+    long? EndTicks,
+    int? ConfiguredMs);
 
 internal readonly record struct TxMonitorPreviewState(
     StateDto RadioState,
