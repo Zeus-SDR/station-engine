@@ -180,7 +180,8 @@ public sealed class TxIqRing : ITxIqSource
             // the ~63-sample EP2 cadence while still dropping to near-zero
             // within ~200 ms of unkey.
             _recentMag = 0.99 * _recentMag + 0.01 * (Math.Abs((int)i) + Math.Abs((int)q));
-            if (amplitude >= 0.999) return (i, q);
+            // Unity skips the multiply. A value just under 1 is a real scale.
+            if (amplitude >= 1.0) return (i, q);
             double a = Math.Clamp(amplitude, 0.0, 1.0);
             return ((short)(i * a), (short)(q * a));
         }

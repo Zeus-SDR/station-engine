@@ -89,6 +89,9 @@ public sealed class Protocol1Client : IProtocol1Client
 
     private readonly ILogger<Protocol1Client> _log;
     private readonly Channel<IqFrame> _channel;
+    // Monotonic milliseconds. TX loop stamps HL2 IQ-scale changes; the RX
+    // thread reads that stamp. Tests inject a clock; production uses boot time.
+    private readonly Func<long> _monotonicMs;
 
     // Mutation state written from any thread, read from the TX thread.
     // 64-bit fields are written atomically on 64-bit .NET (Interlocked.Exchange used for safety).
@@ -161,10 +164,32 @@ public sealed class Protocol1Client : IProtocol1Client
     // OR the per-band OcTune mask on top of OcTx only during TUN.
     private int _tune;          // 0 / 1
     private int _drivePct;      // 0..100 UI percent; mapped to 0..255 on snapshot
-    // When >= 0, RadioService has pushed a fully-computed drive byte (post PA
-    // calibration) and we send that instead of the percent mapping. Legacy
-    // callers that only call SetDrive(percent) keep working untouched.
-    private int _driveByteOverride = -1;
+    // Null is the old "override unset" (-1): SnapshotState falls back to
+    // _drivePct * 255 / 100 with unity IQ. One reference so a frame never
+    // pairs a new drive byte with the previous IQ scale.
+    private DriveOutputSlot? _driveOutput;
+    // TX-loop thread only. Pairs each USB frame's IQ scale with the DriveFilter
+    // byte that has actually been sent. Reset when the TX loop starts. VNA
+    // clear and pre-start frames do not come through here.
+    private readonly DriveWirePairing _driveWirePairing = new();
+    // IQ scale of the last MOX packet's odd USB frame. The RX thread reads it
+    // to undo HL2 TX IQ scaling on the DDC3 PureSignal reference. 1.0 until
+    // the first committed MOX packet, and again when the TX loop resets the
+    // drive pairing. PublishBuiltMoxIqScale stamps _hl2PsScaleChangedAtMs and
+    // bumps _hl2PsScaleChangeEpoch when the published value changes. The
+    // TX-loop reset does neither.
+    private double _lastSentTxIqScale = 1.0;
+    // Monotonic ms of the last published sent-scale change. long.MinValue
+    // means none. Written on the TX loop, read on the RX thread.
+    private const long NoHl2PsScaleChange = long.MinValue;
+    private long _hl2PsScaleChangedAtMs = NoHl2PsScaleChange;
+    // How many times the published MOX IQ scale has changed. The TX loop
+    // increments it beside the stamp; the RX thread compares it with the
+    // epoch it last observed. The TX-loop reset to 1.0 does not increment it.
+    private long _hl2PsScaleChangeEpoch;
+    // TX-loop thread only. Scale applied to the odd frame of the packet just
+    // built. Published to _lastSentTxIqScale after that MOX datagram is sent.
+    private double _builtOddTxIqScale = 1.0;
     // Effective PA state (global PA toggle combined with per-band Disable PA)
     // and independent transverter output enable. Both default to Thetis' normal
     // HF baseline: PA on, XVTR off.
@@ -357,11 +382,16 @@ public sealed class Protocol1Client : IProtocol1Client
     // ControlFrame.WriteUsbFrame; see RxAudioRing.
     private readonly IRxAudioSource? _rxAudioSource;
 
-    public Protocol1Client(ILogger<Protocol1Client>? logger = null, ITxIqSource? iqSource = null, IRxAudioSource? rxAudioSource = null)
+    public Protocol1Client(
+        ILogger<Protocol1Client>? logger = null,
+        ITxIqSource? iqSource = null,
+        IRxAudioSource? rxAudioSource = null,
+        Func<long>? monotonicMs = null)
     {
         _log = logger ?? NullLogger<Protocol1Client>.Instance;
         _txIqSource = iqSource ?? new TestToneGenerator();
         _rxAudioSource = rxAudioSource;
+        _monotonicMs = monotonicMs ?? (static () => Environment.TickCount64);
         _channel = Channel.CreateBounded<IqFrame>(new BoundedChannelOptions(DefaultFrameChannelCapacity)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
@@ -463,6 +493,10 @@ public sealed class Protocol1Client : IProtocol1Client
     // these buffers and emits PsFeedbackFrame for the DspPipelineService
     // pump. Cleanup issue #434.
     private const int PsFeedbackBlockSize = 1024;
+    // 5x the HL2 default 20 ms TX buffer latency, register 0x17 unset.
+    // Single duration for both the wall-clock discard and the stall budget
+    // (Hl2PsScaleChangeDiscardSamples, at the wire rate).
+    internal const int Hl2PsScaleChangeGuardMs = 100;
     private readonly Channel<PsFeedbackFrame> _psFeedbackFrames = Channel.CreateUnbounded<PsFeedbackFrame>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     private readonly float[] _psTxI = new float[PsFeedbackBlockSize];
@@ -480,6 +514,14 @@ public sealed class Protocol1Client : IProtocol1Client
     private PsFeedbackObservation? _lastPsFeedbackObservation;
     private int _psBlockFill;
     private ulong _psBlockStartSeq;
+    // RX thread only. Last published-scale epoch observed on the keyed HL2
+    // path. Starts at 0, matching the pre-publish epoch, so the first keyed
+    // packet still sees a 1.0 -> s publish after a TX-loop reset.
+    private long _hl2PsScaleEpochSeen;
+    // RX thread only. Samples still to drop for the scale epoch last
+    // observed. Armed to a full guard interval on every new epoch;
+    // packets inside the wall-clock window count against it.
+    private int _hl2PsDiscardBudget;
     // Diagnostic counter — tells the operator (via 1-Hz log line) whether the
     // gateware is actually emitting paired DDC0/DDC1 frames after PS arm.
     // See lessons_puresignal_convergence_g2_mkii.md for the same idiom on P2.
@@ -587,7 +629,9 @@ public sealed class Protocol1Client : IProtocol1Client
     ///          Hence per-board HW peak calibration is mandatory.
     ///   DDC3 = mix2_2+tx_data_dac at TX freq → pscc "tx" arg. The only
     ///          deterministic feedback path on HL2 (pre-PA DAC samples
-    ///          demodulated to baseband).
+    ///          demodulated to baseband). The AD9866 step attenuator is
+    ///          after this tap, so HL2 multiplies these samples by
+    ///          1/IqScale (pihpsdr drive_iscal).
     /// Pair DDC2 + DDC3 samples 1:1, accumulate 1024 paired complex samples,
     /// then emit a PsFeedbackFrame for the DspPipelineService pump.
     /// <paramref name="micScratch"/> is RxLoop's per-thread mic scratch
@@ -719,13 +763,90 @@ public sealed class Protocol1Client : IProtocol1Client
                 _psBlockFill = 0;
                 return true;
             }
-            for (int s = 0; s < samples; s++)
+
+            // Scale first, then the stamp and epoch. PublishBuiltMoxIqScale
+            // writes both before the scale, so a new scale observed here
+            // already has its discard window visible. HermesC10 and every
+            // other board skip the guard and stay on the raw cast below.
+            double sentIqScale = Volatile.Read(ref _lastSentTxIqScale);
+            int psSampleSkip = 0;
+            if (BoardKind == HpsdrBoardKind.HermesLite2)
+            {
+                long epoch = Volatile.Read(ref _hl2PsScaleChangeEpoch);
+                bool windowActive = Hl2PsScaleChangeGuardActive();
+                if (epoch != _hl2PsScaleEpochSeen)
+                {
+                    // New epoch: drop a partial block and arm one guard of
+                    // samples. Packets during the wall-clock window burn that
+                    // budget, so the discard is the longer of the timer and
+                    // the sample count, not the sum. A stall that outlives
+                    // the timer still drops the samples that missed it.
+                    _hl2PsScaleEpochSeen = epoch;
+                    _psBlockFill = 0;
+                    _hl2PsDiscardBudget = Hl2PsScaleChangeDiscardSamples(rateHz);
+                }
+
+                // DDC0 user IQ above already went out. Discard the PureSignal
+                // pair while the timer is open or the stall budget remains.
+                // Counting the packet against the budget while the timer is
+                // open keeps a live stream from discarding twice.
+                if (windowActive)
+                {
+                    if (_hl2PsDiscardBudget > samples)
+                        _hl2PsDiscardBudget -= samples;
+                    else
+                        _hl2PsDiscardBudget = 0;
+                    _psBlockFill = 0;
+                    return true;
+                }
+
+                if (_hl2PsDiscardBudget > 0)
+                {
+                    if (_hl2PsDiscardBudget >= samples)
+                    {
+                        _hl2PsDiscardBudget -= samples;
+                        _psBlockFill = 0;
+                        return true;
+                    }
+
+                    // This packet crosses the end of the budget. Drop the
+                    // prefix and keep the rest, so the next block starts on
+                    // the first post-budget sample.
+                    psSampleSkip = _hl2PsDiscardBudget;
+                    _hl2PsDiscardBudget = 0;
+                    _psBlockFill = 0;
+                }
+            }
+
+            // pihpsdr drive_iscal (radio.c, applied in transmitter.c
+            // tx_add_ps_iq_samples) undoes TX IQ scaling on the DAC feedback
+            // so PureSignal sees the reference it would have had at full
+            // scale. On HL2 the AD9866 step attenuator is after the
+            // tx_data_dac tap that fills DDC3, so that register is not in
+            // these samples and only the IQ scale is compensated. The factor
+            // is the reciprocal of the IQ scale the last MOX packet's odd
+            // frame actually sent. HermesC10 shares this parser and is left
+            // as the raw cast. s <= 0 or s >= 1 skips the multiply so those
+            // floats stay the unscaled cast.
+            bool compensateReference = BoardKind == HpsdrBoardKind.HermesLite2
+                && sentIqScale > 0.0
+                && sentIqScale < 1.0;
+            float referenceGain = compensateReference ? (float)(1.0 / sentIqScale) : 0f;
+            for (int s = psSampleSkip; s < samples; s++)
             {
                 if (_psBlockFill == 0) _psBlockStartSeq = seq;
                 _psRxI[_psBlockFill] = (float)ddc2[2 * s];
                 _psRxQ[_psBlockFill] = (float)ddc2[2 * s + 1];
-                _psTxI[_psBlockFill] = (float)ddc3[2 * s];
-                _psTxQ[_psBlockFill] = (float)ddc3[2 * s + 1];
+                if (compensateReference)
+                {
+                    _psTxI[_psBlockFill] = (float)ddc3[2 * s] * referenceGain;
+                    _psTxQ[_psBlockFill] = (float)ddc3[2 * s + 1] * referenceGain;
+                }
+                else
+                {
+                    _psTxI[_psBlockFill] = (float)ddc3[2 * s];
+                    _psTxQ[_psBlockFill] = (float)ddc3[2 * s + 1];
+                }
                 _psBlockFill++;
 
                 if (_psBlockFill >= PsFeedbackBlockSize)
@@ -1802,7 +1923,10 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _drivePct, Math.Clamp(percent, 0, 100));
 
     public void SetDriveByte(byte value) =>
-        Interlocked.Exchange(ref _driveByteOverride, value);
+        SetDriveOutput(TxDriveOutput.FromLegacyByte(value));
+
+    public void SetDriveOutput(TxDriveOutput output) =>
+        Volatile.Write(ref _driveOutput, new DriveOutputSlot(output));
 
     public void SetPaEnabled(bool enabled) =>
         Interlocked.Exchange(ref _paEnabled, enabled ? 1 : 0);
@@ -2458,6 +2582,50 @@ public sealed class Protocol1Client : IProtocol1Client
     internal bool HandlePs4DdcPacketForTest(ReadOnlySpan<byte> packet)
         => HandlePs4DdcPacket(packet, new short[PacketParser.Hl2Ps4DdcSamplesPerPacket]);
 
+    /// <summary>
+    /// Publish the odd-frame IQ scale of the MOX packet just sent. Called
+    /// after <see cref="CommitDriveWirePairing"/> accepts that datagram.
+    /// A non-MOX packet leaves the last MOX scale in place. A value different
+    /// from the last sent scale stamps the HL2 DDC3 discard window and bumps
+    /// the scale-change epoch.
+    /// </summary>
+    internal void PublishBuiltMoxIqScale(bool mox)
+    {
+        if (!mox) return;
+        double next = _builtOddTxIqScale;
+        double prev = Volatile.Read(ref _lastSentTxIqScale);
+        if (next != prev)
+        {
+            Volatile.Write(ref _hl2PsScaleChangedAtMs, _monotonicMs());
+            Interlocked.Increment(ref _hl2PsScaleChangeEpoch);
+        }
+        Volatile.Write(ref _lastSentTxIqScale, next);
+    }
+
+    /// <summary>
+    /// TX-loop start writes unity into the last sent IQ scale. That write is
+    /// not a published MOX scale, so it does not open the HL2 discard window
+    /// and does not bump the scale-change epoch. The next real publish
+    /// (1.0 to the built scale) is an ordinary change.
+    /// </summary>
+    internal void ResetLastSentTxIqScaleForTxLoopStart()
+        => Volatile.Write(ref _lastSentTxIqScale, 1.0);
+
+    // True while HL2 DDC2/DDC3 samples still belong to the previous sent
+    // scale. The stamp is a TX-loop write; this read runs on the RX thread.
+    private bool Hl2PsScaleChangeGuardActive()
+    {
+        long changedAt = Volatile.Read(ref _hl2PsScaleChangedAtMs);
+        if (changedAt == NoHl2PsScaleChange)
+            return false;
+        return unchecked(_monotonicMs() - changedAt) < Hl2PsScaleChangeGuardMs;
+    }
+
+    // Samples in one guard interval at the wire rate the packet was stamped
+    // with. Hl2PsScaleChangeGuardMs is the only duration.
+    private static int Hl2PsScaleChangeDiscardSamples(int rateHz)
+        => rateHz * Hl2PsScaleChangeGuardMs / 1000;
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -2468,14 +2636,17 @@ public sealed class Protocol1Client : IProtocol1Client
 
     internal ControlFrame.CcState SnapshotState()
     {
-        int over = Volatile.Read(ref _driveByteOverride);
-        byte drive = over >= 0
-            ? (byte)over
-            // UI percent → raw 0..255 HPSDR drive byte. Used only when
-            // RadioService hasn't pushed a calibrated byte (tests / legacy).
-            : (byte)(Volatile.Read(ref _drivePct) * 255 / 100);
+        // Override unset: percent → byte, unity IQ (a zero byte stays silent).
+        // That is the pre-calibration path tests and SetDrive-only callers use.
+        var slot = Volatile.Read(ref _driveOutput);
+        TxDriveOutput output = slot?.Output
+            ?? TxDriveOutput.FromLegacyByte((byte)(Volatile.Read(ref _drivePct) * 255 / 100));
 
         bool psOn = Volatile.Read(ref _psEnabled) != 0;
+        // PureSignal uses the same drive byte and IQ scale as every other
+        // transmission. HL2 compensates the DDC3 reference by 1/IqScale.
+        byte drive = output.DriveByte;
+        double iqScale = output.IqScale;
         var board = (HpsdrBoardKind)Volatile.Read(ref _boardKind);
         bool isHl2 = board == HpsdrBoardKind.HermesLite2;
         bool isC10 = board == HpsdrBoardKind.HermesC10;
@@ -2588,7 +2759,15 @@ public sealed class Protocol1Client : IProtocol1Client
             VnaStepHz: vna.StepHz,
             VnaPoints: vna.Points,
             VnaFixedRxGainHigh: vna.FixedRxGainHigh,
-            VnaDriveLevel: vna.DriveLevel);
+            VnaDriveLevel: vna.DriveLevel,
+            TxIqScale: iqScale);
+    }
+
+    // One heap box so the TX loop swaps drive byte and IQ scale together.
+    private sealed class DriveOutputSlot
+    {
+        public DriveOutputSlot(TxDriveOutput output) => Output = output;
+        public TxDriveOutput Output { get; }
     }
 
     private void RxLoop()
@@ -3386,11 +3565,53 @@ public sealed class Protocol1Client : IProtocol1Client
         };
     }
 
+    /// <summary>
+    /// TX-loop EP2 build. Even USB frame, then odd. On Hermes-Lite 2, a MOX
+    /// frame keeps the IQ scale paired with the DriveFilter byte already
+    /// sent, whether or not PureSignal is armed. The pair this packet would
+    /// write stays pending until <see cref="CommitDriveWirePairing"/>. Every
+    /// other board and every non-MOX frame encodes the snapshot scale. The
+    /// odd frame's scale is remembered for <see cref="PublishBuiltMoxIqScale"/>.
+    /// </summary>
+    internal void BuildTxDataPacket(
+        Span<byte> packet,
+        uint sendSequence,
+        ControlFrame.CcRegister evenRegister,
+        ControlFrame.CcRegister oddRegister,
+        in ControlFrame.CcState state,
+        ITxIqSource? iqSource,
+        IRxAudioSource? rxAudioSource = null)
+    {
+        _driveWirePairing.BeginPacket();
+        var even = state with { TxIqScale = _driveWirePairing.ScaleForFrame(evenRegister, in state) };
+        var odd = state with { TxIqScale = _driveWirePairing.ScaleForFrame(oddRegister, in state) };
+        _builtOddTxIqScale = odd.TxIqScale.GetValueOrDefault(1.0);
+        ControlFrame.BuildDataPacket(
+            packet,
+            sendSequence,
+            evenRegister,
+            oddRegister,
+            in even,
+            in odd,
+            iqSource,
+            rxAudioSource);
+    }
+
+    /// <summary>
+    /// The packet just built was accepted by the socket. Promote its drive pair.
+    /// </summary>
+    internal void CommitDriveWirePairing() => _driveWirePairing.Commit();
+
     private void RunTxLoop(CancellationToken ct)
     {
         Volatile.Write(ref _txLoopManagedThreadId, Environment.CurrentManagedThreadId);
         Volatile.Write(ref _txLoopIsThreadPoolThread, Thread.CurrentThread.IsThreadPoolThread ? 1 : 0);
         Volatile.Write(ref _txLoopRunning, 1);
+        // Before the first packet of this run. A reused client must not keep
+        // the previous stream's register byte or its DDC3 compensation scale.
+        // Unity here is not a sent-scale change and must not open the guard.
+        _driveWirePairing.Reset();
+        ResetLastSentTxIqScaleForTxLoopStart();
         try
         {
             RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log);
@@ -3515,7 +3736,11 @@ public sealed class Protocol1Client : IProtocol1Client
                 var (first, second) = PhaseRegisters(phase, state.Mox, psArmed);
                 phase = psArmed ? ((phase + 1) & 0xF) : ((phase + 1) % 7);
                 bool pacedAudioSend = !state.Mox && _audioEgressPacer.Active;
-                ControlFrame.BuildDataPacket(buf, NextEp2Seq(), first, second, in state, _txIqSource, _rxAudioSource);
+                // HL2 MOX keeps each frame's IQ scale paired with the DriveFilter
+                // byte already sent, PureSignal included. The new pair stays
+                // pending until SendTo below accepts the datagram. Other
+                // boards and non-MOX frames stay on the snapshot scale.
+                BuildTxDataPacket(buf, NextEp2Seq(), first, second, in state, _txIqSource, _rxAudioSource);
                 // Borrow a repeated frequency slot; preserve configuration,
                 // drive, keyer, and every second-frame register in the rotation.
                 if (BoardKind == HpsdrBoardKind.HermesLite2)
@@ -3554,6 +3779,8 @@ public sealed class Protocol1Client : IProtocol1Client
                     // while keeping this promoted thread fully synchronous.
                     ct.ThrowIfCancellationRequested();
                     sock.SendTo(buf, SocketFlags.None, remote);
+                    CommitDriveWirePairing();
+                    PublishBuiltMoxIqScale(state.Mox);
                     consecutiveSendFailures = 0;
                     long sentTicks = Stopwatch.GetTimestamp();
                     if (pacedAudioSend) _audioEgressPacer.RecordSend(sentTicks);

@@ -37,9 +37,10 @@ namespace Zeus.Contracts;
 //            5 MOXCHECK, 6 CALC, 7 DELAY, 8 STAYON, 9 TURNON.
 // Correcting — info[14] != 0; non-zero means the iqc stage has a curve loaded
 //              and is actively predistorting.
-// MaxTxEnvelope — GetPSMaxTX(out double maxtx); the highest TX envelope
-//                 magnitude seen since last PS reset. Used by the auto-attenuate
-//                 control loop.
+// MaxTxEnvelope — held peak magnitude of the pscc TX-reference blocks (2 s
+//                 hold, then decays while keyed; frozen while unkeyed). Stays
+//                 truthful before a calibration fit completes (unlike
+//                 GetPSMaxTX). Used by the auto-attenuate control loop.
 //
 // Bare-payload like TxMetersV2Frame (0x16) — no 16-byte WireFormat header.
 // Server only emits this when PsEnabled is true so idle wire stays quiet.

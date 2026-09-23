@@ -152,10 +152,19 @@ public interface IProtocol1Client : IDisposable
 
     /// <summary>
     /// Push a fully-computed raw drive byte (0..255), overriding the percent
-    /// path. RadioService uses this when PA calibration converts target watts
-    /// → drive byte via the per-band gain lookup.
+    /// path. Implemented as <see cref="SetDriveOutput"/> of
+    /// <see cref="TxDriveOutput.FromLegacyByte"/>: unity IQ, silent when the
+    /// byte is 0. RadioService's calibrated path uses <see cref="SetDriveOutput"/>.
     /// </summary>
     void SetDriveByte(byte value);
+
+    /// <summary>
+    /// Push the drive register byte and the TX IQ scale as one value. A frame
+    /// cannot observe a new byte with the previous scale. PureSignal uses the
+    /// same pair. On Hermes-Lite 2 the DDC3 reference is compensated by
+    /// <c>1/IqScale</c>.
+    /// </summary>
+    void SetDriveOutput(TxDriveOutput output);
 
     /// <summary>
     /// Set the effective PA enable after global and per-band/transverter policy

@@ -22,9 +22,10 @@
 namespace Zeus.Dsp;
 
 /// <summary>
-/// PureSignal calcc-stage readings sampled from <c>GetPSInfo</c> and
-/// <c>GetPSMaxTX</c>. Captured at the same 10 Hz cadence as the TX stage
-/// meters but only emitted to the wire when PsEnabled is true.
+/// PureSignal calcc-stage readings sampled from <c>GetPSInfo</c> plus the
+/// live TX-reference blocks passed to <c>psccF</c>. Captured at the same 10 Hz
+/// cadence as the TX stage meters but only emitted to the wire when PsEnabled
+/// is true.
 /// </summary>
 /// <param name="FeedbackLevel">info[4] — feedback envelope level, 0..256
 /// raw. UI normalises to 0..1 via /256 for the bar.</param>
@@ -35,9 +36,11 @@ namespace Zeus.Dsp;
 /// applying a correction curve.</param>
 /// <param name="CorrectionDb">Derived metric: RMS of the calcc output curve
 /// in dB. Zero when not correcting; useful as a "depth" indicator.</param>
-/// <param name="MaxTxEnvelope"><c>GetPSMaxTX</c> — peak TX envelope
-/// magnitude since the last reset. Used by auto-attenuate to know when to
-/// step the attenuator down.</param>
+/// <param name="MaxTxEnvelope">Held peak magnitude of the TX-reference
+/// blocks passed to <c>psccF</c> (see <see cref="PsObservedPeakHold"/>). This is the live quantity calcc bins against
+/// <c>hw_peak</c>, and — unlike <c>GetPSMaxTX</c> — it stays truthful before a
+/// calibration fit completes, so the operator can set HW peak from it. Also
+/// used by auto-attenuate to know when to step the attenuator down.</param>
 /// <param name="CalibrationAttempts">info[5] — cumulative count of completed
 /// calibration fits (calc() invocations that produced a result, regardless
 /// of whether scheck accepted them). Thetis <c>PSForm.cs:1097-1099</c>

@@ -654,6 +654,11 @@ public sealed class RadioService : IDisposable
         var persistedTxFilterWindow = _dspSettingsStore.GetTxFilterWindow() ?? BandpassWindow.Normal;
         var persistedRxFilterPhase = _dspSettingsStore.GetRxFilterPhase() ?? FilterPhaseMode.Linear;
         var persistedTxFilterPhase = _dspSettingsStore.GetTxFilterPhase() ?? FilterPhaseMode.Linear;
+        // A row persisted before the TX linear-phase tap ceiling (issue #2380)
+        // may hold an incompatible (Linear, >16384-tap) pair that would rebuild
+        // three long serial TX FIRs and stall transmit. Normalize it before it
+        // reaches _state so the pipeline applies a bounded window every startup.
+        persistedTxFilterWindow = NormalizeTxBandpassWindow(persistedTxFilterWindow, persistedTxFilterPhase);
 
         // TX Audio Profile startup overlay. If the operator has a "last loaded"
         // unified TX Audio Profile, its scalar/config values overlay the
@@ -5553,11 +5558,9 @@ public sealed class RadioService : IDisposable
             activePct = Math.Min(activePct, productCap);
         if (txThroughTransverter && txXvtrBand.MaxPowerDbm is null)
             activePct = Math.Min(activePct, txXvtrBand.Power);
-        // Route through the per-board drive-profile so HL2's 4-bit drive
-        // register is respected (bottom nibble ignored by gateware). See
-        // Zeus.Server.RadioDriveProfile + docs/lessons/hl2-drive-byte-
-        // quantization.md. Non-HL2 boards get the straight 8-bit math via
-        // FullByteDriveProfile.
+        // Per-board drive encoding. HL2 pairs its 4-bit 0.5 dB step with an
+        // IQ scale so slider percent tracks output power, PureSignal
+        // included. Every other board stays on the 8-bit byte.
         var connectedBoard = ConnectedBoardKind;
         var variant = EffectiveOrionMkIIVariant;
         // A2/C3/D3: the engine module owns board/variant policy and today's
@@ -5585,22 +5588,24 @@ public sealed class RadioService : IDisposable
         double driveGain = txThroughTransverter && txXvtrBand.MaxPowerDbm is not null
             ? driveProfile.ResolveXvtrGain(calibratedGain, maxPowerWatts, cfg.Global.PaMaxPowerWatts)
             : calibratedGain;
-        byte driveByte = decision.Allowed && safetyAuthorized && !safetyInhibit
-            ? driveProfile.EncodeDriveByte(
+        bool allowed = decision.Allowed && safetyAuthorized && !safetyInhibit;
+        TxDriveOutput driveOutput = allowed
+            ? driveProfile.EncodeDrive(
                 decision.EffectiveDrivePercent,
                 driveGain,
                 maxPowerWatts)
-            : (byte)0;
-        bool paEnabled = decision.Allowed && safetyAuthorized && !safetyInhibit
+            : TxDriveOutput.Off;
+        byte driveByte = driveOutput.DriveByte;
+        bool paEnabled = allowed
             && cfg.Global.PaEnabled && !bandCfg.DisablePa
             && (!txThroughTransverter || !txXvtrBand.DisablePa);
 
         _log.LogInformation(
-            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, paEnabled,
+            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} iqScale={IqScale:F4} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
+            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, driveOutput.IqScale, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
-        ActiveClient?.SetDriveByte(driveByte);
+        ActiveClient?.SetDriveOutput(driveOutput);
         ActiveClient?.SetOcMasks(bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune);
         ActiveClient?.SetPaEnabled(paEnabled);
         ActiveClient?.SetXvtrEnabled(xvtrOutputEnabled);
@@ -6019,10 +6024,40 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
+    // Thetis caps the TX linear-phase bandpass at 16384 taps. Zeus exposes the
+    // extended tap ladder up to 262144 for minimum-phase TX (where the long
+    // resolution rides a single master FIR) and for RX. In linear phase the
+    // native ApplyTXABandpassProfile rebuilds ALL THREE serial TX bandpass
+    // stages at the full master tap count, so an unbounded selection stacks
+    // seconds of constant group delay across the chain (a 262144-tap FIR at the
+    // 96 kHz P2 TX rate is ~1.37 s each, ~4.1 s over three stages) — the
+    // multi-second TX/two-tone stall in issue #2380. Clamp the linear-phase TX
+    // window to the Thetis ceiling regardless of which selector the operator
+    // changes first, so no incompatible (Linear, >16384) pair ever reaches the
+    // engine or the store. Minimum phase keeps the full selection.
+    internal const BandpassWindow MaxLinearPhaseTxWindow = BandpassWindow.Taps16384;
+
+    internal static BandpassWindow NormalizeTxBandpassWindow(BandpassWindow window, FilterPhaseMode phase)
+    {
+        // The appended Taps* enum values are monotonic in tap count, so a byte
+        // comparison correctly identifies only the over-ceiling selections.
+        if (phase == FilterPhaseMode.Linear && window > MaxLinearPhaseTxWindow)
+            return MaxLinearPhaseTxWindow;
+        return window;
+    }
+
     public StateDto SetTxBandpassWindow(BandpassWindow window)
     {
-        Mutate(s => s with { TxFilterWindow = window });
-        _dspSettingsStore.SetTxFilterWindow(window);
+        // Normalize against the phase read under the state lock, not a separate
+        // Snapshot() before it, so a concurrent SetTxFilterPhase can't slip
+        // between the read and the write and leave an (Linear, >16384) pair.
+        var normalized = window;
+        Mutate(s =>
+        {
+            normalized = NormalizeTxBandpassWindow(window, s.TxFilterPhase);
+            return s with { TxFilterWindow = normalized };
+        });
+        _dspSettingsStore.SetTxFilterWindow(normalized);
         return Snapshot();
     }
 
@@ -6035,8 +6070,19 @@ public sealed class RadioService : IDisposable
 
     public StateDto SetTxFilterPhase(FilterPhaseMode phase)
     {
-        Mutate(s => s with { TxFilterPhase = phase });
+        // Switching to linear must retract an already-selected ultra-resolution
+        // window to the linear ceiling; switching to minimum leaves it intact.
+        // Normalize against the window read under the state lock (not a separate
+        // Snapshot() before it) so a concurrent SetTxBandpassWindow can't commit
+        // an ultra window after this read and re-create an (Linear, >16384) pair.
+        var normalizedWindow = BandpassWindow.Normal;
+        Mutate(s =>
+        {
+            normalizedWindow = NormalizeTxBandpassWindow(s.TxFilterWindow, phase);
+            return s with { TxFilterPhase = phase, TxFilterWindow = normalizedWindow };
+        });
         _dspSettingsStore.SetTxFilterPhase(phase);
+        _dspSettingsStore.SetTxFilterWindow(normalizedWindow);
         return Snapshot();
     }
 

@@ -14,16 +14,13 @@
 //     (target watts → dBm − PA gain → volts @ 50 Ω → byte/255 × 0.8 V)
 //     maps cleanly to output power.
 //
-//   - Hermes-Lite 2 — reads ONLY bits [31:28] of the drive register.
-//     The bottom nibble is silently discarded by the HL2 gateware.
-//     That means the 8-bit byte the math produces is quantised to
-//     one of 16 power steps. A "correct-looking" byte like 48
-//     (from piHPSDR's generic pa_calibration=40.5 with 5 W rated PA)
-//     lands in nibble 0x3 → 3/15 = 20 % of max drive, capping
-//     output at 1–2 W no matter how precise the IQ or how correct
-//     the packet rate. See docs/references/protocol-1/
-//     hermes-lite2-protocol.md:51 and docs/lessons/
-//     hl2-drive-byte-quantization.md.
+//   - Hermes-Lite 2 — DriveFilter C1 bits [7:4] are a 0.5 dB step
+//     attenuator (code 15 = 0 dB, code 0 = -7.5 dB, not silence).
+//     EncodeDrive picks the lowest step that covers the target
+//     amplitude and scales TX IQ so output power tracks the slider.
+//     PureSignal uses that same pair. The DDC3 reference is
+//     compensated by 1/IqScale because the DAC tap is before the
+//     attenuator. See HermesLite2DriveProfile and pihpsdr radio.c:2572.
 //
 // IMPORTANT for anyone touching TX / PA / drive-byte code:
 //
@@ -43,6 +40,7 @@
 //     further HL2 quirks Zeus may need to mirror.
 
 using Zeus.Contracts;
+using Zeus.Protocol1;
 using Zeus.Protocol1.Discovery;
 
 namespace Zeus.Server;
@@ -76,6 +74,14 @@ public interface IRadioDriveProfile
     /// FullByte profiles. Ignored on HL2 — percentage-based math doesn't
     /// consult rated watts.</param>
     byte EncodeDriveByte(int drivePct, double paGainDb, double maxWatts);
+
+    /// <summary>
+    /// Drive register byte plus the TX IQ scale that together produce the
+    /// requested output. Hermes-Lite 2, including PureSignal, uses this
+    /// pair. Other boards return <see cref="TxDriveOutput.FromLegacyByte"/>
+    /// of <see cref="EncodeDriveByte"/>.
+    /// </summary>
+    TxDriveOutput EncodeDrive(int drivePct, double paGainDb, double maxWatts);
 
     /// <summary>
     /// Resolves an Xvtr dBm rating into the profile's PA-gain domain. Most
@@ -133,6 +139,9 @@ public sealed class FullByteDriveProfile : IRadioDriveProfile
     public byte EncodeDriveByte(int drivePct, double paGainDb, double maxWatts)
         => DriveByteMath.ComputeFullByte(drivePct, paGainDb, maxWatts);
 
+    public TxDriveOutput EncodeDrive(int drivePct, double paGainDb, double maxWatts)
+        => TxDriveOutput.FromLegacyByte(EncodeDriveByte(drivePct, paGainDb, maxWatts));
+
     public double ResolveXvtrGain(double paGainDb, double maxWatts, int radioMaxWatts)
     {
         _ = maxWatts;
@@ -142,43 +151,49 @@ public sealed class FullByteDriveProfile : IRadioDriveProfile
 }
 
 /// <summary>
-/// Hermes-Lite 2 profile. HL2 is NOT driven by the piHPSDR/Thetis dB model
-/// that every other HPSDR radio uses — it has a completely separate wire-
-/// level power model that the mi0bot openhpsdr-thetis fork (the HL2-specific
-/// Thetis upstream) implements in clsHardwareSpecific.cs:767-795 and
-/// console.cs:49290-49299.
+/// Hermes-Lite 2 profile. HL2 does not use the piHPSDR/Thetis dB drive
+/// model. <c>paGainDb</c> is a per-band <b>output percentage</b> (0..100),
+/// matching mi0bot openhpsdr-thetis (100 = no band cap; 6 m on the stock
+/// PA is about 38.8). <c>maxWatts</c> is ignored. The DTO field stays
+/// named <c>PaGainDb</c> so the stored row is shared with other boards.
 ///
-/// Semantics on HL2:
-///   • <paramref name="paGainDb"/> is a <b>PER-BAND OUTPUT PERCENTAGE</b>
-///     (0.0–100.0), not a dB forward gain. 100 = no attenuation;
-///     for a weaker band (6 m on the stock HL2 PA) it's around 38.8.
-///     The DTO field is still called <c>PaGainDb</c> for storage
-///     compatibility with other boards — it's overloaded per board.
-///   • <paramref name="maxWatts"/> is ignored. HL2 power is governed by
-///     slider × band-percentage directly, not by a target-watts formula.
+/// The AD9866 TX PGA (DriveFilter C1, only bits [7:4]) is a hardware step
+/// attenuator. Code <c>n</c> in 0..15 has gain
+/// <c>g(n) = 10^(-(15-n)*0.5/20)</c>: 0 dB at n=15, -7.5 dB at n=0.
+/// Code 0 is not silence. <see cref="EncodeDrive"/> picks the lowest step
+/// whose gain covers the target amplitude <c>sqrt(slider% × band%)</c> and
+/// scales TX IQ by the remainder, so delivered power tracks the slider.
+/// pihpsdr does the same split (radio.c:2572). At slider 100 and band 100
+/// the result is drive byte 240 and IQ scale exactly 1.0.
 ///
-/// Math:
-///     byte_raw = round( (drivePct / 100) × (paGainDb / 100) × 255 )
-///     byte     = nearest-nibble( byte_raw )            // HL2 gateware quirk
-///
-/// Derivation from mi0bot Thetis (console.cs:49296, audio.cs:249-258):
-///     RadioVolume        = slider × pctBand / 100 / 93.75     // 0..0.96
-///     SetOutputPower arg = RadioVolume × 1.02
-///     wire_byte          = SetOutputPower_arg × 255
-/// The 1/((16/6)/(255/1.02)) = 93.75 constant is calibration for the
-/// mi0bot 0–90 slider span. Zeus slides 0–100, so at drivePct=100 and
-/// paGainDb=100 the raw byte reaches 255 and cleanly lands in nibble 0xF.
+/// <see cref="EncodeDriveByte"/> is the older register-only mapping
+/// (slider × band% quantised to the nearest nibble), kept for legacy
+/// callers. PureSignal sends <see cref="EncodeDrive"/>, the same pair as
+/// every other HL2 transmission. The protocol client multiplies the DDC3
+/// reference by <c>1/IqScale</c> because that tap is before the attenuator.
 ///
 /// Reference:
+///   • docs/references/firmware/hermes-lite-2/wiki/Software.md:110
+///   • pihpsdr src/radio.c:2572
 ///   • docs/references/protocol-1/hermes-lite2-protocol.md:51
 ///   • docs/lessons/hl2-drive-model.md
-///   • ../OpenHPSDR-Thetis/Project Files/Source/Console/clsHardwareSpecific.cs:767-795
-///   • ../OpenHPSDR-Thetis/Project Files/Source/Console/console.cs:49290-49299
 /// </summary>
 public sealed class HermesLite2DriveProfile : IRadioDriveProfile
 {
     public static readonly HermesLite2DriveProfile Instance = new();
     private HermesLite2DriveProfile() { }
+
+    // g(n) for n = 0..15. Computed once; EncodeDrive does not allocate.
+    private static readonly double[] StepGain = BuildStepGain();
+
+    private static double[] BuildStepGain()
+    {
+        var gain = new double[16];
+        for (int n = 0; n < gain.Length; n++)
+            gain[n] = Math.Pow(10.0, -(15 - n) * 0.5 / 20.0);
+        gain[15] = 1.0;
+        return gain;
+    }
 
     public string BoardLabel => "HermesLite2 (%-scale, 4-bit)";
 
@@ -187,7 +202,8 @@ public sealed class HermesLite2DriveProfile : IRadioDriveProfile
         // On HL2 "paGainDb" is a percentage, not decibels (see class-level
         // comment). Clamp to the percentage domain; maxWatts is ignored
         // because the HL2 drive pipeline is slider × band-percentage, no
-        // target-watts conversion.
+        // target-watts conversion. Legacy callers only. PureSignal uses
+        // EncodeDrive.
         _ = maxWatts;
         int pct = Math.Clamp(drivePct, 0, 100);
         double bandPct = Math.Clamp(paGainDb, 0.0, 100.0);
@@ -201,6 +217,34 @@ public sealed class HermesLite2DriveProfile : IRadioDriveProfile
         int nibble = (int)Math.Round(raw / 16.0);
         if (nibble > 15) nibble = 15;
         return (byte)(nibble * 16);
+    }
+
+    public TxDriveOutput EncodeDrive(int drivePct, double paGainDb, double maxWatts)
+    {
+        int pct = Math.Clamp(drivePct, 0, 100);
+        double bandPct = Math.Clamp(paGainDb, 0.0, 100.0);
+        double power = (pct / 100.0) * (bandPct / 100.0);
+        if (power <= 0.0) return TxDriveOutput.Off;
+
+        // Lowest hardware step whose gain covers the target amplitude.
+        // Epsilon keeps an exact hit on g(n) from falling through to n+1.
+        double amplitude = Math.Sqrt(power);
+        const double gainEpsilon = 1e-9;
+        int n = 15;
+        for (int i = 0; i < StepGain.Length; i++)
+        {
+            if (StepGain[i] + gainEpsilon >= amplitude)
+            {
+                n = i;
+                break;
+            }
+        }
+
+        double scale = amplitude / StepGain[n];
+        if (scale < 0.0) scale = 0.0;
+        else if (scale > 1.0) scale = 1.0;
+
+        return new TxDriveOutput((byte)(n * 16), scale);
     }
 
     public double ResolveXvtrGain(double paGainDb, double maxWatts, int radioMaxWatts)

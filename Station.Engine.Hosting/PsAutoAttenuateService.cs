@@ -798,6 +798,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
         long now = Environment.TickCount64;
         if (now - _lastAutoCalTickMs < AutoCalMinIntervalMs) return;
 
+        // Before re-enabling: MaxTxEnvelope is now the operator display peak
+        // (PsObservedPeakHold — 2 s hold, decays while keyed, frozen while
+        // unkeyed), not WDSP GetPSMaxTX. Re-check it is the right input here.
         double env = engine.GetPsStageMeters().MaxTxEnvelope;
         if (env < EnvelopeMinForAutoCal) return;   // no real TX content
 

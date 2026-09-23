@@ -596,7 +596,16 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // Periodic log at every 100th call lets the operator confirm feedback is
     // arriving from the radio without flooding when PS is idle.
     private long _psFeedCount;
-    private double _psMaxTxEnvelope;
+    // Peak magnitude from the most recent block passed to psccF. WDSP's
+    // GetPSMaxTX only refreshes ctrl.env_maxtx after calc() completes a fit
+    // (calcc.c:1148-1154, reached only at LCALC), so using it for the operator
+    // readout leaves a stale zero precisely when collection is stalled because
+    // variable voice cannot fill the top envelope bin. Computing the peak from
+    // the live TX reference here keeps the observed-peak readout truthful so
+    // the operator can follow the "set HW peak just above your peak" banner.
+    // Held (see PsObservedPeakHold) because feedback blocks keep arriving in
+    // speech gaps and while unkeyed; a per-block value dropped to zero.
+    private readonly PsObservedPeakHold _psObservedPeak = new();
     // Bring-up diagnostic — emit info[] every Nth GetPsStageMeters tick so the
     // calcc state machine is visible in the server log without flooding.
     // Drop alongside the wdsp.psSeed log once PS is confirmed stable.
@@ -3758,6 +3767,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (enabled)
             {
                 _psEnabled = true;
+                // Drop any peak carried over from a prior arm so the readout
+                // starts from the fresh calibration cycle, not a stale value.
+                _psObservedPeak.Reset();
                 // Re-assert the operator's COMP/CESSB topology before PS
                 // starts. WDSP runs osctrl before iqc, so PureSignal corrects
                 // the CESSB-shaped reference instead of replacing that stage.
@@ -3809,6 +3821,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 NativeMethods.SetPSRunCal(id, 0);
                 NativeMethods.SetPSControl(id, 1, 0, 0, 0);
                 _psEnabled = false;
+                _psObservedPeak.Reset();
                 // PS and CESSB are independent, but re-assert the operator's
                 // effective topology after both native PS controls are down.
                 ApplyTxCompressorAndCessbRuns(id);
@@ -3944,7 +3957,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             return;
         }
         int? txa;
-        lock (_txaLock) txa = _txaChannelId;
+        bool keyed;
+        lock (_txaLock)
+        {
+            txa = _txaChannelId;
+            keyed = _moxOn;
+        }
         if (txa is not int id) return;
 
         // psccF takes float[] (not Span). Allocate fresh — caller may reuse
@@ -3959,6 +3977,19 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // mox/solidmox args are ignored by psccF (calcc.c:846); SetPSMox
             // is the source of truth and is driven from SetMox above.
             NativeMethods.psccF(id, PsFeedbackBlockSize, bufTxI, bufTxQ, bufRxI, bufRxQ, 0, 0);
+            // Capture the peak envelope magnitude of the exact TX-reference
+            // block calcc just binned against hw_peak. This is the live
+            // quantity the operator readout needs; GetPSMaxTX only reflects it
+            // after a completed fit (see _psObservedPeak field note).
+            double maxTxSquared = 0.0;
+            for (int i = 0; i < PsFeedbackBlockSize; i++)
+            {
+                double magnitudeSquared =
+                    (double)bufTxI[i] * bufTxI[i] +
+                    (double)bufTxQ[i] * bufTxQ[i];
+                if (magnitudeSquared > maxTxSquared) maxTxSquared = magnitudeSquared;
+            }
+            _psObservedPeak.Observe(Math.Sqrt(maxTxSquared), keyed, Environment.TickCount64);
             long n = Interlocked.Increment(ref _psFeedCount);
             if (n % 100 == 1)
             {
@@ -4040,8 +4071,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             correcting = _psInfoBuf[14] != 0;
             calState = (byte)Math.Clamp(_psInfoBuf[15], 0, 255);
             calibrationAttempts = _psInfoBuf[5];
-            NativeMethods.GetPSMaxTX(id, out maxTx);
-            _psMaxTxEnvelope = maxTx;
+            // Report the live TX-reference peak captured in FeedPsFeedbackBlock
+            // rather than GetPSMaxTX, which stays zero until calc() runs and so
+            // is useless while collection is stalled (issue #2385).
+            maxTx = _psObservedPeak.Value;
         }
 
         // CorrectionDb: until we tap GetPSDisp's curve, derive a coarse
@@ -4084,7 +4117,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         }
 
         // Hot-audio robustness diagnostic. At ~1 Hz while PS is armed, surface
-        // the forward TX envelope PEAK (GetPSMaxTX, ~1.0 = at the ALC cap)
+        // the live forward TX envelope peak (~1.0 = at the ALC cap)
         // next to the feedback level (info4), the 2-bit scheck reject mask
         // (info6), calcc fit count (info5), state and correcting flag. On a
         // deliberately-hot over this separates the three candidate root

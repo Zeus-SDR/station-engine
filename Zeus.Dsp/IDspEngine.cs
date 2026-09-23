@@ -482,7 +482,7 @@ public interface IDspEngine : IDisposable
     void FeedPsFeedbackBlock(ReadOnlySpan<float> txI, ReadOnlySpan<float> txQ,
                              ReadOnlySpan<float> rxI, ReadOnlySpan<float> rxQ);
 
-    /// <summary>Latest PureSignal stage readings (GetPSInfo + GetPSMaxTX).
+    /// <summary>Latest PureSignal stage readings (GetPSInfo + held pscc TX peak).
     /// Returns <see cref="PsStageMeters.Silent"/> when PS isn't armed or
     /// the engine has no TXA. Safe to poll concurrently.</summary>
     PsStageMeters GetPsStageMeters();

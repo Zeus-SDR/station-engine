@@ -394,7 +394,12 @@ internal static class ControlFrame
         // PA drive setting cannot leak into the low-power VNA path.
         byte VnaDriveLevel = 0,
         bool EnableHl2CodecSpeaker = false,
-        bool Hl2CodecInstalled = false);
+        bool Hl2CodecInstalled = false,
+        // Explicit TX IQ amplitude in 0..1. Null means the legacy derivation
+        // (DriveLevel == 0 → silence, otherwise unity). HL2's power-linear
+        // path sets this because drive code 0 is -7.5 dB, not silence.
+        // Trailing default keeps older CcState constructions valid.
+        double? TxIqScale = null);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -1073,6 +1078,7 @@ internal static class ControlFrame
     /// Build a complete 1032-byte Metis data frame with two USB frames carrying
     /// the two given registers back-to-back, an increasing sequence number, and
     /// (when MOX is on and a tone generator is supplied) an IQ test-tone payload.
+    /// Both USB frames encode <paramref name="state"/>.
     /// </summary>
     public static void BuildDataPacket(
         Span<byte> packet,
@@ -1080,6 +1086,32 @@ internal static class ControlFrame
         CcRegister evenRegister,
         CcRegister oddRegister,
         in CcState state,
+        ITxIqSource? iqSource = null,
+        IRxAudioSource? rxAudioSource = null)
+    {
+        BuildDataPacket(
+            packet,
+            sendSequence,
+            evenRegister,
+            oddRegister,
+            in state,
+            in state,
+            iqSource,
+            rxAudioSource);
+    }
+
+    /// <summary>
+    /// Build one Metis data frame whose even and odd USB frames each encode
+    /// their own state. Wire order is the even frame, then the odd frame.
+    /// The single-state overload calls this with the same state twice.
+    /// </summary>
+    public static void BuildDataPacket(
+        Span<byte> packet,
+        uint sendSequence,
+        CcRegister evenRegister,
+        CcRegister oddRegister,
+        in CcState evenState,
+        in CcState oddState,
         ITxIqSource? iqSource = null,
         IRxAudioSource? rxAudioSource = null)
     {
@@ -1095,8 +1127,8 @@ internal static class ControlFrame
         packet[3] = 0x02;
         BinaryPrimitives.WriteUInt32BigEndian(packet[4..8], sendSequence);
 
-        WriteUsbFrame(packet.Slice(8, UsbFrameLength), evenRegister, in state, iqSource, rxAudioSource);
-        WriteUsbFrame(packet.Slice(8 + UsbFrameLength, UsbFrameLength), oddRegister, in state, iqSource, rxAudioSource);
+        WriteUsbFrame(packet.Slice(8, UsbFrameLength), evenRegister, in evenState, iqSource, rxAudioSource);
+        WriteUsbFrame(packet.Slice(8 + UsbFrameLength, UsbFrameLength), oddRegister, in oddState, iqSource, rxAudioSource);
     }
 
     /// <summary>
@@ -1160,18 +1192,15 @@ internal static class ControlFrame
         // From here MOX is engaged; the TX I/Q path needs a real source.
         if (source is null) return;
 
-        // The HL2's TXG stage (DriveFilter C1 = DriveLevel byte) scales the
-        // transmit path by drive%. Scaling IQ here on top would double-multiply
-        // (drive⁴ power response). Send at unity — WDSP's ALC already clamps
-        // the TXA output to ≤ 0 dBFS and the TUN post-gen tone is a
-        // fixed-amplitude single-tone carrier, so neither source can overshoot
-        // +1.0 here. The prior 0.85 factor cost ~1.4 dB of achievable output
-        // and was observed to leave HL2 at 1.2 W when deskHPSDR hit 6.6 W on
-        // the same antenna/band; it was belt-and-suspenders on top of ALC.
-        // At DriveLevel=0 the HL2 TXG is already 0 (silent), but zero the IQ
-        // too so the wire bytes are silent regardless of board.
-        if (state.DriveLevel == 0) return;
-        const double amplitude = 1.0;
+        // HL2's TX attenuator (DriveFilter C1 bits [7:4]) steps 0.5 dB from
+        // 0 dB at code 15 down to -7.5 dB at code 0. Code 0 is not silence.
+        // A snapshot that carries TxIqScale uses that DAC amplitude (HL2:
+        // the remainder under the chosen step; other boards: 1, or 0 when
+        // the drive byte is 0). Null keeps the legacy rule: DriveLevel 0 is
+        // silence and anything else is unity. A non-positive scale writes
+        // no IQ, on every board.
+        double amplitude = state.TxIqScale ?? (state.DriveLevel == 0 ? 0.0 : 1.0);
+        if (amplitude <= 0) return;
 
         var payload = frame[8..];
         int peak = 0;
