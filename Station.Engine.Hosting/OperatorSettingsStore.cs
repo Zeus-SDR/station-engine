@@ -36,6 +36,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["rx-wf-windows"] = "display_aux_settings",
             ["spectrum-view-scope"] = "display_aux_settings",
             ["surface-opacity"] = "display_aux_settings",
+            ["background-image-area"] = "display_aux_settings",
         };
 
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
