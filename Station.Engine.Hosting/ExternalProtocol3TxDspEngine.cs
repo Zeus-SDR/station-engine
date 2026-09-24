@@ -149,6 +149,8 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
     public void SetMox(bool moxOn) => _inner.SetMox(moxOn, stopRxForPureSignal: false);
     public void SetMox(bool moxOn, bool stopRxForPureSignal) =>
         _inner.SetMox(moxOn, stopRxForPureSignal: false);
+    public void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex) =>
+        _inner.SetMox(moxOn, stopRxForPureSignal: false, stopRxForHalfDuplex);
     public double GetRxaSignalDbm(int channelId) => _inner.GetRxaSignalDbm(channelId);
     public RxStageMeters GetRxStageMeters(int channelId) => _inner.GetRxStageMeters(channelId);
     public void SetTxMode(RxMode mode) => _inner.SetTxMode(mode);

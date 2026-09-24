@@ -302,10 +302,18 @@ public interface IDspEngine : IDisposable
     void SetMox(bool moxOn);
 
     /// <summary>Flip MOX with the caller's already-latched PureSignal display
-    /// intent. Ordinary display-DUP keeps RXA running; PureSignal damps RXA on
-    /// key-down and restores it on key-up. The default keeps existing test and
-    /// alternate engines source-compatible.</summary>
+    /// intent. WDSP defaults to half-duplex audible receive when PureSignal is
+    /// off; callers needing full-duplex receive use the three-argument overload.
+    /// The default keeps existing test and alternate engines source-compatible.</summary>
     void SetMox(bool moxOn, bool stopRxForPureSignal) => SetMox(moxOn);
+
+    /// <summary>Flip MOX with both the PureSignal RXA policy and the caller's
+    /// latched half-duplex audio policy. When <paramref name="stopRxForHalfDuplex"/> is
+    /// true, ordinary MOX keeps the raw-IQ display path live while suspending
+    /// audible receive DSP to exclude keyed leakage. Full-duplex receive passes
+    /// false so its live keyed audio remains unchanged.</summary>
+    void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex) =>
+        SetMox(moxOn, stopRxForPureSignal);
 
     /// <summary>Raw RXA signal-strength meter in dBm (Thetis rxaMeterType.RXA_S_AV, idx 1).
     /// Returns a frozen −140 dBm from the synthetic engine. Safe to call from the

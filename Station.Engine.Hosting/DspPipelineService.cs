@@ -1551,14 +1551,18 @@ public class DspPipelineService : BackgroundService,
     private volatile bool _rxAudioSuppressedForTx;  // publish silence/sidetone instead of RX while TX is keyed
     private volatile bool _fullDuplexRxActiveForCurrentTx;
     private volatile bool _localRxAudioContinuousForCurrentTx;
-    // Set on the MOX edge; consumed by the first suppressed tick, which latches
-    // the operator's DUP choice without taking the radio-state lock.
+    // Latest projected setting, cached by OnRadioStateChanged so the MOX edge
+    // can choose its receive DSP policy without taking RadioService's state lock.
+    private volatile bool _fullDuplexRxConfigured;
+    // Set on the MOX edge; consumed by the first suppressed tick, which starts
+    // continuity tracking using the already-latched DUP policy.
     private volatile bool _fullDuplexLatchPendingForCurrentTx;
     // Latch key-down policy so UI/PS changes cannot alter the matching keyed
     // interval and key-up cleanup. P2 keeps RX display analyzers intact; P1 PS
     // retains its established TX-domain reset until P1 has independent receive
     // and transmit tuning frames.
     private volatile bool _stopRxForPureSignalForCurrentTx;
+    private volatile bool _stopRxForHalfDuplexForCurrentTx;
     private bool _resetDisplayPixelsForCurrentTx;
     private bool _p2DisplayDuplexForCurrentTx;
     private int _rxPostTxMuteBlocksRemaining;       // RXA transition-drain blocks after MOX↓
@@ -3471,13 +3475,15 @@ public class DspPipelineService : BackgroundService,
             Volatile.Write(ref _rxPostTxDisplayFramesRemaining, 0);
             _p2DisplayDuplexForCurrentTx = _radio.IsProtocol2Active;
             _stopRxForPureSignalForCurrentTx = _appliedPsEnabled;
-            // The operator's DUP choice is latched by the first suppressed tick
-            // rather than read here. SetMox runs on the caller's thread (see the
+            _stopRxForHalfDuplexForCurrentTx =
+                !_stopRxForPureSignalForCurrentTx && !_fullDuplexRxConfigured;
+            // Use this same cached DUP choice for DSP and audio throughout TX.
+            // SetMox runs on the caller's thread (see the
             // note above) and RadioService.Snapshot takes the radio-state lock,
             // so reading it here would put a cross-service lock acquisition on
-            // the MOX edge. The tick already holds a projected StateDto and can
-            // latch without any lock at all.
-            _fullDuplexRxActiveForCurrentTx = false;
+            // the MOX edge. OnRadioStateChanged supplies the cached setting.
+            _fullDuplexRxActiveForCurrentTx =
+                !_stopRxForPureSignalForCurrentTx && !_stopRxForHalfDuplexForCurrentTx;
             _localRxAudioContinuousForCurrentTx = false;
             _fullDuplexLatchPendingForCurrentTx = true;
             _resetDisplayPixelsForCurrentTx = _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx;
@@ -3487,7 +3493,10 @@ public class DspPipelineService : BackgroundService,
             _rxAudioSuppressedForTx = true;
             lock (_engineLock)
             {
-                _engine?.SetMox(true, _stopRxForPureSignalForCurrentTx);
+                _engine?.SetMox(
+                    true,
+                    _stopRxForPureSignalForCurrentTx,
+                    _stopRxForHalfDuplexForCurrentTx);
                 if (_resetDisplayPixelsForCurrentTx)
                     _engine?.ResetDisplayPixelBuffers();
             }
@@ -3499,7 +3508,10 @@ public class DspPipelineService : BackgroundService,
             {
                 lock (_engineLock)
                 {
-                    _engine?.SetMox(false, _stopRxForPureSignalForCurrentTx);
+                    _engine?.SetMox(
+                        false,
+                        _stopRxForPureSignalForCurrentTx,
+                        _stopRxForHalfDuplexForCurrentTx);
                     if (_resetDisplayPixelsForCurrentTx)
                         _engine?.ResetDisplayPixelBuffers();
                 }
@@ -3516,6 +3528,7 @@ public class DspPipelineService : BackgroundService,
                 Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
                 _rxAudioSuppressedForTx = false;
                 _stopRxForPureSignalForCurrentTx = false;
+                _stopRxForHalfDuplexForCurrentTx = false;
                 _resetDisplayPixelsForCurrentTx = false;
                 _p2DisplayDuplexForCurrentTx = false;
             }
@@ -5667,6 +5680,7 @@ public class DspPipelineService : BackgroundService,
         // A queued pre-key snapshot must not retune the TX DUC or restore an
         // older sideband while a fixed-channel audio lease owns transmission.
         s = _radio.ReconcileProductPluginTxState(s);
+        _fullDuplexRxConfigured = s.FullDuplexMultiRxEnabled;
         // FreeDV spec-profile override (see the AGC/TX-leveling pushes below):
         // gates those engine pushes to linear-friendly values while the operator's
         // stored config stays untouched for automatic restore on exit.
@@ -9485,18 +9499,12 @@ public class DspPipelineService : BackgroundService,
         // audio survives this tick (RX1, each secondary, and the publish
         // branch) needs to agree on the same keyed/post-TX-drain snapshot.
         bool suppressRxAudioForTx = ShouldSuppressRxAudioForCurrentTick(out bool activelyKeyed);
-        // The operator's DUP choice and the PureSignal guard are latched on the
-        // first suppressed tick of a transmission. A mid-transmission toggle
-        // applies on the next transmission, keeping this TX and its drain window
-        // on one stable policy. Latching here rather than in SetMox keeps the
-        // radio-state lock off the MOX edge: this tick already has a projected
-        // StateDto, so no cross-service call is needed.
+        // The MOX edge chooses one DUP policy for both DSP and audio. The
+        // first suppressed tick starts continuity tracking from that same
+        // decision; a later settings snapshot must not disagree with RXA state.
         if (_fullDuplexLatchPendingForCurrentTx && suppressRxAudioForTx)
         {
-            bool latched =
-                state.FullDuplexMultiRxEnabled && !_stopRxForPureSignalForCurrentTx;
-            _fullDuplexRxActiveForCurrentTx = latched;
-            _localRxAudioContinuousForCurrentTx = latched;
+            _localRxAudioContinuousForCurrentTx = _fullDuplexRxActiveForCurrentTx;
             _fullDuplexLatchPendingForCurrentTx = false;
         }
         bool fullDuplexRxActive = _fullDuplexRxActiveForCurrentTx;

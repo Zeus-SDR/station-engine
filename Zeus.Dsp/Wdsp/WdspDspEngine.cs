@@ -312,6 +312,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // AGC mode last applied via SetAgc / ApplyAgcDefaults. MED matches the
         // open-time default; surfaced so callers / tests can read back the mode.
         public AgcMode CurrentAgcMode = AgcMode.Med;
+        // Spectrum0 is independent of RXA processing. Half-duplex TX suspends
+        // the audible chain so AM demodulator memory and AGC cannot accumulate
+        // keyed leakage while the analyzer continues receiving raw IQ.
+        public bool RxStoppedForHalfDuplexMox;
+        public bool IsTxMonitor;
         // RX squelch config last applied via SetSquelch. Default off/adaptive
         // so a fresh channel matches Thetis (all squelch off) while the UI
         // defaults to the server-side noise-floor gate once enabled.
@@ -661,6 +666,10 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // PureSignal still damps RXA on key-down. Remember that transition across
     // an emergency mid-over PS disarm so key-up always restores RXA.
     private bool _rxaStoppedForCurrentMox;
+    // Serialize ordinary MOX policy with publication of newly opened RXAs.
+    // Private TX-monitor channels carry their role before publication.
+    private readonly object _rxMoxGate = new();
+    private bool _halfDuplexRxSuspended;
     // Tracked engine-side TXA state-bit so the helper can flip idempotently
     // and avoid double-priming. TXA opens at state=0; SetChannelState walks
     // it through 1 / 0 transitions explicitly.
@@ -810,7 +819,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public int OpenRxDisplayChannel(int sampleRateHz, int pixelWidth) =>
         OpenChannelCore(sampleRateHz, pixelWidth, displayOnly: true);
 
-    private int OpenChannelCore(int sampleRateHz, int pixelWidth, bool displayOnly = false)
+    private int OpenChannelCore(int sampleRateHz, int pixelWidth, bool displayOnly = false, bool isTxMonitor = false)
     {
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
         if (pixelWidth <= 0) throw new ArgumentOutOfRangeException(nameof(pixelWidth));
@@ -920,6 +929,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 Id = id,
                 Generation = Interlocked.Increment(ref _channelGeneration),
                 IsDisplayOnly = displayOnly,
+                IsTxMonitor = isTxMonitor,
                 SampleRateHz = sampleRateHz,
                 PixelWidth = pixelWidth,
                 SnrAnalyzerId = snrAnalyzerId,
@@ -940,19 +950,27 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             };
             state.Worker = worker;
 
-            _channels[id] = state;
-            ConfigureMaxBinDetector(state);
-            worker.Start();
-            workerStarted = true;
+            lock (_rxMoxGate)
+            {
+                state.RxStoppedForHalfDuplexMox =
+                    _halfDuplexRxSuspended && !displayOnly && !isTxMonitor;
+                _channels[id] = state;
+                ConfigureMaxBinDetector(state);
+                worker.Start();
+                workerStarted = true;
 
-            // Thetis rxa.cs:63 — "main rcvr ON". The OpenChannel call above used
-            // state=0 so the slew.upflag / ch_upslew / exchange-bit initialisation
-            // block in channel.c:94-99 did NOT run. SetChannelState(id, 1, 0) is
-            // the canonical transition: it sets slew.upflag, ch_upslew, clears
-            // exec_bypass, and sets exchange (channel.c:278-283). After this
-            // returns, fexchange0's `if (_InterlockedAnd (&ch[channel].exchange, 1))`
-            // guard (iobuffs.c:484) will be satisfied and xrxa → xmeter will run.
-            NativeMethods.SetChannelState(id, 1, 0);
+                // Thetis rxa.cs:63 — "main rcvr ON". The OpenChannel call above used
+                // state=0 so the slew.upflag / ch_upslew / exchange-bit initialisation
+                // block in channel.c:94-99 did NOT run. SetChannelState(id, 1, 0) is
+                // the canonical transition: it sets slew.upflag, ch_upslew, clears
+                // exec_bypass, and sets exchange (channel.c:278-283). After this
+                // returns, fexchange0's `if (_InterlockedAnd (&ch[channel].exchange, 1))`
+                // guard (iobuffs.c:484) will be satisfied and xrxa → xmeter will run.
+                // A receiver opened during half-duplex TX remains at its initial
+                // state=0 until unkey; it must not ingest keyed leakage first.
+                if (!state.RxStoppedForHalfDuplexMox)
+                    NativeMethods.SetChannelState(id, 1, 0);
+            }
 
             // Re-apply any manual notches to the freshly-opened channel. A sample-
             // rate or mode change rebuilds the WDSP channel with an empty notch DB;
@@ -2733,10 +2751,13 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         bool stopRxForPureSignal;
         lock (_psLock)
             stopRxForPureSignal = _psEnabled;
-        SetMox(moxOn, stopRxForPureSignal);
+        SetMox(moxOn, stopRxForPureSignal, stopRxForHalfDuplex: !stopRxForPureSignal);
     }
 
-    public void SetMox(bool moxOn, bool stopRxForPureSignal)
+    public void SetMox(bool moxOn, bool stopRxForPureSignal) =>
+        SetMox(moxOn, stopRxForPureSignal, stopRxForHalfDuplex: !stopRxForPureSignal);
+
+    public void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex)
     {
         if (_disposed != 0) return;
 
@@ -2747,8 +2768,8 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_txaChannelId is not int txa) return;
             txaId = txa;
 
-            // MOX acts on RX1 only. The monitor RXA and RX2+ are also present in
-            // _channels, so dictionary enumeration cannot identify RX1.
+            // PureSignal's established transition targets RX1 specifically.
+            // The dictionary also contains secondary and private monitor RXAs.
             rxaId = Volatile.Read(ref _primaryRxaChannelId);
             if (rxaId < 0
                 || !_channels.TryGetValue(rxaId, out var primary)
@@ -2756,11 +2777,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 return;
         }
 
-        // Display-DUP keeps RXA running through ordinary MOX so its analyzer
-        // and averaging history remain continuous. RX audio is suppressed by
-        // DspPipelineService after it drains the live RXA output. PureSignal
-        // retains the established RXA damp/down transition because its keyed
-        // feedback routing is intentionally unchanged.
+        // Spectrum0 receives raw IQ independently of RXA, so stopping the
+        // audible chain preserves the analyzer and its averaging history.
+        // Holding only AGC is insufficient: AM fade-leveler memory upstream
+        // can retain strong keyed leakage for seconds after unkeying.
+        // Full duplex leaves RXA live; PureSignal retains its RX1 transition.
         //
         // TX-monitor wrinkle: when MOX falls but monitor is on, TXA must
         // stay running so fexchange2 keeps producing IQ for the monitor
@@ -2779,6 +2800,22 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             else
             {
                 _rxaStoppedForCurrentMox = false;
+                lock (_rxMoxGate)
+                {
+                    _halfDuplexRxSuspended = stopRxForHalfDuplex;
+                    if (stopRxForHalfDuplex)
+                    {
+                        foreach (var receive in _channels.Values)
+                        {
+                            if (receive.Stopped || receive.IsDisplayOnly || receive.IsTxMonitor)
+                                continue;
+                            if (receive.RxStoppedForHalfDuplexMox) continue;
+                            int prior = NativeMethods.SetChannelState(receive.Id, 0, 1);
+                            if (receive.Id == rxaId) rxaPrior = prior;
+                            receive.RxStoppedForHalfDuplexMox = true;
+                        }
+                    }
+                }
             }
             if (!_txaRunning)
             {
@@ -2813,6 +2850,20 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // PERF_PASS_3_DEBUG: t2 — WDSP RXA brought back up. Uncommitted.
                 _log.LogInformation("wdsp.rxa.up ts={Ts}",
                     System.Diagnostics.Stopwatch.GetTimestamp());
+            }
+            else
+            {
+                lock (_rxMoxGate)
+                {
+                    _halfDuplexRxSuspended = false;
+                    foreach (var receive in _channels.Values)
+                    {
+                        if (!receive.RxStoppedForHalfDuplexMox || receive.Stopped) continue;
+                        int prior = NativeMethods.SetChannelState(receive.Id, 1, 0);
+                        if (receive.Id == rxaId) rxaPrior = prior;
+                        receive.RxStoppedForHalfDuplexMox = false;
+                    }
+                }
             }
             // Unkeying: clear the stage-meter snapshot so UI doesn't latch the
             // last-during-TX reading while idle. The next MOX-on will publish
@@ -3527,7 +3578,7 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             int id;
             try
             {
-                id = OpenChannelCore(iqRate, pixelWidth: 1024);
+                id = OpenChannelCore(iqRate, pixelWidth: 1024, isTxMonitor: true);
             }
             catch (Exception ex)
             {

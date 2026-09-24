@@ -58,11 +58,15 @@ public sealed record StreamDeckMappingDto(
 
 /// <summary>The full persisted controller binding document — MIDI control maps
 /// plus Stream Deck key maps — versioned for forward migration. Stored as a
-/// single row in <c>MidiConfigStore</c>.</summary>
+/// single row in <c>MidiConfigStore</c>. <paramref name="VfoWheelMessagesPerStep"/>
+/// is the VFO wheel sensitivity (Thetis <c>MidiMessagesPerTuneStep</c>): how
+/// many wheel messages make one tune step, 1..64. Optional so documents saved
+/// before it existed load as 1 (every detent tunes).</summary>
 public sealed record MidiBindingsDoc(
     int Version,
     IReadOnlyList<MidiMappingDto> Mappings,
-    IReadOnlyList<StreamDeckMappingDto> StreamDeckMappings)
+    IReadOnlyList<StreamDeckMappingDto> StreamDeckMappings,
+    int VfoWheelMessagesPerStep = 1)
 {
     public const int CurrentVersion = 1;
 
