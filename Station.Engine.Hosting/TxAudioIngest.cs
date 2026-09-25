@@ -281,6 +281,17 @@ public sealed class TxAudioIngest : IDisposable
         _accumulatorFill = 0;
     }
 
+    /// <summary>Sources whose audio is operator speech (or a recorded voice
+    /// message) and may carry a CW ID. TCI and the virtual cable are digital-mode
+    /// feeds, and a speech-bypassed product-plugin lease is linear digital audio
+    /// (FT8); a tone summed into those would corrupt the data signal.</summary>
+    private bool CarriesCwId(MicBlockSource source) => source switch
+    {
+        MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.Wav => true,
+        MicBlockSource.ProductPlugin => Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0,
+        _ => false,
+    };
+
     /// <summary>Current armed source for the host/radio gate (test/diagnostic).</summary>
     internal MicBlockSource ActiveSource { get { lock (_sync) return _activeSource; } }
 
@@ -307,6 +318,8 @@ public sealed class TxAudioIngest : IDisposable
     private float _peakIqAccum;
     private int _peakBlocksAccum;
 
+    private readonly CwIdService? _cwId;
+
     public TxAudioIngest(
         TxIqRing ring,
         DspPipelineService pipeline,
@@ -315,7 +328,8 @@ public sealed class TxAudioIngest : IDisposable
         ILogger<TxAudioIngest> log,
         IAudioModemPort? audioModem = null,
         IProductTxAudioPort? productAudio = null,
-        ProductPluginAudioPort? productPluginAudio = null)
+        ProductPluginAudioPort? productPluginAudio = null,
+        CwIdService? cwId = null)
         : this(ring, () => pipeline.CurrentEngine, () => tx.IsMoxOn, hub, log,
                forwardP2: iq => pipeline.ForwardTxIqToP2(iq.Span),
                drainTxTransport: pipeline.DrainTxIqTransportTail,
@@ -323,7 +337,8 @@ public sealed class TxAudioIngest : IDisposable
                preKeyOpenAtTicks: () => tx.PreKeyOpenAtTicks,
                audioModem: audioModem,
                productAudio: productAudio,
-               productPluginAudio: productPluginAudio)
+               productPluginAudio: productPluginAudio,
+               cwId: cwId)
     {
     }
 
@@ -346,9 +361,11 @@ public sealed class TxAudioIngest : IDisposable
         Func<long>? stopwatchTicks = null,
         IAudioModemPort? audioModem = null,
         IProductTxAudioPort? productAudio = null,
-        ProductPluginAudioPort? productPluginAudio = null)
+        ProductPluginAudioPort? productPluginAudio = null,
+        CwIdService? cwId = null)
     {
         _ring = ring;
+        _cwId = cwId;
         _engineProvider = engineProvider;
         _isMoxOn = isMoxOn;
         _audioModem = audioModem ?? new NullAudioModemPort();
@@ -1299,6 +1316,16 @@ public sealed class TxAudioIngest : IDisposable
                 // No-op unless FreeDV is the active mode.
                 if (_audioModem.Active)
                     _audioModem.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
+                // CW station ID: sum the due ID tone into this keyed voice
+                // block. Only on the air path (MOX), never over FreeDV, and
+                // held off during the pre-key mute so no dit is lost.
+                else if (moxNow && _cwId is { } cwId && CarriesCwId(source))
+                {
+                    long openAt = _preKeyOpenAtTicks();
+                    bool preKeyMuted = openAt != 0L
+                        && TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks());
+                    cwId.MixTxBlock(new Span<float>(_scratchMic, 0, blockSize), canSend: !preKeyMuted);
+                }
                 int produced = engine.ProcessTxBlock(
                     new ReadOnlySpan<float>(_scratchMic, 0, blockSize),
                     new Span<float>(_scratchIq, 0, 2 * iqOut));

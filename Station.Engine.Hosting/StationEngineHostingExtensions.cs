@@ -115,6 +115,7 @@ public static class StationEngineHostingExtensions
             sp.GetRequiredService<ILogger<LayoutStore>>(),
             PrefsDbPath.EngineGet()));
         services.AddSingleton<CwSettingsStore>();
+        services.AddSingleton<CwIdSettingsStore>();
         services.AddSingleton<AntennaSettingsStore>();
         services.AddSingleton<VnaSweepStore>();
         services.AddSingleton<Hl2VnaSweepHardware>();
@@ -258,6 +259,7 @@ public static class StationEngineHostingExtensions
             return source;
         });
         services.AddSingleton<CwEngine>();
+        services.AddSingleton<CwIdService>();
         services.AddSingleton<CwDecoderService>();
         services.AddSingleton<ExternalPttService>();
         services.AddHl2IoBoard();

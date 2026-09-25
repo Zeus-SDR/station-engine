@@ -72,6 +72,7 @@ public sealed class LayoutStore : IDisposable
     private readonly ILiteCollection<LayoutEntry> _legacy;
     private readonly ILiteCollection<RadioLayoutsEntry> _v2;
     private readonly ILiteCollection<RadioSavedLayoutsEntry> _saved;
+    private readonly ILiteCollection<MeterGroupPresetEntry> _meterPresets;
     private readonly ILogger<LayoutStore> _log;
     private readonly object _lock = new();
     private readonly Dictionary<string, TransverterWorkspaceSelection> _activeTransverterSelections =
@@ -102,6 +103,8 @@ public sealed class LayoutStore : IDisposable
         _v2.EnsureIndex(x => x.RadioKey, unique: true);
         _saved = _db.GetCollection<RadioSavedLayoutsEntry>("ui_saved_layouts");
         _saved.EnsureIndex(x => x.RadioKey, unique: true);
+        _meterPresets = _db.GetCollection<MeterGroupPresetEntry>("ui_meter_group_presets");
+        _meterPresets.EnsureIndex(x => x.PresetId, unique: true);
 
         _log.LogInformation("LayoutStore initialized at {Path}", dbPath);
     }
@@ -538,6 +541,110 @@ public sealed class LayoutStore : IDisposable
         }
     }
 
+    // -----------------------------------------------------------------
+    // Meter-group presets — one library shared by every radio. A preset is a
+    // Meter Group tile's config blob (the SPA's MeterGroupConfig JSON), saved
+    // so the operator can drop the same group into any workspace. The server
+    // treats the blob as opaque apart from size and "is a JSON object"; the
+    // SPA's parser validates and migrates it on load.
+    // -----------------------------------------------------------------
+
+    /// <summary>Largest accepted preset config, in UTF-16 chars.</summary>
+    public const int MaxMeterGroupPresetJsonChars = 64 * 1024;
+
+    /// <summary>Library cap — keeps a runaway client from filling the db.</summary>
+    public const int MaxMeterGroupPresets = 200;
+
+    public MeterGroupPresetsDto GetMeterGroupPresets()
+    {
+        lock (_lock)
+        {
+            return ToMeterPresetsDto();
+        }
+    }
+
+    /// <summary>
+    /// Create or replace a meter-group preset. Throws
+    /// <see cref="ArgumentException"/> for an invalid config and
+    /// <see cref="InvalidOperationException"/> when the library is full.
+    /// </summary>
+    public MeterGroupPresetsDto UpsertMeterGroupPreset(string presetId, string? name, string configJson)
+    {
+        presetId = NormalizeLayoutId(presetId);
+        ValidateMeterGroupConfig(configJson);
+        var normalisedName = NormalizeMeterPresetName(name);
+        lock (_lock)
+        {
+            var existing = _meterPresets.FindOne(x => x.PresetId == presetId);
+            if (existing is null)
+            {
+                if (_meterPresets.Count() >= MaxMeterGroupPresets)
+                    throw new InvalidOperationException("meter group library is full");
+                _meterPresets.Insert(new MeterGroupPresetEntry
+                {
+                    PresetId = presetId,
+                    Name = normalisedName,
+                    ConfigJson = configJson,
+                    UpdatedUtc = DateTime.UtcNow,
+                });
+            }
+            else
+            {
+                existing.Name = normalisedName;
+                existing.ConfigJson = configJson;
+                existing.UpdatedUtc = DateTime.UtcNow;
+                _meterPresets.Update(existing);
+            }
+            return ToMeterPresetsDto();
+        }
+    }
+
+    /// <summary>Remove a meter-group preset. No-op if absent.</summary>
+    public MeterGroupPresetsDto DeleteMeterGroupPreset(string presetId)
+    {
+        presetId = NormalizeLayoutId(presetId);
+        lock (_lock)
+        {
+            _meterPresets.DeleteMany(x => x.PresetId == presetId);
+            return ToMeterPresetsDto();
+        }
+    }
+
+    private MeterGroupPresetsDto ToMeterPresetsDto() => new(
+        _meterPresets.FindAll()
+            .OrderBy(p => p.UpdatedUtc)
+            .Select(p => new MeterGroupPresetDto(
+                p.PresetId,
+                p.Name,
+                p.ConfigJson,
+                new DateTimeOffset(DateTime.SpecifyKind(p.UpdatedUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds()))
+            .ToList());
+
+    private static void ValidateMeterGroupConfig(string? configJson)
+    {
+        if (string.IsNullOrWhiteSpace(configJson))
+            throw new ArgumentException("configJson required");
+        if (configJson.Length > MaxMeterGroupPresetJsonChars)
+            throw new ArgumentException("configJson too large");
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(configJson);
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                throw new ArgumentException("configJson must be a JSON object");
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            throw new ArgumentException("configJson is not valid JSON");
+        }
+    }
+
+    private static string NormalizeMeterPresetName(string? raw)
+    {
+        var trimmed = (raw ?? string.Empty).Trim();
+        if (trimmed.Length == 0) return "Meters";
+        return trimmed.Length > 60 ? trimmed[..60] : trimmed;
+    }
+
     private static SavedLayoutsDto ToSavedDto(RadioSavedLayoutsEntry e) => new(
         e.RadioKey,
         e.SavedLayouts
@@ -700,6 +807,15 @@ public sealed class RadioSavedLayoutsEntry
     public int Id { get; set; }
     public string RadioKey { get; set; } = string.Empty;
     public List<SavedLayoutEntry> SavedLayouts { get; set; } = new();
+}
+
+public sealed class MeterGroupPresetEntry
+{
+    public int Id { get; set; }
+    public string PresetId { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string ConfigJson { get; set; } = string.Empty;
+    public DateTime UpdatedUtc { get; set; }
 }
 
 public sealed class SavedLayoutEntry

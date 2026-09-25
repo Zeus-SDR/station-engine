@@ -49,6 +49,7 @@ public sealed class GodsEyeFeedsService : BackgroundService
     private readonly Dictionary<string, DateTimeOffset> _nextAllowed = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _nextRefresh = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _backoffAttempts = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _awaitingObserver = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GodsEyeItemDto> _vessels = new(StringComparer.Ordinal);
     private CancellationTokenSource _configurationChanged = new();
     private GodsEyeObserver? _observer;
@@ -85,15 +86,23 @@ public sealed class GodsEyeFeedsService : BackgroundService
             if (Nullable.Equals(_observer, observer)) return;
             var becameAvailable = _observer is null && observer is not null;
             _observer = observer;
-            if (becameAvailable) WakeRefreshLoopLocked();
+            if (!becameAvailable) return;
+            foreach (var layer in _awaitingObserver) _nextRefresh.Remove(layer);
+            _awaitingObserver.Clear();
+            WakeRefreshLoopLocked();
         }
     }
 
     private void WakeRefreshLoopLocked()
     {
-        _configurationChanged.Cancel();
-        _configurationChanged.Dispose();
+        // Swap in the fresh source before cancelling: Cancel() runs callbacks
+        // synchronously on this thread while _sync is held (reentrant), so
+        // inline continuations can restart the refresh loop re-entrantly and
+        // must capture the new token, not the one being cancelled.
+        var previous = _configurationChanged;
         _configurationChanged = new CancellationTokenSource();
+        previous.Cancel();
+        previous.Dispose();
     }
 
     public GodsEyeLogbookSettings GetLogbookSettings() => _settings.GetLogbook();
@@ -107,6 +116,7 @@ public sealed class GodsEyeFeedsService : BackgroundService
             _observer = null;
             _nextObserverResolution = default;
             _nextRefresh.Clear();
+            _awaitingObserver.Clear();
             _aisReconnectAttempt = 0;
             WakeRefreshLoopLocked();
         }
@@ -190,14 +200,59 @@ public sealed class GodsEyeFeedsService : BackgroundService
             var settings = _settings.GetInternal()[layer];
             var now = _timeProvider.GetUtcNow();
             var due = false;
+            var stamped = default(DateTimeOffset);
+            DateTimeOffset previous = default;
+            var hadPrevious = false;
+            var requestsBefore = 0L;
             if (_viewers.HasViewers && settings.Enabled && settings.Configured)
             {
                 lock (_sync)
                 {
-                    due = !_nextRefresh.TryGetValue(layer, out var next) || next <= now;
-                    if (due) _nextRefresh[layer] = now + EffectiveCadence(settings);
+                    // SetObserver cancels this loop's token (waking the refresh loop) while holding
+                    // _sync, and this check runs under the same lock, so the two are atomic: bail
+                    // before stamping _nextRefresh or the restarted loop skips this layer.
+                    cancellationToken.ThrowIfCancellationRequested();
+                    hadPrevious = _nextRefresh.TryGetValue(layer, out previous);
+                    due = !hadPrevious || previous <= now;
+                    if (due)
+                    {
+                        _nextRefresh[layer] = stamped = now + EffectiveCadence(settings);
+                        requestsBefore = _caches[layer].RequestCount;
+                    }
                 }
-                if (due) await RefreshLayerAsync(layer, cancellationToken).ConfigureAwait(false);
+                if (due)
+                {
+                    try
+                    {
+                        await RefreshLayerAsync(layer, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        // A canceled attempt that never reached the network gives its slot back so
+                        // the restarted loop refreshes the layer right away; an attempt whose
+                        // request was already dispatched upstream keeps the slot, or the restarted
+                        // loop would immediately re-request and break both the layer cadence and
+                        // the provider's quota. RecordRequest checks the token under _sync just
+                        // before GetAsync, and SetObserver cancels under the same lock, so the two
+                        // are atomic: a counted request is one whose token was still live at the
+                        // moment of counting, and an unchanged RequestCount here proves this
+                        // attempt was canceled before it could dispatch. Roll the stamp back only
+                        // if it is still the value stamped here: SettingsChanged or SetObserver
+                        // may already have cleared or replaced the slot and must not be
+                        // resurrected over. ExecuteAsync awaits every loop before restarting them,
+                        // so this rollback always completes before the next round stamps.
+                        lock (_sync)
+                        {
+                            if (_caches[layer].RequestCount == requestsBefore
+                                && _nextRefresh.TryGetValue(layer, out var current) && current == stamped)
+                            {
+                                if (hadPrevious) _nextRefresh[layer] = previous;
+                                else _nextRefresh.Remove(layer);
+                            }
+                        }
+                        throw;
+                    }
+                }
             }
             GodsEyeObserver? observer; lock (_sync) observer = _observer;
             var delay = observer is null ? TimeSpan.FromSeconds(Math.Min(5, settings.CadenceSeconds)) : TimeSpan.FromSeconds(settings.CadenceSeconds);
@@ -229,7 +284,8 @@ public sealed class GodsEyeFeedsService : BackgroundService
             try
             {
                 var bounds = BoundsAround(observer.Value, settings.RadiusKm);
-                RecordRequest(GodsEyeLayerNames.Vessels);
+                // Vessels has no schedule slot to roll back, so keep counting every connect attempt, canceled or not.
+                RecordRequest(GodsEyeLayerNames.Vessels, CancellationToken.None);
                 await _ais.RunAsync(settings.ApiKey, bounds, OnAisMessageAsync, cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 MarkFailure(GodsEyeLayerNames.Vessels, "AISStream connection closed; reconnecting.", null);
@@ -311,13 +367,13 @@ public sealed class GodsEyeFeedsService : BackgroundService
             lock (_sync) observer = _observer;
             if (layer == GodsEyeLayerNames.Traffic && string.IsNullOrWhiteSpace(_settings.GetProviderKeys().TomTomApiKey))
             {
-                if (observer is null) { MarkFailure(layer, "Operator QTH is unavailable.", null); return false; }
+                if (observer is null) { MarkObserverUnavailable(layer); return false; }
                 lock (_sync) PublishLocked(layer, SimulatedTraffic(observer.Value, settings.MaxCount), settings, _timeProvider.GetUtcNow(), "Simulated traffic; add a TomTom key for live flow.");
                 return true;
             }
             var url = BuildUrl(layer, settings, observer, _settings.GetProviderKeys().TomTomApiKey);
-            if (url is null) { MarkFailure(layer, "Operator QTH is unavailable.", null); return false; }
-            RecordRequest(layer);
+            if (url is null) { MarkObserverUnavailable(layer); return false; }
+            RecordRequest(layer, cancellationToken);
             using var response = await _httpClients.CreateClient(HttpClientName).GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
@@ -348,7 +404,7 @@ public sealed class GodsEyeFeedsService : BackgroundService
             var currentSettings = _settings.GetInternal()[layer];
             lock (_sync)
             {
-                _nextAllowed.Remove(layer); _backoffAttempts.Remove(layer);
+                _nextAllowed.Remove(layer); _backoffAttempts.Remove(layer); _awaitingObserver.Remove(layer);
                 if (!currentSettings.Enabled || !currentSettings.Configured)
                 {
                     ApplyConfigurationStateLocked(layer, currentSettings);
@@ -407,6 +463,18 @@ public sealed class GodsEyeFeedsService : BackgroundService
         }
     }
 
+    private void MarkObserverUnavailable(string layer)
+    {
+        // The observer may have resolved after RefreshLayerAsync read it; drop the schedule
+        // here since the SetObserver wake already fired before this layer could be registered.
+        lock (_sync)
+        {
+            if (_observer is not null) _nextRefresh.Remove(layer);
+            else _awaitingObserver.Add(layer);
+        }
+        MarkFailure(layer, "Operator QTH is unavailable.", null);
+    }
+
     private void MarkRateLimited(string layer, string reason)
     {
         var settings = _settings.GetInternal()[layer];
@@ -424,10 +492,14 @@ public sealed class GodsEyeFeedsService : BackgroundService
         }
     }
 
-    private void RecordRequest(string layer)
+    private void RecordRequest(string layer, CancellationToken cancellationToken)
     {
         lock (_sync)
         {
+            // SetObserver cancels the loop token while holding _sync, so this check under the
+            // same lock is atomic with that cancellation: a counted request is one whose token
+            // was still live at the moment of counting.
+            cancellationToken.ThrowIfCancellationRequested();
             _caches[layer].RequestCount++;
             _caches[layer].LastFetchUtc = _timeProvider.GetUtcNow();
         }

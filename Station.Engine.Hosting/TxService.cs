@@ -175,13 +175,24 @@ public sealed class TxService
         }
     }
 
-    // Only voice UI MOX uses the pre-key window. CW would clip the first dit,
-    // and digital/FreeDV timing is owned by external modem sequencing.
     private static bool IsCwMode(RxMode mode) => mode is RxMode.CWU or RxMode.CWL;
-    private static bool IsPreKeyVoiceMode(RxMode mode) =>
-        mode is RxMode.LSB or RxMode.USB or RxMode.AM or RxMode.SAM or RxMode.DSB or RxMode.FM;
 
-    private static bool IsRogerBeepMode(RxMode mode) =>
+    // Key sources that get the TX pre-key delay so an external amp's T/R relay
+    // settles before RF: the operator's own keying (UI/MIDI, foot switch or mic
+    // PTT, CAT). TCI, CWX, and plugin keying drive digital/CW/clip playback
+    // and stay undelayed.
+    private static bool SourceArmsPreKey(MoxSource source) =>
+        source is MoxSource.UI or MoxSource.Hardware or MoxSource.Cat;
+
+    // Only voice-mode MOX uses the pre-key window. CW would clip the first dit,
+    // and digital/FreeDV timing is owned by external modem sequencing.
+    private static bool IsPreKeyVoiceMode(RxMode mode) => IsVoiceTxMode(mode);
+
+    private static bool IsRogerBeepMode(RxMode mode) => IsVoiceTxMode(mode);
+
+    /// <summary>Voice (phone) modulation modes: the modes whose TX chain carries
+    /// operator speech. Shared by the pre-key delay, roger beep and CW ID.</summary>
+    internal static bool IsVoiceTxMode(RxMode mode) =>
         mode is RxMode.LSB or RxMode.USB or RxMode.AM or RxMode.SAM or RxMode.DSB or RxMode.FM;
 
     public TxService(RadioService radio, DspPipelineService pipeline, StreamingHub hub, IBandPlanService bandPlan, ILogger<TxService> log)
@@ -1103,7 +1114,7 @@ public sealed class TxService
             {
                 if (_activeIntent == TransmitIntent.Mox) { error = null; return true; }
             }
-            int preKeyMs = source == MoxSource.UI ? _radio.TxMoxPreKeyDelayMs : 0;
+            int preKeyMs = SourceArmsPreKey(source) ? _radio.EffectiveTxMoxPreKeyDelayMs : 0;
             bool armPreKey = preKeyMs > 0 && IsPreKeyVoiceMode(_radio.Snapshot().Mode);
             long preKeyDelayTicks = armPreKey ? DelayMsToStopwatchTicks(preKeyMs) : 0;
             long revision = NextTransitionRevision();
@@ -1615,7 +1626,7 @@ public sealed class TxService
                     paCalibrationLeaseOwner)) return false;
             if (active == TransmitIntent.Tun) { error = null; return true; }
 
-            int preKeyMs = source == MoxSource.UI ? _radio.TxMoxPreKeyDelayMs : 0;
+            int preKeyMs = SourceArmsPreKey(source) ? _radio.EffectiveTxMoxPreKeyDelayMs : 0;
             long preKeyDelayTicks = preKeyMs > 0 ? DelayMsToStopwatchTicks(preKeyMs) : 0;
             long revision = NextTransitionRevision();
             _safety.AdmitExplicitRequest();

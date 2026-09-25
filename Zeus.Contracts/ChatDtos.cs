@@ -193,6 +193,8 @@ public sealed record ChatFriendsDto(
 /// is "offer"|"answer"|"candidate"|"key"|"end". The relay stamps
 /// <paramref name="From"/> from the authenticated connection and delivers the
 /// event only to <paramref name="To"/>; no audio or signalling is persisted.
+/// <paramref name="ReceiveMuted"/> is set only on an answer from a recipient
+/// whose PTT receive audio is muted, so the caller can say so.
 /// </summary>
 public sealed record ChatPttSignal(
     string Type,
@@ -204,7 +206,8 @@ public sealed record ChatPttSignal(
     string? OverId = null,
     long? SourceEpoch = null,
     ChatPttIceCandidate? Ice = null,
-    long? TargetEpoch = null)
+    long? TargetEpoch = null,
+    bool? ReceiveMuted = null)
 {
     /// <summary>Maximum accepted WebRTC SDP length, mirrored by the relay.</summary>
     public const int MaxSdpLength = 64_000;
@@ -331,7 +334,8 @@ public sealed record ChatPttRequest(
     string? Room = null,
     string? OverId = null,
     ChatPttIceCandidate? Ice = null,
-    long? TargetEpoch = null);
+    long? TargetEpoch = null,
+    bool? ReceiveMuted = null);
 
 /// <summary>Authoritative result for a key/end edge when supported by the relay.</summary>
 public sealed record ChatPttSendResponse(

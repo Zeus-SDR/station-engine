@@ -60,6 +60,7 @@ internal static class EnginePrefsDbMigration
             "band_plan_prefs",
             "band_stack",
             "board_sample_rates",
+            "cw_id_settings",
             "cw_settings",
             "dsp_settings",
             "filter_presets",

@@ -49,6 +49,27 @@ public static class TxControlEndpoints
         // the whole record. Returns the post-merge snapshot so the client
         // can reconcile its store with what the server actually stored
         // (e.g. clamped values).
+        // CW station ID timer. The ID is mixed into the operator's own voice
+        // transmission (TxAudioIngest); none of these routes key the radio.
+        endpoints.MapGet("/api/cwid", (CwIdService cwId) => Results.Ok(cwId.Status()));
+
+        endpoints.MapPost("/api/cwid/start", (CwIdStartRequest req, CwIdService cwId) =>
+            cwId.Start(req.Callsign, out var error)
+                ? Results.Ok(cwId.Status())
+                : Results.BadRequest(new { error }));
+
+        endpoints.MapPost("/api/cwid/stop", (CwIdStopRequest? req, CwIdService cwId) =>
+        {
+            cwId.Stop(req?.SkipFinalId ?? false);
+            return Results.Ok(cwId.Status());
+        });
+
+        endpoints.MapPut("/api/cwid/settings", (CwIdSettingsSetRequest req, CwIdSettingsStore store, CwIdService cwId) =>
+        {
+            cwId.ApplySettings(store.Save(req));
+            return Results.Ok(cwId.Status());
+        });
+
         endpoints.MapGet("/api/cw/settings", (CwSettingsStore store) =>
             Results.Ok(store.Get()));
 

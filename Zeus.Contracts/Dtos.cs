@@ -2157,6 +2157,42 @@ public sealed record CwSettingsSetRequest(
     int? Weight = null,
     bool? PaddleReverse = null);
 
+// CW station ID timer (/api/cwid). The ID is mixed into the operator's own
+// voice transmission; it never keys the radio by itself. Wpm is capped at 20
+// (FCC 97.119(b)(1) limit for a CW ID on a phone emission). LevelDb is the
+// tone peak relative to digital full scale, before the TX chain.
+public sealed record CwIdSettingsDto(
+    int Wpm,
+    int ToneHz,
+    double LevelDb,
+    int IntervalMinutes);
+
+// PATCH-shaped like CwSettingsSetRequest: null fields keep their value.
+public sealed record CwIdSettingsSetRequest(
+    int? Wpm = null,
+    int? ToneHz = null,
+    double? LevelDb = null,
+    int? IntervalMinutes = null);
+
+// Callsign is resolved by the client (QRZ callsign or operator override, via
+// /api/operator) and validated server-side.
+public sealed record CwIdStartRequest(string? Callsign);
+
+// SkipFinalId = true stops without the end-of-contact ID.
+public sealed record CwIdStopRequest(bool SkipFinalId = false);
+
+// Live timer state. Due = an ID is owed and goes out on the next voice
+// transmission. SecondsUntilDue is null until the first key-down of a period.
+public sealed record CwIdStatusDto(
+    bool Running,
+    string? Callsign,
+    bool Due,
+    bool Sending,
+    bool FinalIdArmed,
+    int? SecondsUntilDue,
+    DateTime? LastIdUtc,
+    CwIdSettingsDto Settings);
+
 // Hermes-Lite 2 (and the wider openHPSDR family) on-board CW keyer mode,
 // written to C&C register 0x0B C3[7:6] (gateware rtl/cw_openhpsdr.sv:32).
 // Straight is the default-safe choice: in this mode the gateware passes the
@@ -2308,6 +2344,21 @@ public sealed record SaveSavedLayoutRequest(
     string LayoutJson,
     string? Icon = null,
     string? Description = null);
+
+// Meter-group presets — one library shared across radios. ConfigJson is the
+// SPA's Meter Group tile config (MeterGroupConfig), opaque to the server.
+public sealed record MeterGroupPresetDto(
+    string Id,
+    string Name,
+    string ConfigJson,
+    long UpdatedUtc);
+
+public sealed record MeterGroupPresetsDto(IReadOnlyList<MeterGroupPresetDto> Presets);
+
+public sealed record SaveMeterGroupPresetRequest(
+    string PresetId,
+    string Name,
+    string ConfigJson);
 
 // Prefs-database (profile) selector. All Zeus settings/layouts/prefs persist in
 // a single LiteDB file resolved by PrefsDbPath.Get() at startup. The operator

@@ -219,10 +219,10 @@ public sealed class RadioService : IDisposable
     // the same per-band PA gain gives equal watts at equal percentages). piHPSDR
     // default is 10 — a 0 default would be "press TUN, nothing happens".
     private int _tunePct = 10;
-    // TX pre-key (MOX) delay ms (0..500). Authoritative copy read by TxService
-    // on the MOX rising edge to arm the IQ-mute window; the StateDto mirror is
-    // for the frontend. Always kept strictly below the PS MOX hold-off so PS
-    // never calibrates on muted RF — see SetTxMoxPreKeyDelayMs / ClampPreKeyToPs.
+    // TX pre-key (MOX) delay ms (0..500) as the operator set it in PA Settings.
+    // TxService reads EffectiveTxMoxPreKeyDelayMs on the MOX rising edge, which
+    // clamps this strictly below the PS MOX hold-off only while PS is armed, so
+    // PS never calibrates on muted RF while non-PS stations get the full delay.
     // Issue #630.
     private int _txMoxPreKeyDelayMs;
     // TX tail (MOX hang) delay ms (0..5000). Held after a UI PTT release so
@@ -763,12 +763,9 @@ public sealed class RadioService : IDisposable
                 .ToList();
             _drivePct = Math.Clamp(rsSnap.DrivePct, 0, 100);
             _tunePct = Math.Clamp(rsSnap.TunePct, 0, 100);
-            // Hydrate the TX pre-key delay, then clamp it below the persisted PS
-            // MOX hold-off so a hand-edited DB row can't break the invariant.
-            double hydPsMoxDelaySec = PsTimingLimits.ClampMoxDelaySec(ps?.MoxDelaySec ?? PsTimingLimits.DefaultMoxDelaySec);
-            _txMoxPreKeyDelayMs = ClampPreKeyToPs(
-                Math.Clamp(rsSnap.TxMoxPreKeyDelayMs, 0, MaxPreKeyDelayMs),
-                hydPsMoxDelaySec);
+            // Hydrate the operator's TX pre-key delay. The PS hold-off clamp is
+            // applied at key-down (EffectiveTxMoxPreKeyDelayMs), not here.
+            _txMoxPreKeyDelayMs = Math.Clamp(rsSnap.TxMoxPreKeyDelayMs, 0, MaxPreKeyDelayMs);
             _txMoxTailDelayMs = Math.Clamp(rsSnap.TxMoxTailDelayMs, 0, MaxTailDelayMs);
             _txPostTxRxMuteDelayMs = Math.Clamp(
                 rsSnap.TxPostTxRxMuteDelayMs,
@@ -4629,10 +4626,10 @@ public sealed class RadioService : IDisposable
     // longer than one WDSP TX block at any supported rate.
     private const int PsPreKeyMarginMs = 50;
 
-    // Clamp a requested pre-key delay to [0, MaxPreKeyDelayMs] AND strictly
-    // below (psMoxDelaySec*1000 - margin). With the default PS hold-off of
-    // 200 ms this caps the pre-key at 150 ms — ample for amp T/R sequencing
-    // (the #630 reporter needs ~30 ms) while keeping PS safe by construction.
+    // Clamp a pre-key delay to [0, MaxPreKeyDelayMs] AND strictly below
+    // (psMoxDelaySec*1000 - margin). With the default PS hold-off of 200 ms
+    // this caps the pre-key at 150 ms while PS is armed. Applied at key-down
+    // only when PS is armed; without PS the operator's full value is used.
     private static int ClampPreKeyToPs(int requestedMs, double psMoxDelaySec)
     {
         int ceiling = (int)(psMoxDelaySec * 1000.0) - PsPreKeyMarginMs;
@@ -4642,15 +4639,14 @@ public sealed class RadioService : IDisposable
     }
 
     /// <summary>
-    /// Set the TX pre-key (MOX) delay in milliseconds. Clamped to
-    /// [0, <see cref="MaxPreKeyDelayMs"/>] and hard-clamped strictly below the
-    /// current PureSignal MOX hold-off (bidirectional invariant — the PS setter
-    /// re-clamps this downward too). Returns the updated snapshot so the caller
-    /// can surface the actually-applied value (which may be lower than asked).
+    /// Set the TX pre-key (MOX) delay in milliseconds, clamped to
+    /// [0, <see cref="MaxPreKeyDelayMs"/>]. The PureSignal hold-off ceiling is
+    /// not baked into the stored value — <see cref="EffectiveTxMoxPreKeyDelayMs"/>
+    /// applies it at key-down while PS is armed.
     /// </summary>
     public StateDto SetTxMoxPreKeyDelayMs(int ms)
     {
-        int clamped = ClampPreKeyToPs(ms, Snapshot().PsMoxDelaySec);
+        int clamped = Math.Clamp(ms, 0, MaxPreKeyDelayMs);
         Interlocked.Exchange(ref _txMoxPreKeyDelayMs, clamped);
         Mutate(s => s with { TxMoxPreKeyDelayMs = clamped });
         return Snapshot();
@@ -4671,9 +4667,23 @@ public sealed class RadioService : IDisposable
         get { lock (_sync) return _state.RogerBeepEnabled; }
     }
 
-    /// <summary>Authoritative pre-key delay (ms) read by TxService on the MOX
-    /// rising edge. Already PS-clamped.</summary>
+    /// <summary>Operator-set pre-key delay (ms), not PS-clamped.</summary>
     public int TxMoxPreKeyDelayMs => Volatile.Read(ref _txMoxPreKeyDelayMs);
+
+    /// <summary>Pre-key delay (ms) TxService arms on the MOX rising edge. While
+    /// PureSignal is armed it is clamped strictly below the PS MOX hold-off so
+    /// calcc never bins muted feedback; otherwise the operator's full value.
+    /// PS arm is deferred while keyed, so the PS state read here holds for the
+    /// whole pre-key window.</summary>
+    public int EffectiveTxMoxPreKeyDelayMs
+    {
+        get
+        {
+            int requested = Volatile.Read(ref _txMoxPreKeyDelayMs);
+            var snap = Snapshot();
+            return snap.PsEnabled ? ClampPreKeyToPs(requested, snap.PsMoxDelaySec) : requested;
+        }
+    }
 
     // ---- TX tail (MOX hang) delay (issue #1294) --------------------------
     // Thetis exposes PTT Delay up to 5000 ms. Zeus uses this specifically as a
@@ -4766,20 +4776,6 @@ public sealed class RadioService : IDisposable
     /// every meter tick to evaluate the protection trip. 0 = disabled (no
     /// trip). Issue #1270.</summary>
     public int TxTimeoutSec => Volatile.Read(ref _txTimeoutSec);
-
-    // Re-clamp the stored pre-key delay after the PS MOX hold-off changed, so
-    // lowering PsMoxDelaySec can never leave a now-too-large pre-key window in
-    // place. Called from SetPsAdvanced after the PS mutate commits.
-    private void ReclampPreKeyToPs()
-    {
-        int current = Volatile.Read(ref _txMoxPreKeyDelayMs);
-        int reclamped = ClampPreKeyToPs(current, Snapshot().PsMoxDelaySec);
-        if (reclamped != current)
-        {
-            Interlocked.Exchange(ref _txMoxPreKeyDelayMs, reclamped);
-            Mutate(s => s with { TxMoxPreKeyDelayMs = reclamped });
-        }
-    }
 
     /// <summary>
     /// Forward the on-board CW keyer config to the connected radio and
@@ -6278,9 +6274,6 @@ public sealed class RadioService : IDisposable
                 : s.PsAmpDelayNs,
             PsHwPeak = req.HwPeak ?? s.PsHwPeak,
         });
-        // If the PS MOX hold-off just dropped, shrink the pre-key window so the
-        // pre-key < PS-hold-off invariant holds regardless of setter ordering.
-        ReclampPreKeyToPs();
         PersistPsState();
         return Snapshot();
     }

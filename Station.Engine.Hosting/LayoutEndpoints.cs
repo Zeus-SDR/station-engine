@@ -117,6 +117,35 @@ public static class LayoutEndpoints
             return Results.Ok(store.DeleteSavedLayout(radio ?? "default", id));
         });
 
+        // Meter-group presets — one library for every radio (no radio key).
+        endpoints.MapGet("/api/ui/meter-group-presets", (LayoutStore store) =>
+            Results.Ok(store.GetMeterGroupPresets()));
+
+        endpoints.MapPut("/api/ui/meter-group-presets", (SaveMeterGroupPresetRequest req, LayoutStore store) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.PresetId))
+                return Results.BadRequest(new { error = "presetId required" });
+            try
+            {
+                return Results.Ok(store.UpsertMeterGroupPreset(req.PresetId, req.Name, req.ConfigJson));
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        endpoints.MapDelete("/api/ui/meter-group-presets", (string? id, LayoutStore store) =>
+        {
+            if (string.IsNullOrWhiteSpace(id))
+                return Results.BadRequest(new { error = "id required" });
+            return Results.Ok(store.DeleteMeterGroupPreset(id));
+        });
+
         return endpoints;
     }
 }
