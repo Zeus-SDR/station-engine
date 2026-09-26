@@ -38,8 +38,13 @@ namespace Zeus.Server;
 /// </summary>
 public sealed class CwEngine : BackgroundService
 {
-    // TX-side ring sample rate. Both P1 and P2 backends pull from TxIqRing
-    // at 48 kHz; see Zeus.Protocol1.TxIqRing class doc.
+    // P1 TX sample rate: the EP2 packer drains TxIqRing at 48 kHz (see
+    // Zeus.Protocol1.TxIqRing class doc). P2 does NOT read the ring — its
+    // 1029-port DUC stream runs at the TXA output rate (192 kHz on the G2)
+    // and is fed via DspPipelineService.ForwardTxIqToP2, the same seam
+    // TxTuneDriver and TxAudioIngest use. The live rate is resolved per job
+    // from the DSP engine (ResolveTxOutputRateHz); this constant is the P1
+    // value and the fallback when no engine is loaded.
     public const int SampleRateHz = 48_000;
     // Raised-cosine ramp on each key edge. 5 ms ≈ ±100 Hz of skirt energy at
     // the CW pitch — well under the WDSP RX CW bandpass (250 Hz wide). Below
@@ -53,16 +58,21 @@ public sealed class CwEngine : BackgroundService
     private const int WpmMax = 50;
     private const int WpmDefault = 20;
 
-    // Chunk size used by the playback loop. 480 samples = 10 ms at 48 kHz —
-    // small enough that the ring stays well under its 340 ms drop-oldest
-    // threshold, large enough that the loop only wakes 100 times per second
-    // of TX (negligible CPU). Stay coherent with the ring's `Write(span)`
-    // path which is per-block.
-    private const int ChunkSamples = 480;
+    // Chunk length used by the playback loop: 10 ms of IQ at the active TX
+    // rate (480 samples at 48 kHz, 1920 at 192 kHz) — small enough that the
+    // P1 ring stays well under its 340 ms drop-oldest threshold, large enough
+    // that the loop only wakes 100 times per second of TX.
+    private const int ChunkMs = 10;
+    // How far production runs ahead of real time. Covers coarse OS timer
+    // granularity (~15.6 ms on Windows) so the radio FIFO never starves
+    // between wakeups. The P2 sender queue is unbounded and paces itself to
+    // the DAC, and the P1 ring holds 340 ms, so the lead is latency, not loss.
+    private const int LeadMs = 20;
 
     private readonly TxService _tx;
     private readonly RadioService _radio;
     private readonly TxIqRing _ring;
+    private readonly DspPipelineService? _pipeline;
     private readonly StreamingHub _hub;
     private readonly CwSettingsStore _settings;
     private readonly CwSidetoneSource? _sidetone;
@@ -91,11 +101,12 @@ public sealed class CwEngine : BackgroundService
     /// fired from the playback worker thread.</summary>
     public event Action<CwEngineStatus>? Status;
 
-    public CwEngine(TxService tx, RadioService radio, TxIqRing ring, StreamingHub hub, CwSettingsStore settings, ILogger<CwEngine> log, CwSidetoneSource? sidetone = null)
+    public CwEngine(TxService tx, RadioService radio, TxIqRing ring, StreamingHub hub, CwSettingsStore settings, ILogger<CwEngine> log, CwSidetoneSource? sidetone = null, DspPipelineService? pipeline = null)
     {
         _tx = tx;
         _radio = radio;
         _ring = ring;
+        _pipeline = pipeline;
         _hub = hub;
         _settings = settings;
         _sidetone = sidetone;
@@ -207,12 +218,15 @@ public sealed class CwEngine : BackgroundService
                 _currentIsRawKey = job.RawKeyDown;
                 _currentRemoteTxLeaseId = job.RemoteTxLeaseId;
             }
+            // A refused key-down already reported Idle carrying the job text
+            // (plus the reason); that frame is how clients tell "not keyed"
+            // from "finished", so don't overwrite it with a bare Idle.
+            bool refused = false;
             try
             {
-                if (job.RawKeyDown)
-                    await PlayRawKeyAsync(job, remaining, jobCts.Token).ConfigureAwait(false);
-                else
-                    await PlayJobAsync(job, remaining, jobCts.Token).ConfigureAwait(false);
+                refused = job.RawKeyDown
+                    ? !await PlayRawKeyAsync(job, remaining, jobCts.Token).ConfigureAwait(false)
+                    : !await PlayJobAsync(job, remaining, jobCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -242,7 +256,7 @@ public sealed class CwEngine : BackgroundService
 
             // Emit Idle once the queue actually drains. Mid-queue jobs roll
             // into the next iteration without a flicker.
-            if (Volatile.Read(ref _pendingJobs) == 0)
+            if (!refused && Volatile.Read(ref _pendingJobs) == 0)
                 Notify(new CwEngineStatus(CwEngineState.Idle, string.Empty, 0, 0));
         }
     }
@@ -257,7 +271,8 @@ public sealed class CwEngine : BackgroundService
         }
     }
 
-    private async Task PlayJobAsync(CwJob job, int queueDepth, CancellationToken ct)
+    /// <returns>False when MOX was refused and nothing was keyed.</returns>
+    private async Task<bool> PlayJobAsync(CwJob job, int queueDepth, CancellationToken ct)
     {
         // Before keying, force the hardware LO to the canonical CW offset
         // of the dial — eliminates CTUN drift so the carrier lands on the
@@ -287,23 +302,16 @@ public sealed class CwEngine : BackgroundService
             Notify(new CwEngineStatus(
                 CwEngineState.Idle, job.Text, job.Wpm, queueDepth,
                 Reason: err ?? "MOX refused"));
-            return;
+            return false;
         }
         // Host CW now owns the air — disarm the P2 internal keyer so the
         // gateware doesn't self-key against this host-keyed send (#1032).
         _radio.SetHostCwKeying(true);
         Notify(new CwEngineStatus(CwEngineState.Sending, job.Text, job.Wpm, queueDepth));
+        var pump = new IqPump(_ring, ForwardToDuc, ResolveTxRateHz(snap), basebandHz);
         _log.LogInformation(
-            "cw.send text={Text} wpm={Wpm} mode={Mode} txVfo={TxVfo} txHz={TxHz}Hz lo={Lo}Hz baseband={Bb}Hz loRealigned={LoRealigned}",
-            Truncate(job.Text), job.Wpm, snap.Mode, snap.TxVfo, txHz, snap.RadioLoHz, basebandHz, loRealigned);
-
-        // Phase accumulator runs continuously across symbols so the tone
-        // stays coherent through inter-element gaps (no phase pop on
-        // each dit-onset). Reset per-job.
-        double phase = 0.0;
-        double phaseStep = 2.0 * Math.PI * basebandHz / SampleRateHz;
-        // Scratch buffer for chunked IQ writes. 2 floats per sample.
-        var iq = new float[ChunkSamples * 2];
+            "cw.send text={Text} wpm={Wpm} mode={Mode} txVfo={TxVfo} txHz={TxHz}Hz lo={Lo}Hz baseband={Bb}Hz rate={Rate}Hz p2Forward={P2} loRealigned={LoRealigned}",
+            Truncate(job.Text), job.Wpm, snap.Mode, snap.TxVfo, txHz, snap.RadioLoHz, basebandHz, pump.RateHz, _pipeline is not null, loRealigned);
 
         try
         {
@@ -320,37 +328,20 @@ public sealed class CwEngine : BackgroundService
                     else _sidetone.Up();
                 }
 
-                int totalSamples = (int)((long)symbol.DurationMs * SampleRateHz / 1000);
-                int rampSamples = Math.Min(
-                    (int)((long)RampMs * SampleRateHz / 1000),
-                    totalSamples / 2);
+                int totalSamples = (int)((long)symbol.DurationMs * pump.RateHz / 1000);
+                int rampSamples = Math.Min(pump.RampSamples, totalSamples / 2);
 
                 int written = 0;
                 while (written < totalSamples)
                 {
                     ct.ThrowIfCancellationRequested();
-                    int n = Math.Min(ChunkSamples, totalSamples - written);
-                    for (int i = 0; i < n; i++)
-                    {
-                        double env = symbol.KeyDown
-                            ? RaisedCosineEnvelope(written + i, totalSamples, rampSamples)
-                            : 0.0;
-                        iq[2 * i] = (float)(env * Math.Cos(phase));
-                        iq[2 * i + 1] = (float)(env * Math.Sin(phase));
-                        phase += phaseStep;
-                        // Keep phase bounded so cos/sin stays numerically clean
-                        // over multi-minute transmissions.
-                        if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI;
-                    }
-                    _ring.Write(new ReadOnlySpan<float>(iq, 0, 2 * n));
+                    int n = Math.Min(pump.ChunkSamples, totalSamples - written);
+                    int start = written;
+                    pump.Emit(n, i => symbol.KeyDown
+                        ? RaisedCosineEnvelope(start + i, totalSamples, rampSamples)
+                        : 0.0);
                     written += n;
-                    // Pace ourselves to the ring drain rate so the ring stays
-                    // well below its 16384-pair drop-oldest threshold. EP2 drains
-                    // ~42k pairs/s; we write at the same average rate, so a
-                    // (chunk/rate) sleep keeps the ring at ~one-chunk depth.
-                    int sleepMs = Math.Max(1, (n * 1000) / SampleRateHz - 1);
-                    try { await Task.Delay(sleepMs, ct).ConfigureAwait(false); }
-                    catch (OperationCanceledException) { throw; }
+                    await pump.PaceAsync(ct).ConfigureAwait(false);
                 }
             }
         }
@@ -362,13 +353,13 @@ public sealed class CwEngine : BackgroundService
             _sidetone?.Up();
         }
 
-        // Drop MOX after the final symbol. The ring still has up to ~10 ms
-        // of envelope tail queued; wait that long so the radio actually
-        // transmits the tail before MOX falls. (Shorter than the natural
-        // ring depth — we deliberately keep the ring shallow above.)
-        try { await Task.Delay(20, ct).ConfigureAwait(false); }
-        catch (OperationCanceledException) { throw; }
+        // Drop MOX after the final symbol, once the production lead has
+        // played out, so the radio actually transmits the envelope tail.
+        // Not cancellable: every symbol is already produced, so a STOP here
+        // must not relabel a complete message as aborted.
+        await pump.DrainAsync(CancellationToken.None).ConfigureAwait(false);
         TryReleaseMox("done", job.RemoteTxLeaseId);
+        return true;
     }
 
     /// <summary>
@@ -379,7 +370,7 @@ public sealed class CwEngine : BackgroundService
     /// <paramref name="ct"/> cancellation or after <c>job.DurationMs</c>
     /// elapses, whichever comes first.
     /// </summary>
-    private async Task PlayRawKeyAsync(CwJob job, int queueDepth, CancellationToken ct)
+    private async Task<bool> PlayRawKeyAsync(CwJob job, int queueDepth, CancellationToken ct)
     {
         // Same LO-align and baseband math as PlayJobAsync — keep them in
         // step so the carrier lands at the operator's dial regardless of
@@ -395,26 +386,24 @@ public sealed class CwEngine : BackgroundService
             Notify(new CwEngineStatus(
                 CwEngineState.Idle, string.Empty, 0, queueDepth,
                 Reason: err ?? "MOX refused"));
-            return;
+            return false;
         }
         // Host CW (raw keyer/logger) owns the air — disarm the P2 internal
         // keyer for the duration so the gateware doesn't self-key too (#1032).
         _radio.SetHostCwKeying(true);
         Notify(new CwEngineStatus(CwEngineState.Sending, "<keyer>", 0, queueDepth));
+        var pump = new IqPump(_ring, ForwardToDuc, ResolveTxRateHz(snap), basebandHz);
         _log.LogInformation(
-            "cw.keyer.down txVfo={TxVfo} txHz={TxHz}Hz baseband={Bb}Hz durationMs={Dur} loRealigned={LoR}",
-            snap.TxVfo, txHz, basebandHz, job.DurationMs?.ToString() ?? "until-release", loRealigned);
+            "cw.keyer.down txVfo={TxVfo} txHz={TxHz}Hz baseband={Bb}Hz rate={Rate}Hz durationMs={Dur} loRealigned={LoR}",
+            snap.TxVfo, txHz, basebandHz, pump.RateHz, job.DurationMs?.ToString() ?? "until-release", loRealigned);
 
-        double phase = 0.0;
-        double phaseStep = 2.0 * Math.PI * basebandHz / SampleRateHz;
-        int rampSamples = RampMs * SampleRateHz / 1000;
-        var iq = new float[ChunkSamples * 2];
+        int rampSamples = pump.RampSamples;
 
         // No upper bound when the operator wants to hold the key indefinitely —
         // ct + keyer:0 are the release path. With a duration, we play exactly
         // that many samples then release with the same fade-out shape.
         int? totalSamples = job.DurationMs.HasValue
-            ? (int)((long)job.DurationMs.Value * SampleRateHz / 1000)
+            ? (int)((long)job.DurationMs.Value * pump.RateHz / 1000)
             : null;
 
         int written = 0;
@@ -430,26 +419,21 @@ public sealed class CwEngine : BackgroundService
             {
                 if (ct.IsCancellationRequested) { releasedByCancel = true; break; }
                 int n = totalSamples.HasValue
-                    ? Math.Min(ChunkSamples, totalSamples.Value - written)
-                    : ChunkSamples;
-                for (int i = 0; i < n; i++)
+                    ? Math.Min(pump.ChunkSamples, totalSamples.Value - written)
+                    : pump.ChunkSamples;
+                int start = written;
+                // Attack region only — once past rampSamples we plateau at 1.0
+                // until release. The release tail is rendered after this loop
+                // exits so it always sees the steady-state amplitude.
+                pump.Emit(n, i =>
                 {
-                    int pos = written + i;
-                    // Attack region only — once past rampSamples we plateau at 1.0
-                    // until release. The release tail is rendered after this loop
-                    // exits so it always sees the steady-state amplitude.
-                    double env = pos < rampSamples
+                    int pos = start + i;
+                    return pos < rampSamples
                         ? 0.5 * (1.0 - Math.Cos(Math.PI * pos / rampSamples))
                         : 1.0;
-                    iq[2 * i] = (float)(env * Math.Cos(phase));
-                    iq[2 * i + 1] = (float)(env * Math.Sin(phase));
-                    phase += phaseStep;
-                    if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI;
-                }
-                _ring.Write(new ReadOnlySpan<float>(iq, 0, 2 * n));
+                });
                 written += n;
-                int sleepMs = Math.Max(1, (n * 1000) / SampleRateHz - 1);
-                try { await Task.Delay(sleepMs, ct).ConfigureAwait(false); }
+                try { await pump.PaceAsync(ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { releasedByCancel = true; break; }
             }
         }
@@ -461,26 +445,134 @@ public sealed class CwEngine : BackgroundService
         // Release tail — raised-cosine fall from 1.0 to 0. Use a non-cancellable
         // path so a cancellation that triggered the release doesn't itself
         // truncate the fade and put a click on the air.
-        for (int chunkStart = 0; chunkStart < rampSamples; chunkStart += ChunkSamples)
+        for (int chunkStart = 0; chunkStart < rampSamples; chunkStart += pump.ChunkSamples)
         {
-            int n = Math.Min(ChunkSamples, rampSamples - chunkStart);
-            for (int i = 0; i < n; i++)
-            {
-                int into = chunkStart + i;
-                double env = 0.5 * (1.0 - Math.Cos(Math.PI * (rampSamples - into) / rampSamples));
-                iq[2 * i] = (float)(env * Math.Cos(phase));
-                iq[2 * i + 1] = (float)(env * Math.Sin(phase));
-                phase += phaseStep;
-                if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI;
-            }
-            _ring.Write(new ReadOnlySpan<float>(iq, 0, 2 * n));
-            int sleepMs = Math.Max(1, (n * 1000) / SampleRateHz - 1);
-            await Task.Delay(sleepMs).ConfigureAwait(false);
+            int n = Math.Min(pump.ChunkSamples, rampSamples - chunkStart);
+            int start = chunkStart;
+            pump.Emit(n, i => 0.5 * (1.0 - Math.Cos(Math.PI * (rampSamples - (start + i)) / rampSamples)));
+            await pump.PaceAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
-        try { await Task.Delay(20, CancellationToken.None).ConfigureAwait(false); }
-        catch (OperationCanceledException) { /* shouldn't fire — token is None */ }
+        await pump.DrainAsync(CancellationToken.None).ConfigureAwait(false);
         TryReleaseMox(releasedByCancel ? "keyer.up" : "keyer.duration", job.RemoteTxLeaseId);
+        return true;
+    }
+
+    /// <summary>
+    /// TX output rate of the active DSP engine: the TXA input block is
+    /// always 48 kHz mic audio, so the output rate is 48 kHz scaled by the
+    /// output/input block ratio (1:1 on P1, 4:1 → 192 kHz on P2). Falls
+    /// back to the P1 rate when no engine is loaded.
+    /// </summary>
+    internal delegate void TxIqForward(ReadOnlySpan<float> iqInterleaved);
+
+    private TxIqForward? ForwardToDuc => _pipeline is { } p ? p.ForwardTxIqToP2 : null;
+
+    /// <summary>
+    /// Rate for this job's IQ. P1 always drains the ring at 48 kHz; P2/P3
+    /// follow the loaded TXA profile. A mismatch (e.g. a P2 radio with the
+    /// P1-profile engine still loaded) would key 4× off-speed and off-pitch,
+    /// so it is logged loudly.
+    /// </summary>
+    private int ResolveTxRateHz(StateDto snap)
+    {
+        bool p1 = string.IsNullOrEmpty(snap.ConnectedProtocol)
+            || string.Equals(snap.ConnectedProtocol, "P1", StringComparison.OrdinalIgnoreCase);
+        if (p1) return SampleRateHz;
+        int rate = ResolveTxOutputRateHz(_pipeline?.CurrentEngine);
+        if (rate == SampleRateHz)
+            _log.LogWarning("cw.rate.mismatch protocol={Protocol} engineRate={Rate}Hz — TXA profile does not match the transport",
+                snap.ConnectedProtocol, rate);
+        return rate;
+    }
+
+    internal static int ResolveTxOutputRateHz(Zeus.Dsp.IDspEngine? engine)
+    {
+        if (engine is null) return SampleRateHz;
+        return ResolveTxOutputRateHz(engine.TxBlockSamples, engine.TxOutputSamples);
+    }
+
+    internal static int ResolveTxOutputRateHz(int txBlockSamples, int txOutputSamples)
+    {
+        if (txBlockSamples <= 0 || txOutputSamples <= 0) return SampleRateHz;
+        long rate = (long)SampleRateHz * txOutputSamples / txBlockSamples;
+        // Only integer multiples of 48 kHz are real DAC rates; anything else
+        // means a half-initialised engine, so stay on the P1 rate.
+        return rate is >= SampleRateHz and <= 8 * SampleRateHz && rate % SampleRateHz == 0
+            ? (int)rate
+            : SampleRateHz;
+    }
+
+    /// <summary>
+    /// Per-job IQ producer. Renders a phase-continuous tone at the job's
+    /// baseband offset, writes each chunk to BOTH transports — the P1 ring
+    /// and the P2/P3 DUC forward (each is a no-op when its protocol isn't
+    /// active) — and paces production against a monotonic deadline so the
+    /// average rate stays locked to the DAC regardless of timer granularity.
+    /// Mirrors TxTuneDriver's dual-write.
+    /// </summary>
+    internal sealed class IqPump
+    {
+        private readonly TxIqRing _ring;
+        private readonly TxIqForward? _forward;
+        private readonly float[] _iq;
+        private readonly double _phaseStep;
+        private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+        private double _phase;
+        private long _producedSamples;
+
+        public IqPump(TxIqRing ring, TxIqForward? forward, int rateHz, int basebandHz)
+        {
+            _ring = ring;
+            _forward = forward;
+            RateHz = rateHz;
+            ChunkSamples = rateHz * ChunkMs / 1000;
+            RampSamples = rateHz * RampMs / 1000;
+            _iq = new float[ChunkSamples * 2];
+            _phaseStep = 2.0 * Math.PI * basebandHz / rateHz;
+        }
+
+        public int RateHz { get; }
+        public int ChunkSamples { get; }
+        public int RampSamples { get; }
+
+        public void Emit(int n, Func<int, double> envelope)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                double env = envelope(i);
+                _iq[2 * i] = (float)(env * Math.Cos(_phase));
+                _iq[2 * i + 1] = (float)(env * Math.Sin(_phase));
+                _phase += _phaseStep;
+                // Keep phase bounded so cos/sin stays numerically clean
+                // over multi-minute transmissions.
+                if (_phase > 2.0 * Math.PI) _phase -= 2.0 * Math.PI;
+            }
+            var span = new ReadOnlySpan<float>(_iq, 0, 2 * n);
+            _ring.Write(span);
+            _forward?.Invoke(span);
+            _producedSamples += n;
+        }
+
+        /// <summary>Wait until real time is within <see cref="LeadMs"/> of
+        /// what has been produced. Returns immediately when behind.</summary>
+        public Task PaceAsync(CancellationToken ct)
+        {
+            double aheadMs = ProducedMs - _clock.Elapsed.TotalMilliseconds - LeadMs;
+            int delayMs = (int)aheadMs;
+            return delayMs > 0 ? Task.Delay(delayMs, ct) : Task.CompletedTask;
+        }
+
+        /// <summary>Wait for the production lead to play out, plus a small
+        /// margin for the radio FIFO, before MOX falls.</summary>
+        public Task DrainAsync(CancellationToken ct)
+        {
+            double remainingMs = ProducedMs - _clock.Elapsed.TotalMilliseconds;
+            int delayMs = Math.Max(0, (int)remainingMs) + 20;
+            return Task.Delay(delayMs, ct);
+        }
+
+        private double ProducedMs => _producedSamples * 1000.0 / RateHz;
     }
 
     private void TryReleaseMox(string reason, string? remoteTxLeaseId = null)
@@ -572,15 +664,15 @@ public sealed class CwEngine : BackgroundService
     /// at <paramref name="wpm"/>. <paramref name="basebandHz"/> is the live
     /// engine's signed <c>(TX effective LO − TX carrier Hz)</c> — pass -600
     /// for CWU, +600 for CWL, or any signed offset to exercise CTUN.</summary>
-    internal static float[] RenderForTest(string text, int wpm, int basebandHz)
+    internal static float[] RenderForTest(string text, int wpm, int basebandHz, int rateHz = SampleRateHz)
     {
         double phase = 0.0;
-        double phaseStep = 2.0 * Math.PI * basebandHz / SampleRateHz;
+        double phaseStep = 2.0 * Math.PI * basebandHz / rateHz;
         var buf = new System.Collections.Generic.List<float>();
         foreach (var sym in MorseEncoder.Encode(text, wpm))
         {
-            int total = (int)((long)sym.DurationMs * SampleRateHz / 1000);
-            int ramp = Math.Min((int)((long)RampMs * SampleRateHz / 1000), total / 2);
+            int total = (int)((long)sym.DurationMs * rateHz / 1000);
+            int ramp = Math.Min((int)((long)RampMs * rateHz / 1000), total / 2);
             for (int i = 0; i < total; i++)
             {
                 double env = sym.KeyDown ? RaisedCosineEnvelope(i, total, ramp) : 0.0;

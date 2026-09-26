@@ -47,10 +47,25 @@ public static class RadioFrequencyResolver
     public static long TxFrequencyHz(StateDto state)
     {
         var receiver = TxReceiver(state);
-        return receiver.SplitEnabled && receiver.TxVfoHz > 0
-            ? receiver.TxVfoHz
-            : receiver.VfoHz;
+        return ResolveTxFrequencyHz(
+            receiver.Mode, receiver.VfoHz, receiver.SplitEnabled, receiver.TxVfoHz, state.Fm);
     }
+
+    // FM repeater shift (Thetis console.cs:29348-29367, applied to TXFreq on
+    // key-up): only while the TX mode is FM, the shift is not Simplex, and
+    // split is OFF — split owns the TX dial and Thetis disables the FM
+    // shift controls while it is on (console.cs:35630). The dial (VfoHz /
+    // TxDialFrequencyHz) never moves; only the transmitted carrier does.
+    internal static long ResolveTxFrequencyHz(
+        RxMode txMode, long vfoHz, bool splitEnabled, long txVfoHz, FmConfig? fm)
+    {
+        if (splitEnabled)
+            return txVfoHz > 0 ? txVfoHz : vfoHz;
+        return vfoHz + FmRepeaterOffsetHz(txMode, vfoHz, fm);
+    }
+
+    public static long FmRepeaterOffsetHz(RxMode txMode, long rxHz, FmConfig? fm) =>
+        txMode == RxMode.FM ? (fm ?? FmConfig.Default).SignedRepeaterOffsetHz(rxHz) : 0;
 
     public static long TxDialFrequencyHz(StateDto state)
     {

@@ -154,6 +154,9 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
     public double GetRxaSignalDbm(int channelId) => _inner.GetRxaSignalDbm(channelId);
     public RxStageMeters GetRxStageMeters(int channelId) => _inner.GetRxStageMeters(channelId);
     public void SetTxMode(RxMode mode) => _inner.SetTxMode(mode);
+    public void SetTxAmBroadcast(AmBroadcastConfig config) => _inner.SetTxAmBroadcast(config);
+    public void SetTxAmFilter(int highPassHz, int lowPassHz) => _inner.SetTxAmFilter(highPassHz, lowPassHz);
+    public bool TxAmBroadcastSupported => _inner.TxAmBroadcastSupported;
     public void SetTxDigitalBypass(bool bypass) => _inner.SetTxDigitalBypass(bypass);
     public void SetTxInjectedAudioBypass(bool bypass) => _inner.SetTxInjectedAudioBypass(bypass);
     public void SetTxRogerBeepBypass(bool bypass) => _inner.SetTxRogerBeepBypass(bypass);
@@ -221,6 +224,8 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
 
     public void SetCfcConfig(CfcConfig cfg) => _inner.SetCfcConfig(cfg);
     public void SetDexpConfig(DexpConfig cfg) => _inner.SetDexpConfig(cfg);
+    public void SetFmConfig(FmConfig cfg) => _inner.SetFmConfig(cfg);
+    public FmDspStatus GetFmDspStatus() => _inner.GetFmDspStatus();
     public DexpMeterDto GetDexpMeter() => _inner.GetDexpMeter();
     public void SetTxMonitorEnabled(bool enabled) => _inner.SetTxMonitorEnabled(enabled);
     public int ReadTxMonitorAudio(Span<float> output) => _inner.ReadTxMonitorAudio(output);

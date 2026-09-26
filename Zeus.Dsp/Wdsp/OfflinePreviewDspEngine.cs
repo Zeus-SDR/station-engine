@@ -227,6 +227,13 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetTxAmCarrierLevel(double carrierLevel) =>
         _tx.SetTxAmCarrierLevel(carrierLevel);
 
+    public void SetTxAmBroadcast(AmBroadcastConfig config) => _tx.SetTxAmBroadcast(config);
+
+    public void SetTxAmFilter(int highPassHz, int lowPassHz) => _tx.SetTxAmFilter(highPassHz, lowPassHz);
+
+    public bool TxAmBroadcastSupported => _tx.TxAmBroadcastSupported;
+    public void SetFmConfig(FmConfig cfg) => _tx.SetFmConfig(cfg);
+
     public void SetTxDigitalBypass(bool bypass) => _tx.SetTxDigitalBypass(bypass);
     public void SetTxInjectedAudioBypass(bool bypass) => _tx.SetTxInjectedAudioBypass(bypass);
     public void SetTxRogerBeepBypass(bool bypass) => _tx.SetTxRogerBeepBypass(bypass);

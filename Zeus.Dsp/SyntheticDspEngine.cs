@@ -274,6 +274,9 @@ public sealed class SyntheticDspEngine : IDspEngine
     // DEXP — synthetic has no mic path; validate the payload only.
     public void SetDexpConfig(DexpConfig cfg) => ArgumentNullException.ThrowIfNull(cfg);
 
+    // FM — synthetic has no FM chain; validate the payload only.
+    public void SetFmConfig(FmConfig cfg) => ArgumentNullException.ThrowIfNull(cfg);
+
     public DexpMeterDto GetDexpMeter() => DexpMeterDto.Inactive;
 
     // TX Monitor — synthetic has no TXA / RXA, no IQ to demodulate. Toggle is

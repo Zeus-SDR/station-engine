@@ -1196,20 +1196,28 @@ public class DspPipelineService : BackgroundService,
         StateDto s,
         RxMode txEngineMode)
     {
+        // One live TX audio config for every mode: AM/SAM use the same mic /
+        // leveler / leveling / CFC / rotator as SSB. Their live TX pair is
+        // already the symmetric -hi..+hi bandpass (RadioService re-signs the
+        // shared voice cuts per mode).
         var txMode = RadioFrequencyResolver.TxReceiver(s).Mode;
-        var am = RadioService.NormalizeAmTxProfile(s.AmTxProfile);
-        if (txMode is RxMode.AM or RxMode.SAM)
+        if (txMode == RxMode.FM)
         {
-            int high = am.TxFilterHighHz;
+            // Thetis console.cs:8016 UpdateTXLowHighFilterForMode: the FM TX
+            // bandpass is ±(TXFMDeviation + TXFMHighCut) — ±8000 at stock —
+            // independent of the SSB-style TX filter. FM mic gain (ptbFMMic)
+            // overrides the ordinary mic gain when set.
+            var fm = (s.Fm ?? FmConfig.Default).Normalized();
+            int half = fm.DeviationHz + fm.TxHighCutHz;
             return new(
-                am.MicGainDb,
-                am.LevelerMaxGainDb,
-                am.TxLeveling,
-                am.Cfc,
-                am.TxPhaseRotator,
-                -high,
-                high,
-                0.5 * Math.Sqrt(am.CarrierLevelPercent / 100.0));
+                fm.MicGainDb ?? s.MicGainDb,
+                s.LevelerMaxGainDb,
+                s.TxLeveling ?? new TxLevelingConfig(),
+                s.Cfc ?? CfcConfig.Default,
+                s.TxPhaseRotator ?? new TxPhaseRotatorConfig(),
+                -half,
+                half,
+                0.5 * Math.Sqrt(AmCarrierLevel.Clamp(s.AmCarrierLevelPercent) / 100.0));
         }
         int loAbs = Math.Min(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
         int hiAbs = Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
@@ -1226,7 +1234,7 @@ public class DspPipelineService : BackgroundService,
             s.TxPhaseRotator ?? new TxPhaseRotatorConfig(),
             low,
             highNormal,
-            0.5 * Math.Sqrt(am.CarrierLevelPercent / 100.0));
+            0.5 * Math.Sqrt(AmCarrierLevel.Clamp(s.AmCarrierLevelPercent) / 100.0));
     }
 
     private static (int low, int high) SignedTxFilterFor(StateDto s, RxMode txEngineMode)
@@ -1349,6 +1357,26 @@ public class DspPipelineService : BackgroundService,
     // with the persisted value matching the 8 dB default still re-pushes it.
     private double _appliedTxLevelerMaxGainDb = double.NaN;
     private double _appliedTxAmCarrierLevel = double.NaN;
+    // Broadcast-AM modulator config + AM modulator audio filter (high-pass =
+    // AM low cut, brickwall low-pass = AM high cut) last pushed to the engine.
+    private AmBroadcastConfig? _appliedAmBroadcast;
+    private (int HighPassHz, int LowPassHz)? _appliedAmModFilter;
+
+    // The native AM stage applies these only in ammod mode 0 (AM/SAM), so they
+    // are pushed regardless of the live TX mode; entering AM needs no re-push.
+    // High-pass = the live voice low cut, low-pass = the live high cut.
+    internal static (int HighPassHz, int LowPassHz) AmModulatorFilterFor(StateDto s)
+    {
+        int high = Math.Clamp(
+            Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz)),
+            RadioService.MinFilterWidthHz,
+            RadioService.MaxFilterEdgeHz);
+        int lowCeiling = Math.Max(0, Math.Min(AmModulatorFilter.MaxHighPassHz, high - RadioService.MinFilterWidthHz));
+        return (Math.Clamp(Math.Abs(s.TxLowCutHz), 0, lowCeiling), high);
+    }
+    // FM config latch (compared with FmConfig.DspEquals — the repeater offset
+    // map is not DSP state). Null seed forces the first apply.
+    private FmConfig? _appliedFm;
     private NrConfig _appliedNr = new();
     // Diversity-combiner latch. Null seed so the first state push always applies
     // (mirrors _appliedNr's change-detect). Global, not per-channel.
@@ -2076,6 +2104,28 @@ public class DspPipelineService : BackgroundService,
     /// the radio wire MOX bit is asserted on a new key-down.
     /// </summary>
     public virtual bool PrimeTxDspForKeyDown() => ResolveTxIngest()?.PrimeTxDspForKeyDown() ?? false;
+
+    /// <summary>Arm an FM access tone burst on the TX mic stream (see
+    /// <see cref="FmToneBurstGenerator"/>). False when no TX ingest exists.</summary>
+    public virtual bool ArmFmToneBurst(double toneHz, int durationMs, double micGainDb)
+    {
+        var ingest = ResolveTxIngest();
+        if (ingest is null) return false;
+        ingest.ArmFmToneBurst(toneHz, durationMs, micGainDb);
+        return true;
+    }
+
+    public virtual void CancelFmToneBurst() => ResolveTxIngest()?.CancelFmToneBurst();
+
+    /// <summary>Live FM readouts from the current engine; Unavailable when no
+    /// engine is running.</summary>
+    public virtual FmDspStatus GetFmDspStatus()
+    {
+        var engine = CurrentEngine;
+        if (engine is null) return FmDspStatus.Unavailable;
+        try { return engine.GetFmDspStatus() ?? FmDspStatus.Unavailable; }
+        catch (ObjectDisposedException) { return FmDspStatus.Unavailable; }
+    }
 
     /// <summary>
     /// Leaves a zero word at the output of a legacy Protocol-2 radio's TX FIFO
@@ -5935,6 +5985,16 @@ public class DspPipelineService : BackgroundService,
         // TX filter (legacy prefs DB, or a writer that set the mode without
         // re-signing the TX width) would otherwise transmit USB. This is
         // idempotent for well-formed state, so it never fights an operator edit.
+        // FM before the TX bandpass: in FM the engine re-sends the FM audio
+        // cuts right after SetTXABandpassFreqs, so it must already hold the
+        // new config. A deviation / TX high-cut change also moves the FM TX
+        // bandpass below (±(dev + high cut)), which the latch then re-pushes.
+        var fm = (s.Fm ?? FmConfig.Default).Normalized();
+        if (!fm.DspEquals(_appliedFm))
+        {
+            engine.SetFmConfig(fm);
+            _appliedFm = fm;
+        }
         var (txLow, txHigh) = SignedTxFilterFor(s, txEngineMode);
         if (txLow != _appliedTxLowHz || txHigh != _appliedTxHighHz)
         {
@@ -6093,6 +6153,18 @@ public class DspPipelineService : BackgroundService,
         {
             engine.SetTxAmCarrierLevel(amCarrierLevel);
             _appliedTxAmCarrierLevel = amCarrierLevel;
+        }
+        var amBroadcast = (s.AmBroadcast ?? AmBroadcastConfig.Default).Clamped();
+        if (!amBroadcast.Equals(_appliedAmBroadcast))
+        {
+            engine.SetTxAmBroadcast(amBroadcast);
+            _appliedAmBroadcast = amBroadcast;
+        }
+        var amModFilter = AmModulatorFilterFor(s);
+        if (amModFilter != _appliedAmModFilter)
+        {
+            engine.SetTxAmFilter(amModFilter.HighPassHz, amModFilter.LowPassHz);
+            _appliedAmModFilter = amModFilter;
         }
         ApplyVisibleDdcZoom(engine, s);
 
@@ -6690,6 +6762,10 @@ public class DspPipelineService : BackgroundService,
         // OpenTxChannel).
         engine.SetTxMode(openTxEngineMode);
         engine.SetTxDigitalBypass(IsDigitalTxZeusMode(openTxReceiver.Mode));
+        // FM config ahead of the TX filter (see OnRadioStateChanged). The
+        // engine also caches it for TXA/RXA channels it opens later.
+        var openFm = (s.Fm ?? FmConfig.Default).Normalized();
+        engine.SetFmConfig(openFm);
         var (openRxLow, openRxHigh) = SignedRxFilterFor(s, openEngineMode);
         engine.SetFilter(channelId, openRxLow, openRxHigh);
         // Sign the TX bandpass from the live mode (see SignedTxFilterFor) so a
@@ -6728,6 +6804,10 @@ public class DspPipelineService : BackgroundService,
         engine.SetTxLevelerMaxGain(levelerMax);
         double carrierLevel = effectiveTxAudio.CarrierCoefficient;
         engine.SetTxAmCarrierLevel(carrierLevel);
+        var openAmBroadcast = (s.AmBroadcast ?? AmBroadcastConfig.Default).Clamped();
+        engine.SetTxAmBroadcast(openAmBroadcast);
+        var openAmModFilter = AmModulatorFilterFor(s);
+        engine.SetTxAmFilter(openAmModFilter.HighPassHz, openAmModFilter.LowPassHz);
         engine.SetNoiseReduction(channelId, nr);
         // Force-apply AGC mode/custom params on a fresh engine so the operator's
         // persisted choice survives a reconnect. The engine's channel-open path
@@ -6787,6 +6867,9 @@ public class DspPipelineService : BackgroundService,
         _appliedTxMicGainLinear = micLinearInit;
         _appliedTxLevelerMaxGainDb = levelerMax;
         _appliedTxAmCarrierLevel = carrierLevel;
+        _appliedAmBroadcast = openAmBroadcast;
+        _appliedAmModFilter = openAmModFilter;
+        _appliedFm = openFm;
         _appliedNr = nr;
         _appliedAgc = agc;
         _appliedSquelch = squelch;

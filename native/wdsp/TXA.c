@@ -344,7 +344,8 @@ void create_txa (int channel)
 		ch[channel].dsp_size,						// size
 		txa[channel].midbuff,						// pointer to input buffer
 		txa[channel].midbuff,						// pointer to output buffer
-		0.5);										// carrier level
+		0.5,										// carrier level
+		ch[channel].dsp_rate);						// sample rate (broadcast HPF / LPF / pre-emphasis)
 
 
 	txa[channel].fmmod.p = create_fmmod (

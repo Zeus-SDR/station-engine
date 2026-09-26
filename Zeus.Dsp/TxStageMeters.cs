@@ -83,7 +83,13 @@ public readonly record struct TxStageMeters(
     float AlcAv,
     float AlcGr,
     float OutPk,
-    float OutAv)
+    float OutAv,
+    // Broadcast-AM modulation peaks (percent) over the meter window: positive
+    // peak and the MAGNITUDE of the negative peak (97 => -97 %). Only non-zero
+    // while transmitting AM/SAM; 0 otherwise or on a libwdsp without the
+    // GetTXAAMModPeaks export.
+    float AmModPosPct = 0f,
+    float AmModNegPct = 0f)
 {
     public static readonly TxStageMeters Silent = new(
         MicPk: float.NegativeInfinity,

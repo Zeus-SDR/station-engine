@@ -6,6 +6,9 @@ internal interface IWdspTxControlNative
 {
     void SetTXAMode(int channel, int mode);
     void SetTXAAMCarrierLevel(int channel, double carrierLevel);
+    void SetTXAAMBroadcast(int channel, int run, double posLimit, double negLimit, int preemph, int invert);
+    void SetTXAAMFilter(int channel, double hpfHz, double lpfHz);
+    void GetTXAAMModPeaks(int channel, out double posPct, out double negPct);
     void SetTXACompressorRun(int channel, int run);
     void SetTXAosctrlRun(int channel, int run);
     void SetTXAosctrlBandwidth(int channel, double bandwidth);
@@ -24,6 +27,20 @@ internal interface IWdspTxControlNative
     void SetTXAPostGenMode(int channel, int mode);
     void SetTXAPostGenToneMag(int channel, double magnitude);
     void SetTXAPostGenToneFreq(int channel, double frequency);
+    void SetTXAFMDeviation(int channel, double deviation);
+    void SetTXAFMEmphPosition(int channel, int position);
+    void SetTXAFMAFFilter(int channel, double low, double high);
+    void SetTXACTCSSRun(int channel, int run);
+    void SetTXACTCSSFreq(int channel, double freq);
+    // Zeus FM extension: callers must check IsExportAvailable first.
+    void SetTXACTCSSLevel(int channel, double level);
+    void SetTXADCSRun(int channel, int run);
+    void SetTXADCSCode(int channel, int code, int inverted);
+    void SetTXAFMEmphRun(int channel, int run);
+    void GetTXAFMDeviationPeak(int channel, out double peakHz);
+    /// <summary>True when the loaded libwdsp exports <paramref name="symbol"/>
+    /// (cached per symbol). Never throws.</summary>
+    bool IsExportAvailable(string symbol);
 }
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
@@ -33,6 +50,15 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXAAMCarrierLevel(int channel, double carrierLevel) =>
         NativeMethods.SetTXAAMCarrierLevel(channel, carrierLevel);
+
+    public void SetTXAAMBroadcast(int channel, int run, double posLimit, double negLimit, int preemph, int invert) =>
+        NativeMethods.SetTXAAMBroadcast(channel, run, posLimit, negLimit, preemph, invert);
+
+    public void SetTXAAMFilter(int channel, double hpfHz, double lpfHz) =>
+        NativeMethods.SetTXAAMFilter(channel, hpfHz, lpfHz);
+
+    public void GetTXAAMModPeaks(int channel, out double posPct, out double negPct) =>
+        NativeMethods.GetTXAAMModPeaks(channel, out posPct, out negPct);
 
     public void SetTXACompressorRun(int channel, int run) =>
         NativeMethods.SetTXACompressorRun(channel, run);
@@ -94,4 +120,37 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXAPostGenToneFreq(int channel, double frequency) =>
         NativeMethods.SetTXAPostGenToneFreq(channel, frequency);
+
+    public void SetTXAFMDeviation(int channel, double deviation) =>
+        NativeMethods.SetTXAFMDeviation(channel, deviation);
+
+    public void SetTXAFMEmphPosition(int channel, int position) =>
+        NativeMethods.SetTXAFMEmphPosition(channel, position);
+
+    public void SetTXAFMAFFilter(int channel, double low, double high) =>
+        NativeMethods.SetTXAFMAFFilter(channel, low, high);
+
+    public void SetTXACTCSSRun(int channel, int run) =>
+        NativeMethods.SetTXACTCSSRun(channel, run);
+
+    public void SetTXACTCSSFreq(int channel, double freq) =>
+        NativeMethods.SetTXACTCSSFreq(channel, freq);
+
+    public void SetTXACTCSSLevel(int channel, double level) =>
+        NativeMethods.SetTXACTCSSLevel(channel, level);
+
+    public void SetTXADCSRun(int channel, int run) =>
+        NativeMethods.SetTXADCSRun(channel, run);
+
+    public void SetTXADCSCode(int channel, int code, int inverted) =>
+        NativeMethods.SetTXADCSCode(channel, code, inverted);
+
+    public void SetTXAFMEmphRun(int channel, int run) =>
+        NativeMethods.SetTXAFMEmphRun(channel, run);
+
+    public void GetTXAFMDeviationPeak(int channel, out double peakHz) =>
+        NativeMethods.GetTXAFMDeviationPeak(channel, out peakHz);
+
+    public bool IsExportAvailable(string symbol) =>
+        WdspNativeLoader.TryProbeExport(symbol);
 }

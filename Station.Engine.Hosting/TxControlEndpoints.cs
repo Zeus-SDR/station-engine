@@ -1,11 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using Zeus.Contracts;
+using Zeus.Dsp;
 namespace Zeus.Server;
 
 /// <summary>Maps core CW and TX-control routes.</summary>
 public static class TxControlEndpoints
 {
+    /// <summary>Combine engine FM readouts with the effective repeater shift:
+    /// active only while the TX mode is FM, split is off and the signed offset
+    /// is non-zero; EffectiveShift is the direction actually applied
+    /// (Reverse folded in).</summary>
+    internal static FmStatusDto BuildFmStatus(FmDspStatus dsp, StateDto state)
+    {
+        var rx = RadioFrequencyResolver.TxReceiver(state);
+        long offset = rx.SplitEnabled
+            ? 0
+            : RadioFrequencyResolver.FmRepeaterOffsetHz(rx.Mode, rx.VfoHz, state.Fm);
+        var shift = offset > 0 ? FmRepeaterShift.Plus
+            : offset < 0 ? FmRepeaterShift.Minus
+            : FmRepeaterShift.Simplex;
+        return new FmStatusDto(
+            dsp.ToneDecodeAvailable,
+            dsp.DcsAvailable,
+            dsp.DeviationMeterAvailable,
+            dsp.CtcssLevelAvailable,
+            dsp.DeEmphasisBypassAvailable,
+            dsp.DetectedCtcssHz,
+            dsp.DetectedDcsCode,
+            dsp.DetectedDcsInverted,
+            dsp.ToneSquelchOpen,
+            dsp.TxPeakDeviationHz,
+            RepeaterShiftActive: offset != 0,
+            TxFrequencyHz: RadioFrequencyResolver.TxFrequencyHz(state),
+            EffectiveShift: shift);
+    }
+
     public static IEndpointRouteBuilder MapTxControlEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
@@ -115,22 +145,63 @@ public static class TxControlEndpoints
             return Results.Ok(new { micGainDb = snap.MicGainDb });
         });
 
-        endpoints.MapGet("/api/tx/am-profile", (RadioService r) =>
-            Results.Ok(r.GetAmTxProfile()));
-
-        endpoints.MapPost("/api/tx/am-profile", (AmTxProfileSetRequest req, RadioService r) =>
+        // Legacy symmetric AM carrier level (0..125 %, clamped), used by AM/SAM
+        // when broadcast AM is disabled. Part of the single live TX audio
+        // config (StateDto.AmCarrierLevelPercent); TX audio profiles carry it.
+        endpoints.MapPost("/api/tx/am-carrier-level", (AmCarrierLevelSetRequest req, RadioService r) =>
         {
-            if (req.AmTxProfile is null)
-                return Results.BadRequest(new { error = "amTxProfile required" });
-            r.SetAmTxProfile(req.AmTxProfile);
+            var snap = r.SetAmCarrierLevel(req.CarrierLevelPercent);
+            return Results.Ok(new { carrierLevelPercent = snap.AmCarrierLevelPercent });
+        });
+
+        // Broadcast AM (AM/SAM TX modulator): asymmetric +pos/-neg modulation,
+        // clipper + brickwall LPF at the AM high cut, optional pre-emphasis and
+        // polarity invert, PEP-preserving carrier. Body/response is
+        // AmBroadcastConfig; out-of-range percentages are clamped (pos 100..150,
+        // neg 80..100) and the sanitized config is returned. Also mirrored on
+        // StateDto.AmBroadcast.
+        endpoints.MapGet("/api/tx/am-broadcast", (RadioService r) =>
+            Results.Ok(r.GetAmBroadcast()));
+
+        endpoints.MapPost("/api/tx/am-broadcast", (AmBroadcastConfig? req, RadioService r) =>
+        {
+            if (req is null)
+                return Results.BadRequest(new { error = "amBroadcast body required" });
+            return Results.Ok(r.SetAmBroadcast(req));
+        });
+
+        // supported: true when the live WDSP engine carries the broadcast-AM
+        // native stage, false when the engine lacks it (stale libwdsp or a
+        // non-WDSP engine), null when no DSP engine is running.
+        endpoints.MapGet("/api/tx/am-broadcast/status", (DspPipelineService pipe) =>
+            Results.Ok(new { supported = pipe.CurrentEngine?.TxAmBroadcastSupported }));
+        // FM configuration (Thetis FM console panel + Setup -> DSP -> FM):
+        // deviation, FM audio cuts, pre-emphasis position, FM mic, CTCSS
+        // encode + RX tone notch, detector limiter, repeater shift/reverse and
+        // per-band offsets. RadioService normalizes (clamps / snaps) and
+        // persists; the pipeline pushes it to TX and every RX channel.
+        endpoints.MapGet("/api/fm", (RadioService r) =>
+            Results.Ok(r.GetFmConfig()));
+
+        endpoints.MapPost("/api/fm", (FmConfigSetRequest req, RadioService r) =>
+        {
+            if (req?.Fm is null)
+                return Results.BadRequest(new { error = "fm required" });
+            r.SetFmConfig(req.Fm);
             return Results.Ok(r.Snapshot());
         });
 
-        endpoints.MapPost("/api/tx/am-profile/capture-current", (RadioService r) =>
-        {
-            r.CaptureCurrentAmTxProfile();
-            return Results.Ok(r.Snapshot());
-        });
+        // Live FM readouts for the operator strip (polled ~5 Hz): engine tone
+        // decode / deviation meter + the effective repeater shift and TX carrier.
+        endpoints.MapGet("/api/fm/status", (RadioService r, DspPipelineService pipeline) =>
+            Results.Ok(BuildFmStatus(pipeline.GetFmDspStatus(), r.Snapshot())));
+
+        // Access tone burst on demand. Only while keyed voice TX in FM; it
+        // never keys the transmitter (409 otherwise).
+        endpoints.MapPost("/api/fm/burst", (TxService tx) =>
+            tx.TryStartFmToneBurst(out var error)
+                ? Results.Ok(new { ok = true })
+                : Results.Conflict(new { error }));
 
         // Leveler max-gain ceiling in dB. Operator band is 0..20 dB (Thetis parity,
         // setup.designer.cs): 0 disables the headroom entirely (unity-cap Leveler);

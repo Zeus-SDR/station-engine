@@ -256,11 +256,22 @@ internal sealed class EngineTransmitSafetyModule
         {
             return TransmitSafetyDecision.Deny(
                 TransmitSafetyReasonCode.OutOfBand,
-                $"TX blocked: {envelope.LowHz / 1_000_000.0:F6}-{envelope.HighHz / 1_000_000.0:F6} MHz emission envelope is not allowed for mode {RadioFrequencyResolver.TxMode(snapshot.State)} in region {snapshot.Region.DisplayName}",
+                $"TX blocked: {envelope.LowHz / 1_000_000.0:F6}-{envelope.HighHz / 1_000_000.0:F6} MHz emission envelope is not allowed for mode {RadioFrequencyResolver.TxMode(snapshot.State)} in region {snapshot.Region.DisplayName}{RepeaterShiftNote(snapshot.State)}",
                 envelope);
         }
 
         return TransmitSafetyDecision.Allow(envelope);
+    }
+
+    // An FM repeater shift moves the carrier off the dial; say so, or the
+    // operator sees an in-band dial and an unexplained out-of-band refusal.
+    private static string RepeaterShiftNote(StateDto state)
+    {
+        var rx = RadioFrequencyResolver.TxReceiver(state);
+        if (rx.SplitEnabled) return "";
+        long offset = RadioFrequencyResolver.FmRepeaterOffsetHz(rx.Mode, rx.VfoHz, state.Fm);
+        if (offset == 0) return "";
+        return $" (FM repeater shift {(offset > 0 ? "+" : "-")}{Math.Abs(offset) / 1_000_000.0:0.######} MHz moves the transmit carrier from the {rx.VfoHz / 1_000_000.0:F6} MHz dial to {(rx.VfoHz + offset) / 1_000_000.0:F6} MHz; check the shift / offset or use Simplex)";
     }
 
     public TransmitSafetyDecision RevalidateActive(
@@ -500,10 +511,6 @@ internal sealed class EngineTransmitSafetyModule
 
 internal static class TxEmissionEnvelopeResolver
 {
-    // WDSP TXA.c constructs FM with 5 kHz deviation; its audio high edge is
-    // supplied by the live TX filter. Carson containment is deviation + fmax.
-    private const int FmDeviationHz = 5_000;
-
     public static TxEmissionEnvelope Resolve(TransmitIntent intent, StateDto state, MoxSource? source = null)
     {
         long baseCarrier = RadioFrequencyResolver.TxFrequencyHz(state);
@@ -537,7 +544,12 @@ internal static class TxEmissionEnvelopeResolver
 
         if (txMode == RxMode.FM)
         {
-            long extent = FmDeviationHz + hiAbs;
+            // Carson containment: the operator's FM deviation plus the TX
+            // audio high cut — the same ±(dev + high cut) the WDSP FM TX
+            // bandpass is locked to (Thetis console.cs:8016). The carrier
+            // above already includes any repeater shift.
+            var fm = (state.Fm ?? FmConfig.Default).Normalized();
+            long extent = fm.DeviationHz + fm.TxHighCutHz;
             return new TxEmissionEnvelope(carrier - extent, carrier + extent);
         }
 

@@ -989,18 +989,409 @@ public sealed record TxPhaseRotatorAsymmetry(
     double CurrentCornerHz,
     double AutoStep);
 
-/// <summary>Dedicated AM/SAM transmit chain selected automatically by the DSP
-/// pipeline without overwriting the ordinary voice-mode settings.</summary>
-public sealed record AmTxProfile
+/// <summary>Legacy (pre-broadcast-AM) symmetric AM carrier level, used when
+/// <see cref="AmBroadcastConfig.Enabled"/> is false. Part of the single live TX
+/// audio config (StateDto.AmCarrierLevelPercent) and of TX audio profiles.</summary>
+public static class AmCarrierLevel
 {
-    public int CarrierLevelPercent { get; init; } = 100;
-    public int MicGainDb { get; init; }
-    public double LevelerMaxGainDb { get; init; } = 8.0;
-    public TxLevelingConfig TxLeveling { get; init; } = new();
-    public CfcConfig Cfc { get; init; } = CfcConfig.Default;
-    public TxPhaseRotatorConfig TxPhaseRotator { get; init; } = new();
-    public int TxFilterHighHz { get; init; } = 4000;
+    public const int DefaultPercent = 100;
+    public const int MinPercent = 0;
+    public const int MaxPercent = 125;
+
+    public static int Clamp(int percent) => Math.Clamp(percent, MinPercent, MaxPercent);
 }
+
+/// <summary>AM/SAM modulator audio high-pass limits. In AM/SAM the live voice
+/// low cut (StateDto.TxLowCutHz) becomes a high-pass on the modulating signal
+/// inside WDSP's AM modulator; the TX bandpass itself stays -High..+High.</summary>
+public static class AmModulatorFilter
+{
+    public const int MaxHighPassHz = 2000;
+}
+
+/// <summary>Broadcast-style AM modulation (AM/SAM TX only). When enabled, the
+/// WDSP AM modulator clips the modulating signal asymmetrically — positive
+/// peaks up to <see cref="PositivePeakPct"/>, negative peaks held at
+/// <see cref="NegativePeakPct"/> so the carrier never pinches off — then
+/// brickwall low-passes it at the AM TX high cut and derives the carrier so
+/// peak envelope power is unchanged. Disabled = the legacy symmetric AM
+/// formula (carrier level from StateDto.AmCarrierLevelPercent).
+/// </summary>
+public sealed record AmBroadcastConfig(
+    bool Enabled = true,
+    double PositivePeakPct = AmBroadcastConfig.DefaultPositivePeakPct,
+    double NegativePeakPct = AmBroadcastConfig.DefaultNegativePeakPct,
+    bool PreEmphasis = false,
+    bool InvertPolarity = false)
+{
+    public const double DefaultPositivePeakPct = 125;
+    public const double DefaultNegativePeakPct = 97;
+    public const double MinPositivePeakPct = 100;
+    public const double MaxPositivePeakPct = 150;
+    public const double MinNegativePeakPct = 80;
+    public const double MaxNegativePeakPct = 100;
+
+    public static AmBroadcastConfig Default { get; } = new();
+
+    /// <summary>Clamp percentages into the supported envelope; non-finite
+    /// values fall back to the defaults.</summary>
+    public AmBroadcastConfig Clamped() => this with
+    {
+        PositivePeakPct = double.IsFinite(PositivePeakPct)
+            ? Math.Clamp(PositivePeakPct, MinPositivePeakPct, MaxPositivePeakPct)
+            : DefaultPositivePeakPct,
+        NegativePeakPct = double.IsFinite(NegativePeakPct)
+            ? Math.Clamp(NegativePeakPct, MinNegativePeakPct, MaxNegativePeakPct)
+            : DefaultNegativePeakPct,
+    };
+}
+
+/// <summary>FM repeater TX shift (Thetis FMTXMode, enums.cs:381). Applied to
+/// the TX carrier only while TX mode is FM and split is off.</summary>
+public enum FmRepeaterShift
+{
+    Simplex = 0,
+    Plus = 1,
+    Minus = 2,
+}
+
+/// <summary>Receive tone squelch (beyond Thetis, which only notches the
+/// tone): Ctcss opens on <see cref="FmConfig.EffectiveRxCtcssToneHz"/>, Dcs
+/// on <see cref="FmConfig.EffectiveRxDcsCode"/>. Requires a WDSP build with
+/// the Zeus FM tone decoder; see <see cref="FmStatusDto.ToneDecodeAvailable"/>.</summary>
+public enum FmRxToneSquelch
+{
+    Off = 0,
+    Ctcss = 1,
+    Dcs = 2,
+}
+
+/// <summary>FM receive/transmit configuration — a port of the Thetis FM
+/// console panel (deviation, CTCSS, repeater offset, FM mic) and the Setup →
+/// DSP → FM tab (audio filters, pre-emphasis position, CTCSS tone notch,
+/// detector limiter). Defaults are Thetis stock, except that CTCSS encode is
+/// OFF (WDSP create_fmmod seeds it ON at 100 Hz; Thetis SyncAll forces it off
+/// and so does Zeus).</summary>
+public sealed record FmConfig
+{
+    /// <summary>Peak deviation for TX and RX demod scaling. Thetis offers
+    /// exactly 5000 and 2500 (console.cs FM_deviation_array); Zeus accepts
+    /// 1000..8000 in 100 Hz steps with those two as the Wide/Narrow presets.</summary>
+    public int DeviationHz { get; init; } = DefaultDeviationHz;
+
+    /// <summary>TX audio passband (pre-emphasis + modulator post-filter,
+    /// WDSP SetTXAFMAFFilter). Thetis udFMLowCutTX / udFMHighCutTX.</summary>
+    public int TxLowCutHz { get; init; } = DefaultLowCutHz;
+    public int TxHighCutHz { get; init; } = DefaultHighCutHz;
+
+    /// <summary>RX de-emphasis + audio passband (WDSP SetRXAFMAFFilter).
+    /// Thetis udFMLowCutRX / udFMHighCutRX. The RX IF bandpass is derived as
+    /// ±(DeviationHz + RxHighCutHz).</summary>
+    public int RxLowCutHz { get; init; } = DefaultLowCutHz;
+    public int RxHighCutHz { get; init; } = DefaultHighCutHz;
+
+    /// <summary>Thetis chkEmphPos "Pre-emphasize before limiting". False =
+    /// WDSP position 1 (after ALC, just ahead of the modulator — Thetis
+    /// default); true = position 0 (ahead of leveler/CFC/compressor/ALC).
+    /// Pre-emphasis itself always runs in FM.</summary>
+    public bool PreEmphasisBeforeLimiting { get; init; }
+
+    /// <summary>Dedicated FM mic gain (Thetis ptbFMMic). Null = follow the
+    /// ordinary mic gain.</summary>
+    public int? MicGainDb { get; init; }
+
+    /// <summary>CTCSS sub-audible tone encode (WDSP SetTXACTCSSRun/Freq).</summary>
+    public bool CtcssEnabled { get; init; }
+    public double CtcssToneHz { get; init; } = DefaultCtcssToneHz;
+
+    /// <summary>Notch the CTCSS tone out of RX audio (Thetis chkRemoveTone,
+    /// WDSP SetRXACTCSSRun). The notch tracks the effective RX tone
+    /// (<see cref="EffectiveRxCtcssToneHz"/>).</summary>
+    public bool RxToneNotch { get; init; } = true;
+
+    /// <summary>CTCSS injection as WDSP's ctcss_level x 100 (tone amplitude
+    /// relative to full-scale audio). WDSP hard-codes 10; the resulting tone
+    /// deviation is DeviationHz x L / (100 + L). Zeus extension
+    /// (SetTXACTCSSLevel).</summary>
+    public double CtcssLevelPercent { get; init; } = DefaultCtcssLevelPercent;
+
+    /// <summary>Split tone: RX CTCSS tone for squelch/notch/scan reference.
+    /// Null = same as <see cref="CtcssToneHz"/>.</summary>
+    public double? RxCtcssToneHz { get; init; }
+
+    /// <summary>DCS (digital coded squelch) TX encode. Mutually exclusive
+    /// with CTCSS encode: enabling DCS turns <see cref="CtcssEnabled"/> off.
+    /// The code is the octal code written as decimal digits (023 -> 23) and
+    /// must be one of <see cref="DcsCodes"/>.</summary>
+    public bool DcsTxEnabled { get; init; }
+    public int DcsCode { get; init; } = DefaultDcsCode;
+    /// <summary>Null = same as <see cref="DcsCode"/>.</summary>
+    public int? RxDcsCode { get; init; }
+    /// <summary>Inverted DCS polarity, TX and RX.</summary>
+    public bool DcsInverted { get; init; }
+
+    /// <summary>Receive tone squelch mode (Zeus extension).</summary>
+    public FmRxToneSquelch RxToneSquelch { get; init; } = FmRxToneSquelch.Off;
+
+    /// <summary>TX pre-emphasis. False = flat TX audio (packet/data), a Zeus
+    /// extension; Thetis always pre-emphasizes in FM.</summary>
+    public bool TxPreEmphasis { get; init; } = true;
+
+    /// <summary>RX de-emphasis. False = flat demodulated audio (packet/data),
+    /// a Zeus extension (SetRXAFMDeemphRun).</summary>
+    public bool RxDeEmphasis { get; init; } = true;
+
+    /// <summary>Access tone burst (European repeaters). Sent for
+    /// <see cref="ToneBurstMs"/> at the start of every FM over when
+    /// <see cref="ToneBurstOnKeyUp"/>, or on demand via POST /api/fm/burst.</summary>
+    public double ToneBurstHz { get; init; } = DefaultToneBurstHz;
+    public int ToneBurstMs { get; init; } = DefaultToneBurstMs;
+    public bool ToneBurstOnKeyUp { get; init; }
+
+    /// <summary>Automatic Repeater Shift: when the dial is tuned in FM with
+    /// Reverse off, the server sets <see cref="RepeaterShift"/> from the
+    /// repeater segments of the active band-plan IARU region. The operator can
+    /// still override the shift until the next tune.</summary>
+    public bool AutoRepeaterShift { get; init; }
+
+    /// <summary>IARU region ("R1" | "R2" | "R3") that the default repeater
+    /// offsets and the ARS table follow. Server-owned: mirrored from the
+    /// active band plan; client-supplied values are ignored.</summary>
+    public string RepeaterRegion { get; init; } = DefaultRepeaterRegion;
+
+    /// <summary>FM detector limiter (Thetis chkFMDetLimON /
+    /// tbDSPFMDetLimGain, WDSP SetRXAFMLimRun / SetRXAFMLimGain).</summary>
+    public bool DetectorLimiterEnabled { get; init; }
+    public double DetectorLimiterGainDb { get; init; } = DefaultDetectorLimiterGainDb;
+
+    /// <summary>Repeater TX shift direction and reverse (Thetis chkFMTXHigh /
+    /// Simplex / Low / Rev).</summary>
+    public FmRepeaterShift RepeaterShift { get; init; } = FmRepeaterShift.Simplex;
+    public bool RepeaterReverse { get; init; }
+
+    /// <summary>Per-band repeater offset magnitude in Hz, keyed by
+    /// <c>FmConfig.RepeaterBandKey</c>. Missing bands use
+    /// <see cref="DefaultRepeaterOffsetHz"/> (Thetis: 6 m = 1 MHz, else
+    /// 100 kHz; VHF/UHF transverter bands use their customary offsets).</summary>
+    public IReadOnlyDictionary<string, long>? RepeaterOffsetsHz { get; init; }
+
+    public const int DefaultDeviationHz = 5000;
+    public const int NarrowDeviationHz = 2500;
+    public const int DefaultLowCutHz = 300;
+    public const int DefaultHighCutHz = 3000;
+    public const int MinAudioCutHz = 1;
+    public const int MaxAudioCutHz = 8000;
+    public const double DefaultCtcssToneHz = 100.0;
+    public const double DefaultDetectorLimiterGainDb = 10.0;
+    public const double MinDetectorLimiterGainDb = 0.0;
+    public const double MaxDetectorLimiterGainDb = 30.0;
+    public const long MaxRepeaterOffsetHz = 50_000_000;
+    public const int MinDeviationHz = 1000;
+    public const int MaxDeviationHz = 8000;
+    public const double DefaultCtcssLevelPercent = 10.0;
+    public const double MinCtcssLevelPercent = 2.0;
+    public const double MaxCtcssLevelPercent = 25.0;
+    public const int DefaultDcsCode = 23;
+    public const double DefaultToneBurstHz = 1750.0;
+    public const int DefaultToneBurstMs = 500;
+    public const int MinToneBurstMs = 100;
+    public const int MaxToneBurstMs = 3000;
+    public const string DefaultRepeaterRegion = "R2";
+
+    /// <summary>Selectable access-burst tones (1750 Hz is the European
+    /// standard; 1000/1450/2100 cover older regional systems).</summary>
+    public static IReadOnlyList<double> ToneBurstTones { get; } = new[] { 1000.0, 1450.0, 1750.0, 2100.0 };
+
+    /// <summary>The 104 standard DCS codes (octal, written as decimal
+    /// digits).</summary>
+    public static IReadOnlyList<int> DcsCodes { get; } = new[]
+    {
+        23, 25, 26, 31, 32, 36, 43, 47, 51, 53, 54, 65, 71, 72, 73, 74,
+        114, 115, 116, 122, 125, 131, 132, 134, 143, 145, 152, 155, 156, 162, 165, 172, 174,
+        205, 212, 223, 225, 226, 243, 244, 245, 246, 251, 252, 255, 261, 263, 265, 266, 271, 274,
+        306, 311, 315, 325, 331, 332, 343, 346, 351, 356, 364, 365, 371,
+        411, 412, 413, 423, 431, 432, 445, 446, 452, 454, 455, 462, 464, 465, 466,
+        503, 506, 516, 523, 526, 532, 546, 565,
+        606, 612, 624, 627, 631, 632, 654, 662, 664,
+        703, 712, 723, 731, 732, 734, 743, 754,
+    };
+
+    public double EffectiveRxCtcssToneHz => RxCtcssToneHz ?? CtcssToneHz;
+    public int EffectiveRxDcsCode => RxDcsCode ?? DcsCode;
+
+    /// <summary>Thetis CTCSS_array (console.cs:236) — the 49 selectable tones.</summary>
+    public static IReadOnlyList<double> CtcssTones { get; } = new[]
+    {
+        67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4,
+        100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5,
+        141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9, 171.3, 173.8,
+        177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 199.5, 203.5, 206.5, 210.7,
+        218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
+    };
+
+    public static FmConfig Default { get; } = new();
+
+    /// <summary>Band key used for <see cref="RepeaterOffsetsHz"/>. HF/6 m
+    /// follow the band plan; VHF/UHF (transverter) ranges get their own keys
+    /// so a 2 m and a 70 cm offset never share a slot.</summary>
+    public static string RepeaterBandKey(long hz) => hz switch
+    {
+        >= 28_000_000 and < 29_700_000 => "10m",
+        >= 50_000_000 and < 54_000_000 => "6m",
+        >= 144_000_000 and < 148_000_000 => "2m",
+        >= 219_000_000 and < 225_000_000 => "1.25m",
+        >= 420_000_000 and < 450_000_000 => "70cm",
+        >= 902_000_000 and < 928_000_000 => "33cm",
+        >= 1_240_000_000 and < 1_300_000_000 => "23cm",
+        _ => "other",
+    };
+
+    public static long DefaultRepeaterOffsetHz(string bandKey) =>
+        DefaultRepeaterOffsetHz(bandKey, DefaultRepeaterRegion);
+
+    /// <summary>Customary repeater split per band and IARU region. Region 2/3
+    /// HF + 6 m follow Thetis (6 m = 1 MHz, else 100 kHz); Region 1 uses the
+    /// IARU R1 splits (6 m 600 kHz, 70 cm 7.6 MHz, 23 cm 6 MHz).</summary>
+    public static long DefaultRepeaterOffsetHz(string bandKey, string? region) => (region, bandKey) switch
+    {
+        ("R1", "6m") => 600_000,
+        ("R1", "70cm") => 7_600_000,
+        ("R1", "23cm") => 6_000_000,
+        (_, "6m") => 1_000_000,
+        (_, "2m") => 600_000,
+        (_, "1.25m") => 1_600_000,
+        (_, "70cm") => 5_000_000,
+        (_, "33cm") => 12_000_000,
+        (_, "23cm") => 12_000_000,
+        _ => 100_000,
+    };
+
+    public long RepeaterOffsetHzFor(long hz)
+    {
+        string key = RepeaterBandKey(hz);
+        return RepeaterOffsetsHz is { } map && map.TryGetValue(key, out long v) && v >= 0
+            ? v
+            : DefaultRepeaterOffsetHz(key, RepeaterRegion);
+    }
+
+    /// <summary>Signed TX offset for a receive frequency: Plus → +offset,
+    /// Minus → −offset, Reverse flips the sign (the VFO then sits on the
+    /// repeater input). Simplex → 0.</summary>
+    public long SignedRepeaterOffsetHz(long rxHz)
+    {
+        if (RepeaterShift == FmRepeaterShift.Simplex) return 0;
+        long offset = RepeaterOffsetHzFor(rxHz);
+        long sign = RepeaterShift == FmRepeaterShift.Plus ? 1 : -1;
+        if (RepeaterReverse) sign = -sign;
+        return sign * offset;
+    }
+
+    /// <summary>Clamp to supported ranges; non-finite values fall back to
+    /// defaults. Deviation rounds to 100 Hz; tones and codes snap to their
+    /// lists.</summary>
+    public FmConfig Normalized()
+    {
+        int dev = (int)Math.Round(Math.Clamp(DeviationHz, MinDeviationHz, MaxDeviationHz) / 100.0) * 100;
+        int txLo = Math.Clamp(TxLowCutHz, MinAudioCutHz, MaxAudioCutHz);
+        int txHi = Math.Clamp(TxHighCutHz, MinAudioCutHz, MaxAudioCutHz);
+        if (txHi <= txLo) (txLo, txHi) = (DefaultLowCutHz, DefaultHighCutHz);
+        int rxLo = Math.Clamp(RxLowCutHz, MinAudioCutHz, MaxAudioCutHz);
+        int rxHi = Math.Clamp(RxHighCutHz, MinAudioCutHz, MaxAudioCutHz);
+        if (rxHi <= rxLo) (rxLo, rxHi) = (DefaultLowCutHz, DefaultHighCutHz);
+        double tone = double.IsFinite(CtcssToneHz) ? CtcssToneHz : DefaultCtcssToneHz;
+        tone = CtcssTones.MinBy(t => Math.Abs(t - tone));
+        double limGain = double.IsFinite(DetectorLimiterGainDb)
+            ? Math.Clamp(DetectorLimiterGainDb, MinDetectorLimiterGainDb, MaxDetectorLimiterGainDb)
+            : DefaultDetectorLimiterGainDb;
+        var shift = Enum.IsDefined(RepeaterShift) ? RepeaterShift : FmRepeaterShift.Simplex;
+        double? rxTone = RxCtcssToneHz is double rt && double.IsFinite(rt)
+            ? CtcssTones.MinBy(t => Math.Abs(t - rt))
+            : null;
+        double level = double.IsFinite(CtcssLevelPercent)
+            ? Math.Clamp(CtcssLevelPercent, MinCtcssLevelPercent, MaxCtcssLevelPercent)
+            : DefaultCtcssLevelPercent;
+        int dcs = DcsCodes.Contains(DcsCode) ? DcsCode : DefaultDcsCode;
+        int? rxDcs = RxDcsCode is int rd && DcsCodes.Contains(rd) ? rd : null;
+        double burstTone = double.IsFinite(ToneBurstHz) ? ToneBurstHz : DefaultToneBurstHz;
+        double burst = ToneBurstTones.MinBy(t => Math.Abs(t - burstTone));
+        var sq = Enum.IsDefined(RxToneSquelch) ? RxToneSquelch : FmRxToneSquelch.Off;
+        string region = RepeaterRegion is "R1" or "R2" or "R3" ? RepeaterRegion : DefaultRepeaterRegion;
+        Dictionary<string, long>? offsets = null;
+        if (RepeaterOffsetsHz is { Count: > 0 } map)
+        {
+            offsets = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var (k, v) in map)
+                if (!string.IsNullOrWhiteSpace(k))
+                    offsets[k] = Math.Clamp(v, 0, MaxRepeaterOffsetHz);
+        }
+        return this with
+        {
+            DeviationHz = dev,
+            TxLowCutHz = txLo,
+            TxHighCutHz = txHi,
+            RxLowCutHz = rxLo,
+            RxHighCutHz = rxHi,
+            MicGainDb = MicGainDb is int g ? Math.Clamp(g, -96, 70) : null,
+            CtcssEnabled = CtcssEnabled && !DcsTxEnabled,
+            CtcssToneHz = tone,
+            RxCtcssToneHz = rxTone,
+            CtcssLevelPercent = level,
+            DcsCode = dcs,
+            RxDcsCode = rxDcs,
+            RxToneSquelch = sq,
+            ToneBurstHz = burst,
+            ToneBurstMs = Math.Clamp(ToneBurstMs, MinToneBurstMs, MaxToneBurstMs),
+            RepeaterRegion = region,
+            DetectorLimiterGainDb = limGain,
+            RepeaterShift = shift,
+            RepeaterReverse = shift != FmRepeaterShift.Simplex && RepeaterReverse,
+            RepeaterOffsetsHz = offsets,
+        };
+    }
+
+    /// <summary>Value equality for the DSP-relevant fields (the offsets map
+    /// is a reference type, so record equality alone would treat every
+    /// normalized copy as a change).</summary>
+    public bool DspEquals(FmConfig? other) =>
+        other is not null
+        && DeviationHz == other.DeviationHz
+        && TxLowCutHz == other.TxLowCutHz && TxHighCutHz == other.TxHighCutHz
+        && RxLowCutHz == other.RxLowCutHz && RxHighCutHz == other.RxHighCutHz
+        && PreEmphasisBeforeLimiting == other.PreEmphasisBeforeLimiting
+        && CtcssEnabled == other.CtcssEnabled
+        && CtcssToneHz.Equals(other.CtcssToneHz)
+        && RxToneNotch == other.RxToneNotch
+        && DetectorLimiterEnabled == other.DetectorLimiterEnabled
+        && DetectorLimiterGainDb.Equals(other.DetectorLimiterGainDb)
+        && CtcssLevelPercent.Equals(other.CtcssLevelPercent)
+        && EffectiveRxCtcssToneHz.Equals(other.EffectiveRxCtcssToneHz)
+        && DcsTxEnabled == other.DcsTxEnabled
+        && DcsCode == other.DcsCode
+        && EffectiveRxDcsCode == other.EffectiveRxDcsCode
+        && DcsInverted == other.DcsInverted
+        && RxToneSquelch == other.RxToneSquelch
+        && TxPreEmphasis == other.TxPreEmphasis
+        && RxDeEmphasis == other.RxDeEmphasis;
+}
+
+/// <summary>Live FM readouts for the operator strip (GET /api/fm/status).
+/// The *Available flags report whether the loaded WDSP binary exports the
+/// matching Zeus FM extension; when false the control is inert and the UI
+/// says so.</summary>
+public sealed record FmStatusDto(
+    bool ToneDecodeAvailable,
+    bool DcsAvailable,
+    bool DeviationMeterAvailable,
+    bool CtcssLevelAvailable,
+    bool DeEmphasisBypassAvailable,
+    double? DetectedCtcssHz,
+    int? DetectedDcsCode,
+    bool? DetectedDcsInverted,
+    bool ToneSquelchOpen,
+    double TxPeakDeviationHz,
+    bool RepeaterShiftActive,
+    long TxFrequencyHz,
+    FmRepeaterShift EffectiveShift);
 
 // A notch filter (MNF) — a band the operator paints, or Signal Intelligence
 // auto-detects, to remove EMF/birdies from the RX audio via WDSP's notch
@@ -1539,14 +1930,39 @@ public sealed record StateDto(
     bool SplitEnabled = false,
     long SplitTxHz = 0,
 
-    // Null from an older state producer resolves to the safe AM defaults.
-    AmTxProfile? AmTxProfile = null,
-
     // ---- DEXP (downward expander / noise gate) ----
     // Appended so older positional StateDto construction sites stay valid.
     // Null (older producer / legacy frame) means DexpConfig.Default, which is
     // OFF — the TX mic path stays bit-identical until the operator enables it.
-    DexpConfig? Dexp = null);
+    DexpConfig? Dexp = null,
+
+    // ---- Broadcast AM (AM/SAM TX modulator) ----
+    // Appended for positional-construction compatibility. Null (older
+    // producer) means AmBroadcastConfig.Default. Persisted in the
+    // am_broadcast_settings LiteDB collection; edited via /api/tx/am-broadcast.
+    AmBroadcastConfig? AmBroadcast = null,
+
+    // ---- Single live TX audio config: AM extras ----
+    // Legacy symmetric AM carrier level (0..125 %), used by AM/SAM when
+    // broadcast AM is disabled. Part of the live TX audio config (owned by the
+    // loaded TX audio profile); edited via /api/tx/am-carrier-level.
+    int AmCarrierLevelPercent = AmCarrierLevel.DefaultPercent,
+    // Live voice TX low cut (Hz magnitude) of the SSB/AM shared cut memory.
+    // In AM/SAM the TX bandpass is symmetric (TxFilterLowHz = -High) so this
+    // carries the low cut, applied as the AM modulator's audio high-pass.
+    int TxLowCutHz = 0,
+
+    // ---- TX audio profile selection (server-owned, not persisted here) ----
+    // The operator's own loaded profile (the last-loaded pointer), and the
+    // profile the server auto-applied on entering a bound mode family (null
+    // when none is active). Clients show TxAudioAutoProfileId ?? TxAudioProfileId
+    // as the selected profile.
+    string? TxAudioProfileId = null,
+    string? TxAudioAutoProfileId = null,
+    // ---- FM (Thetis FM panel + Setup → DSP → FM) ----
+    // Appended so older positional StateDto construction sites stay valid.
+    // Null (older producer) resolves to FmConfig.Default.
+    FmConfig? Fm = null);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both
@@ -2214,7 +2630,11 @@ public enum CwKeyerMode : byte
 
 public sealed record MicGainSetRequest(int Db);
 
-public sealed record AmTxProfileSetRequest(AmTxProfile AmTxProfile);
+// Legacy symmetric AM carrier level (0..125 %, clamped). Used by AM/SAM when
+// broadcast AM is disabled.
+public sealed record AmCarrierLevelSetRequest(int CarrierLevelPercent);
+
+public sealed record FmConfigSetRequest(FmConfig Fm);
 
 // Leveler max-gain ceiling in dB. Server clamps to [0, 20]; outside that is
 // 400. Frontend POSTs this whenever the slider moves and on WS reconnect so
@@ -2259,13 +2679,37 @@ public sealed record StationFavoriteDto(
     RxMode? Mode,
     int? FilterLowHz,
     int? FilterHighHz,
-    long? UpdatedUtcMs);
+    long? UpdatedUtcMs,
+    // FM repeater memory (Thetis memory recall restores RPTR / offset /
+    // CTCSS / deviation for FM, console.cs:40534). Null for non-FM slots and
+    // for slots saved before this field existed. Appended to keep older
+    // positional construction sites valid.
+    FmMemory? Fm = null);
 
 public sealed record StationFavoriteSetRequest(
     long FrequencyHz,
     RxMode Mode,
     int FilterLowHz,
-    int FilterHighHz);
+    int FilterHighHz,
+    FmMemory? Fm = null);
+
+/// <summary>The per-repeater slice of <see cref="FmConfig"/> a memory
+/// captures and restores: shift, offset, tones/codes and deviation. Recalling
+/// it merges these fields into the live FmConfig; the station-wide audio,
+/// limiter and burst settings are left alone.</summary>
+public sealed record FmMemory(
+    FmRepeaterShift RepeaterShift,
+    bool RepeaterReverse,
+    long RepeaterOffsetHz,
+    int DeviationHz,
+    bool CtcssEnabled,
+    double CtcssToneHz,
+    double? RxCtcssToneHz,
+    bool DcsTxEnabled,
+    int DcsCode,
+    int? RxDcsCode,
+    bool DcsInverted,
+    FmRxToneSquelch RxToneSquelch);
 
 // Band stack entry (issue #179) — a named per-band preset that snapshots
 // frequency, mode, and (optionally) filter edges. A band can have any number of
@@ -3141,7 +3585,18 @@ public sealed record TxAudioProfileDto(
     // Null — every profile saved before DEXP existed, and the built-in seeds —
     // means "leave the operator's current DEXP untouched" on apply; it never
     // forces DEXP off.
-    DexpConfig? Dexp = null);
+    DexpConfig? Dexp = null,
+    // Mode families this profile is bound to ("SSB", "AM", "FM", "DIGI").
+    // Entering a bound family auto-applies the profile. A family is bound to
+    // at most one profile. Null/empty = unbound (legacy behaviour). Set via
+    // PUT /api/tx-audio-profiles/{id}/binding.
+    List<string>? BoundModes = null,
+    // Broadcast-AM modulator settings carried by the profile. Null = leave
+    // the live broadcast-AM config untouched on apply.
+    AmBroadcastConfig? AmBroadcast = null,
+    // Legacy symmetric AM carrier level (0..125 %). Null = leave the live
+    // carrier level untouched on apply.
+    int? CarrierLevelPercent = null);
 
 public sealed record TxAudioProfilesResponse(IReadOnlyList<TxAudioProfileDto> Profiles);
 
@@ -3153,6 +3608,12 @@ public sealed record SaveTxAudioProfileRequest(string Name);
 // PUT body for the persisted "last loaded profile" pointer. Null/empty Id
 // clears it (nothing is applied at startup).
 public sealed record LastLoadedTxAudioProfileDto(string? Id);
+
+// PUT body for /api/tx-audio-profiles/{id}/binding. Modes are mode-family
+// names ("SSB", "AM", "FM", "DIGI") or individual mode names ("USB", "SAM",
+// ...) which resolve to their family. Empty/null unbinds the profile. Binding
+// a family here removes that family from every other profile.
+public sealed record TxAudioProfileBindingRequest(List<string>? Modes);
 
 public sealed record TxFidelityPolicyDto(
     string ProfileId,

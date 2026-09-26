@@ -134,6 +134,16 @@ public sealed class RadioService : IDisposable
     private readonly AudioSettingsStore? _audioStore;
     private readonly TransverterSettingsStore? _transverterSettingsStore;
     private readonly LayoutStore? _layoutStore;
+    // Active band plan: source of the server-owned FmConfig.RepeaterRegion.
+    // Null in unit tests that do not supply one (region stays as persisted).
+    private readonly IBandPlanService? _bandPlan;
+    // Automatic Repeater Shift latch: the (TX receiver, dial, mode) last
+    // evaluated. ARS re-runs only when this changes, so an operator's manual
+    // shift holds until the next tune. Read/written under _sync.
+    private (int TxIndex, long DialHz, RxMode Mode) _arsLastKey;
+    // Serializes FmConfig writes to LiteDB so concurrent ARS / SetFmConfig
+    // persists always land the latest live value last.
+    private readonly object _fmPersistSync = new();
     // Global (per-radio, NOT per-band) HL2 user GPIO mask (external-ports plan,
     // Phase 5; re-ported in the external-port parity audit). Pushed via
     // PushHl2Gpio on store edit + connect. HL2-only on the wire.
@@ -546,7 +556,7 @@ public sealed class RadioService : IDisposable
     private readonly IExternalReceiverSource _externalReceiverSource;
     private readonly int? _defaultConnectSampleRateHz;
 
-    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null, TransverterSettingsStore? transverterSettingsStore = null, LayoutStore? layoutStore = null)
+    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null, TransverterSettingsStore? transverterSettingsStore = null, LayoutStore? layoutStore = null, IBandPlanService? bandPlan = null)
     {
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<RadioService>();
@@ -563,6 +573,7 @@ public sealed class RadioService : IDisposable
         _audioStore = audioStore;
         _transverterSettingsStore = transverterSettingsStore;
         _layoutStore = layoutStore;
+        _bandPlan = bandPlan;
         if (p1Discovery is not null)
         {
             _p1StartFailureRecovery = new P1StartFailureRecovery(
@@ -642,8 +653,21 @@ public sealed class RadioService : IDisposable
         // in later. Reverse stays an explicit operator polarity choice.
         var persistedTxPhaseRotator = NormalizeTxPhaseRotator(
             _dspSettingsStore.GetTxPhaseRotator() ?? new TxPhaseRotatorConfig());
-        var persistedAmTxProfile = NormalizeAmTxProfile(
-            _dspSettingsStore.GetAmTxProfile() ?? new AmTxProfile());
+        // Legacy symmetric AM carrier level — part of the single live TX audio
+        // config (the retired dedicated AM profile no longer owns it).
+        var persistedAmCarrierLevel = _dspSettingsStore.GetAmCarrierLevelPercent()
+            ?? AmCarrierLevel.DefaultPercent;
+        // Broadcast AM (AM/SAM modulator). Fresh install = the maintainer's
+        // "ham broadcast" default: enabled, +125 % / -97 %, no pre-emphasis.
+        var persistedAmBroadcast = (_dspSettingsStore.GetAmBroadcast() ?? AmBroadcastConfig.Default).Clamped();
+        // FM (deviation, CTCSS, repeater shift, FM audio cuts). Null on a
+        // fresh install / legacy DB row → Thetis stock defaults with CTCSS
+        // encode OFF.
+        var persistedFm = (_dspSettingsStore.GetFmConfig() ?? FmConfig.Default).Normalized();
+        // RepeaterRegion is server-owned: mirror the active band plan's IARU
+        // region over whatever was persisted.
+        if (_bandPlan is not null)
+            persistedFm = persistedFm with { RepeaterRegion = SafeIaruRegion(_bandPlan) };
         // DEXP (downward expander / noise gate). Null on a fresh install /
         // legacy DB row falls back to DexpConfig.Default (OFF) so the TX mic
         // path is unchanged until the operator enables it.
@@ -675,6 +699,7 @@ public sealed class RadioService : IDisposable
         int? overlayMicGain = null;
         double? overlayLevelerMaxGain = null;
         int? overlayTxFilterLow = null, overlayTxFilterHigh = null;
+        int? overlayTxLoAbs = null, overlayTxHiAbs = null;
         var initialTxAudioConfig = initialTxAudioConfigSource?.GetInitialConfig();
         if (initialTxAudioConfig is not null)
         {
@@ -697,6 +722,8 @@ public sealed class RadioService : IDisposable
             var (sLo, sHi) = SignedFilterForMode(startupMode, loAbs, hiAbs);
             overlayTxFilterLow = sLo;
             overlayTxFilterHigh = sHi;
+            overlayTxLoAbs = loAbs;
+            overlayTxHiAbs = hiAbs;
         }
 
         // Seed the last-preset cache from persisted store for all modes so
@@ -795,7 +822,25 @@ public sealed class RadioService : IDisposable
         int hydFilterLowB = rsSnap?.FilterLowHzB ?? rsSnap?.FilterLowHz ?? 100;
         int hydFilterHighB = rsSnap?.FilterHighHzB ?? rsSnap?.FilterHighHz ?? 2850;
         string? hydPresetB = rsSnap?.FilterPresetNameB ?? rsSnap?.FilterPresetName ?? "VAR1";
+        // FM locks the RX IF filter to ±(deviation + RX high cut) (Thetis
+        // console.cs:7499/7621), so a persisted FM receiver hydrates onto the
+        // derived width rather than a stale saved slot.
+        if (hydModeB == RxMode.FM)
+        {
+            int fmHalfB = FmRxFilterHalfWidthHz(persistedFm);
+            hydFilterLowB = -fmHalfB;
+            hydFilterHighB = fmHalfB;
+        }
         double hydAfGainB = SanitizeAfGainDb(rsSnap?.Rx2AfGainDb);
+
+        // AM/SAM transmit the shared voice (SSB) cuts. A pair persisted in AM/SAM
+        // (e.g. -4000..+4000 from the retired dedicated AM profile) is not
+        // trusted: rebuild it from the SSB memory so the first AM->USB switch
+        // cannot store a stale high cut into the SSB slot.
+        int hydTxLow = rsSnap?.TxFilterLowHz ?? 150;
+        int hydTxHigh = rsSnap?.TxFilterHighHz ?? 2850;
+        if (rsSnap?.Mode is RxMode.AM or RxMode.SAM && _ssbTxFilter.HiAbs > _ssbTxFilter.LoAbs)
+            (hydTxLow, hydTxHigh) = SignedFilterForMode(rsSnap.Mode, _ssbTxFilter.LoAbs, _ssbTxFilter.HiAbs);
 
         _state = new(
             Status: ConnectionStatus.Disconnected,
@@ -832,8 +877,8 @@ public sealed class RadioService : IDisposable
             AdcOverloadWarning: false,
             FilterPresetName: rsSnap?.FilterPresetName ?? "VAR1",
             FilterAdvancedPaneOpen: filterPresetStore?.GetAdvancedPaneOpen() ?? false,
-            TxFilterLowHz: overlayTxFilterLow ?? rsSnap?.TxFilterLowHz ?? 150,
-            TxFilterHighHz: overlayTxFilterHigh ?? rsSnap?.TxFilterHighHz ?? 2850,
+            TxFilterLowHz: overlayTxFilterLow ?? hydTxLow,
+            TxFilterHighHz: overlayTxFilterHigh ?? hydTxHigh,
             RxFilterWindow: persistedRxFilterWindow,
             TxFilterWindow: persistedTxFilterWindow,
             RxFilterPhase: persistedRxFilterPhase,
@@ -905,6 +950,11 @@ public sealed class RadioService : IDisposable
             FullDuplexMultiRxEnabled: rsSnap?.FullDuplexMultiRxEnabled ?? false,
             PreampOn: rsSnap?.PreampOn ?? false,
             RogerBeepEnabled: rsSnap?.RogerBeepEnabled ?? false,
+            // Clamp so a hand-edited row can't exceed the Thetis udRIT/udXIT range.
+            RitEnabled: rsSnap?.RitEnabled ?? false,
+            RitHz: Math.Clamp(rsSnap?.RitHz ?? 0L, -RitXitMaxHz, RitXitMaxHz),
+            XitEnabled: rsSnap?.XitEnabled ?? false,
+            XitHz: Math.Clamp(rsSnap?.XitHz ?? 0L, -RitXitMaxHz, RitXitMaxHz),
             SplitEnabled: false,
             SplitTxHz: 0);
         _currentMode = (int)_state.Mode;
@@ -912,9 +962,28 @@ public sealed class RadioService : IDisposable
         _state = _state with
         {
             TxPhaseRotator = persistedTxPhaseRotator,
-            AmTxProfile = persistedAmTxProfile,
             Dexp = persistedDexp,
+            AmBroadcast = persistedAmBroadcast,
+            AmCarrierLevelPercent = persistedAmCarrierLevel,
+            TxLowCutHz = _ssbTxFilter.LoAbs,
+            Fm = persistedFm,
         };
+        if (_state.Mode == RxMode.FM)
+        {
+            int fmHalf = FmRxFilterHalfWidthHz(persistedFm);
+            _state = _state with
+            {
+                FilterLowHz = -fmHalf,
+                FilterHighHz = fmHalf,
+                TxFilterLowHz = -persistedFm.TxHighCutHz,
+                TxFilterHighHz = persistedFm.TxHighCutHz,
+            };
+        }
+        // Seed the ARS latch with the hydrated dial so startup never rewrites a
+        // persisted manual shift; only a real tune / mode change re-evaluates.
+        _arsLastKey = ArsKeyLocked(_state);
+        if (_bandPlan is not null)
+            _bandPlan.PlanChanged += OnBandPlanChangedForFm;
 
         // One-time repair for the master/RX1 AF split. Before the split the
         // station-wide master WAS the operator's AF slider; the split shipped
@@ -1017,14 +1086,18 @@ public sealed class RadioService : IDisposable
         // so a later SetMode/band recall — or the legacy-upgrade flush above —
         // cannot resurrect a stale saved slot. Runs AFTER the upgrade block so
         // its final persisted TX-family value always reflects the profile.
-        if (overlayTxFilterLow.HasValue && overlayTxFilterHigh.HasValue)
+        if (overlayTxLoAbs.HasValue && overlayTxHiAbs.HasValue)
         {
-            int loAbs = Math.Min(Math.Abs(overlayTxFilterLow.Value), Math.Abs(overlayTxFilterHigh.Value));
-            int hiAbs = Math.Max(Math.Abs(overlayTxFilterLow.Value), Math.Abs(overlayTxFilterHigh.Value));
+            // Use the profile's own magnitudes, not the re-signed pair: in
+            // AM/SAM the signed pair is symmetric (-hi..+hi) and would clobber
+            // the shared voice low cut.
+            int loAbs = overlayTxLoAbs.Value;
+            int hiAbs = overlayTxHiAbs.Value;
             var family = TxFamilyFilterFor(_state.Mode);
             if (family.LoAbs != loAbs || family.HiAbs != hiAbs)
             {
                 StoreTxFamilyFilter(_state.Mode, loAbs, hiAbs);
+                _state = _state with { TxLowCutHz = _ssbTxFilter.LoAbs };
                 _stateDirty = true;
                 FlushState();
             }
@@ -1273,6 +1346,11 @@ public sealed class RadioService : IDisposable
     /// <summary>Current RX1 mode without taking the radio-state lock or
     /// projecting a StateDto. Intended for protocol RX edge handlers.</summary>
     internal RxMode CurrentMode => (RxMode)_currentMode;
+
+    /// <summary>Current on-board keyer mode without taking the radio-state
+    /// lock. Intended for Protocol-2 telemetry edge handling.</summary>
+    internal CwKeyerMode CurrentCwKeyerMode =>
+        (CwKeyerMode)Volatile.Read(ref _cwKeyerMode);
 
     /// <summary>Current operator preamp toggle. PreampOn isn't on the
     /// StateDto wire format, so DspPipelineService reads it directly when
@@ -2477,21 +2555,25 @@ public sealed class RadioService : IDisposable
         int i => i < _extraReceivers.Length && _extraReceivers[i] is { } e ? e.VfoHz : state.VfoHz,
     };
 
+    // Must agree with RadioFrequencyResolver.TxFrequencyHz, including the FM
+    // repeater shift (applied only with split off).
     private long TxFrequencyHzLocked(StateDto state)
     {
         int index = state.TxReceiverIndex;
         if (index <= 0)
-            return state.SplitEnabled && state.SplitTxHz > 0
-                ? state.SplitTxHz
-                : state.VfoHz;
+            return RadioFrequencyResolver.ResolveTxFrequencyHz(
+                state.Mode, state.VfoHz, state.SplitEnabled, state.SplitTxHz, state.Fm);
         if (index == 1)
         {
             var rx2 = state.Rx2();
-            return rx2.SplitEnabled && rx2.TxVfoHz > 0 ? rx2.TxVfoHz : rx2.VfoHz;
+            return RadioFrequencyResolver.ResolveTxFrequencyHz(
+                rx2.Mode, rx2.VfoHz, rx2.SplitEnabled, rx2.TxVfoHz, state.Fm);
         }
 
         var e = index < _extraReceivers.Length ? _extraReceivers[index] : null;
-        return e is { SplitEnabled: true, TxVfoHz: > 0 } ? e.TxVfoHz : e?.VfoHz ?? state.VfoHz;
+        if (e is null) return state.VfoHz;
+        return RadioFrequencyResolver.ResolveTxFrequencyHz(
+            e.Mode, e.VfoHz, e.SplitEnabled, e.TxVfoHz, state.Fm);
     }
 
     /// <summary>TX carrier frequency including any active XIT offset. The
@@ -3299,8 +3381,8 @@ public sealed class RadioService : IDisposable
             StoreFamilyFilter(currentMode, curLoAbs, curHiAbs, targetB ? TxVfo.B : TxVfo.A);
             if (!targetB)
             {
-                int curTxLoAbs = Math.Min(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
-                int curTxHiAbs = Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz));
+                var (curTxLoAbs, curTxHiAbs) = TxCutsFromSignedPair(
+                    currentMode, s.TxFilterLowHz, s.TxFilterHighHz);
                 StoreTxFamilyFilter(currentMode, curTxLoAbs, curTxHiAbs);
             }
 
@@ -3338,12 +3420,17 @@ public sealed class RadioService : IDisposable
             }
 
             var txFam = TxFamilyFilterFor(mode);
+            // AM/SAM read the shared voice (SSB) cut memory: -hi..+hi here, the
+            // low cut rides StateDto.TxLowCutHz to the AM modulator high-pass.
             var (txLo, txHi) = SignedFilterForMode(mode, txFam.LoAbs, txFam.HiAbs);
-            if (mode is RxMode.AM or RxMode.SAM)
+            if (mode == RxMode.FM)
             {
-                int amHigh = NormalizeAmTxProfile(s.AmTxProfile).TxFilterHighHz;
-                txLo = -amHigh;
-                txHi = amHigh;
+                // FM presents its audio high cut (Thetis udFMHighCutTX) as the
+                // TX filter; the on-air bandpass is derived from it plus the
+                // deviation in DspPipelineService.ResolveEffectiveTxAudioProfile.
+                int fmHigh = (s.Fm ?? FmConfig.Default).TxHighCutHz;
+                txLo = -fmHigh;
+                txHi = fmHigh;
             }
 
             // RX2 is untouched on an RX1 mode change — ProjectReceivers carries
@@ -3382,70 +3469,258 @@ public sealed class RadioService : IDisposable
         return Snapshot();
     }
 
-    public AmTxProfile GetAmTxProfile() =>
-        Snapshot().AmTxProfile ?? new AmTxProfile();
+    public AmBroadcastConfig GetAmBroadcast() =>
+        (Snapshot().AmBroadcast ?? AmBroadcastConfig.Default).Clamped();
 
-    public StateDto SetAmTxProfile(AmTxProfile profile)
+    /// <summary>Persist + publish the broadcast-AM modulator settings. The DSP
+    /// pipeline pushes them to the engine on the resulting state change.
+    /// Returns the sanitized (clamped) config.</summary>
+    public AmBroadcastConfig SetAmBroadcast(AmBroadcastConfig config)
     {
-        var clean = NormalizeAmTxProfile(profile);
-        _dspSettingsStore.SetAmTxProfile(clean);
-        Mutate(s =>
-        {
-            if (RadioFrequencyResolver.TxReceiver(s).Mode is RxMode.AM or RxMode.SAM)
-            {
-                return s with
-                {
-                    AmTxProfile = clean,
-                    TxFilterLowHz = -clean.TxFilterHighHz,
-                    TxFilterHighHz = clean.TxFilterHighHz,
-                };
-            }
-            return s with { AmTxProfile = clean };
-        });
+        ArgumentNullException.ThrowIfNull(config);
+        var clean = _dspSettingsStore.SetAmBroadcast(config);
+        Mutate(s => s with { AmBroadcast = clean });
+        _log.LogInformation(
+            "radio.setAmBroadcast enabled={Enabled} pos={Pos:F0}% neg={Neg:F0}% preemph={Pre} invert={Inv}",
+            clean.Enabled, clean.PositivePeakPct, clean.NegativePeakPct, clean.PreEmphasis, clean.InvertPolarity);
+        return clean;
+    }
+
+    /// <summary>Legacy symmetric AM carrier level (0..125 %, clamped), used by
+    /// AM/SAM when broadcast AM is disabled. Part of the single live TX audio
+    /// config; persisted and pushed to the engine by the DSP pipeline.</summary>
+    public StateDto SetAmCarrierLevel(int percent)
+    {
+        int clean = AmCarrierLevel.Clamp(percent);
+        _dspSettingsStore.SetAmCarrierLevelPercent(clean);
+        Mutate(s => s with { AmCarrierLevelPercent = clean });
+        _log.LogInformation("radio.setAmCarrierLevel pct={Pct}", clean);
         return Snapshot();
     }
 
-    public StateDto CaptureCurrentAmTxProfile()
+    /// <summary>The retired dedicated AM TX profile's persisted JSON when the
+    /// one-time migration to a normal TX audio profile has not run yet.</summary>
+    public string? GetPendingLegacyAmTxProfileJson() =>
+        _dspSettingsStore.GetPendingLegacyAmTxProfileJson();
+
+    public void MarkLegacyAmTxProfileMigrated() =>
+        _dspSettingsStore.MarkLegacyAmTxProfileMigrated();
+
+    /// <summary>Publish the TX audio profile selection (owned by the TX audio
+    /// profile service) on the state stream so clients follow server-side
+    /// auto-applies. Not persisted here.</summary>
+    public void SetTxAudioProfileSelection(string? lastLoadedId, string? autoProfileId)
     {
-        var s = Snapshot();
-        var captured = NormalizeAmTxProfile(new AmTxProfile
-        {
-            CarrierLevelPercent = s.AmTxProfile?.CarrierLevelPercent ?? 100,
-            MicGainDb = s.MicGainDb,
-            LevelerMaxGainDb = s.LevelerMaxGainDb,
-            TxLeveling = s.TxLeveling ?? new TxLevelingConfig(),
-            Cfc = s.Cfc ?? CfcConfig.Default,
-            TxPhaseRotator = s.TxPhaseRotator ?? new TxPhaseRotatorConfig(),
-            TxFilterHighHz = Math.Max(Math.Abs(s.TxFilterLowHz), Math.Abs(s.TxFilterHighHz)),
-        });
-        return SetAmTxProfile(captured);
+        var snap = Snapshot();
+        if (snap.TxAudioProfileId == lastLoadedId && snap.TxAudioAutoProfileId == autoProfileId) return;
+        Mutate(s => s with { TxAudioProfileId = lastLoadedId, TxAudioAutoProfileId = autoProfileId });
     }
 
-    internal static AmTxProfile NormalizeAmTxProfile(AmTxProfile? profile)
+    public FmConfig GetFmConfig() =>
+        Snapshot().Fm ?? FmConfig.Default;
+
+    /// <summary>Apply and persist the FM configuration. Side effects mirror
+    /// Thetis: a deviation / RX high-cut change re-derives the locked FM RX
+    /// filter on every FM receiver (console.cs:7499), a TX high-cut change
+    /// re-derives the TX filter, and toggling repeater Reverse moves the TX
+    /// receiver's dial by the offset so it sits on the repeater input
+    /// (console.cs:40442 chkFMTXRev_CheckedChanged). RepeaterRegion is
+    /// server-owned (the client value is ignored); turning Automatic Repeater
+    /// Shift on applies it to the current dial immediately.</summary>
+    public StateDto SetFmConfig(FmConfig config) =>
+        SetFmConfigCore(config, moveDialForReverse: true);
+
+    private StateDto SetFmConfigCore(FmConfig config, bool moveDialForReverse)
     {
-        profile ??= new AmTxProfile();
-        double leveler = double.IsFinite(profile.LevelerMaxGainDb)
-            ? Math.Clamp(profile.LevelerMaxGainDb, 0.0, 20.0)
-            : 8.0;
-        var leveling = profile.TxLeveling ?? new TxLevelingConfig();
-        leveling = leveling with
+        ArgumentNullException.ThrowIfNull(config);
+        FmConfig clean;
+        FmConfig previous;
+        int txIndex;
+        long txDialHz;
+        long previousTx;
+        lock (_sync)
         {
-            AlcMaxGainDb = double.IsFinite(leveling.AlcMaxGainDb) ? Math.Clamp(leveling.AlcMaxGainDb, 0.0, 120.0) : 3.0,
-            AlcDecayMs = Math.Clamp(leveling.AlcDecayMs, 1, 50),
-            LevelerDecayMs = Math.Clamp(leveling.LevelerDecayMs, 1, 5000),
-            CompressorGainDb = double.IsFinite(leveling.CompressorGainDb) ? Math.Clamp(leveling.CompressorGainDb, 0.0, 20.0) : 0.0,
-        };
-        var cfc = profile.Cfc is { Bands.Length: 10 } ? profile.Cfc : CfcConfig.Default;
-        return profile with
+            previous = (_state.Fm ?? FmConfig.Default).Normalized();
+            clean = config.Normalized() with { RepeaterRegion = previous.RepeaterRegion };
+            txIndex = _state.TxReceiverIndex;
+            txDialHz = ReceiverFrequencyHzLocked(_state, txIndex);
+            previousTx = TxFrequencyHzLocked(_state);
+        }
+        bool arsEnabled = clean.AutoRepeaterShift && !previous.AutoRepeaterShift;
+
+        bool rxFilterChanged = clean.DeviationHz != previous.DeviationHz
+            || clean.RxHighCutHz != previous.RxHighCutHz;
+        bool txFilterChanged = clean.TxHighCutHz != previous.TxHighCutHz;
+        int rxHalf = FmRxFilterHalfWidthHz(clean);
+        Mutate(s =>
         {
-            CarrierLevelPercent = Math.Clamp(profile.CarrierLevelPercent, 0, 125),
-            MicGainDb = Math.Clamp(profile.MicGainDb, -40, 10),
-            LevelerMaxGainDb = leveler,
-            TxLeveling = leveling,
-            Cfc = cfc,
-            TxPhaseRotator = NormalizeTxPhaseRotator(profile.TxPhaseRotator ?? new TxPhaseRotatorConfig()),
-            TxFilterHighHz = Math.Clamp(Math.Abs(profile.TxFilterHighHz), MinFilterWidthHz, MaxFilterEdgeHz),
-        };
+            var next = s with { Fm = clean };
+            // Force an ARS evaluation on this mutation when ARS was just
+            // switched on (Mutate runs it under the same lock).
+            if (arsEnabled) _arsLastKey = default;
+            if (rxFilterChanged)
+            {
+                if (next.Mode == RxMode.FM)
+                    next = next with { FilterLowHz = -rxHalf, FilterHighHz = rxHalf };
+                if (next.Rx2().Mode == RxMode.FM)
+                    next = WithRx2(next, r => r with { FilterLowHz = -rxHalf, FilterHighHz = rxHalf });
+                for (int i = 2; i < _extraReceivers.Length; i++)
+                {
+                    if (_extraReceivers[i] is { Mode: RxMode.FM } e)
+                    {
+                        e.FilterLowHz = -rxHalf;
+                        e.FilterHighHz = rxHalf;
+                    }
+                }
+            }
+            if (txFilterChanged && TxModeLocked(next) == RxMode.FM)
+                next = next with { TxFilterLowHz = -clean.TxHighCutHz, TxFilterHighHz = clean.TxHighCutHz };
+            return next;
+        });
+        PersistLiveFmConfig();
+
+        // Reverse: un-apply the previous reverse move, then apply the new one,
+        // so a Reverse toggle, a shift change while reversed, or an offset
+        // edit while reversed all land the dial on the right side. Plus 600k
+        // at 146.940: Rev ON → dial 147.540 (TX 146.940); Rev OFF → 146.940.
+        long outputHz = txDialHz - ReverseDialMoveHz(previous, txDialHz);
+        long reversedDialHz = outputHz + ReverseDialMoveHz(clean, outputHz);
+        if (moveDialForReverse && reversedDialHz != txDialHz)
+        {
+            // Reverse is a programmatic dial move (Thetis writes VFOAFreq
+            // directly), so RX1 takes the external path that ignores VFO lock.
+            if (txIndex <= 0) SetVfo(reversedDialHz, fromExternal: true);
+            else SetReceiverVfo(txIndex, reversedDialHz);
+        }
+
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(Snapshot())))
+            RecomputePaAndPush();
+        return Snapshot();
+    }
+
+    /// <summary>Restore a favorite's FM repeater memory (Thetis memory recall,
+    /// console.cs:40534): merge it into the live FmConfig, writing the offset
+    /// into the per-band slot for <paramref name="frequencyHz"/>. The dial is
+    /// NOT moved for Reverse — the favorite's saved dial already sits where
+    /// the memory was captured (on the input when it was saved reversed).
+    /// Call after the favorite's VFO / mode / filter recall, so any Automatic
+    /// Repeater Shift that ran on that tune is overridden by the memory.</summary>
+    public StateDto RecallFmMemory(FmMemory memory, long frequencyHz)
+    {
+        ArgumentNullException.ThrowIfNull(memory);
+        return SetFmConfigCore(
+            FmMemories.Merge(GetFmConfig(), memory, frequencyHz),
+            moveDialForReverse: false);
+    }
+
+    /// <summary>Snapshot the live FM repeater settings for a favorite at
+    /// <paramref name="frequencyHz"/>.</summary>
+    public FmMemory CaptureFmMemory(long frequencyHz) =>
+        FmMemories.Capture(GetFmConfig().Normalized(), frequencyHz);
+
+    /// <summary>Mirror the band plan's IARU region into
+    /// <see cref="FmConfig.RepeaterRegion"/> (server-owned). A change
+    /// re-evaluates Automatic Repeater Shift against the new region's table.</summary>
+    public void SetFmRepeaterRegion(string region)
+    {
+        string code = region is "R1" or "R2" or "R3" ? region : FmConfig.DefaultRepeaterRegion;
+        bool changed = false;
+        Mutate(s =>
+        {
+            var fm = (s.Fm ?? FmConfig.Default).Normalized();
+            if (fm.RepeaterRegion == code) return null;
+            changed = true;
+            _arsLastKey = default;
+            return s with { Fm = fm with { RepeaterRegion = code } };
+        }, out _);
+        if (changed)
+        {
+            PersistLiveFmConfig();
+            _log.LogInformation("fm.repeaterRegion={Region}", code);
+        }
+    }
+
+    private void OnBandPlanChangedForFm()
+    {
+        if (_bandPlan is null || _disposed) return;
+        try { SetFmRepeaterRegion(SafeIaruRegion(_bandPlan)); }
+        catch (Exception ex) { _log.LogWarning(ex, "fm.repeaterRegion.sync failed"); }
+    }
+
+    private static string SafeIaruRegion(IBandPlanService bandPlan)
+    {
+        try { return bandPlan.IaruRegion; }
+        catch { return FmConfig.DefaultRepeaterRegion; }
+    }
+
+    private void PersistLiveFmConfig()
+    {
+        lock (_fmPersistSync)
+        {
+            FmConfig? fm;
+            lock (_sync) fm = _state.Fm;
+            if (fm is not null) _dspSettingsStore.SetFmConfig(fm);
+        }
+    }
+
+    // Caller holds _sync. The ARS latch key: TX receiver, its dial, its mode
+    // and its split state.
+    private (int TxIndex, long DialHz, RxMode Mode) ArsKeyLocked(StateDto s) =>
+        (s.TxReceiverIndex, ReceiverFrequencyHzLocked(s, s.TxReceiverIndex), TxModeLocked(s));
+
+    private bool TxSplitLocked(StateDto s) => s.TxReceiverIndex switch
+    {
+        <= 0 => s.SplitEnabled,
+        1 => s.Rx2().SplitEnabled,
+        int i => i < _extraReceivers.Length && _extraReceivers[i] is { SplitEnabled: true },
+    };
+
+    // Caller holds _sync (inside Mutate). Automatic Repeater Shift: when the
+    // TX receiver's dial or mode changed since the last evaluation, and it is
+    // in FM with ARS on, Reverse off and split off, set the shift from the
+    // region's repeater-output table (Simplex outside every segment). Reverse
+    // suppresses ARS, freezing the current shift. Returns the (possibly)
+    // updated state; <paramref name="changed"/> reports a shift change.
+    private StateDto ApplyAutoRepeaterShiftLocked(StateDto next, out bool changed)
+    {
+        changed = false;
+        var key = ArsKeyLocked(next);
+        if (key == _arsLastKey) return next;
+        _arsLastKey = key;
+        if (next.Fm is not { AutoRepeaterShift: true, RepeaterReverse: false } fm) return next;
+        if (key.Mode != RxMode.FM || TxSplitLocked(next)) return next;
+        var shift = FmRepeaterBandPlan.ShiftFor(key.DialHz, fm.RepeaterRegion) ?? FmRepeaterShift.Simplex;
+        if (shift == fm.RepeaterShift) return next;
+        changed = true;
+        return next with { Fm = fm with { RepeaterShift = shift } };
+    }
+
+    // Dial displacement Reverse applies: the shift's normal signed offset, so
+    // the dial moves onto the repeater input.
+    private static long ReverseDialMoveHz(FmConfig fm, long dialHz) =>
+        fm.RepeaterReverse
+            ? (fm with { RepeaterReverse = false }).SignedRepeaterOffsetHz(dialHz)
+            : 0;
+
+    // Caller holds _sync. TX receiver mode on the (possibly un-projected)
+    // internal state; extra receivers resolve from _extraReceivers.
+    private RxMode TxModeLocked(StateDto s) => s.TxReceiverIndex switch
+    {
+        <= 0 => s.Mode,
+        1 => s.Rx2().Mode,
+        int i => i < _extraReceivers.Length && _extraReceivers[i] is { } e ? e.Mode : s.Mode,
+    };
+
+    // Magnitudes to remember for a signed TX pair. AM/SAM share the voice
+    // (SSB) cut memory but their live pair is the symmetric -hi..+hi bandpass,
+    // which carries no low cut: keep the remembered voice low cut instead.
+    private (int LoAbs, int HiAbs) TxCutsFromSignedPair(RxMode mode, int lowHz, int highHz)
+    {
+        int loAbs = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
+        int hiAbs = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
+        if (mode is RxMode.AM or RxMode.SAM && lowHz < 0 && highHz > 0)
+            loAbs = Math.Min(_ssbTxFilter.LoAbs, Math.Max(0, hiAbs - MinFilterWidthHz));
+        return (loAbs, hiAbs);
     }
 
     public StateDto SetFilter(int lowHz, int highHz, string? presetName = null)
@@ -3553,34 +3828,49 @@ public sealed class RadioService : IDisposable
     {
         if (highHz < lowHz) (lowHz, highHz) = (highHz, lowHz);
         (lowHz, highHz) = ClampMinFilterWidth(lowHz, highHz);
-        AmTxProfile? updatedAmProfile = null;
+        FmConfig? updatedFm = null;
         Mutate(s =>
         {
-            int loAbs = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
-            int hiAbs = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
             var txMode = RadioFrequencyResolver.TxReceiver(s).Mode;
-            if (txMode is RxMode.AM or RxMode.SAM)
+            if (txMode == RxMode.FM)
             {
-                // AM/SAM always use the dedicated symmetric profile. Route the
-                // ordinary TX-filter endpoint here too so every UI/CAT writer
-                // edits the value that is actually on air instead of a hidden
-                // global field that the AM overlay ignores.
-                updatedAmProfile = NormalizeAmTxProfile(s.AmTxProfile) with
-                {
-                    TxFilterHighHz = Math.Clamp(hiAbs, MinFilterWidthHz, MaxFilterEdgeHz),
-                };
+                // FM: the editable TX width is the audio high cut (Thetis
+                // udFMHighCutTX); the WDSP bandpass is locked to
+                // ±(deviation + high cut) (console.cs:8016). A same-signed pair
+                // also carries an explicit low cut; the usual symmetric ±X pair
+                // leaves the low cut alone.
+                var fm = (s.Fm ?? FmConfig.Default).Normalized();
+                int fmHi = Math.Clamp(Math.Max(Math.Abs(lowHz), Math.Abs(highHz)), FmConfig.MinAudioCutHz + 1, FmConfig.MaxAudioCutHz);
+                int fmLo = lowHz > 0 && lowHz < highHz ? lowHz : fm.TxLowCutHz;
+                fmLo = Math.Clamp(Math.Min(fmLo, fmHi - 1), FmConfig.MinAudioCutHz, FmConfig.MaxAudioCutHz);
+                updatedFm = (fm with { TxLowCutHz = fmLo, TxHighCutHz = fmHi }).Normalized();
                 return s with
                 {
-                    AmTxProfile = updatedAmProfile,
-                    TxFilterLowHz = -updatedAmProfile.TxFilterHighHz,
-                    TxFilterHighHz = updatedAmProfile.TxFilterHighHz,
+                    Fm = updatedFm,
+                    TxFilterLowHz = -updatedFm.TxHighCutHz,
+                    TxFilterHighHz = updatedFm.TxHighCutHz,
                 };
             }
-            StoreTxFamilyFilter(s.Mode, loAbs, hiAbs);
+            if (txMode is RxMode.AM or RxMode.SAM)
+            {
+                // AM/SAM transmit the shared voice cuts: WDSP bandpass -hi..+hi,
+                // low cut = AM modulator high-pass (StateDto.TxLowCutHz).
+                // A pair straddling zero (-hi..+hi, the symmetric view of the
+                // passband) carries only the high cut; a non-negative pair
+                // (lo..hi) is the operator's low/high cut and sets both.
+                var (loAbs, hiAbs) = TxCutsFromSignedPair(txMode, lowHz, highHz);
+                hiAbs = Math.Clamp(hiAbs, MinFilterWidthHz, MaxFilterEdgeHz);
+                loAbs = Math.Clamp(loAbs, 0, Math.Max(0, hiAbs - MinFilterWidthHz));
+                StoreTxFamilyFilter(txMode, loAbs, hiAbs);
+                return s with { TxFilterLowHz = -hiAbs, TxFilterHighHz = hiAbs };
+            }
+            int lo = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
+            int hi = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
+            StoreTxFamilyFilter(s.Mode, lo, hi);
             return s with { TxFilterLowHz = lowHz, TxFilterHighHz = highHz };
         });
-        if (updatedAmProfile is not null)
-            _dspSettingsStore.SetAmTxProfile(updatedAmProfile);
+        if (updatedFm is not null)
+            _dspSettingsStore.SetFmConfig(updatedFm);
         FlushState();
         return Snapshot();
     }
@@ -3773,9 +4063,12 @@ public sealed class RadioService : IDisposable
         var slot = new FamilyFilter(loAbs, hiAbs);
         switch (mode)
         {
+            // AM/SAM share the voice (SSB) cuts: one live TX audio config, the
+            // mode only decides the modulation. DSB keeps its own slot.
             case RxMode.USB: case RxMode.LSB: case RxMode.DIGU: case RxMode.DIGL:
+            case RxMode.AM: case RxMode.SAM:
                 _ssbTxFilter = slot; break;
-            case RxMode.AM: case RxMode.SAM: case RxMode.DSB:
+            case RxMode.DSB:
                 _amTxFilter = slot; break;
             case RxMode.FM:
                 _fmTxFilter = slot; break;
@@ -3789,7 +4082,8 @@ public sealed class RadioService : IDisposable
     private FamilyFilter TxFamilyFilterFor(RxMode mode) => mode switch
     {
         RxMode.USB or RxMode.LSB or RxMode.DIGU or RxMode.DIGL => _ssbTxFilter,
-        RxMode.AM or RxMode.SAM or RxMode.DSB => _amTxFilter,
+        RxMode.AM or RxMode.SAM => _ssbTxFilter,
+        RxMode.DSB => _amTxFilter,
         RxMode.FM => _fmTxFilter,
         RxMode.CWL or RxMode.CWU => _cwTxFilter,
         RxMode.FreeDv => _freeDvTxFilter,
@@ -3801,11 +4095,25 @@ public sealed class RadioService : IDisposable
         RxMode.USB or RxMode.LSB => _ssbFilter,
         RxMode.DIGU or RxMode.DIGL => _digFilter,
         RxMode.AM or RxMode.SAM or RxMode.DSB => _amFilter,
-        RxMode.FM => _fmFilter,
+        RxMode.FM => FmRxFamilyFilterLocked(),
         RxMode.CWL or RxMode.CWU => _cwFilter,
         RxMode.FreeDv => _freeDvFilter,
         _ => _ssbFilter,
     };
+
+    // FM has no operator RX filter memory: Thetis locks the RX IF bandpass to
+    // ±(RXFMDeviation + RXFMHighCut) (console.cs:7499 UpdateRX1Filters, :7621
+    // for RX2) — ±8000 at stock 5 kHz deviation / 3 kHz high cut. The legacy
+    // _fmFilter/_fmFilterB slots are still persisted but no longer read.
+    // Caller holds _sync (reads the live FmConfig off _state).
+    private FamilyFilter FmRxFamilyFilterLocked() =>
+        new(0, FmRxFilterHalfWidthHz(_state.Fm));
+
+    internal static int FmRxFilterHalfWidthHz(FmConfig? fm)
+    {
+        var cfg = fm ?? FmConfig.Default;
+        return cfg.DeviationHz + cfg.RxHighCutHz;
+    }
 
     private FamilyFilter FamilyFilterFor(RxMode mode, TxVfo receiver)
     {
@@ -3817,7 +4125,7 @@ public sealed class RadioService : IDisposable
             RxMode.USB or RxMode.LSB => _ssbFilterB,
             RxMode.DIGU or RxMode.DIGL => _digFilterB,
             RxMode.AM or RxMode.SAM or RxMode.DSB => _amFilterB,
-            RxMode.FM => _fmFilterB,
+            RxMode.FM => FmRxFamilyFilterLocked(),
             RxMode.CWL or RxMode.CWU => _cwFilterB,
             RxMode.FreeDv => _freeDvFilter,
             _ => _ssbFilterB,
@@ -6645,6 +6953,8 @@ public sealed class RadioService : IDisposable
         if (_disposed) return;
         _disposed = true;
         _paStore.Changed -= RecomputePaAndPush;
+        if (_bandPlan is not null)
+            _bandPlan.PlanChanged -= OnBandPlanChangedForFm;
         if (_antennaStore is not null)
             _antennaStore.Changed -= RecomputePaAndPush;
         if (_rfFilterStore is not null)
@@ -6692,6 +7002,7 @@ public sealed class RadioService : IDisposable
     private void Mutate(Func<StateDto, StateDto?> fn, out bool applied)
     {
         StateDto? next;
+        bool arsChanged = false;
         try
         {
             lock (_sync)
@@ -6711,7 +7022,13 @@ public sealed class RadioService : IDisposable
                     Receivers = ProjectReceivers(next),
                     MaxReceivers = EffectiveMaxReceivers,
                     ConnectedProtocol = ConnectedProtocolLocked(),
+                    // Mirror of the shared voice low cut (SSB/AM memory) so
+                    // the pipeline and clients see the AM high-pass value.
+                    TxLowCutHz = _ssbTxFilter.LoAbs,
                 };
+                // Automatic Repeater Shift runs before the TX safety hook so a
+                // keyed-while-tuning shift is validated on the shifted carrier.
+                next = ApplyAutoRepeaterShiftLocked(next, out arsChanged);
                 TransmitSafetyStateChanging?.Invoke(_state, next);
                 _state = next;
                 _currentMode = (int)next.Mode;
@@ -6724,6 +7041,8 @@ public sealed class RadioService : IDisposable
         }
         applied = true;
         _stateDirty = true;
+        // Persist only when ARS actually changed the shift — never per tune tick.
+        if (arsChanged) PersistLiveFmConfig();
         StateChanged?.Invoke(next);
     }
 
@@ -6999,6 +7318,10 @@ public sealed class RadioService : IDisposable
                 TxVfo = snap.TxVfo,
                 CtunEnabled = snap.CtunEnabled,
                 FullDuplexMultiRxEnabled = snap.FullDuplexMultiRxEnabled,
+                RitEnabled = snap.RitEnabled,
+                RitHz = snap.RitHz,
+                XitEnabled = snap.XitEnabled,
+                XitHz = snap.XitHz,
                 Notches = notches.Select(n => new RadioStateNotchEntry
                 {
                     CenterHz = n.CenterHz,

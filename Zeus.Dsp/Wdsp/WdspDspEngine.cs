@@ -438,6 +438,19 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // run bits only; these cached configs keep voice-mode restore exact.
     private TxPhaseRotatorConfig _txPhaseRotatorConfig = new();
     private CfcConfig _cfcConfig = CfcConfig.Default;
+    // Latest FM configuration (Thetis console FM panel + Setup -> DSP -> FM).
+    // Cached so every TXA/RXA channel opened later starts from it; written
+    // under _txaLock, read lock-free (reference swap) by the RXA open path.
+    private FmConfig _fmConfig = FmConfig.Default;
+    // Zeus FM extension exports present in the loaded libwdsp. Probed once
+    // (lazily, through _txControlNative so tests can inject it); a binary
+    // built before the extension reports all false and the features stay
+    // inert. Every call to those exports is gated on these flags.
+    private FmNativeCaps? _fmCaps;
+    // Peak TX deviation (Hz) sampled on the TX ingest thread after each
+    // fexchange2 while transmitting FM; GetFmDspStatus reads and resets it.
+    private readonly object _fmDevPeakLock = new();
+    private double _fmDevPeakHoldHz;
     // Operator's Compressor on/off, last applied via SetTxLeveling. Digital TX
     // and roger-beep bypasses force only the effective run bit off; this cache
     // preserves the operator's intent for exact voice-mode restore while the
@@ -481,6 +494,25 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // TxStageMeters.Silent in that case.
     private TxStageMeters? _latestTxStageMeters;
     private readonly object _txMeterPublishLock = new();
+
+    // ---- Broadcast AM (Zeus extension of WDSP ammod.c) ----
+    // Cached under _txaLock and re-applied whenever TXA (re)opens. Legacy
+    // (broadcast off, no filters) until the hosting layer pushes its state.
+    // A libwdsp built before the extension lacks the exports: the first
+    // EntryPointNotFoundException latches _amBroadcastUnavailable and the
+    // feature silently stays off (warning logged once).
+    private AmBroadcastConfig _amBroadcastConfig = AmBroadcastConfig.Default with { Enabled = false };
+    private int _amHighPassHz;
+    private int _amLowPassHz;
+    private volatile bool _amBroadcastUnavailable;
+    // Modulation peak hold (TX ingest thread only). The native getter resets
+    // per block; holding for AmModHoldMs lets the 10 Hz meter readers see the
+    // window peak without a reset-on-read race between them.
+    private const long AmModHoldMs = 200;
+    private double _amModPosHold;
+    private double _amModNegHold;
+    private long _amModPosHoldAtMs;
+    private long _amModNegHoldAtMs;
 
     // Latest per-stage RX meters, published atomically each time
     // GetRxStageMeters is called from the pipeline tick. The reader sees a
@@ -886,6 +918,11 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
             ApplyAgcDefaults(id);
             ApplySquelchDefaults(id);
+            // FM demod state (deviation, de-emphasis/audio cuts, CTCSS notch,
+            // detector limiter) from the cached config. WDSP create_fmd seeds
+            // the tone notch ON at 254.1 Hz (RXA.c:196); Thetis re-sends the
+            // operator values per receiver (radio.cs:1429-1598).
+            ApplyFmRx(id, Volatile.Read(ref _fmConfig), isTxMonitor);
 
             // Pre-RXA blankers: create run=0 so the setters / xanbEXT slots are
             // allocated before any SetNoiseReduction call touches them (EXT
@@ -2596,6 +2633,12 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // CESSB state after configuring the compressor.
                 NativeMethods.SetTXAEQRun(id, 0);
                 NativeMethods.SetTXAAMSQRun(id, 0);
+                // FM modulator state. WDSP create_fmmod (TXA.c:350) seeds CTCSS
+                // run=1 @ 100 Hz, so without an explicit SetTXACTCSSRun every FM
+                // transmission carries a sub-audible tone. Thetis radio.cs
+                // SyncAll re-sends CTCSSFlag/TXFMDeviation/TXFMEmphOn/AF cuts on
+                // every TXA create; mirror that from the cached config.
+                ApplyFmTxLocked(id, Volatile.Read(ref _fmConfig));
 
                 // CFIR compensates the sinc droop introduced by the TXA upsample
                 // to the output rate. Thetis (audio.cs:1808) turns it ON for P2,
@@ -2606,6 +2649,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 {
                     NativeMethods.SetTXACFIRRun(id, 1);
                 }
+
+                ApplyAmBroadcastLocked(id);
 
                 _txaChannelId = id;
                 _txaNativeOwned = true;
@@ -3270,6 +3315,299 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setTxAmCarrierLevel level={Level:F3}", clamped);
     }
 
+    public bool TxAmBroadcastSupported => !_amBroadcastUnavailable;
+
+    public void SetTxAmBroadcast(AmBroadcastConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        if (_disposed != 0) return;
+        var clean = config.Clamped();
+        lock (_txaLock)
+        {
+            _amBroadcastConfig = clean;
+            if (_txaChannelId is int txa) ApplyAmBroadcastLocked(txa);
+        }
+        _log.LogInformation(
+            "wdsp.setTxAmBroadcast enabled={Enabled} pos={Pos:F0}% neg={Neg:F0}% preemph={Pre} invert={Inv} available={Available}",
+            clean.Enabled, clean.PositivePeakPct, clean.NegativePeakPct,
+            clean.PreEmphasis, clean.InvertPolarity, !_amBroadcastUnavailable);
+    }
+
+    public void SetTxAmFilter(int highPassHz, int lowPassHz)
+    {
+        if (_disposed != 0) return;
+        int hp = Math.Max(0, highPassHz);
+        int lp = Math.Max(0, lowPassHz);
+        lock (_txaLock)
+        {
+            _amHighPassHz = hp;
+            _amLowPassHz = lp;
+            if (_txaChannelId is int txa) ApplyAmBroadcastLocked(txa);
+        }
+        _log.LogInformation("wdsp.setTxAmFilter hpf={Hpf} lpf={Lpf}", hp, lp);
+    }
+
+    // Caller holds _txaLock.
+    private void ApplyAmBroadcastLocked(int txa)
+    {
+        if (_amBroadcastUnavailable) return;
+        var c = _amBroadcastConfig;
+        try
+        {
+            _txControlNative.SetTXAAMBroadcast(
+                txa,
+                c.Enabled ? 1 : 0,
+                c.PositivePeakPct / 100.0,
+                c.NegativePeakPct / 100.0,
+                c.PreEmphasis ? 1 : 0,
+                c.InvertPolarity ? 1 : 0);
+            _txControlNative.SetTXAAMFilter(txa, _amHighPassHz, _amLowPassHz);
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            MarkAmBroadcastUnavailable(ex);
+        }
+    }
+
+    private void MarkAmBroadcastUnavailable(EntryPointNotFoundException ex)
+    {
+        if (_amBroadcastUnavailable) return;
+        _amBroadcastUnavailable = true;
+        _log.LogWarning(
+            "wdsp.amBroadcast unavailable — libwdsp lacks the broadcast-AM exports ({Message}); AM TX stays on the legacy modulator with no low cut until the native library is rebuilt",
+            ex.Message);
+    }
+
+    // TX ingest thread. Returns (positive %, negative-magnitude %) for AM/SAM.
+    private (float Pos, float Neg) SampleAmModulationPeaks(int txa)
+    {
+        var mode = _txCurrentMode;
+        if (_amBroadcastUnavailable || mode is not (RxaMode.AM or RxaMode.SAM))
+        {
+            _amModPosHold = 0;
+            _amModNegHold = 0;
+            return (0f, 0f);
+        }
+        double pos, neg;
+        try
+        {
+            _txControlNative.GetTXAAMModPeaks(txa, out pos, out neg);
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            MarkAmBroadcastUnavailable(ex);
+            return (0f, 0f);
+        }
+        long now = Environment.TickCount64;
+        if (!double.IsFinite(pos)) pos = 0;
+        if (!double.IsFinite(neg)) neg = 0;
+        if (pos >= _amModPosHold || now - _amModPosHoldAtMs > AmModHoldMs)
+        {
+            _amModPosHold = pos;
+            _amModPosHoldAtMs = now;
+        }
+        if (neg >= _amModNegHold || now - _amModNegHoldAtMs > AmModHoldMs)
+        {
+            _amModNegHold = neg;
+            _amModNegHoldAtMs = now;
+        }
+        return ((float)_amModPosHold, (float)_amModNegHold);
+    }
+
+    internal (float Pos, float Neg) SampleAmModulationPeaksForTests(int txa) =>
+        SampleAmModulationPeaks(txa);
+    public void SetFmConfig(FmConfig cfg)
+    {
+        if (_disposed != 0) return;
+        ArgumentNullException.ThrowIfNull(cfg);
+        var clean = cfg.Normalized();
+        lock (_txaLock)
+        {
+            Volatile.Write(ref _fmConfig, clean);
+            if (_txaChannelId is int txa)
+                ApplyFmTxLocked(txa, clean);
+        }
+        // Every RXA channel — RX1, secondary receivers and the TX monitor —
+        // demodulates FM with the same deviation / audio band / notch, as
+        // Thetis applies RXFM* to every (thread, subrx) pair. The lifecycle
+        // gate serializes against channel teardown (StopChannel), the same
+        // way SetNotches walks every channel.
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            int? monitorId = _monitorChannelId;
+            foreach (var id in _channels.Keys)
+                ApplyFmRx(id, clean, id == monitorId);
+        });
+        var caps = FmCaps;
+        _log.LogInformation(
+            "wdsp.setFmConfig dev={Dev} txAf={TxLo}-{TxHi} rxAf={RxLo}-{RxHi} emphPos={Pos} ctcss={Ctcss}@{Tone:F1} notch={Notch} lim={Lim}/{LimDb:F1} level={Level:F1}% dcs={Dcs}:{DcsCode:D3}{DcsPol} txPreEmph={PreEmph} rxDeEmph={DeEmph} toneSq={ToneSq} ext={Ext}",
+            clean.DeviationHz, clean.TxLowCutHz, clean.TxHighCutHz, clean.RxLowCutHz, clean.RxHighCutHz,
+            clean.PreEmphasisBeforeLimiting ? 0 : 1, clean.CtcssEnabled, clean.CtcssToneHz,
+            clean.RxToneNotch, clean.DetectorLimiterEnabled, clean.DetectorLimiterGainDb,
+            clean.CtcssLevelPercent, clean.DcsTxEnabled, clean.DcsCode, clean.DcsInverted ? "I" : "N",
+            clean.TxPreEmphasis, clean.RxDeEmphasis, clean.RxToneSquelch, caps);
+    }
+
+    /// <summary>Which Zeus FM extension exports the loaded libwdsp carries.</summary>
+    internal readonly record struct FmNativeCaps(
+        bool CtcssLevel,
+        bool Dcs,
+        bool DeviationMeter,
+        bool ToneDecode,
+        bool DeemphBypass,
+        bool EmphRun)
+    {
+        internal static FmNativeCaps Probe(IWdspTxControlNative native) => new(
+            CtcssLevel: native.IsExportAvailable(nameof(NativeMethods.SetTXACTCSSLevel)),
+            Dcs: native.IsExportAvailable(nameof(NativeMethods.SetTXADCSRun))
+                && native.IsExportAvailable(nameof(NativeMethods.SetTXADCSCode)),
+            DeviationMeter: native.IsExportAvailable(nameof(NativeMethods.GetTXAFMDeviationPeak)),
+            ToneDecode: native.IsExportAvailable(nameof(NativeMethods.SetRXAFMToneSquelch))
+                && native.IsExportAvailable(nameof(NativeMethods.GetRXAFMToneStatus)),
+            DeemphBypass: native.IsExportAvailable(nameof(NativeMethods.SetRXAFMDeemphRun)),
+            EmphRun: native.IsExportAvailable(nameof(NativeMethods.SetTXAFMEmphRun)));
+    }
+
+    // Probed once; a benign race can probe twice (same answer, and
+    // WdspNativeLoader caches per symbol).
+    internal FmNativeCaps FmCaps
+    {
+        get
+        {
+            if (_fmCaps is FmNativeCaps caps) return caps;
+            caps = FmNativeCaps.Probe(_txControlNative);
+            _fmCaps = caps;
+            return caps;
+        }
+    }
+
+    public FmDspStatus GetFmDspStatus()
+    {
+        if (_disposed != 0) return FmDspStatus.Unavailable;
+        var caps = FmCaps;
+        double? ctcssHz = null;
+        int? dcsCode = null;
+        bool? dcsInverted = null;
+        bool squelchOpen = true;
+        int rx = Volatile.Read(ref _primaryRxaChannelId);
+        if (caps.ToneDecode && rx >= 0)
+        {
+            double hz = 0;
+            int code = 0, inv = 0, open = 1;
+            bool read = false;
+            // The lifecycle gate orders this against StopChannel's native
+            // CloseChannel; the native getter itself takes only fmd's short
+            // status lock, never csDSP, so the audio thread is not stalled.
+            RunNativeLifecycleCriticalSection(() =>
+            {
+                if (_channels.TryGetValue(rx, out var state) && !state.Stopped)
+                {
+                    NativeMethods.GetRXAFMToneStatus(rx, out hz, out code, out inv, out open);
+                    read = true;
+                }
+            });
+            if (read)
+            {
+                if (double.IsFinite(hz) && hz > 0) ctcssHz = hz;
+                if (code > 0)
+                {
+                    dcsCode = code;
+                    dcsInverted = inv != 0;
+                }
+                squelchOpen = open != 0;
+            }
+        }
+        double devPeakHz = 0;
+        if (caps.DeviationMeter)
+        {
+            lock (_fmDevPeakLock)
+            {
+                devPeakHz = _fmDevPeakHoldHz;
+                _fmDevPeakHoldHz = 0;
+            }
+        }
+        return new FmDspStatus(
+            ToneDecodeAvailable: caps.ToneDecode,
+            DcsAvailable: caps.Dcs && caps.ToneDecode,
+            DeviationMeterAvailable: caps.DeviationMeter,
+            CtcssLevelAvailable: caps.CtcssLevel,
+            DeEmphasisBypassAvailable: caps.DeemphBypass,
+            DetectedCtcssHz: ctcssHz,
+            DetectedDcsCode: dcsCode,
+            DetectedDcsInverted: dcsInverted,
+            ToneSquelchOpen: squelchOpen,
+            TxPeakDeviationHz: devPeakHz);
+    }
+
+    // TX ingest thread, right after fexchange2. Folds the native per-block
+    // peak into the hold GetFmDspStatus drains; nothing outside FM.
+    private void SampleFmDeviationPeak(int txa)
+    {
+        if (_txCurrentMode != RxaMode.FM || !FmCaps.DeviationMeter) return;
+        _txControlNative.GetTXAFMDeviationPeak(txa, out double peakHz);
+        if (!double.IsFinite(peakHz) || peakHz <= 0) return;
+        lock (_fmDevPeakLock)
+        {
+            if (peakHz > _fmDevPeakHoldHz) _fmDevPeakHoldHz = peakHz;
+        }
+    }
+
+    internal void SampleFmDeviationPeakForTests(int txa) => SampleFmDeviationPeak(txa);
+
+    // Caller holds _txaLock. Thetis radio.cs:2884-3112 / 4163-4180 setters.
+    // Emphasis position: Thetis passes TXFMEmphOn = !chkEmphPos.Checked, so
+    // "pre-emphasize before limiting" is WDSP position 0 and the default is 1
+    // (after ALC, just ahead of the modulator).
+    // Zeus extensions (gated on the loaded binary): CTCSS/DCS level, DCS
+    // encode (Normalized() already cleared CtcssEnabled when DCS is on; the
+    // native modulator also lets DCS win), and the operator pre-emphasis
+    // enable, which is independent of the run flag SetTXAMode forces on in FM.
+    private void ApplyFmTxLocked(int txa, FmConfig fm)
+    {
+        var caps = FmCaps;
+        _txControlNative.SetTXAFMDeviation(txa, fm.DeviationHz);
+        _txControlNative.SetTXAFMEmphPosition(txa, fm.PreEmphasisBeforeLimiting ? 0 : 1);
+        _txControlNative.SetTXAFMAFFilter(txa, fm.TxLowCutHz, fm.TxHighCutHz);
+        if (caps.CtcssLevel)
+            _txControlNative.SetTXACTCSSLevel(txa, fm.CtcssLevelPercent / 100.0);
+        _txControlNative.SetTXACTCSSFreq(txa, fm.CtcssToneHz);
+        _txControlNative.SetTXACTCSSRun(txa, fm.CtcssEnabled ? 1 : 0);
+        if (caps.Dcs)
+        {
+            _txControlNative.SetTXADCSCode(txa, fm.DcsCode, fm.DcsInverted ? 1 : 0);
+            _txControlNative.SetTXADCSRun(txa, fm.DcsTxEnabled ? 1 : 0);
+        }
+        if (caps.EmphRun)
+            _txControlNative.SetTXAFMEmphRun(txa, fm.TxPreEmphasis ? 1 : 0);
+    }
+
+    // WDSP fmd.c quirk: calc_fmd rebuilds the CTCSS notch with run=1, and
+    // SetRXAFMLimGain goes through decalc/calc_fmd. Push the limiter gain
+    // FIRST and the notch run LAST so the operator's notch choice survives.
+    // The notch frequency tracks the effective RX tone (split tone; Thetis
+    // radio.cs:2903-2916 uses the single TX tone). The Zeus tone detector /
+    // squelch and the de-emphasis bypass live outside calc_fmd, so their
+    // order does not matter. The TX monitor never tone-squelches: it
+    // demodulates our own signal and must always be audible.
+    private void ApplyFmRx(int id, FmConfig fm, bool isTxMonitor = false)
+    {
+        var caps = FmCaps;
+        NativeMethods.SetRXAFMLimGain(id, fm.DetectorLimiterGainDb);
+        NativeMethods.SetRXAFMLimRun(id, fm.DetectorLimiterEnabled ? 1 : 0);
+        NativeMethods.SetRXAFMDeviation(id, fm.DeviationHz);
+        NativeMethods.SetRXAFMAFFilter(id, fm.RxLowCutHz, fm.RxHighCutHz);
+        NativeMethods.SetRXACTCSSFreq(id, fm.EffectiveRxCtcssToneHz);
+        NativeMethods.SetRXACTCSSRun(id, fm.RxToneNotch ? 1 : 0);
+        if (caps.DeemphBypass)
+            NativeMethods.SetRXAFMDeemphRun(id, fm.RxDeEmphasis ? 1 : 0);
+        if (caps.ToneDecode)
+        {
+            var mode = isTxMonitor ? FmRxToneSquelch.Off : fm.RxToneSquelch;
+            NativeMethods.SetRXAFMToneSquelch(
+                id, (int)mode, fm.EffectiveRxCtcssToneHz, fm.EffectiveRxDcsCode, fm.DcsInverted ? 1 : 0);
+        }
+    }
+
     public void SetTxDigitalBypass(bool bypass)
     {
         if (_disposed != 0) return;
@@ -3342,6 +3680,14 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // its own.
             var (txLow, txHigh) = FloorPassbandWidth(lowHz, highHz);
             RunNativeLifecycleCriticalSection(() => NativeMethods.SetTXABandpassFreqs(txa, txLow, txHigh));
+            // Thetis console.cs SetTXFilters (~8050): in FM, re-send the TX FM
+            // low/high cuts (SetTXAFMAFFilter) right after the bandpass so the
+            // pre-emphasis + modulator audio band stay authoritative.
+            if (_txCurrentMode == RxaMode.FM)
+            {
+                var fm = _fmConfig;
+                _txControlNative.SetTXAFMAFFilter(txa, fm.TxLowCutHz, fm.TxHighCutHz);
+            }
         }
         // Mirror the filter onto the monitor channel so the preview stays at
         // the same bandwidth as the on-air signal. Stash the values regardless
@@ -4396,6 +4742,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         {
             _log.LogWarning("wdsp.fexchange2 tx err={Err} (suppressed after 8 occurrences)", err);
         }
+        SampleFmDeviationPeak(txa);
 
         float txOutPeak = 0f;
         for (int i = 0; i < outSize; i++)
@@ -4503,6 +4850,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         double alcGain = NativeMethods.GetTXAMeter(txa, 14);
         double outPk = NativeMethods.GetTXAMeter(txa, 15);
         double outAv = NativeMethods.GetTXAMeter(txa, 16);
+        var (amModPos, amModNeg) = SampleAmModulationPeaks(txa);
 
         // Publish the snapshot before returning so pollers don't see a
         // partially-written set. Lock is uncontended in steady state —
@@ -4528,7 +4876,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             AlcAv: (float)alcAv,
             AlcGr: (float)-alcGain,
             OutPk: (float)outPk,
-            OutAv: (float)outAv);
+            OutAv: (float)outAv,
+            AmModPosPct: amModPos,
+            AmModNegPct: amModNeg);
         lock (_txMeterPublishLock) { _latestTxStageMeters = snap; }
 
         var now = DateTime.UtcNow;

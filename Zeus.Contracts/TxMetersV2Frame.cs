@@ -47,7 +47,7 @@ using System.Buffers.Binary;
 
 namespace Zeus.Contracts;
 
-// Extended TX-telemetry frame (v2). 81 bytes total:
+// Extended TX-telemetry frame (v2). 89 bytes total (81 before broadcast AM):
 //
 //   [0x16] [fwdW:f32] [refW:f32] [swr:f32]
 //          [micPk:f32] [micAv:f32]
@@ -57,6 +57,14 @@ namespace Zeus.Contracts;
 //          [compPk:f32][compAv:f32]
 //          [alcPk:f32] [alcAv:f32] [alcGr:f32]
 //          [outPk:f32] [outAv:f32]
+//          [amModPosPct:f32] [amModNegPct:f32]      <- appended (offsets 81, 85)
+//
+// The two AM modulation fields were appended for broadcast AM: positive
+// modulation peak % and the magnitude of the negative peak % (97 => -97 %)
+// over the ~100 ms meter window, non-zero only while transmitting AM/SAM.
+// Appending keeps every earlier offset stable; decoders MUST accept frames of
+// at least 81 bytes and treat the AM fields as 0 when the frame is shorter
+// (older server). Deserialize below does exactly that.
 //
 // Compatible additive extension of TxMetersFrame (0x11): carries average
 // readings alongside peak for every stage, plus CFC / COMP stages that v1
@@ -91,9 +99,15 @@ public readonly record struct TxMetersV2Frame(
     float AlcAv,
     float AlcGr,
     float OutPk,
-    float OutAv)
+    float OutAv,
+    float AmModPosPct = 0f,
+    float AmModNegPct = 0f)
 {
-    public const int ByteLength = 1 + 4 * 20;
+    public const int ByteLength = 1 + 4 * 22;
+
+    /// <summary>Length of the pre-broadcast-AM frame (20 floats). Still
+    /// accepted by <see cref="Deserialize"/>.</summary>
+    public const int LegacyByteLength = 1 + 4 * 20;
 
     public void Serialize(IBufferWriter<byte> writer)
     {
@@ -119,13 +133,16 @@ public readonly record struct TxMetersV2Frame(
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(69, 4), AlcGr);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(73, 4), OutPk);
         BinaryPrimitives.WriteSingleLittleEndian(span.Slice(77, 4), OutAv);
+        BinaryPrimitives.WriteSingleLittleEndian(span.Slice(81, 4), AmModPosPct);
+        BinaryPrimitives.WriteSingleLittleEndian(span.Slice(85, 4), AmModNegPct);
         writer.Advance(ByteLength);
     }
 
     public static TxMetersV2Frame Deserialize(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.Length < ByteLength)
-            throw new InvalidDataException($"TxMetersV2Frame requires {ByteLength} bytes, got {bytes.Length}");
+        if (bytes.Length < LegacyByteLength)
+            throw new InvalidDataException($"TxMetersV2Frame requires {LegacyByteLength} bytes, got {bytes.Length}");
+        bool hasAm = bytes.Length >= ByteLength;
         if (bytes[0] != (byte)MsgType.TxMetersV2)
             throw new InvalidDataException($"expected TxMetersV2 (0x{(byte)MsgType.TxMetersV2:X2}), got 0x{bytes[0]:X2}");
         return new TxMetersV2Frame(
@@ -148,6 +165,8 @@ public readonly record struct TxMetersV2Frame(
             AlcAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(65, 4)),
             AlcGr: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(69, 4)),
             OutPk: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(73, 4)),
-            OutAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(77, 4)));
+            OutAv: BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(77, 4)),
+            AmModPosPct: hasAm ? BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(81, 4)) : 0f,
+            AmModNegPct: hasAm ? BinaryPrimitives.ReadSingleLittleEndian(bytes.Slice(85, 4)) : 0f);
     }
 }

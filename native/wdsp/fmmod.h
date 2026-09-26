@@ -27,6 +27,12 @@ warren@wpratt.com
 #ifndef _fmmod_h
 #define _fmmod_h
 #include "firmin.h"
+#include "fm_tone.h"
+
+// Zeus extension (FM tones): adjustable CTCSS level (SetTXACTCSSLevel), DCS
+// encode (SetTXADCSRun / SetTXADCSCode; DCS wins over CTCSS when both run)
+// and a peak-deviation readout of the composite modulating signal
+// (GetTXAFMDeviationPeak). DSP helpers live in fm_tone.c.
 typedef struct _fmmod {
   int run;
   int size;
@@ -52,6 +58,13 @@ typedef struct _fmmod {
   int nc;
   int mp;
   FIRCORE p;
+  // ---- Zeus FM tone extension ----
+  int dcs_run;
+  int dcs_code;                         // octal written as decimal (23 = 023)
+  int dcs_inverted;
+  fmtone_dcsenc dcs;
+  CRITICAL_SECTION cs_peak;
+  double dev_peak;                      // peak |deviation| (Hz) since last GetTXAFMDeviationPeak
 } fmmod, *FMMOD;
 
 extern FMMOD create_fmmod (int run, int size, double* in, double* out, int rate, double dev, double f_low,
@@ -83,5 +96,15 @@ extern __declspec (dllexport) void SetTXAFMMP (int channel, int mp);
 extern __declspec (dllexport) void SetTXAFMNC (int channel, int nc);
 
 extern __declspec (dllexport) void SetTXAFMAFFreqs (int channel, double low, double high);
+
+// Zeus extension (FM tones)
+
+extern __declspec (dllexport) void SetTXACTCSSLevel (int channel, double level);
+
+extern __declspec (dllexport) void SetTXADCSRun (int channel, int run);
+
+extern __declspec (dllexport) void SetTXADCSCode (int channel, int code, int inverted);
+
+extern __declspec (dllexport) void GetTXAFMDeviationPeak (int channel, double* peakHz);
 
 #endif

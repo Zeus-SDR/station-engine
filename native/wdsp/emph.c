@@ -53,6 +53,7 @@ typedef struct _emphp
 	int wintype;
 	FCIMP pfcimp;
 	FIRCORE p;
+	int zeus_bypass;			// Zeus extension: 1 = pre-emphasis forced off (SetTXAFMEmphRun)
 } emphp, * EMPHP;
 
 EMPHP create_emphp (int run, int position, int size, int nc, int mp, double* in, double* out,
@@ -77,6 +78,7 @@ EMPHP create_emphp (int run, int position, int size, int nc, int mp, double* in,
 	a->scale = 1.0 / (2.0 * a->size);
 	exec_fcimp (a->pfcimp, a->f_low, a->f_high, a->g0, a->g1, a->ctype, a->rate, a->scale, 0);
 	a->p = create_fircore (a->size, a->in, a->out, a->nc, a->mp, 4, get_pfcpulse(a->pfcimp));
+	a->zeus_bypass = 0;
 	return a;
 }
 
@@ -94,7 +96,7 @@ void flush_emphp (EMPHP a)
 
 void xemphp (EMPHP a, int position)
 {
-	if (a->run && a->position == position)
+	if (a->run && !a->zeus_bypass && a->position == position)
 		xfircore (a->p);
 	else if (a->in != a->out)
 		memcpy (a->out, a->in, a->size * sizeof (complex));
@@ -188,6 +190,20 @@ void SetTXAFMPreEmphRun(int channel, int run)
 {
 	EMPHP a = txa[channel].preemph.p;
 	a->run = run;
+}
+
+// Zeus extension (FM): operator pre-emphasis enable, independent of the
+// run flag SetTXAMode drives (it forces run = 1 in FM). run = 0 sends flat
+// audio (data / packet). Pre-emphasis has unity gain at f_high and less
+// below, so bypassing it only restores the flat response; the modulator
+// input is still ALC-limited. With in == out (midbuff) the bypass is a
+// no-op pass-through, so buffers stay intact.
+PORT
+void SetTXAFMEmphRun (int channel, int run)
+{
+	EnterCriticalSection (&ch[channel].csDSP);
+	txa[channel].preemph.p->zeus_bypass = run ? 0 : 1;
+	LeaveCriticalSection (&ch[channel].csDSP);
 }
 
 /********************************************************************************************************

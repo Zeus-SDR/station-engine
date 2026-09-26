@@ -18,6 +18,7 @@ public sealed class DspSettingsStore : IDisposable
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<DspSettingsEntry> _entries;
+    private readonly ILiteCollection<AmBroadcastSettingsEntry> _amBroadcast;
     private readonly ILogger<DspSettingsStore> _log;
 
     public DspSettingsStore(ILogger<DspSettingsStore> log, string? dbPathOverride = null)
@@ -33,6 +34,8 @@ public sealed class DspSettingsStore : IDisposable
         _db = _dbLease.Database;
         _entries = _db.GetCollection<DspSettingsEntry>("dsp_settings");
         _entries.EnsureIndex(x => x.ProfileId, unique: true);
+        _amBroadcast = _db.GetCollection<AmBroadcastSettingsEntry>("am_broadcast_settings");
+        _amBroadcast.EnsureIndex(x => x.ProfileId, unique: true);
 
         _log.LogInformation("DspSettingsStore initialized at {Path}", dbPath);
     }
@@ -769,24 +772,39 @@ public sealed class DspSettingsStore : IDisposable
         e.CfcBand10Freq = c.Bands[9].FreqHz; e.CfcBand10Comp = c.Bands[9].CompLevelDb; e.CfcBand10Post = c.Bands[9].PostGainDb;
     }
 
-    public AmTxProfile? GetAmTxProfile(string profileId = "default")
+    // ---- Retired dedicated AM TX profile (#1665) ----
+    // AM/SAM now run on the single live TX audio config. The old JSON column
+    // is read exactly once by the startup migration (TxAudioProfileService),
+    // which converts a customised profile into a normal TX audio profile and
+    // then marks the migration done. Nothing else reads the column.
+
+    /// <summary>The persisted legacy AM TX profile JSON, or null when none was
+    /// ever saved or the one-time migration already ran.</summary>
+    public string? GetPendingLegacyAmTxProfileJson(string profileId = "default")
     {
-        var json = _entries.FindOne(x => x.ProfileId == profileId)?.AmTxProfileJson;
-        if (string.IsNullOrWhiteSpace(json)) return null;
-        try
-        {
-            return System.Text.Json.JsonSerializer.Deserialize<AmTxProfile>(json);
-        }
-        catch (System.Text.Json.JsonException ex)
-        {
-            _log.LogWarning(ex, "Ignoring invalid AM TX profile for {ProfileId}", profileId);
-            return null;
-        }
+        var e = _entries.FindOne(x => x.ProfileId == profileId);
+        if (e is null || e.AmTxProfileMigrated == true) return null;
+        return string.IsNullOrWhiteSpace(e.AmTxProfileJson) ? null : e.AmTxProfileJson;
     }
 
-    public void SetAmTxProfile(AmTxProfile profile, string profileId = "default")
+    /// <summary>Record that the legacy AM TX profile migration has run so it
+    /// never runs again (the legacy JSON is left in place, unused).</summary>
+    public void MarkLegacyAmTxProfileMigrated(string profileId = "default") =>
+        UpsertEntry(profileId, e => e.AmTxProfileMigrated = true);
+
+    /// <summary>Legacy symmetric AM carrier level (0..125 %). Null = never
+    /// saved; the caller applies <see cref="AmCarrierLevel.DefaultPercent"/>.</summary>
+    public int? GetAmCarrierLevelPercent(string profileId = "default")
     {
-        ArgumentNullException.ThrowIfNull(profile);
+        var v = _entries.FindOne(x => x.ProfileId == profileId)?.AmCarrierLevelPercent;
+        return v.HasValue ? AmCarrierLevel.Clamp(v.Value) : null;
+    }
+
+    public void SetAmCarrierLevelPercent(int percent, string profileId = "default") =>
+        UpsertEntry(profileId, e => e.AmCarrierLevelPercent = AmCarrierLevel.Clamp(percent));
+
+    private void UpsertEntry(string profileId, Action<DspSettingsEntry> apply)
+    {
         var existing = _entries.FindOne(x => x.ProfileId == profileId);
         if (existing is null)
         {
@@ -801,13 +819,58 @@ public sealed class DspSettingsStore : IDisposable
                 NbMode = nrSeed.NbMode,
                 NbThreshold = nrSeed.NbThreshold,
             };
-            existing.AmTxProfileJson = System.Text.Json.JsonSerializer.Serialize(profile);
+            apply(existing);
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _entries.Insert(existing);
+            return;
+        }
+        apply(existing);
+        existing.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(existing);
+    }
+
+    // FM configuration (deviation, CTCSS, repeater shift/offsets, FM audio
+    // filters). JSON like AmTxProfile so the record can grow without a LiteDB
+    // column per field. Null on a fresh install → FmConfig.Default.
+    public FmConfig? GetFmConfig(string profileId = "default")
+    {
+        var json = _entries.FindOne(x => x.ProfileId == profileId)?.FmConfigJson;
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<FmConfig>(json);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            _log.LogWarning(ex, "Ignoring invalid FM config for {ProfileId}", profileId);
+            return null;
+        }
+    }
+
+    public void SetFmConfig(FmConfig config, string profileId = "default")
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        var existing = _entries.FindOne(x => x.ProfileId == profileId);
+        if (existing is null)
+        {
+            var nrSeed = new NrConfig();
+            existing = new DspSettingsEntry
+            {
+                ProfileId = profileId,
+                NrMode = nrSeed.NrMode,
+                AnfEnabled = nrSeed.AnfEnabled,
+                SnbEnabled = nrSeed.SnbEnabled,
+                NbpNotchesEnabled = nrSeed.NbpNotchesEnabled,
+                NbMode = nrSeed.NbMode,
+                NbThreshold = nrSeed.NbThreshold,
+            };
+            existing.FmConfigJson = System.Text.Json.JsonSerializer.Serialize(config);
             existing.UpdatedUtc = DateTime.UtcNow;
             _entries.Insert(existing);
             return;
         }
 
-        existing.AmTxProfileJson = System.Text.Json.JsonSerializer.Serialize(profile);
+        existing.FmConfigJson = System.Text.Json.JsonSerializer.Serialize(config);
         existing.UpdatedUtc = DateTime.UtcNow;
         _entries.Update(existing);
     }
@@ -820,8 +883,52 @@ public sealed class DspSettingsStore : IDisposable
             ? mode
             : NrMode.Off;
 
+    // Broadcast AM (AM/SAM TX modulator). Separate collection so it never
+    // collides with the wide DspSettingsEntry row. Null = never saved; the
+    // caller applies AmBroadcastConfig.Default (Enabled, +125 / -97 %).
+    public AmBroadcastConfig? GetAmBroadcast(string profileId = "default")
+    {
+        var e = _amBroadcast.FindOne(x => x.ProfileId == profileId);
+        if (e is null) return null;
+        return new AmBroadcastConfig(
+            Enabled: e.Enabled,
+            PositivePeakPct: e.PositivePeakPct,
+            NegativePeakPct: e.NegativePeakPct,
+            PreEmphasis: e.PreEmphasis,
+            InvertPolarity: e.InvertPolarity).Clamped();
+    }
+
+    public AmBroadcastConfig SetAmBroadcast(AmBroadcastConfig config, string profileId = "default")
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        var clean = config.Clamped();
+        var existing = _amBroadcast.FindOne(x => x.ProfileId == profileId);
+        var entry = existing ?? new AmBroadcastSettingsEntry { ProfileId = profileId };
+        entry.Enabled = clean.Enabled;
+        entry.PositivePeakPct = clean.PositivePeakPct;
+        entry.NegativePeakPct = clean.NegativePeakPct;
+        entry.PreEmphasis = clean.PreEmphasis;
+        entry.InvertPolarity = clean.InvertPolarity;
+        entry.UpdatedUtc = DateTime.UtcNow;
+        if (existing is null) _amBroadcast.Insert(entry);
+        else _amBroadcast.Update(entry);
+        return clean;
+    }
+
     public void Dispose() => _dbLease.Dispose();
 
+}
+
+public sealed class AmBroadcastSettingsEntry
+{
+    public int Id { get; set; }
+    public string ProfileId { get; set; } = "default";
+    public bool Enabled { get; set; }
+    public double PositivePeakPct { get; set; }
+    public double NegativePeakPct { get; set; }
+    public bool PreEmphasis { get; set; }
+    public bool InvertPolarity { get; set; }
+    public DateTime UpdatedUtc { get; set; }
 }
 
 public sealed class DspSettingsEntry
@@ -956,6 +1063,13 @@ public sealed class DspSettingsEntry
     public BandpassWindow? TxFilterWindow { get; set; }
     public FilterPhaseMode? RxFilterPhase { get; set; }
     public FilterPhaseMode? TxFilterPhase { get; set; }
+    // Retired dedicated AM TX profile (#1665). Read once by the startup
+    // migration; AmTxProfileMigrated = true once it has run.
     public string? AmTxProfileJson { get; set; }
+    public bool? AmTxProfileMigrated { get; set; }
+    // Legacy symmetric AM carrier level (part of the live TX audio config).
+    // Null on legacy rows = AmCarrierLevel.DefaultPercent.
+    public int? AmCarrierLevelPercent { get; set; }
+    public string? FmConfigJson { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

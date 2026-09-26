@@ -52,6 +52,7 @@ internal static class EnginePrefsDbMigration
     internal static readonly IReadOnlyList<string> EngineCollectionNames =
         Array.AsReadOnly(
         [
+            "am_broadcast_settings",
             "antenna_bands",
             "audio_device_settings",
             "audio_frontend",

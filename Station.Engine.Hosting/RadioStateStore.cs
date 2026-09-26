@@ -240,6 +240,12 @@ public sealed class RadioStateEntry
     // Full-duplex RX audio ("DUP"). See StateDto.FullDuplexMultiRxEnabled.
     // Default false matches legacy rows and the pre-toggle MOX behaviour.
     public bool FullDuplexMultiRxEnabled { get; set; }
+    // RIT / XIT arm state and offsets (Thetis chkRIT/udRIT, chkXIT/udXIT, which
+    // Thetis also restores across restarts). Legacy rows hydrate to off / 0 Hz.
+    public bool RitEnabled { get; set; }
+    public long RitHz { get; set; }
+    public bool XitEnabled { get; set; }
+    public long XitHz { get; set; }
     // Per-mode-family RX filter memory (abs values, always positive)
     public int SsbFilterLoAbs { get; set; } = 150;
     public int SsbFilterHiAbs { get; set; } = 2850;

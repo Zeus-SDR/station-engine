@@ -273,6 +273,56 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXAFMSQThreshold(int channel, double threshold);
 
+    // FM demodulator (fmd.c). Deviation scales the PLL audio gain; AF filter
+    // is the de-emphasis + audio cutoff pair; CTCSS run/freq drive the tone
+    // notch; Lim* the detector limiter. NOTE: SetRXAFMLimGain (and any other
+    // path through calc_fmd) recreates the tone notch with run=1, so callers
+    // must re-assert SetRXACTCSSRun afterwards.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMDeviation(int channel, double deviation);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMAFFilter(int channel, double low, double high);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXACTCSSRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXACTCSSFreq(int channel, double freq);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMLimRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMLimGain(int channel, double gaindB);
+
+    // ---- Zeus FM extension (native/wdsp/fm_tone.c, fmd.c, fmmod.c, emph.c) ----
+    // NOT in upstream WDSP and absent from a libwdsp built before the
+    // extension. Every call is gated on WdspNativeLoader.TryProbeExport via
+    // WdspDspEngine's FM capability probe, so EntryPointNotFoundException
+    // cannot occur. Listed in OptionalZeusFmExports.
+
+    // mode 0 off / 1 CTCSS / 2 DCS; dcsCode is octal written as decimal.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMToneSquelch(int channel, int mode, double ctcssHz, int dcsCode, int dcsInverted);
+
+    // ctcssHz 0 / dcsCode 0 when nothing is locked; squelchOpen 1 when the
+    // tone squelch is off, the target is locked, or the demod is idle.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void GetRXAFMToneStatus(int channel, out double ctcssHz, out int dcsCode, out int dcsInverted, out int squelchOpen);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetRXAFMDeemphRun(int channel, int run);
+
     [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void XCreateAnalyzer(
@@ -726,6 +776,96 @@ internal static partial class NativeMethods
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAAMCarrierLevel(int channel, double c_level);
+
+    // Zeus broadcast-AM extension of ammod.c (AM/SAM only). A libwdsp built
+    // before this extension lacks these exports; callers must guard
+    // EntryPointNotFoundException and disable the feature.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAAMBroadcast(
+        int channel, int run, double posLimit, double negLimit, int preemph, int invert);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAAMFilter(int channel, double hpfHz, double lpfHz);
+
+    // Modulation peaks (percent) since the previous call, then reset.
+    // negPct is the magnitude of the negative peak (97 => -97 %).
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void GetTXAAMModPeaks(int channel, out double posPct, out double negPct);
+
+    /// <summary>Zeus broadcast-AM extension entry points. Optional: a libwdsp
+    /// built before the extension lacks them; WdspDspEngine latches the
+    /// feature off on EntryPointNotFoundException, and the packaged-runtime
+    /// compatibility test does not require them.</summary>
+    internal static readonly string[] OptionalZeusAmExports =
+    [
+        nameof(SetTXAAMBroadcast),
+        nameof(SetTXAAMFilter),
+        nameof(GetTXAAMModPeaks),
+    ];
+    // FM modulator (fmmod.c / emph.c / TXA.c). create_fmmod seeds CTCSS
+    // run=1 @ 100 Hz, so the TXA open path must assert SetTXACTCSSRun.
+    // SetTXAFMAFFilter sets both the pre-emphasis and modulator audio band.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAFMDeviation(int channel, double deviation);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAFMEmphPosition(int channel, int position);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAFMAFFilter(int channel, double low, double high);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXACTCSSRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXACTCSSFreq(int channel, double freq);
+
+    // ---- Zeus FM extension (see the RX block above for the gating rule) ----
+    // level = WDSP ctcss_level (0.02..0.25); also scales DCS.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXACTCSSLevel(int channel, double level);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXADCSRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXADCSCode(int channel, int code, int inverted);
+
+    // Operator pre-emphasis enable, independent of the run flag SetTXAMode drives.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetTXAFMEmphRun(int channel, int run);
+
+    // Peak |deviation| (Hz) since the previous call, then reset.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void GetTXAFMDeviationPeak(int channel, out double peakHz);
+
+    /// <summary>Zeus FM extension entry points. Optional: a libwdsp built
+    /// before the extension lacks them, so callers probe first and the
+    /// packaged-runtime compatibility test does not require them.</summary>
+    internal static readonly string[] OptionalZeusFmExports =
+    [
+        nameof(SetRXAFMToneSquelch),
+        nameof(GetRXAFMToneStatus),
+        nameof(SetRXAFMDeemphRun),
+        nameof(SetTXACTCSSLevel),
+        nameof(SetTXADCSRun),
+        nameof(SetTXADCSCode),
+        nameof(SetTXAFMEmphRun),
+        nameof(GetTXAFMDeviationPeak),
+    ];
 
     // fexchange2 (iobuffs.h:91) — TX-side frame exchange. Iin carries mono mic
     // samples, Qin stays silent, Iout/Qout receive modulated I/Q for the P1 EP2

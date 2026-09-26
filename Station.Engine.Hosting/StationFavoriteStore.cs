@@ -48,12 +48,23 @@ public sealed class StationFavoriteStore : IDisposable
         }
     }
 
+    public StationFavoriteDto? Get(int slot)
+    {
+        ValidateSlot(slot);
+        lock (_gate)
+        {
+            var entry = _entries.FindOne(candidate => candidate.Slot == slot);
+            return entry is null ? null : ToDto(entry);
+        }
+    }
+
     public StationFavoriteDto Upsert(
         int slot,
         long frequencyHz,
         RxMode mode,
         int filterLowHz,
-        int filterHighHz)
+        int filterHighHz,
+        FmMemory? fm = null)
     {
         ValidateSlot(slot);
 
@@ -65,6 +76,11 @@ public sealed class StationFavoriteStore : IDisposable
             entry.Mode = mode;
             entry.FilterLowHz = filterLowHz;
             entry.FilterHighHz = filterHighHz;
+            // FM repeater memory as a JSON string column (same pattern as
+            // DspSettingsEntry.FmConfigJson): no new POCO for LiteDB's
+            // BsonMapper (parallel-construction race, commit b57c12d). Null
+            // for non-FM slots.
+            entry.FmJson = fm is null ? null : System.Text.Json.JsonSerializer.Serialize(fm);
             entry.UpdatedUtc = DateTime.UtcNow;
 
             if (entry.Id == 0)
@@ -122,7 +138,15 @@ public sealed class StationFavoriteStore : IDisposable
         entry.FilterLowHz,
         entry.FilterHighHz,
         new DateTimeOffset(DateTime.SpecifyKind(entry.UpdatedUtc, DateTimeKind.Utc))
-            .ToUnixTimeMilliseconds());
+            .ToUnixTimeMilliseconds(),
+        entry.Mode == RxMode.FM ? ReadFm(entry.FmJson) : null);
+
+    private static FmMemory? ReadFm(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try { return System.Text.Json.JsonSerializer.Deserialize<FmMemory>(json); }
+        catch (System.Text.Json.JsonException) { return null; }
+    }
 
     public void Dispose() => _dbLease.Dispose();
 }
@@ -135,5 +159,6 @@ public sealed class StationFavoriteEntry
     public RxMode Mode { get; set; }
     public int FilterLowHz { get; set; }
     public int FilterHighHz { get; set; }
+    public string? FmJson { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

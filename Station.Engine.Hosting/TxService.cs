@@ -920,8 +920,72 @@ public sealed class TxService
 
     private void ClearReleaseTailAbort() => Volatile.Write(ref _releaseTailAbortRequested, 0);
 
+    // Operator voice keying: the sources whose over carries speech and so an
+    // automatic FM access burst. TCI / CWX / plugins / WAV / analyzer keying
+    // drive digital, CW or recorded audio and never get one.
+    private static bool IsToneBurstKeySource(MoxSource source) =>
+        source is MoxSource.UI or MoxSource.Hardware or MoxSource.Midi or MoxSource.Cat;
+
+    /// <summary>FM access tone burst at the start of an over (Zeus extension,
+    /// European repeaters): MOX/PTT/VOX-keyed voice TX whose TX mode is FM with
+    /// <see cref="FmConfig.ToneBurstOnKeyUp"/> set. Not TUN, two-tone, CW or
+    /// digital. Best-effort — a failure never affects the key-up.</summary>
+    private void ArmFmToneBurstOnKeyUp(MoxSource source)
+    {
+        if (!IsToneBurstKeySource(source)) return;
+        try
+        {
+            var state = _radio.Snapshot();
+            if (RadioFrequencyResolver.TxReceiver(state).Mode != RxMode.FM) return;
+            var fm = (state.Fm ?? FmConfig.Default).Normalized();
+            if (!fm.ToneBurstOnKeyUp) return;
+            ArmFmToneBurst(state, fm);
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "tx.fm.burst.keyUp failed"); }
+    }
+
+    /// <summary>POST /api/fm/burst: send the access burst now. Allowed only
+    /// while operator MOX is keyed and the TX mode is FM; never keys the
+    /// transmitter. <paramref name="error"/> explains a refusal.</summary>
+    public bool TryStartFmToneBurst(out string? error)
+    {
+        lock (_transitionSync)
+        {
+            TransmitIntent? active;
+            MoxSource? owner;
+            lock (_sync) { active = _activeIntent; owner = _moxOwner; }
+            if (active != TransmitIntent.Mox || owner == MoxSource.Cwx)
+            {
+                error = "tone burst requires keyed voice transmit (MOX/PTT); the transmitter is not keyed";
+                return false;
+            }
+            var state = _radio.Snapshot();
+            if (RadioFrequencyResolver.TxReceiver(state).Mode != RxMode.FM)
+            {
+                error = "tone burst requires FM transmit mode";
+                return false;
+            }
+            if (!ArmFmToneBurst(state, (state.Fm ?? FmConfig.Default).Normalized()))
+            {
+                error = "TX audio path is not available";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+    }
+
+    private bool ArmFmToneBurst(StateDto state, FmConfig fm)
+    {
+        double micGainDb = DspPipelineService.ResolveEffectiveTxAudioProfile(state, RxMode.FM).MicGainDb;
+        return _pipeline.ArmFmToneBurst(fm.ToneBurstHz, fm.ToneBurstMs, micGainDb);
+    }
+
     private void DrainMoxTailBestEffort()
     {
+        // An unfinished access burst never runs into the release tail.
+        try { _pipeline.CancelFmToneBurst(); }
+        catch (Exception ex) { _log.LogWarning(ex, "tx.tail.fmBurst.cancel.failed"); }
         var state = _radio.Snapshot();
         try { _pipeline.DrainFreeDvTxTail(); }
         catch (Exception ex) { _log.LogWarning(ex, "tx.tail.freedv.failed"); }
@@ -1025,6 +1089,7 @@ public sealed class TxService
         var wireDroppedTs = _stopwatchTicks();
         Safe("authority.revoke", () => _radio.SetTxSafetyAuthority(false));
         Safe("generator.tune.off", () => _pipeline.SetTxTune(false));
+        Safe("generator.fmBurst.off", _pipeline.CancelFmToneBurst);
         Safe("generator.twoTone.off", () => _radio.SetTwoToneRuntimeEnabled(false));
         Safe("tune.latch.off", _radio.ClearTunActiveForSafety);
         Safe("drive.inhibit", _radio.ApplyTxSafetyInhibit);
@@ -1190,6 +1255,7 @@ public sealed class TxService
                 _pipeline.SetPsMox(true);
                 CommitActiveIntent(TransmitIntent.Mox, source, revision, armPreKey);
                 RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
+                ArmFmToneBurstOnKeyUp(source);
                 _log.LogInformation("tx.mox on=true revision={Revision}", revision);
                 BroadcastMoxState(moxOn: true, tunOn: false, source);
                 error = null;

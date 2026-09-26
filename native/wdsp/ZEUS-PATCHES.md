@@ -55,6 +55,15 @@ wholesale: Zeus's prior version is **2.00**, and its later fixes are required.
   staging buffers inside the now-private struct, allocate and release with the
   calibrator, and retain the realized `SetPSTXDelay` value. Do not import the
   mirror's separate global compatibility-buffer implementation.
+- `fm_tone.{c,h}`, `fmmod.{c,h}`, `fmd.{c,h}`, `emph.{c,h}`, `tests/fm_tests.c`:
+  Zeus FM extension. TX: `SetTXACTCSSLevel`, DCS encode (`SetTXADCSRun`,
+  `SetTXADCSCode`; Golay (23,12) codewords pinned against published vectors),
+  `GetTXAFMDeviationPeak`, and `SetTXAFMEmphRun` (a `zeus_bypass` flag in
+  `emphp`, independent of the run flag `SetTXAMode` drives). RX: a CTCSS / DCS
+  decoder on the raw discriminator with a ramped tone squelch
+  (`SetRXAFMToneSquelch`, `GetRXAFMToneStatus`) and `SetRXAFMDeemphRun`. The
+  detector state lives outside `calc_fmd`/`decalc_fmd`. Managed callers probe
+  these exports; they are optional in `WdspRuntimeCompatibilityTests`.
 - `wdsp.h`: retain Zeus's public compatibility declarations, update `GetPSDisp`
   to the new native signature, and add NNR/model and CFIR-curve declarations.
   Zeus does not call `GetPSDisp` from managed code.

@@ -341,6 +341,37 @@ public interface IDspEngine : IDisposable
     /// Implementations without an AM modulator may no-op.</summary>
     void SetTxAmCarrierLevel(double carrierLevel) { }
 
+    /// <summary>Broadcast-AM modulator settings (AM/SAM only): asymmetric
+    /// positive/negative modulation limits, pre-emphasis, polarity invert.
+    /// When disabled the legacy symmetric AM formula (carrier level from
+    /// <see cref="SetTxAmCarrierLevel"/>) applies. Implementations without the
+    /// native broadcast stage (or on a libwdsp lacking the export) no-op.</summary>
+    void SetTxAmBroadcast(AmBroadcastConfig config) { }
+
+    /// <summary>AM/SAM modulator audio filter: <paramref name="highPassHz"/>
+    /// is a 4th-order Butterworth low cut on the modulating signal (0 = off,
+    /// active whether or not broadcast mode is on); <paramref name="lowPassHz"/>
+    /// is the 8th-order brickwall used after the broadcast clipper (0 = off).
+    /// The TXA bandpass (<see cref="SetTxFilter"/>) is unaffected.</summary>
+    void SetTxAmFilter(int highPassHz, int lowPassHz) { }
+
+    /// <summary>True when the native AM broadcast stage is present and has not
+    /// failed with a missing entry point. False for engines without it.</summary>
+    bool TxAmBroadcastSupported => false;
+    /// <summary>Apply the FM configuration (deviation, audio filters,
+    /// pre-emphasis position, CTCSS encode/notch, detector limiter) to the TX
+    /// channel and every RX channel, including secondary receivers. The
+    /// engine keeps the latest value and re-applies it to any channel it
+    /// opens later. Implementations without an FM chain may no-op.</summary>
+    void SetFmConfig(FmConfig cfg) { }
+
+    /// <summary>Live FM readouts: detected CTCSS tone / DCS code and tone
+    /// squelch state on the RX1 channel, and peak TX deviation since the last
+    /// call. The *Available flags report which Zeus WDSP FM extensions the
+    /// loaded native binary exports. Engines without an FM chain report
+    /// <see cref="FmDspStatus.Unavailable"/>.</summary>
+    FmDspStatus GetFmDspStatus() => FmDspStatus.Unavailable;
+
     /// <summary>Zeus-level digital TX mode is active (DIGU/DIGL/FreeDV): gate
     /// the TX CFC master + phase rotator run flags off while preserving
     /// operator-configured settings. No-op for Synthetic and when no TXA is
@@ -565,4 +596,21 @@ public interface IDspEngine : IDisposable
     /// audio for the RX AudioFrame. Reflects the toggle, not whether the
     /// monitor channel is fully spun up. Synthetic returns false.</summary>
     bool IsTxMonitorOn { get; }
+}
+
+/// <summary>Engine-side FM readouts; see <see cref="IDspEngine.GetFmDspStatus"/>.</summary>
+public sealed record FmDspStatus(
+    bool ToneDecodeAvailable,
+    bool DcsAvailable,
+    bool DeviationMeterAvailable,
+    bool CtcssLevelAvailable,
+    bool DeEmphasisBypassAvailable,
+    double? DetectedCtcssHz,
+    int? DetectedDcsCode,
+    bool? DetectedDcsInverted,
+    bool ToneSquelchOpen,
+    double TxPeakDeviationHz)
+{
+    public static FmDspStatus Unavailable { get; } =
+        new(false, false, false, false, false, null, null, null, true, 0.0);
 }

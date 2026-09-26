@@ -16,6 +16,11 @@ public interface IBandPlanService
     bool InBand(long freqHz, RxMode mode);
     bool TxGuardIgnore { get; }
 
+    /// <summary>IARU region ("R1" | "R2" | "R3") of the active plan — drives
+    /// the FM repeater defaults and Automatic Repeater Shift.</summary>
+    string IaruRegion =>
+        FmRepeaterBandPlan.IaruRegionCodeFor(CurrentRegion) ?? FmConfig.DefaultRepeaterRegion;
+
     event Action? PlanChanged;
 }
 
@@ -58,6 +63,27 @@ public sealed class BandPlanService : IBandPlanService
     public BandRegion CurrentRegion { get { lock (_lock) return _currentRegion; } }
     public IReadOnlyList<BandSegment> CurrentPlan { get { lock (_lock) return _currentPlan; } }
     public bool TxGuardIgnore => _prefs.GetTxGuardIgnore();
+
+    /// <summary>IARU region of the active plan, walking the parent chain so a
+    /// national plan (EI / G → IARU_R1, US FCC → IARU_R2) resolves to its
+    /// region.</summary>
+    public string IaruRegion
+    {
+        get
+        {
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            BandRegion? region = CurrentRegion;
+            while (region is not null && visited.Add(region.Id))
+            {
+                if (FmRepeaterBandPlan.IaruRegionCodeFor(region) is { } code) return code;
+                var parentId = region.ParentId;
+                region = parentId is null
+                    ? null
+                    : _store.Regions.FirstOrDefault(r => string.Equals(r.Id, parentId, StringComparison.OrdinalIgnoreCase));
+            }
+            return FmConfig.DefaultRepeaterRegion;
+        }
+    }
 
     public void SetRegion(string regionId)
     {

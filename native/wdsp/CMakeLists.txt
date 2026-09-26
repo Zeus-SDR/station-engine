@@ -32,6 +32,7 @@ project(wdsp
 option(WDSP_WITH_NR3 "Build with RNNoise (NR3) support — xiph/rnnoise vendored under native/rnnoise/" ON)
 option(WDSP_WITH_NR4 "Build with libspecbleach (NR4 / SBNR) support — vendored under native/libspecbleach/" ON)
 option(WDSP_BUILD_OSCTRL_TESTS "Build deterministic CESSB overshoot-controller tests" OFF)
+option(WDSP_BUILD_FM_TESTS "Build deterministic FM tone (CTCSS / DCS) encoder/decoder tests" OFF)
 option(WDSP_BUILD_FFTW_TESTS "Verify FFTW measured planning and transform correctness" OFF)
 
 set(CMAKE_C_STANDARD 11)
@@ -50,7 +51,7 @@ set(WDSP_SOURCES
     amd.c ammod.c amsq.c analyzer.c anf.c anr.c apfshadow.c bandpass.c
     calcc.c calculus.c cblock.c cfcomp.c cfir.c channel.c cmath.c compress.c
     delay.c dexp.c div.c doublepole.c eer.c emnr.c emph.c eq.c extrapolate.c fcurve.c
-    FDnoiseIQ.c fir.c firmin.c fmd.c fmmod.c fmsq.c gain.c gaussian.c gen.c
+    FDnoiseIQ.c fir.c firmin.c fm_tone.c fmd.c fmmod.c fmsq.c gain.c gaussian.c gen.c
     icfir.c iir.c impulse_cache.c iobuffs.c iqc.c linux_port.c lmath.c main.c
     matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c nob.c nobII.c nurbs.c nurbs_fit.c
     nurbs_spline.c osctrl.c patchpanel.c phrot.c resample.c reshb.c rmatch.c
@@ -405,6 +406,44 @@ if(WDSP_BUILD_OSCTRL_TESTS)
         target_link_libraries(wdsp_osctrl_tests PRIVATE m)
     endif()
     add_test(NAME wdsp_osctrl_tests COMMAND wdsp_osctrl_tests)
+
+    # Broadcast-AM modulator (ammod.c) core: HPF / clipper / brickwall LPF /
+    # asymmetric limits / PEP-preserving carrier. Same standalone pattern.
+    add_executable(wdsp_ammod_tests
+        ammod.c
+        tests/ammod_tests.c
+    )
+    target_compile_definitions(wdsp_ammod_tests PRIVATE WDSP_AMMOD_CORE_TEST)
+    target_include_directories(wdsp_ammod_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MSVC)
+        target_compile_options(wdsp_ammod_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(wdsp_ammod_tests PRIVATE -UNDEBUG)
+        target_link_libraries(wdsp_ammod_tests PRIVATE m)
+    endif()
+    add_test(NAME wdsp_ammod_tests COMMAND wdsp_ammod_tests)
+endif()
+
+# Also built with WDSP_BUILD_OSCTRL_TESTS so the native-library workflow,
+# which already enables that flag and runs ctest, covers it.
+if(WDSP_BUILD_FM_TESTS OR WDSP_BUILD_OSCTRL_TESTS)
+    enable_testing()
+    # Zeus FM tone extension (fm_tone.c): DCS Golay codewords vs published
+    # vectors, CTCSS Goertzel bank, DCS slicer and tone-squelch gate. The
+    # helpers are WDSP-free, so the test links only fm_tone.c.
+    add_executable(wdsp_fm_tests
+        fm_tone.c
+        tests/fm_tests.c
+    )
+    target_include_directories(wdsp_fm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MSVC)
+        target_compile_options(wdsp_fm_tests PRIVATE /UNDEBUG)
+        target_compile_definitions(wdsp_fm_tests PRIVATE _USE_MATH_DEFINES)
+    else()
+        target_compile_options(wdsp_fm_tests PRIVATE -UNDEBUG)
+        target_link_libraries(wdsp_fm_tests PRIVATE m)
+    endif()
+    add_test(NAME wdsp_fm_tests COMMAND wdsp_fm_tests)
 endif()
 
 if(WDSP_BUILD_FFTW_TESTS)

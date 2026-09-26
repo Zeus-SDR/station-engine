@@ -31,6 +31,7 @@ public static class LanCertificate
         using var certificateLock = AcquireCertificateLock(path);
 
         var ips = GetLanIps().ToHashSet();
+        RSA? retainedKey = null;
 
         if (File.Exists(path))
         {
@@ -55,6 +56,11 @@ public static class LanCertificate
                 }
 
                 log?.LogInformation("LAN certificate regenerating: SAN list out of date or near expiry");
+                // Keep the key pair across regenerations. Clients that pin the
+                // station's public key (the watch app) would otherwise lose the
+                // station every time a DHCP lease, VPN, or virtual adapter
+                // changes the LAN IP set.
+                retainedKey = CloneKey(existing);
                 existing.Dispose();
             }
             catch (Exception ex)
@@ -63,7 +69,9 @@ public static class LanCertificate
             }
         }
 
-        var fresh = Generate(ips);
+        X509Certificate2 fresh;
+        using (retainedKey)
+            fresh = Generate(ips, retainedKey);
         File.WriteAllBytes(path, fresh.Export(X509ContentType.Pfx, string.Empty));
         log?.LogInformation(
             "LAN certificate generated at {Path} for {IpCount} IP(s): {Ips}",
@@ -142,9 +150,10 @@ public static class LanCertificate
             .ToArray();
     }
 
-    private static X509Certificate2 Generate(HashSet<IPAddress> ips)
+    internal static X509Certificate2 Generate(HashSet<IPAddress> ips, RSA? existingKey = null)
     {
-        using var rsa = RSA.Create(2048);
+        using var createdKey = existingKey is null ? RSA.Create(2048) : null;
+        var rsa = existingKey ?? createdKey!;
         var request = new CertificateRequest(
             $"CN=Zeus on {Environment.MachineName}",
             rsa,
@@ -177,6 +186,17 @@ public static class LanCertificate
             pfx,
             string.Empty,
             X509KeyStorageFlags.Exportable);
+    }
+
+    internal static RSA? CloneKey(X509Certificate2 certificate)
+    {
+        using var key = certificate.GetRSAPrivateKey();
+        if (key is null || key.KeySize < 2048)
+            return null;
+
+        var clone = RSA.Create();
+        clone.ImportParameters(key.ExportParameters(includePrivateParameters: true));
+        return clone;
     }
 
     private static bool CoversAllIps(X509Certificate2 certificate, HashSet<IPAddress> required)

@@ -58,6 +58,9 @@ __declspec (dllexport) void SetTXAFMPreEmphFreqs(int channel, double low, double
 
 extern void SetTXAFMPreEmphRun(int channel, int run);
 
+// Zeus extension (FM): operator pre-emphasis enable (see emph.c)
+__declspec (dllexport) void SetTXAFMEmphRun (int channel, int run);
+
 #endif
 
 /********************************************************************************************************

@@ -320,6 +320,43 @@ public sealed class TxAudioIngest : IDisposable
 
     private readonly CwIdService? _cwId;
 
+    // FM access tone burst (see FmToneBurstGenerator for the level
+    // reasoning). Armed by TxService, rendered in place of the mic on the hot
+    // path below. Both fields are read/written only under _sync.
+    private readonly FmToneBurstGenerator _fmBurst = new(TxRateHz);
+    private bool _fmBurstBypassApplied;
+
+    /// <summary>Arm an FM tone burst for the current over. It starts on the
+    /// next keyed voice block (after any pre-key mute) and replaces the mic
+    /// for its duration. Never keys the transmitter.</summary>
+    internal void ArmFmToneBurst(double toneHz, int durationMs, double micGainDb)
+    {
+        lock (_sync) _fmBurst.Arm(toneHz, durationMs, micGainDb);
+        _log.LogInformation(
+            "tx.fm.burst armed freqHz={Freq:F0} durationMs={Ms} micGainDb={Mic:F1} amplitude={Amp:F3}",
+            toneHz, durationMs, micGainDb, _fmBurst.Amplitude);
+    }
+
+    /// <summary>Stop any pending / playing burst and restore the speech
+    /// processors it bypassed. Called on every release.</summary>
+    internal void CancelFmToneBurst()
+    {
+        var engine = _engineProvider();
+        lock (_sync) CancelFmToneBurstLocked(engine);
+    }
+
+    internal bool IsFmToneBurstActive { get { lock (_sync) return _fmBurst.IsActive; } }
+
+    // Caller holds _sync.
+    private void CancelFmToneBurstLocked(IDspEngine? engine)
+    {
+        _fmBurst.Cancel();
+        if (!_fmBurstBypassApplied) return;
+        _fmBurstBypassApplied = false;
+        try { engine?.SetTxRogerBeepBypass(false); }
+        catch (Exception ex) { _log.LogWarning(ex, "tx.fm.burst bypass restore threw"); }
+    }
+
     public TxAudioIngest(
         TxIqRing ring,
         DspPipelineService pipeline,
@@ -1297,6 +1334,7 @@ public sealed class TxAudioIngest : IDisposable
             lock (_sync)
             {
                 if (_accumulatorFill > 0) _accumulatorFill = 0;
+                if (_fmBurst.IsActive || _fmBurstBypassApplied) CancelFmToneBurstLocked(engine);
                 if (_lastSeenMox)
                 {
                     // MOX fell since our last frame — drain the IQ ring so the
@@ -1317,6 +1355,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _ring.Clear();
                 _audioModem.FlushTx();
+                CancelFmToneBurstLocked(engine);
                 _lastSeenMox = false;
             }
         }
@@ -1454,6 +1493,25 @@ public sealed class TxAudioIngest : IDisposable
                 // No-op unless FreeDV is the active mode.
                 if (_audioModem.Active)
                     _audioModem.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
+                // FM access tone burst: replaces (mutes) the mic for its
+                // duration, with the speech processors bypassed like the
+                // roger beep. Held off during the pre-key mute so the whole
+                // burst goes out after the amp relay has settled.
+                else if (moxNow && _fmBurst.IsActive && CarriesCwId(source))
+                {
+                    long openAt = _preKeyOpenAtTicks();
+                    bool preKeyMuted = openAt != 0L
+                        && TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks());
+                    if (!preKeyMuted)
+                    {
+                        if (!_fmBurstBypassApplied)
+                        {
+                            engine.SetTxRogerBeepBypass(true);
+                            _fmBurstBypassApplied = true;
+                        }
+                        _fmBurst.Render(new Span<float>(_scratchMic, 0, blockSize));
+                    }
+                }
                 // CW station ID: sum the due ID tone into this keyed voice
                 // block. Only on the air path (MOX), never over FreeDV, and
                 // held off during the pre-key mute so no dit is lost.
@@ -1467,6 +1525,9 @@ public sealed class TxAudioIngest : IDisposable
                 int produced = engine.ProcessTxBlock(
                     new ReadOnlySpan<float>(_scratchMic, 0, blockSize),
                     new Span<float>(_scratchIq, 0, 2 * iqOut));
+                // Burst finished on this block: speech processing resumes.
+                if (_fmBurstBypassApplied && !_fmBurst.IsActive)
+                    CancelFmToneBurstLocked(engine);
                 // Product/WDSP calls may stall after the native capture route
                 // changed or the block deadline expired. Never publish their
                 // now-stale IQ to either radio transport.

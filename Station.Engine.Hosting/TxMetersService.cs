@@ -816,7 +816,9 @@ public sealed class TxMetersService : BackgroundService
             AlcAv: stage.AlcAv,
             AlcGr: stage.AlcGr,
             OutPk: stage.OutPk,
-            OutAv: stage.OutAv);
+            OutAv: stage.OutAv,
+            AmModPosPct: stage.AmModPosPct,
+            AmModNegPct: stage.AmModNegPct);
 
     /// <summary>
     /// Port of Thetis <c>console.cs:25008-25072</c> watts math plus the

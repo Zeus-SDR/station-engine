@@ -28,6 +28,17 @@ warren@pratt.one
 #include "iir.h"
 #include "firmin.h"
 #include "wcpAGC.h"
+#include "fm_tone.h"
+
+// Zeus extension (FM tones): a CTCSS / DCS decoder taps the raw PLL
+// discriminator output (ahead of de-emphasis, the audio band-pass and the
+// CTCSS notch, which all strip the sub-audible band) and drives an optional
+// tone squelch that ramps fmd's audio output (10 ms). fmsq's noise squelch
+// runs after fmd and is untouched, so the two are ANDed. The detector and
+// its configuration live in this struct, outside calc_fmd/decalc_fmd, so
+// they survive every recalc (limiter gain, buffers); only a sample-rate
+// change rebuilds its filters. De-emphasis can be bypassed
+// (SetRXAFMDeemphRun) while keeping the audio band-pass.
 typedef struct _fmd
 {
 	int run;
@@ -81,6 +92,15 @@ typedef struct _fmd
 	int lim_run;
 	double lim_gain;
 	double lim_pre_gain;
+	// ---- Zeus FM tone extension ----
+	int deemph_run;
+	int tone_stale;						// detector state predates the last run=0 period
+	fmtone_det tone;
+	CRITICAL_SECTION cs_tone;			// guards the published status below
+	double st_ctcss_hz;
+	int st_dcs_code;
+	int st_dcs_inv;
+	int st_open;
 } fmd, * FMD;
 
 void calc_fmd (FMD a)
@@ -102,6 +122,9 @@ void calc_fmd (FMD a)
 	a->again = a->rate / (a->deviation * TWOPI);
 	// CTCSS Removal
 	a->sntch = create_snotch(1, a->size, a->out, a->out, (int)a->rate, a->ctcss_freq, 0.0002);
+	// Zeus tone detector: rebuilds only on a rate change (lock state and
+	// squelch target otherwise persist across decalc/calc)
+	fmtone_det_setrate (&a->tone, a->rate);
 	// detector limiter
 	a->plim = create_wcpagc (
 		1,											// run - always ON
@@ -163,6 +186,14 @@ FMD create_fmd( int run, int size, double* in, double* out, int rate, double dev
 	a->lim_run = 0;
 	a->lim_pre_gain = 0.4;
 	a->lim_gain = 2.5;
+	a->deemph_run = 1;
+	a->tone_stale = 0;
+	fmtone_det_init (&a->tone, a->rate);
+	InitializeCriticalSectionAndSpinCount (&a->cs_tone, 2500);
+	a->st_ctcss_hz = 0.0;
+	a->st_dcs_code = 0;
+	a->st_dcs_inv = 0;
+	a->st_open = 1;
 	calc_fmd (a);
 	// de-emphasis filter
 	a->g0_de = +20.0 * log10 (a->f_high / a->f_low);
@@ -187,6 +218,7 @@ void destroy_fmd (FMD a)
 	_aligned_free (a->audio);
 	teardown_fcimp (a->pfcimp);
 	decalc_fmd (a);
+	DeleteCriticalSection (&a->cs_tone);
 	_aligned_free (a);
 }
 
@@ -201,6 +233,10 @@ void flush_fmd (FMD a)
 	a->fmdc = 0.0;
 	flush_snotch (a->sntch);
 	flush_wcpagc (a->plim);
+	fmtone_det_reset (&a->tone);
+	EnterCriticalSection (&a->cs_tone);
+	fmtone_det_status (&a->tone, &a->st_ctcss_hz, &a->st_dcs_code, &a->st_dcs_inv, &a->st_open);
+	LeaveCriticalSection (&a->cs_tone);
 }
 
 void xfmd (FMD a)
@@ -210,6 +246,11 @@ void xfmd (FMD a)
 		int i;
 		double det, del_out;
 		double vco[2], corr[2];
+		if (a->tone_stale)
+		{
+			fmtone_det_reset (&a->tone);
+			a->tone_stale = 0;
+		}
 		for (i = 0; i < a->size; i++)
 		{
 			// pll
@@ -231,9 +272,14 @@ void xfmd (FMD a)
 			a->fmdc = a->mtau * a->fmdc + a->onem_mtau * a->fil_out;
 			a->audio[2 * i + 0] = a->again * (a->fil_out - a->fmdc);
 			a->audio[2 * i + 1] = a->audio[2 * i + 0];
+			// Zeus tone detector: raw discriminator, 1.0 = full deviation
+			fmtone_det_process (&a->tone, a->again * a->fil_out);
 		}
-		// de-emphasis
-		xfircore (a->pde);
+		// de-emphasis (Zeus: bypassable, audio band-pass still runs)
+		if (a->deemph_run)
+			xfircore (a->pde);
+		else
+			memcpy (a->out, a->audio, a->size * sizeof (complex));
 		// audio filter
 		xfircore (a->paud);
 		// CTCSS Removal
@@ -244,9 +290,18 @@ void xfmd (FMD a)
 				a->out[i] *= a->lim_pre_gain;
 			xwcpagc (a->plim);
 		}
+		// Zeus tone squelch (ramped) and status publication
+		fmtone_det_gate (&a->tone, a->out, a->size);
+		EnterCriticalSection (&a->cs_tone);
+		fmtone_det_status (&a->tone, &a->st_ctcss_hz, &a->st_dcs_code, &a->st_dcs_inv, &a->st_open);
+		LeaveCriticalSection (&a->cs_tone);
 	}
-	else if (a->in != a->out)
-		memcpy (a->out, a->in, a->size * sizeof (complex));
+	else
+	{
+		a->tone_stale = 1;
+		if (a->in != a->out)
+			memcpy (a->out, a->in, a->size * sizeof (complex));
+	}
 }
 
 void setBuffers_fmd (FMD a, double* in, double* out)
@@ -458,4 +513,59 @@ void SetRXAFMAFFilter(int channel, double low, double high)
 		_aligned_free (impulse);
 	}
 	LeaveCriticalSection(&ch[channel].csDSP);
+}
+
+/********************************************************************************************************
+*																										*
+*								Zeus extension (FM tones): RXA Properties								*
+*																										*
+********************************************************************************************************/
+
+// mode: 0 off, 1 CTCSS (ctcssHz), 2 DCS (dcsCode = octal written as decimal,
+// dcsInverted). While the target is not locked fmd's audio is muted.
+PORT
+void SetRXAFMToneSquelch (int channel, int mode, double ctcssHz, int dcsCode, int dcsInverted)
+{
+	FMD a;
+	EnterCriticalSection (&ch[channel].csDSP);
+	a = rxa[channel].fmd.p;
+	fmtone_det_set_squelch (&a->tone, mode, ctcssHz, dcsCode, dcsInverted);
+	LeaveCriticalSection (&ch[channel].csDSP);
+}
+
+// Detected CTCSS tone (0 = none), DCS code (octal as decimal, 0 = none) and
+// polarity, and whether the tone squelch is open (always 1 when it is off
+// or the demodulator is not running). Takes only the status lock.
+PORT
+void GetRXAFMToneStatus (int channel, double* ctcssHz, int* dcsCode, int* dcsInverted, int* squelchOpen)
+{
+	FMD a = rxa[channel].fmd.p;
+	if (a == 0 || !a->run)
+	{
+		*ctcssHz = 0.0;
+		*dcsCode = 0;
+		*dcsInverted = 0;
+		*squelchOpen = 1;
+		return;
+	}
+	EnterCriticalSection (&a->cs_tone);
+	*ctcssHz = a->st_ctcss_hz;
+	*dcsCode = a->st_dcs_code;
+	*dcsInverted = a->st_dcs_inv;
+	*squelchOpen = a->st_open;
+	LeaveCriticalSection (&a->cs_tone);
+}
+
+// run = 0 bypasses the de-emphasis FIR (flat demodulated audio for data);
+// the audio band-pass, CTCSS notch and limiter still run.
+PORT
+void SetRXAFMDeemphRun (int channel, int run)
+{
+	FMD a;
+	EnterCriticalSection (&ch[channel].csDSP);
+	a = rxa[channel].fmd.p;
+	if (run && !a->deemph_run)
+		flush_fircore (a->pde);
+	a->deemph_run = run ? 1 : 0;
+	LeaveCriticalSection (&ch[channel].csDSP);
 }

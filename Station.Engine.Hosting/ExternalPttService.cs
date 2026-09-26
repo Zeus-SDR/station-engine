@@ -427,10 +427,14 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     {
         // Modern P2 gateware reports its shaped key-down envelope in byte 0
         // bit 7. Pre-2.2b10 Orion DLE builds lack that signal, so the
-        // connection-scoped compatibility path substitutes dot/dash input.
+        // connection-scoped compatibility path substitutes dot/dash input in
+        // straight-key mode only. A raw paddle level is not the FPGA-shaped
+        // iambic envelope; using it for Iambic A/B produces a delayed,
+        // continuous host tone that falsely sounds like straight-key RF.
         // Drive either source before the PttIn edge gate below, which would
         // otherwise swallow every element while the PTT level remains held.
         bool sidetone = _p2UseLegacyPaddleSidetone
+            && _radio.CurrentCwKeyerMode == CwKeyerMode.Straight
             ? reading.DotIn || reading.DashIn
             : reading.SidetoneActive;
         if (sidetone != _p2PrevSidetone)
