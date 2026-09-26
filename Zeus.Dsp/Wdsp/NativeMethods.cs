@@ -888,6 +888,115 @@ internal static partial class NativeMethods
         ref double comp_values,
         out int ready);
 
+    // ---- DEXP (downward expander / noise gate) — native/wdsp/dexp.c ----
+    // pdexp[4] is a process-global array indexed by `id` (0..3), NOT a WDSP
+    // channel id. WDSP keeps the raw `in`/`out` pointers, so callers must pass
+    // native memory that outlives the instance (freed only after destroy_dexp).
+    // Buffers are complex interleaved doubles of `size` complex samples.
+    // Method names match the export names exactly so the export probe can use
+    // nameof(). `pushvox` is a __stdcall callback on Windows x86 only; on every
+    // 64-bit target it is the platform default convention. Zeus passes null and
+    // run_vox=0 — every pushvox call site in dexp.c is short-circuited by
+    // `a->run_vox &&`.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static unsafe partial void create_dexp(
+        int id,
+        int run_dexp,
+        int size,
+        double* @in,
+        double* @out,
+        int rate,
+        double dettau,
+        double tattack,
+        double tdecay,
+        double thold,
+        double exp_ratio,
+        double hyst_ratio,
+        double attack_thresh,
+        int nc,
+        int wtype,
+        double lowcut,
+        double highcut,
+        int run_filt,
+        int run_vox,
+        int run_audelay,
+        double audelay,
+        IntPtr pushvox,
+        int antivox_run,
+        int antivox_size,
+        int antivox_rate,
+        double antivox_gain,
+        double antivox_tau);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void destroy_dexp(int id);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void flush_dexp(int id);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void xdexp(int id);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPRun(int id, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPDetectorTau(int id, double tau);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPAttackTime(int id, double time);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPReleaseTime(int id, double time);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPHoldTime(int id, double time);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPExpansionRatio(int id, double ratio);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPHysteresisRatio(int id, double ratio);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPAttackThreshold(int id, double thresh);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPLowCut(int id, double lowcut);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPHighCut(int id, double highcut);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPRunSideChannelFilter(int id, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPRunAudioDelay(int id, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void SetDEXPAudioDelay(int id, double delay);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial void GetDEXPPeakSignal(int id, out double peak);
+
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAPHROTRun(int channel, int run);

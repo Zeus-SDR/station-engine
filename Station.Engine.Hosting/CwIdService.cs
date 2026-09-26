@@ -13,17 +13,23 @@ namespace Zeus.Server;
 /// in Morse at least every <see cref="CwIdSettingsDto.IntervalMinutes"/>
 /// minutes of operating, mixed into the operator's own voice transmission.
 ///
-/// <para><b>It never keys the transmitter.</b> The only way the ID reaches the
-/// air is <see cref="MixTxBlock"/>, which <see cref="TxAudioIngest"/> calls
-/// with mic blocks that are already on their way to a keyed TXA. When the
+/// <para><b>It never starts a transmission.</b> The ID reaches the air only
+/// through <see cref="MixTxBlock"/>, which <see cref="TxAudioIngest"/> calls
+/// with mic blocks already on their way to a keyed TXA, and
+/// <see cref="MixTailBlock"/>, which finishes an ID already on the air while an
+/// operator release holds the key. When the
 /// interval expires while the operator is listening, the ID is marked due and
 /// goes out at the start of their next voice transmission.</para>
 ///
 /// <para>Timing: a period starts at the first keyed block after Start (or after
 /// the previous ID). Stop arms one final ID (end-of-contact identification)
 /// that goes out on the next transmission, unless the operator never
-/// transmitted since Start. An ID interrupted by un-keying is cancelled and
-/// stays due.</para>
+/// transmitted since Start. An ID already on the air when the operator
+/// un-keys is finished before the key drops: <see cref="TxService"/> holds the
+/// release while <see cref="TxAudioIngest.DrainCwIdTail"/> clocks the rest of
+/// it through <see cref="MixTailBlock"/>, so it goes out once instead of being
+/// cut and resent. Only an emergency release (trip, disconnect) cuts it short;
+/// that partial ID is cancelled and stays due.</para>
 /// </summary>
 public sealed class CwIdService : IDisposable
 {
@@ -178,6 +184,29 @@ public sealed class CwIdService : IDisposable
             _log.LogInformation("cwid.send callsign={Callsign} final={Final}", startedCall, startedFinal);
     }
 
+    /// <summary>True while an ID is on the air (started and not finished).</summary>
+    internal bool IsSending
+    {
+        get { lock (_sync) return _mixer.Active; }
+    }
+
+    /// <summary>
+    /// Release-tail path: the operator un-keyed while an ID was on the air and
+    /// <see cref="TxService"/> is holding the key until it ends. Adds the next
+    /// <paramref name="block"/>.Length samples of the ID onto the block and
+    /// completes the ID when it ends. Returns false (block untouched) when no
+    /// ID is on the air.
+    /// </summary>
+    internal bool MixTailBlock(Span<float> block)
+    {
+        lock (_sync)
+        {
+            if (!_mixer.Active) return false;
+            if (_mixer.MixInto(block)) CompleteLocked(_nowMs());
+            return true;
+        }
+    }
+
     internal void OnTxActiveChanged(bool active)
     {
         if (active) return;
@@ -185,14 +214,16 @@ public sealed class CwIdService : IDisposable
         {
             _keyedSinceMs = null;
             if (!_mixer.Active) return;
-            // Un-keyed mid-ID: the partial ID does not count; it stays due
+            // Still on the air after the release: an emergency release cut
+            // the tail short (a normal un-key finishes the ID first). The
+            // partial ID does not count; it stays due
             // (a periodic ID because its period has not been reset, a final
             // ID by re-arming it).
             _mixer.Cancel();
             if (_sendingFinal) _finalArmed = true;
             _sendingFinal = false;
         }
-        _log.LogInformation("cwid.interrupted by un-key; ID stays due");
+        _log.LogInformation("cwid.interrupted by emergency release; ID stays due");
     }
 
     public void Dispose() => _unsubscribe?.Invoke();

@@ -305,6 +305,14 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
         _tx.SetCfcConfig(cfg);
     }
 
+    public void SetDexpConfig(DexpConfig cfg)
+    {
+        _control.SetDexpConfig(cfg);
+        _tx.SetDexpConfig(cfg);
+    }
+
+    public DexpMeterDto GetDexpMeter() => _tx.GetDexpMeter();
+
     public void SetTxMonitorEnabled(bool enabled) => _tx.SetTxMonitorEnabled(enabled);
 
     public int ReadTxMonitorAudio(Span<float> output) => _tx.ReadTxMonitorAudio(output);

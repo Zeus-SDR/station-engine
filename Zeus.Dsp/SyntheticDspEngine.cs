@@ -271,6 +271,11 @@ public sealed class SyntheticDspEngine : IDspEngine
             throw new ArgumentException($"Bands must have exactly 10 entries; got {cfg.Bands.Length}", nameof(cfg));
     }
 
+    // DEXP — synthetic has no mic path; validate the payload only.
+    public void SetDexpConfig(DexpConfig cfg) => ArgumentNullException.ThrowIfNull(cfg);
+
+    public DexpMeterDto GetDexpMeter() => DexpMeterDto.Inactive;
+
     // TX Monitor — synthetic has no TXA / RXA, no IQ to demodulate. Toggle is
     // a no-op; ReadTxMonitorAudio always returns 0 so the audio-broadcast
     // path falls through to the regular RX AudioFrame.

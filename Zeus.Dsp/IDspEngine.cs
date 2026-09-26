@@ -523,6 +523,21 @@ public interface IDspEngine : IDisposable
     /// is open or on Synthetic.</summary>
     void SetCfcConfig(CfcConfig cfg);
 
+    // ----------------- DEXP (downward expander / noise gate) --------------
+    // WDSP dexp.c on the TX mic block, ahead of TXA (Thetis cmaster.c runs
+    // xdexp before fexchange0). The WDSP engine caches the config and applies
+    // it whenever its TXA channel (and the dexp instance with it) exists;
+    // digital-mode bypass skips the stage. Default no-op for engines without a
+    // mic path.
+
+    /// <summary>Apply the operator DEXP configuration. Values are clamped to
+    /// <see cref="DexpConfig.Clamped"/>. Safe before TXA opens.</summary>
+    void SetDexpConfig(DexpConfig cfg) { }
+
+    /// <summary>Live DEXP detector reading. Polling arms meter-only mode (the
+    /// detector runs on a copy of the mic while DEXP is OFF) for ~2 s.</summary>
+    DexpMeterDto GetDexpMeter() => DexpMeterDto.Inactive;
+
     // ----------------- TX Monitor (preview path, issue #106 follow-up) ----
     // Lets the operator hear the post-bandpass / post-CFIR TX audio on a local
     // audio sink — with or without keying — so they can dial in the

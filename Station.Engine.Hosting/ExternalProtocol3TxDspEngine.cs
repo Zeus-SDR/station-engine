@@ -220,6 +220,8 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
     public void RestorePsCorrection(string path) { if (PureSignalEnabled) _inner.RestorePsCorrection(path); }
 
     public void SetCfcConfig(CfcConfig cfg) => _inner.SetCfcConfig(cfg);
+    public void SetDexpConfig(DexpConfig cfg) => _inner.SetDexpConfig(cfg);
+    public DexpMeterDto GetDexpMeter() => _inner.GetDexpMeter();
     public void SetTxMonitorEnabled(bool enabled) => _inner.SetTxMonitorEnabled(enabled);
     public int ReadTxMonitorAudio(Span<float> output) => _inner.ReadTxMonitorAudio(output);
     public bool IsTxMonitorOn => _inner.IsTxMonitorOn;

@@ -51,7 +51,7 @@ using Zeus.Contracts;
 
 namespace Zeus.Dsp.Wdsp;
 
-public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
+public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 {
     // A 512-sample host exchange and DSP partition gives RXA a 10.67 ms
     // scheduling quantum at 48 kHz. Protocol clients already partial-frame IQ
@@ -2705,6 +2705,11 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     }
                 }
 
+                // DEXP sits on the mic block ahead of TXA (Thetis cmaster.c
+                // xdexp before fexchange0); its block size / rate are the TXA
+                // input profile latched above. Never throws.
+                CreateDexpForTxaLocked();
+
                 _log.LogInformation(
                     "wdsp.openTxChannel id={Id} rates={InRate}/{DspRate}/{OutRate} sizes={InSz}/{OutSz} cfir={Cfir} chain=[alc=1 lvlr=1 lvlrMax={LvlrMax:F1}dB cpdr=0 cfc=0 phrot=0 osctrl=0 eq=0 amsq=0] bp=150..2850 panelGain=1.0 txDisp={TxDisp}(pix={Pix} rxRate={RxRate} txRate={TxRate} zoom={Zoom})",
                     id, _txaInputRateHz, _txaDspRateHz, _txaOutputRateHz,
@@ -4366,6 +4371,12 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             }
         }
 
+        // DEXP (downward expander / noise gate) runs in place on the mic block
+        // right before TXA, like Thetis xdexp ahead of fexchange0. Digital,
+        // roger-beep and injected-audio bypass skip it so those paths stay
+        // bit-identical; disabled DEXP costs one volatile read.
+        ProcessDexpBlock(iin, skipTxAudioPlugins);
+
         Span<float> qin = stackalloc float[inSize];
         qin.Clear();
         Span<float> iout = stackalloc float[outSize];
@@ -4560,6 +4571,9 @@ public sealed class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         }
         lock (_txaLock)
         {
+            // DEXP holds a raw pointer into Zeus-owned memory and a global
+            // pdexp[] slot; tear it down with TXA.
+            DestroyDexpLocked();
             if (_txaChannelId is int txa)
             {
                 try

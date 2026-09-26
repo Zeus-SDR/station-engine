@@ -437,6 +437,77 @@ public sealed class DspSettingsStore : IDisposable
         e.TxPhaseRotatorAutoMode = c.AutoMode;
     }
 
+    // DEXP (downward expander / noise gate). Persisted globally like CFC as
+    // nullable scalars behind an explicit set marker, so legacy rows read back
+    // as null and the caller falls back to DexpConfig.Default (OFF).
+    public DexpConfig? GetDexp(string profileId = "default")
+    {
+        var e = _entries.FindOne(x => x.ProfileId == profileId);
+        if (e is null || e.DexpSet is not true) return null;
+        var def = DexpConfig.Default;
+        return new DexpConfig(
+            Enabled: e.DexpEnabled ?? def.Enabled,
+            ThresholdDbv: e.DexpThresholdDbv ?? def.ThresholdDbv,
+            AttackMs: e.DexpAttackMs ?? def.AttackMs,
+            HoldMs: e.DexpHoldMs ?? def.HoldMs,
+            ReleaseMs: e.DexpReleaseMs ?? def.ReleaseMs,
+            ExpansionDb: e.DexpExpansionDb ?? def.ExpansionDb,
+            HysteresisDb: e.DexpHysteresisDb ?? def.HysteresisDb,
+            DetectorTauMs: e.DexpDetectorTauMs ?? def.DetectorTauMs,
+            SideChannelFilterEnabled: e.DexpSideChannelFilterEnabled ?? def.SideChannelFilterEnabled,
+            SideChannelLowHz: e.DexpSideChannelLowHz ?? def.SideChannelLowHz,
+            SideChannelHighHz: e.DexpSideChannelHighHz ?? def.SideChannelHighHz,
+            LookAheadEnabled: e.DexpLookAheadEnabled ?? def.LookAheadEnabled,
+            LookAheadMs: e.DexpLookAheadMs ?? def.LookAheadMs);
+    }
+
+    public void Upsert(DexpConfig config, string profileId = "default")
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        var existing = _entries.FindOne(x => x.ProfileId == profileId);
+        if (existing is null)
+        {
+            var nrSeed = new NrConfig();
+            existing = new DspSettingsEntry
+            {
+                ProfileId = profileId,
+                NrMode = nrSeed.NrMode,
+                AnfEnabled = nrSeed.AnfEnabled,
+                SnbEnabled = nrSeed.SnbEnabled,
+                NbpNotchesEnabled = nrSeed.NbpNotchesEnabled,
+                NbMode = nrSeed.NbMode,
+                NbThreshold = nrSeed.NbThreshold,
+            };
+            ApplyDexpToEntry(existing, config);
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _entries.Insert(existing);
+        }
+        else
+        {
+            ApplyDexpToEntry(existing, config);
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _entries.Update(existing);
+        }
+    }
+
+    private static void ApplyDexpToEntry(DspSettingsEntry e, DexpConfig c)
+    {
+        e.DexpSet = true;
+        e.DexpEnabled = c.Enabled;
+        e.DexpThresholdDbv = c.ThresholdDbv;
+        e.DexpAttackMs = c.AttackMs;
+        e.DexpHoldMs = c.HoldMs;
+        e.DexpReleaseMs = c.ReleaseMs;
+        e.DexpExpansionDb = c.ExpansionDb;
+        e.DexpHysteresisDb = c.HysteresisDb;
+        e.DexpDetectorTauMs = c.DetectorTauMs;
+        e.DexpSideChannelFilterEnabled = c.SideChannelFilterEnabled;
+        e.DexpSideChannelLowHz = c.SideChannelLowHz;
+        e.DexpSideChannelHighHz = c.SideChannelHighHz;
+        e.DexpLookAheadEnabled = c.LookAheadEnabled;
+        e.DexpLookAheadMs = c.LookAheadMs;
+    }
+
     // Bandpass resolution. The append-only enum preserves legacy shape values
     // and adds operator-selectable RX/TX tap sizes through 262144. Null on
     // legacy rows is resolved by RadioService to Normal (2048 taps); both paths
@@ -861,6 +932,22 @@ public sealed class DspSettingsEntry
     public int? TxPhaseRotatorStages { get; set; }
     public bool? TxPhaseRotatorReverse { get; set; }
     public bool? TxPhaseRotatorAutoMode { get; set; }
+    // DEXP (downward expander / noise gate). DexpSet null on legacy rows →
+    // GetDexp() returns null → RadioService uses DexpConfig.Default (OFF).
+    public bool? DexpSet { get; set; }
+    public bool? DexpEnabled { get; set; }
+    public double? DexpThresholdDbv { get; set; }
+    public double? DexpAttackMs { get; set; }
+    public double? DexpHoldMs { get; set; }
+    public double? DexpReleaseMs { get; set; }
+    public double? DexpExpansionDb { get; set; }
+    public double? DexpHysteresisDb { get; set; }
+    public double? DexpDetectorTauMs { get; set; }
+    public bool? DexpSideChannelFilterEnabled { get; set; }
+    public double? DexpSideChannelLowHz { get; set; }
+    public double? DexpSideChannelHighHz { get; set; }
+    public bool? DexpLookAheadEnabled { get; set; }
+    public double? DexpLookAheadMs { get; set; }
     // SSB bandpass "rectangularity" — operator-selectable WDSP FIR window
     // (issue #871). Null on legacy rows → RadioService falls back to
     // BandpassWindow.Sharp on hydration, matching the current hardcoded WDSP

@@ -496,8 +496,10 @@ public sealed class TxService
 
     private void OnRadioDisconnected()
     {
+        RequestReleaseTailAbort();
         lock (_transitionSync)
         {
+            ClearReleaseTailAbort();
             bool wasActive;
             lock (_sync) wasActive = _activeIntent is not null;
             PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
@@ -905,14 +907,54 @@ public sealed class TxService
         RaiseTxActiveChanged(changed);
     }
 
+    // Set by an emergency release (trip, disconnect, dead-man) before it waits
+    // for _transitionSync, so an operator release that is holding the key for
+    // a CW ID tail stops at the next block instead of making the emergency
+    // wait out the ID. Cleared by that emergency path once it holds the lock
+    // (any tail it interrupted has returned by then).
+    private int _releaseTailAbortRequested;
+
+    internal bool IsReleaseTailAbortRequested() => Volatile.Read(ref _releaseTailAbortRequested) != 0;
+
+    private void RequestReleaseTailAbort() => Volatile.Write(ref _releaseTailAbortRequested, 1);
+
+    private void ClearReleaseTailAbort() => Volatile.Write(ref _releaseTailAbortRequested, 0);
+
     private void DrainMoxTailBestEffort()
     {
         var state = _radio.Snapshot();
         try { _pipeline.DrainFreeDvTxTail(); }
         catch (Exception ex) { _log.LogWarning(ex, "tx.tail.freedv.failed"); }
 
+        // A CW station ID already on the air is finished before the key drops,
+        // so it goes out once instead of being cut and resent on every over.
+        // Its tail flushes the operator's last partial block and TXA itself, so
+        // the voice tail is skipped: its mic settle window would otherwise
+        // admit audio from seconds after the operator let go.
+        // The operator's UI cleared its MOX button optimistically on release;
+        // while the key is held for the ID, re-assert the true keyed state so
+        // no client shows receive while the radio is still transmitting. The
+        // off-edge after convergence clears it as usual.
+        MoxSource holdSource;
+        lock (_sync) holdSource = _moxOwner ?? MoxSource.UI;
+        bool cwIdHeld = false;
+        try
+        {
+            cwIdHeld = _pipeline.DrainCwIdTail(
+                IsReleaseTailAbortRequested,
+                () => BroadcastMoxState(moxOn: true, tunOn: false, holdSource));
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "tx.tail.cwid.failed"); }
+        // An emergency release is waiting for the transition lock: drop the
+        // wire now instead of running the voice tail or roger beep first.
+        if (IsReleaseTailAbortRequested())
+        {
+            _log.LogWarning("tx.tail skipped: emergency release pending");
+            return;
+        }
+
         int tailMs = _radio.TxMoxTailDelayMs;
-        if (tailMs > 0 && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
+        if (!cwIdHeld && tailMs > 0 && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
         {
             try
             {
@@ -1271,8 +1313,10 @@ public sealed class TxService
     /// </summary>
     internal bool TryReleaseMoxImmediately(MoxSource source, out string? error)
     {
+        RequestReleaseTailAbort();
         lock (_transitionSync)
         {
+            ClearReleaseTailAbort();
             TransmitIntent? active;
             MoxSource? owner;
             lock (_sync) { active = _activeIntent; owner = _moxOwner; }
@@ -1313,8 +1357,10 @@ public sealed class TxService
     internal bool ForceRemoteDisconnectSafeIdle(string leaseId)
     {
         if (string.IsNullOrWhiteSpace(leaseId)) return false;
+        RequestReleaseTailAbort();
         lock (_transitionSync)
         {
+            ClearReleaseTailAbort();
             bool wasActive;
             lock (_sync)
             {
@@ -1685,8 +1731,10 @@ public sealed class TxService
     /// </summary>
     public void TryTripForAlert(AlertKind kind, string reason)
     {
+        RequestReleaseTailAbort();
         lock (_transitionSync)
         {
+            ClearReleaseTailAbort();
             long epoch = _safety.RecordTrip();
             ConvergeToSafeIdle(faultLatched: true);
             _log.LogWarning(

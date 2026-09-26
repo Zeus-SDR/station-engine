@@ -645,7 +645,6 @@ public sealed class TxAudioIngest : IDisposable
             long deadline = System.Diagnostics.Stopwatch.GetTimestamp();
             int sampleIndex = 0;
             int blocks = 0;
-            int flushBlocks = 0;
             float micPeak = 0f;
             float iqPeak = 0f;
 
@@ -665,20 +664,8 @@ public sealed class TxAudioIngest : IDisposable
                     if (phase >= 2.0 * Math.PI) phase -= 2.0 * Math.PI;
                 }
 
-                int produced = engine.ProcessTxBlock(
-                    new ReadOnlySpan<float>(_tailMic, 0, blockSize),
-                    new Span<float>(_tailIq, 0, 2 * iqOut));
-                if (produced > 0)
+                if (ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out _) > 0)
                 {
-                    var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
-                    for (int i = 0; i < iqSpan.Length; i++)
-                    {
-                        float sampleAbs = iqSpan[i];
-                        if (sampleAbs < 0) sampleAbs = -sampleAbs;
-                        if (sampleAbs > iqPeak) iqPeak = sampleAbs;
-                    }
-                    _ring.Write(iqSpan);
-                    _forwardP2?.Invoke(new ReadOnlyMemory<float>(_tailIq, 0, 2 * produced));
                     emitted = true;
                     blocks++;
                 }
@@ -691,54 +678,14 @@ public sealed class TxAudioIngest : IDisposable
                 }
             }
 
-            Array.Clear(_tailMic, 0, blockSize);
-            int maxFlushBlocks = Math.Max(
-                1,
-                TxRateHz * RogerBeepDspFlushCeilingMs / 1000 / blockSize);
-            int silentBlocks = 0;
-            for (int b = 0; b < maxFlushBlocks; b++)
-            {
-                int produced = engine.ProcessTxBlock(
-                    new ReadOnlySpan<float>(_tailMic, 0, blockSize),
-                    new Span<float>(_tailIq, 0, 2 * iqOut));
-                float blockPeak = 0f;
-                if (produced > 0)
-                {
-                    var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
-                    for (int i = 0; i < iqSpan.Length; i++)
-                    {
-                        float sampleAbs = iqSpan[i];
-                        if (sampleAbs < 0) sampleAbs = -sampleAbs;
-                        if (sampleAbs > blockPeak) blockPeak = sampleAbs;
-                        if (sampleAbs > iqPeak) iqPeak = sampleAbs;
-                    }
-                    _ring.Write(iqSpan);
-                    _forwardP2?.Invoke(new ReadOnlyMemory<float>(_tailIq, 0, 2 * produced));
-                    emitted = true;
-                    blocks++;
-                }
-
-                flushBlocks++;
-                silentBlocks = blockPeak <= RogerBeepFlushIqThreshold
-                    ? silentBlocks + 1
-                    : 0;
-                deadline += periodTicks;
-                if (!SleepToBlockDeadline(deadline, freq))
-                {
-                    deadline = System.Diagnostics.Stopwatch.GetTimestamp();
-                }
-                if (silentBlocks >= RogerBeepFlushSilentBlocks) break;
-            }
-            bool dspFlushed = silentBlocks >= RogerBeepFlushSilentBlocks;
-
-            bool transportDrained = _drainTxTransport?.Invoke(
-                TimeSpan.FromMilliseconds(RogerBeepTransportDrainTimeoutMs)) ?? true;
-            Thread.Sleep(RogerBeepTailGuardMs);
+            var flush = FlushTxTailAndTransport(engine, blockSize, iqOut, periodTicks, freq, ref deadline, ref iqPeak);
+            if (flush.EmittedBlocks > 0) emitted = true;
+            blocks += flush.EmittedBlocks;
             _log.LogInformation(
                 "tx.rogerBeep.tail dropping PTT: blocks={Blocks} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} flushCeilingMs={FlushCeiling} durationMs={Duration} freqHz={Freq:F0} micPeak={MicPeak:F4} iqPeak={IqPeak:F4} transportDrained={TransportDrained} transportBudgetMs={TransportBudget} guardMs={Guard}",
-                blocks, flushBlocks, dspFlushed, RogerBeepDspFlushCeilingMs,
+                blocks, flush.FlushBlocks, flush.DspFlushed, RogerBeepDspFlushCeilingMs,
                 RogerBeepDurationMs, RogerBeepFrequencyHz, micPeak, iqPeak,
-                transportDrained, RogerBeepTransportDrainTimeoutMs, RogerBeepTailGuardMs);
+                flush.TransportDrained, RogerBeepTransportDrainTimeoutMs, RogerBeepTailGuardMs);
             return emitted;
         }
         catch (Exception ex)
@@ -762,6 +709,197 @@ public sealed class TxAudioIngest : IDisposable
             Volatile.Write(ref _tailDraining, 0);
         }
     }
+
+    /// <summary>
+    /// Finish a CW station ID that was on the air when the operator un-keyed.
+    /// Called by <see cref="TxService"/> on an accepted MOX release while the
+    /// wire MOX bit is still asserted, so the ID goes out once, complete,
+    /// instead of being cut and resent on every following over. The operator's
+    /// last partial mic block goes out first (with the ID continuing across
+    /// it), then the rest of the ID is clocked at real time through the normal
+    /// TX chain, and the TXA/transport tail is flushed before the key drops.
+    /// <paramref name="shouldAbort"/> is polled every block: an emergency
+    /// release (trip, disconnect) stops the hold at once and the partial ID
+    /// stays due. <paramref name="onHold"/> runs once the hold is committed,
+    /// before the first ID block, so the caller can tell clients the key is
+    /// still down. Returns true when the hold ran (TX was held for the ID).
+    /// </summary>
+    public bool DrainCwIdTail(Func<bool>? shouldAbort = null, Action? onHold = null)
+    {
+        if (_cwId is not { } cwId || !cwId.IsSending) return false;
+        if (_audioModem.Active) return false;
+        if (_txOwnedByTuneDriver()) return false;
+
+        var engine = _engineProvider();
+        int blockSize = engine?.TxBlockSamples ?? 0;
+        int iqOut = engine?.TxOutputSamples ?? 0;
+        if (engine is null || blockSize <= 0 || iqOut <= 0
+            || blockSize > _tailMic.Length || 2 * iqOut > _tailIq.Length)
+            return false;
+
+        // Barrier: the mic hot path checks _tailDraining under _sync, so from
+        // here this thread is the only TXA feeder. The flag is raised under
+        // _sync so no mic frame can see it (and discard the accumulator)
+        // before the operator's final partial block is captured; the ID
+        // continues across that block without a gap.
+        int residualSamples;
+        lock (_sync)
+        {
+            if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
+            residualSamples = Math.Min(_accumulatorFill, blockSize);
+            Array.Clear(_tailMic, 0, blockSize);
+            if (residualSamples > 0)
+                Array.Copy(_accumulator, 0, _tailMic, 0, residualSamples);
+            _accumulatorFill = 0;
+        }
+        long freq = System.Diagnostics.Stopwatch.Frequency;
+        long startTs = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            try { onHold?.Invoke(); }
+            catch (Exception ex) { _log.LogWarning(ex, "tx.cwid.tail hold notification threw"); }
+
+            long periodTicks = (long)(freq * (double)blockSize / TxRateHz);
+            long deadline = startTs;
+            int idBlocks = 0;
+            int blocks = 0;
+            float iqPeak = 0f;
+            bool aborted = false;
+            while (true)
+            {
+                if (shouldAbort?.Invoke() == true) { aborted = true; break; }
+                if (idBlocks > 0) Array.Clear(_tailMic, 0, blockSize);
+                if (!cwId.MixTailBlock(new Span<float>(_tailMic, 0, blockSize))) break;
+                idBlocks++;
+                blocks += ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out _);
+                deadline += periodTicks;
+                if (!SleepToBlockDeadline(deadline, freq))
+                    deadline = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+
+            if (aborted || shouldAbort?.Invoke() == true)
+            {
+                _log.LogWarning(
+                    "tx.cwid.tail aborted by emergency release: idBlocks={IdBlocks} elapsedMs={Elapsed:F1}",
+                    idBlocks, (System.Diagnostics.Stopwatch.GetTimestamp() - startTs) * 1000.0 / freq);
+                return idBlocks > 0;
+            }
+
+            var flush = FlushTxTailAndTransport(
+                engine, blockSize, iqOut, periodTicks, freq, ref deadline, ref iqPeak, shouldAbort);
+            _log.LogInformation(
+                "tx.cwid.tail dropping PTT: idBlocks={IdBlocks} residualSamples={Residual} blocks={Blocks} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} iqPeak={IqPeak:F4} transportDrained={TransportDrained} emergencyCut={EmergencyCut} elapsedMs={Elapsed:F1}",
+                idBlocks, residualSamples, blocks + flush.EmittedBlocks, flush.FlushBlocks, flush.DspFlushed,
+                iqPeak, flush.TransportDrained, shouldAbort?.Invoke() == true,
+                (System.Diagnostics.Stopwatch.GetTimestamp() - startTs) * 1000.0 / freq);
+            return idBlocks > 0;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "tx.cwid.tail drain threw");
+            return false;
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                _ring.Clear();
+                _accumulatorFill = 0;
+                _lastSeenMox = false;
+            }
+            Volatile.Write(ref _tailDraining, 0);
+        }
+    }
+
+    /// <summary>Run <see cref="_tailMic"/> through TXA and publish the IQ to
+    /// both transports. Returns 1 when IQ was produced, else 0;
+    /// <paramref name="blockPeak"/> is this block's IQ peak.</summary>
+    private int ClockTailBlock(IDspEngine engine, int blockSize, int iqOut, ref float iqPeak, out float blockPeak)
+    {
+        blockPeak = 0f;
+        int produced = engine.ProcessTxBlock(
+            new ReadOnlySpan<float>(_tailMic, 0, blockSize),
+            new Span<float>(_tailIq, 0, 2 * iqOut));
+        if (produced <= 0) return 0;
+        var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
+        for (int i = 0; i < iqSpan.Length; i++)
+        {
+            float sampleAbs = iqSpan[i];
+            if (sampleAbs < 0) sampleAbs = -sampleAbs;
+            if (sampleAbs > blockPeak) blockPeak = sampleAbs;
+        }
+        if (blockPeak > iqPeak) iqPeak = blockPeak;
+        _ring.Write(iqSpan);
+        _forwardP2?.Invoke(new ReadOnlyMemory<float>(_tailIq, 0, 2 * produced));
+        return 1;
+    }
+
+    /// <summary>
+    /// Shared end of a synthesized release tail (roger beep, CW ID): clock
+    /// silence through TXA until its delayed output decays (two quiet blocks,
+    /// bounded by <see cref="RogerBeepDspFlushCeilingMs"/>), let the P1/P2
+    /// transport drain, then hold a short guard so the last IQ reaches the
+    /// radio before the wire MOX bit drops. <paramref name="shouldAbort"/>
+    /// (an emergency release waiting on the key) ends the flush at the next
+    /// block and skips the transport drain and guard.
+    /// </summary>
+    private TxTailFlush FlushTxTailAndTransport(
+        IDspEngine engine, int blockSize, int iqOut, long periodTicks, long freq,
+        ref long deadline, ref float iqPeak, Func<bool>? shouldAbort = null)
+    {
+        Array.Clear(_tailMic, 0, blockSize);
+        int maxFlushBlocks = Math.Max(
+            1,
+            TxRateHz * RogerBeepDspFlushCeilingMs / 1000 / blockSize);
+        int silentBlocks = 0;
+        int flushBlocks = 0;
+        int emittedBlocks = 0;
+        for (int b = 0; b < maxFlushBlocks; b++)
+        {
+            if (shouldAbort?.Invoke() == true)
+                return new TxTailFlush(emittedBlocks, flushBlocks, DspFlushed: false, TransportDrained: false);
+            emittedBlocks += ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak);
+            flushBlocks++;
+            silentBlocks = blockPeak <= RogerBeepFlushIqThreshold
+                ? silentBlocks + 1
+                : 0;
+            deadline += periodTicks;
+            if (!SleepToBlockDeadline(deadline, freq))
+            {
+                deadline = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+            if (silentBlocks >= RogerBeepFlushSilentBlocks) break;
+        }
+        bool dspFlushed = silentBlocks >= RogerBeepFlushSilentBlocks;
+        if (shouldAbort?.Invoke() == true)
+            return new TxTailFlush(emittedBlocks, flushBlocks, dspFlushed, TransportDrained: false);
+
+        bool transportDrained = _drainTxTransport?.Invoke(
+            TimeSpan.FromMilliseconds(RogerBeepTransportDrainTimeoutMs)) ?? true;
+        SleepUnlessAborted(RogerBeepTailGuardMs, shouldAbort);
+        return new TxTailFlush(emittedBlocks, flushBlocks, dspFlushed, transportDrained);
+    }
+
+    private const int TailAbortPollMs = 10;
+
+    /// <summary>Sleep <paramref name="ms"/>, returning early (within
+    /// <see cref="TailAbortPollMs"/>) once <paramref name="shouldAbort"/> fires.</summary>
+    private static void SleepUnlessAborted(int ms, Func<bool>? shouldAbort)
+    {
+        if (shouldAbort is null) { Thread.Sleep(ms); return; }
+        long end = System.Diagnostics.Stopwatch.GetTimestamp()
+            + (long)(System.Diagnostics.Stopwatch.Frequency * (ms / 1000.0));
+        while (!shouldAbort())
+        {
+            long remaining = end - System.Diagnostics.Stopwatch.GetTimestamp();
+            if (remaining <= 0) return;
+            int step = (int)Math.Ceiling(remaining * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            Thread.Sleep(Math.Min(step, TailAbortPollMs));
+        }
+    }
+
+    private readonly record struct TxTailFlush(
+        int EmittedBlocks, int FlushBlocks, bool DspFlushed, bool TransportDrained);
 
     private static bool SleepToBlockDeadline(long deadlineTicks, long stopwatchFrequency)
     {

@@ -644,6 +644,10 @@ public sealed class RadioService : IDisposable
             _dspSettingsStore.GetTxPhaseRotator() ?? new TxPhaseRotatorConfig());
         var persistedAmTxProfile = NormalizeAmTxProfile(
             _dspSettingsStore.GetAmTxProfile() ?? new AmTxProfile());
+        // DEXP (downward expander / noise gate). Null on a fresh install /
+        // legacy DB row falls back to DexpConfig.Default (OFF) so the TX mic
+        // path is unchanged until the operator enables it.
+        var persistedDexp = (_dspSettingsStore.GetDexp() ?? DexpConfig.Default).Clamped();
         // SSB bandpass "rectangularity" (issue #871). Null on a fresh install
         // falls back to BandpassWindow.Normal, which resolves to the WDSP
         // open-time tap count (nc = max(2048, dsp_size)), so first-connect audio
@@ -678,6 +682,7 @@ public sealed class RadioService : IDisposable
             persistedTxLeveling = initialTxAudioConfig.TxLeveling ?? persistedTxLeveling;
             persistedTxPhaseRotator = NormalizeTxPhaseRotator(
                 initialTxAudioConfig.TxPhaseRotator ?? persistedTxPhaseRotator);
+            persistedDexp = initialTxAudioConfig.Dexp?.Clamped() ?? persistedDexp;
             overlayMicGain = Math.Clamp(initialTxAudioConfig.MicGainDb, -40, 10);
             overlayLevelerMaxGain = Math.Clamp(initialTxAudioConfig.LevelerMaxGainDb, 0.0, 20.0);
             // Re-sign the operator-typed positive magnitudes for the startup
@@ -908,6 +913,7 @@ public sealed class RadioService : IDisposable
         {
             TxPhaseRotator = persistedTxPhaseRotator,
             AmTxProfile = persistedAmTxProfile,
+            Dexp = persistedDexp,
         };
 
         // One-time repair for the master/RX1 AF split. Before the split the
@@ -6200,6 +6206,30 @@ public sealed class RadioService : IDisposable
         _log.LogInformation(
             "radio.setCfc enabled={Enabled} peq={Peq} preComp={Pre:F1}dB prePeq={PrePeq:F1}dB",
             cfg.Enabled, cfg.PostEqEnabled, cfg.PreCompDb, cfg.PrePeqDb);
+        return Snapshot();
+    }
+
+    // DEXP (downward expander / noise gate). Replace-style: the whole config
+    // travels in one POST. Scalars are clamped into the Thetis Setup ranges;
+    // an inverted side-channel band is rejected (ArgumentException → 400)
+    // rather than silently reshaped. DspPipelineService pushes the change to
+    // the engine on the next OnRadioStateChanged tick.
+    public StateDto SetDexp(DexpConfig cfg)
+    {
+        ArgumentNullException.ThrowIfNull(cfg);
+        if (double.IsFinite(cfg.SideChannelLowHz) && double.IsFinite(cfg.SideChannelHighHz)
+            && Math.Clamp(cfg.SideChannelLowHz, DexpConfig.MinSideChannelHz, DexpConfig.MaxSideChannelHz)
+                >= Math.Clamp(cfg.SideChannelHighHz, DexpConfig.MinSideChannelHz, DexpConfig.MaxSideChannelHz))
+        {
+            throw new ArgumentException(
+                "sideChannelLowHz must be below sideChannelHighHz", nameof(cfg));
+        }
+        var clamped = cfg.Clamped();
+        Mutate(s => s with { Dexp = clamped });
+        _dspSettingsStore.Upsert(clamped);
+        _log.LogInformation(
+            "radio.setDexp enabled={Enabled} thresh={Thresh:F1}dBV exp={Exp:F1}dB hyst={Hyst:F1}dB",
+            clamped.Enabled, clamped.ThresholdDbv, clamped.ExpansionDb, clamped.HysteresisDb);
         return Snapshot();
     }
 

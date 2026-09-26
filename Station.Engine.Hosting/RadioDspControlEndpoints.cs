@@ -204,6 +204,67 @@ public static class RadioDspControlEndpoints
         return endpoints;
     }
 
+    public static IEndpointRouteBuilder MapDexpEndpoints(
+        this IEndpointRouteBuilder endpoints)
+    {
+        var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
+
+        // DEXP (downward expander / noise gate) — WDSP dexp.c ahead of TXA.
+        // Replace-style: POSTs the whole config. Ranges mirror Thetis Setup >
+        // DSP > VOX/DEXP; RadioService.SetDexp clamps too, but a 400 tells a
+        // misbehaving client its value was rejected.
+        endpoints.MapPost("/api/tx/dexp", (DexpSetRequest req, RadioService r) =>
+        {
+            if (req?.Config is not { } cfg)
+                return Results.BadRequest(new { error = "config required" });
+            log.LogInformation(
+                "api.tx.dexp enabled={Enabled} thresh={Thresh:F1}dBV exp={Exp:F1}dB hyst={Hyst:F1}dB attack={Attack}ms hold={Hold}ms release={Release}ms tau={Tau}ms scf={Scf}({Low}-{High}Hz) lookAhead={La}({LaMs}ms)",
+                cfg.Enabled, cfg.ThresholdDbv, cfg.ExpansionDb, cfg.HysteresisDb,
+                cfg.AttackMs, cfg.HoldMs, cfg.ReleaseMs, cfg.DetectorTauMs,
+                cfg.SideChannelFilterEnabled, cfg.SideChannelLowHz, cfg.SideChannelHighHz,
+                cfg.LookAheadEnabled, cfg.LookAheadMs);
+            if (!TryValidateDexp(cfg, out var error))
+                return Results.BadRequest(new { error });
+            return Results.Ok(r.SetDexp(cfg));
+        });
+
+        // Live detector meter (polling only, no wire-frame change). Each poll
+        // keeps the detector running for ~2 s even while DEXP is OFF so the
+        // threshold can be set before enabling; audio is untouched in that mode.
+        endpoints.MapGet("/api/tx/dexp/meter", (DspPipelineService dsp) =>
+            Results.Ok(dsp.GetDexpMeter()));
+
+        return endpoints;
+    }
+
+    internal static bool TryValidateDexp(DexpConfig cfg, out string error)
+    {
+        static bool In(double v, double min, double max) => double.IsFinite(v) && v >= min && v <= max;
+        error = "";
+        if (!In(cfg.ThresholdDbv, DexpConfig.MinThresholdDbv, DexpConfig.MaxThresholdDbv))
+            error = $"thresholdDbv must be {DexpConfig.MinThresholdDbv}..{DexpConfig.MaxThresholdDbv} dBV";
+        else if (!In(cfg.AttackMs, DexpConfig.MinAttackMs, DexpConfig.MaxAttackMs))
+            error = $"attackMs must be {DexpConfig.MinAttackMs}..{DexpConfig.MaxAttackMs}";
+        else if (!In(cfg.HoldMs, DexpConfig.MinHoldMs, DexpConfig.MaxHoldMs))
+            error = $"holdMs must be {DexpConfig.MinHoldMs}..{DexpConfig.MaxHoldMs}";
+        else if (!In(cfg.ReleaseMs, DexpConfig.MinReleaseMs, DexpConfig.MaxReleaseMs))
+            error = $"releaseMs must be {DexpConfig.MinReleaseMs}..{DexpConfig.MaxReleaseMs}";
+        else if (!In(cfg.ExpansionDb, DexpConfig.MinExpansionDb, DexpConfig.MaxExpansionDb))
+            error = $"expansionDb must be {DexpConfig.MinExpansionDb}..{DexpConfig.MaxExpansionDb} dB";
+        else if (!In(cfg.HysteresisDb, DexpConfig.MinHysteresisDb, DexpConfig.MaxHysteresisDb))
+            error = $"hysteresisDb must be {DexpConfig.MinHysteresisDb}..{DexpConfig.MaxHysteresisDb} dB";
+        else if (!In(cfg.DetectorTauMs, DexpConfig.MinDetectorTauMs, DexpConfig.MaxDetectorTauMs))
+            error = $"detectorTauMs must be {DexpConfig.MinDetectorTauMs}..{DexpConfig.MaxDetectorTauMs}";
+        else if (!In(cfg.SideChannelLowHz, DexpConfig.MinSideChannelHz, DexpConfig.MaxSideChannelHz)
+            || !In(cfg.SideChannelHighHz, DexpConfig.MinSideChannelHz, DexpConfig.MaxSideChannelHz))
+            error = $"side-channel cuts must be {DexpConfig.MinSideChannelHz}..{DexpConfig.MaxSideChannelHz} Hz";
+        else if (cfg.SideChannelLowHz >= cfg.SideChannelHighHz)
+            error = "sideChannelLowHz must be below sideChannelHighHz";
+        else if (!In(cfg.LookAheadMs, DexpConfig.MinLookAheadMs, DexpConfig.MaxLookAheadMs))
+            error = $"lookAheadMs must be {DexpConfig.MinLookAheadMs}..{DexpConfig.MaxLookAheadMs}";
+        return error.Length == 0;
+    }
+
     public static IEndpointRouteBuilder MapTxPhaseRotatorUtilityEndpoints(
         this IEndpointRouteBuilder endpoints)
     {

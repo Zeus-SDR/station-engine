@@ -1445,6 +1445,10 @@ public class DspPipelineService : BackgroundService,
     // reconnect tears down the engine, we re-push the CFC profile too so the
     // new WdspDspEngine instance picks up the operator's persisted config.
     private CfcConfig _appliedCfc = CfcConfig.Default;
+    // DEXP (downward expander / noise gate). Same resync rule as CFC; the
+    // engine also caches the config itself so a push before TXA opens lands
+    // when the dexp instance is created.
+    private DexpConfig _appliedDexp = DexpConfig.Default;
 
     // RX front-end (step attenuator + Mercury preamp). Mirrored to a live
     // Protocol2Client when the value moves; on P1 these go through
@@ -2057,6 +2061,15 @@ public class DspPipelineService : BackgroundService,
     /// MOX release, before the wire MOX bit drops.
     /// </summary>
     public virtual bool DrainRogerBeepTail() => ResolveTxIngest()?.DrainRogerBeepTail() ?? false;
+
+    /// <summary>
+    /// Finish a CW station ID that is on the air at an accepted local MOX
+    /// release, before the wire MOX bit drops. <paramref name="shouldAbort"/>
+    /// cuts the hold short for an emergency release; <paramref name="onHold"/>
+    /// runs when the hold starts. True when TX was held.
+    /// </summary>
+    public virtual bool DrainCwIdTail(Func<bool>? shouldAbort = null, Action? onHold = null) =>
+        ResolveTxIngest()?.DrainCwIdTail(shouldAbort, onHold) ?? false;
 
     /// <summary>
     /// Clocks any stale WDSP TXA output through silence and discards it before
@@ -3596,6 +3609,16 @@ public class DspPipelineService : BackgroundService,
         lock (_engineLock)
         {
             return CurrentEngine?.GetTxPhaseRotatorAsymmetry(_channelId);
+        }
+    }
+
+    /// <summary>Live DEXP detector reading from the current engine; polling
+    /// arms the engine's meter-only mode.</summary>
+    public virtual DexpMeterDto GetDexpMeter()
+    {
+        lock (_engineLock)
+        {
+            return CurrentEngine?.GetDexpMeter() ?? DexpMeterDto.Inactive;
         }
     }
 
@@ -6263,6 +6286,17 @@ public class DspPipelineService : BackgroundService,
             _appliedCfc = cfc;
         }
 
+        // ---- DEXP (downward expander / noise gate) ----------------------
+        // null on the wire (legacy state frame) → DexpConfig.Default (OFF).
+        // All-scalar record, so value equality is exact. Digital TX bypass is
+        // enforced per block inside the engine, not here.
+        var dexp = s.Dexp ?? DexpConfig.Default;
+        if (resync || dexp != _appliedDexp)
+        {
+            engine.SetDexpConfig(dexp);
+            _appliedDexp = dexp;
+        }
+
         // ---- RX step attenuator (operator + auto-ATT offset) -----------
         // Issue #126. Mirror RadioService's effective-atten composition
         // (operator baseline AttenDb + auto-ATT overload offset AttOffsetDb,
@@ -6716,6 +6750,8 @@ public class DspPipelineService : BackgroundService,
         // same config but remains operator-controlled.
         engine.SetTxPhaseRotator(channelId, txPhaseRotator);
         engine.SetCfcConfig(cfc);
+        var dexp = s.Dexp ?? DexpConfig.Default;
+        engine.SetDexpConfig(dexp);
         // Manual notches: feed the LO first (notch positioning reference), then
         // re-apply the operator's notch set onto the fresh engine. A reconnect
         // builds a brand-new engine whose notch DB is empty; RadioService holds
@@ -6757,6 +6793,7 @@ public class DspPipelineService : BackgroundService,
         _appliedTxLeveling = txLeveling;
         _appliedTxPhaseRotator = txPhaseRotator;
         _appliedCfc = cfc;
+        _appliedDexp = dexp;
         _appliedRxBandpassWindow = s.RxFilterWindow;
         _appliedTxBandpassWindow = s.TxFilterWindow;
         _appliedRxFilterPhase = s.RxFilterPhase;

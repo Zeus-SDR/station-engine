@@ -203,6 +203,7 @@ public static class StationEngineEndpoints
         endpoints.MapTxMonitorEndpoint();
         endpoints.MapReceiverDspEndpoints();
         endpoints.MapCfcEndpoint();
+        endpoints.MapDexpEndpoints();
         endpoints.MapCfcPresetEndpoints();
         endpoints.MapSpectralZoomEndpoint();
         endpoints.MapWorkspaceZoomEndpoint();

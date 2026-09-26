@@ -1540,7 +1540,13 @@ public sealed record StateDto(
     long SplitTxHz = 0,
 
     // Null from an older state producer resolves to the safe AM defaults.
-    AmTxProfile? AmTxProfile = null);
+    AmTxProfile? AmTxProfile = null,
+
+    // ---- DEXP (downward expander / noise gate) ----
+    // Appended so older positional StateDto construction sites stay valid.
+    // Null (older producer / legacy frame) means DexpConfig.Default, which is
+    // OFF — the TX mic path stays bit-identical until the operator enables it.
+    DexpConfig? Dexp = null);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both
@@ -2957,6 +2963,115 @@ public sealed record CfcConfig(
 
 public sealed record CfcSetRequest(CfcConfig Config);
 
+// ---- DEXP (downward expander / noise gate) --------------------------------
+// WDSP dexp.c runs on the TX mic block immediately before TXA (Thetis
+// ChannelMaster/cmaster.c: xdexp(tx) then fexchange0). Operator-facing units
+// mirror Thetis Setup > DSP > VOX/DEXP; the engine converts dB/ms to the
+// linear ratios / seconds WDSP expects. Zeus has no VOX, so DEXP only gates
+// audio. Persisted globally like CFC. Defaults are the Thetis Setup defaults
+// with the master OFF.
+
+/// <summary>Operator-tunable DEXP configuration (Thetis Setup > DSP > VOX/DEXP).
+/// Ranges are enforced by <c>RadioService.SetDexp</c>; see the Min/Max consts.</summary>
+public sealed record DexpConfig(
+    bool Enabled,
+    double ThresholdDbv,
+    double AttackMs,
+    double HoldMs,
+    double ReleaseMs,
+    double ExpansionDb,
+    double HysteresisDb,
+    double DetectorTauMs,
+    bool SideChannelFilterEnabled,
+    double SideChannelLowHz,
+    double SideChannelHighHz,
+    bool LookAheadEnabled,
+    double LookAheadMs)
+{
+    public const double MinThresholdDbv = -80.0;
+    public const double MaxThresholdDbv = 0.0;
+    public const double MinAttackMs = 2.0;
+    public const double MaxAttackMs = 100.0;
+    public const double MinHoldMs = 1.0;
+    public const double MaxHoldMs = 2000.0;
+    public const double MinReleaseMs = 2.0;
+    public const double MaxReleaseMs = 1000.0;
+    public const double MinExpansionDb = 0.0;
+    public const double MaxExpansionDb = 30.0;
+    public const double MinHysteresisDb = 0.0;
+    public const double MaxHysteresisDb = 10.0;
+    public const double MinDetectorTauMs = 1.0;
+    public const double MaxDetectorTauMs = 100.0;
+    public const double MinSideChannelHz = 100.0;
+    public const double MaxSideChannelHz = 10000.0;
+    public const double MinLookAheadMs = 10.0;
+    public const double MaxLookAheadMs = 999.0;
+
+    /// <summary>Thetis Setup defaults (setup.designer.cs) with DEXP OFF.</summary>
+    public static DexpConfig Default => new(
+        Enabled: false,
+        ThresholdDbv: -20.0,
+        AttackMs: 2.0,
+        HoldMs: 500.0,
+        ReleaseMs: 100.0,
+        ExpansionDb: 10.0,
+        HysteresisDb: 2.0,
+        DetectorTauMs: 20.0,
+        SideChannelFilterEnabled: true,
+        SideChannelLowHz: 500.0,
+        SideChannelHighHz: 1500.0,
+        LookAheadEnabled: true,
+        LookAheadMs: 60.0);
+
+    /// <summary>Clamp every scalar into its Thetis UI range (non-finite values
+    /// fall back to the default) and force <c>SideChannelLowHz &lt;
+    /// SideChannelHighHz</c>. The engine applies this defensively before any
+    /// value reaches native dexp.c (look-ahead must stay under 1 s because
+    /// WDSP sizes the delay ring to one second of samples).</summary>
+    public DexpConfig Clamped()
+    {
+        var d = Default;
+        static double C(double v, double min, double max, double fallback) =>
+            double.IsFinite(v) ? Math.Clamp(v, min, max) : fallback;
+        double low = C(SideChannelLowHz, MinSideChannelHz, MaxSideChannelHz, d.SideChannelLowHz);
+        double high = C(SideChannelHighHz, MinSideChannelHz, MaxSideChannelHz, d.SideChannelHighHz);
+        if (low >= high)
+        {
+            high = Math.Min(MaxSideChannelHz, low + 10.0);
+            if (low >= high) low = high - 10.0;
+        }
+        return this with
+        {
+            ThresholdDbv = C(ThresholdDbv, MinThresholdDbv, MaxThresholdDbv, d.ThresholdDbv),
+            AttackMs = C(AttackMs, MinAttackMs, MaxAttackMs, d.AttackMs),
+            HoldMs = C(HoldMs, MinHoldMs, MaxHoldMs, d.HoldMs),
+            ReleaseMs = C(ReleaseMs, MinReleaseMs, MaxReleaseMs, d.ReleaseMs),
+            ExpansionDb = C(ExpansionDb, MinExpansionDb, MaxExpansionDb, d.ExpansionDb),
+            HysteresisDb = C(HysteresisDb, MinHysteresisDb, MaxHysteresisDb, d.HysteresisDb),
+            DetectorTauMs = C(DetectorTauMs, MinDetectorTauMs, MaxDetectorTauMs, d.DetectorTauMs),
+            SideChannelLowHz = low,
+            SideChannelHighHz = high,
+            LookAheadMs = C(LookAheadMs, MinLookAheadMs, MaxLookAheadMs, d.LookAheadMs),
+        };
+    }
+}
+
+public sealed record DexpSetRequest(DexpConfig Config);
+
+/// <summary>Live DEXP detector reading for <c>GET /api/tx/dexp/meter</c>.
+/// <c>PeakDbv</c> is the smoothed detector peak over the last TX block (dBV =
+/// 20·log10 of WDSP's linear peak, floored at -160). <c>GateOpen</c> is the
+/// gate state derived with dexp.c's attack/hysteresis/hold rules (while DEXP is
+/// OFF it is the state the gate WOULD be in). <c>Active</c> is false when no
+/// TX block was metered recently: the TX chain only runs while keyed or
+/// monitoring, digital modes bypass DEXP, and an older libwdsp may lack the
+/// exports. Polling arms meter-only mode, so the detector runs while DEXP is
+/// OFF without touching the transmitted audio.</summary>
+public sealed record DexpMeterDto(double? PeakDbv, bool GateOpen, bool Active)
+{
+    public static DexpMeterDto Inactive { get; } = new(null, false, false);
+}
+
 // ---- TX station profiles -------------------------------------------------
 // Operator-tunable macro profiles for the TX voice chain. The frontend owns
 // the built-in defaults; the server persists edited overrides so Studio SSB,
@@ -3021,7 +3136,12 @@ public sealed record TxAudioProfileDto(
     DateTime CreatedUtc, DateTime UpdatedUtc,
     // Product TX Suite uses this marker to distinguish real captured DSP
     // values from the placeholder fields found in legacy product profiles.
-    int SchemaVersion = 2);
+    int SchemaVersion = 2,
+    // DEXP (downward expander / noise gate), stored per profile like Thetis.
+    // Null — every profile saved before DEXP existed, and the built-in seeds —
+    // means "leave the operator's current DEXP untouched" on apply; it never
+    // forces DEXP off.
+    DexpConfig? Dexp = null);
 
 public sealed record TxAudioProfilesResponse(IReadOnlyList<TxAudioProfileDto> Profiles);
 

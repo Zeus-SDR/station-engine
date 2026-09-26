@@ -14,7 +14,9 @@ public sealed record InitialTxAudioConfig(
     int MicGainDb,
     double LevelerMaxGainDb,
     int TxFilterLowHz,
-    int TxFilterHighHz);
+    int TxFilterHighHz,
+    // Null (legacy profile) keeps the persisted DEXP.
+    DexpConfig? Dexp = null);
 
 /// <summary>Supplies an optional product-selected initial TX-audio configuration.</summary>
 public interface IInitialTxAudioConfigSource
