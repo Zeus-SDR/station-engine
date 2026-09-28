@@ -234,6 +234,16 @@ public sealed class TxService
 
     internal Action? TxMonitorPreviewMutationEnteredForTest { get; set; }
 
+    /// <summary>
+    /// Test seam. Invoked on a MOX rise after <see cref="_transitionSync"/> is
+    /// held and before the carrier is committed. This is the wait
+    /// <c>CwEngine</c> cannot cover with its own abort lock: <c>TrySetMox</c>
+    /// blocks here, and the abort lock must not be held across that wait.
+    /// Null in production. The callback runs on the caller thread and must
+    /// not call <see cref="TrySetMox"/> — that lock is already held.
+    /// </summary>
+    internal Action? MoxRiseLockHeldForTest { get; set; }
+
     internal TxMonitorPreviewState ApplyTxMonitorPreview(
         bool enabled,
         bool meterOnly,
@@ -1258,6 +1268,11 @@ public sealed class TxService
                 ArmFmToneBurstOnKeyUp(source);
                 _log.LogInformation("tx.mox on=true revision={Revision}", revision);
                 BroadcastMoxState(moxOn: true, tunOn: false, source);
+                // Still holding the transition lock, after MOX is on. CwEngine
+                // re-checks the abort seq once this returns and drops the
+                // carrier if HALT landed during the wait. The callback must
+                // not call TrySetMox; this lock is already held.
+                MoxRiseLockHeldForTest?.Invoke();
                 error = null;
                 return true;
             }

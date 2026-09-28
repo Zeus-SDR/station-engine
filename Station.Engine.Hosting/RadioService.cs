@@ -283,6 +283,7 @@ public sealed class RadioService : IDisposable
         public bool SplitEnabled;
         public long TxVfoHz;
         public int ZoomLevel = 1; // independent DDC display zoom for this slice
+        public NrMode NrMode = NrMode.Off; // per-RX NR mode (NR tunables stay shared)
     }
     private readonly ExtraReceiver[] _extraReceivers = CreateExtraReceivers();
     // Current Zeus ordinary Protocol-1 ingest decodes one DDC stream and fans it
@@ -832,6 +833,10 @@ public sealed class RadioService : IDisposable
             hydFilterHighB = fmHalfB;
         }
         double hydAfGainB = SanitizeAfGainDb(rsSnap?.Rx2AfGainDb);
+        // RX2's own NR mode. Rows written before per-receiver NR existed carry
+        // null — RX2 then used the shared NR, so seed it from that to keep the
+        // first post-upgrade start sounding the same.
+        NrMode hydNrModeB = NormalizeNrMode(rsSnap?.Rx2NrMode ?? persistedNr.NrMode);
 
         // AM/SAM transmit the shared voice (SSB) cuts. A pair persisted in AM/SAM
         // (e.g. -4000..+4000 from the retired dedicated AM profile) is not
@@ -1034,12 +1039,14 @@ public sealed class RadioService : IDisposable
                     VfoHz: _state.VfoHz, Mode: _state.Mode,
                     FilterLowHz: _state.FilterLowHz, FilterHighHz: _state.FilterHighHz,
                     FilterPresetName: _state.FilterPresetName, AfGainDb: _state.Rx1AfGainDb,
-                    SampleRateHz: _state.SampleRate, Muted: _state.Rx1Muted),
+                    SampleRateHz: _state.SampleRate, Muted: _state.Rx1Muted,
+                    NrMode: persistedNr.NrMode),
                 new(Index: 1, Enabled: _state.Rx2Enabled, AdcSource: 0,
                     VfoHz: hydVfoB, Mode: hydModeB,
                     FilterLowHz: hydFilterLowB, FilterHighHz: hydFilterHighB,
                     FilterPresetName: hydPresetB, AfGainDb: hydAfGainB,
-                    SampleRateHz: _state.SampleRate, Muted: _state.Rx2Muted),
+                    SampleRateHz: _state.SampleRate, Muted: _state.Rx2Muted,
+                    NrMode: hydNrModeB),
             },
         };
 
@@ -2277,7 +2284,8 @@ public sealed class RadioService : IDisposable
         int? filterHighHz = null,
         double? afGainDb = null,
         string? filterPresetName = null,
-        int? zoomLevel = null)
+        int? zoomLevel = null,
+        NrMode? nrMode = null)
     {
         // RX1 (0) and RX2 (1) live on the flat StateDto fields, but the uniform
         // numeric model means /api/receivers/{index} must drive every receiver.
@@ -2321,6 +2329,21 @@ public sealed class RadioService : IDisposable
                     rx2Zoom, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
                 Mutate(s => WithReceiverZoom(s, index, clamped));
             }
+            if (nrMode is NrMode nm)
+            {
+                // RX1's mode is the shared StateDto.Nr.NrMode (persisted in
+                // DspSettingsStore); RX2's lives in Receivers[1] and persists
+                // with the rest of RX2's state in RadioStateStore.
+                var normalized = NormalizeNrMode(nm);
+                if (index == 0)
+                {
+                    // Swap only the mode inside Mutate so a concurrent NB/ANF
+                    // write to the shared config is not lost.
+                    Mutate(s => s with { Nr = (s.Nr ?? new NrConfig()) with { NrMode = normalized } });
+                    _dspSettingsStore.Upsert(Snapshot().Nr ?? new NrConfig());
+                }
+                else Mutate(s => WithRx2(s, r => r with { NrMode = normalized }));
+            }
             return Snapshot();
         }
         if (index < 2 || index >= _extraReceivers.Length)
@@ -2347,6 +2370,7 @@ public sealed class RadioService : IDisposable
             if (afGainDb is double af) e.AfGainDb = Math.Clamp(af, -50.0, 20.0);
             if (zoomLevel is int z)
                 e.ZoomLevel = Math.Clamp(z, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
+            if (nrMode is NrMode nm) e.NrMode = NormalizeNrMode(nm);
             if (enabled is bool en)
             {
                 e.Enabled = en;
@@ -3713,13 +3737,19 @@ public sealed class RadioService : IDisposable
 
     // Magnitudes to remember for a signed TX pair. AM/SAM share the voice
     // (SSB) cut memory but their live pair is the symmetric -hi..+hi bandpass,
-    // which carries no low cut: keep the remembered voice low cut instead.
+    // and DIGU/DIGL's live pair is the one-sided 0..+hi / -hi..0 convention
+    // pair: neither carries the operator's low cut, so keep the remembered
+    // voice low cut instead of storing the pair's 0 edge.
     private (int LoAbs, int HiAbs) TxCutsFromSignedPair(RxMode mode, int lowHz, int highHz)
     {
         int loAbs = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
         int hiAbs = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
-        if (mode is RxMode.AM or RxMode.SAM && lowHz < 0 && highHz > 0)
+        if ((mode is RxMode.AM or RxMode.SAM && lowHz < 0 && highHz > 0)
+            || (mode is RxMode.DIGU && lowHz == 0 && highHz > 0)
+            || (mode is RxMode.DIGL && highHz == 0 && lowHz < 0))
+        {
             loAbs = Math.Min(_ssbTxFilter.LoAbs, Math.Max(0, hiAbs - MinFilterWidthHz));
+        }
         return (loAbs, hiAbs);
     }
 
@@ -3864,9 +3894,15 @@ public sealed class RadioService : IDisposable
                 StoreTxFamilyFilter(txMode, loAbs, hiAbs);
                 return s with { TxFilterLowHz = -hiAbs, TxFilterHighHz = hiAbs };
             }
-            int lo = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
-            int hi = Math.Max(Math.Abs(lowHz), Math.Abs(highHz));
-            StoreTxFamilyFilter(s.Mode, lo, hi);
+            // USB/LSB/DIGU/DIGL write the shared voice cuts. In the digital
+            // modes the posted pair is often the one-sided live view
+            // (0..hi / -hi..0), which carries only the high cut;
+            // TxCutsFromSignedPair keeps the remembered voice low cut for it.
+            // The TX receiver's mode decides the pair's shape: a split TX on
+            // another receiver (e.g. RX2 in DIGU while RX1 is USB) must not
+            // have its one-sided pair judged by RX1's mode.
+            var (lo, hi) = TxCutsFromSignedPair(txMode, lowHz, highHz);
+            StoreTxFamilyFilter(txMode, lo, hi);
             return s with { TxFilterLowHz = lowHz, TxFilterHighHz = highHz };
         });
         if (updatedFm is not null)
@@ -6180,6 +6216,14 @@ public sealed class RadioService : IDisposable
         // default). With a default still active, NR3 stays valid — leave it be.
         if (!_nr3ModelStore.UsingBundledDefault())
         {
+            lock (_sync)
+            {
+                for (int i = 2; i < _extraReceivers.Length; i++)
+                    if (_extraReceivers[i].NrMode == NrMode.Rnnr) _extraReceivers[i].NrMode = NrMode.Off;
+            }
+            Mutate(s => s.Rx2().NrMode == NrMode.Rnnr
+                ? WithRx2(s, r => r with { NrMode = NrMode.Off })
+                : s);
             var cur = Snapshot().Nr;
             if (cur?.NrMode == NrMode.Rnnr)
                 return SetNr(cur with { NrMode = NrMode.Off });
@@ -6189,6 +6233,13 @@ public sealed class RadioService : IDisposable
 
     private static NrConfig NormalizeNrConfig(NrConfig cfg) =>
         IsSupportedNrMode(cfg.NrMode) ? cfg : cfg with { NrMode = NrMode.Off };
+
+    private static NrMode NormalizeNrMode(NrMode mode) =>
+        IsSupportedNrMode(mode) ? mode : NrMode.Off;
+
+    // RX1's NR mode is the shared StateDto.Nr.NrMode; the Receivers[0] entry
+    // only mirrors it.
+    private static NrMode Rx1NrMode(StateDto s) => (s.Nr ?? new NrConfig()).NrMode;
 
     private static bool IsSupportedNrMode(NrMode mode) =>
         mode is NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr or NrMode.Nnr;
@@ -7086,7 +7137,8 @@ public sealed class RadioService : IDisposable
         Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled, TxVfoHz: s.SplitTxHz,
         // Read-only mirror of the legacy global zoom — RX1 is still SET only via
         // StateDto.ZoomLevel / SetZoom, never through this projection.
-        ZoomLevel: s.ZoomLevel);
+        ZoomLevel: s.ZoomLevel,
+        NrMode: Rx1NrMode(s));
 
     private static StateDto WithReceiverAdcSource(StateDto s, int index, byte adcSource)
     {
@@ -7180,7 +7232,8 @@ public sealed class RadioService : IDisposable
                 FilterPresetName: s.FilterPresetName,
                 AfGainDb: s.Rx1AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
-                TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel),
+                TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel,
+                NrMode: Rx1NrMode(s)),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
             // in the array itself (the flat VFO-B fields are gone). Carry the
             // existing tuning forward and overlay the flat RX2 control fields
@@ -7212,7 +7265,7 @@ public sealed class RadioService : IDisposable
                 FilterPresetName: e.FilterPresetName,
                 AfGainDb: e.AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: e.Muted, SplitEnabled: e.SplitEnabled,
-                TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel));
+                TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel, NrMode: e.NrMode));
         }
         // Non-hardware KiwiSDR slice (reserved index KiwiReceiverIndex). Appended
         // out of the contiguous DDC run — it is a remote receiver, not a DDC, so
@@ -7315,6 +7368,7 @@ public sealed class RadioService : IDisposable
                 FilterPresetNameB = rx2Snap.FilterPresetName,
                 Rx2AudioMode = snap.Rx2AudioMode,
                 Rx2AfGainDb = rx2Snap.AfGainDb,
+                Rx2NrMode = rx2Snap.NrMode,
                 TxVfo = snap.TxVfo,
                 CtunEnabled = snap.CtunEnabled,
                 FullDuplexMultiRxEnabled = snap.FullDuplexMultiRxEnabled,

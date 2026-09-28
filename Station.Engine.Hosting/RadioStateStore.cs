@@ -233,6 +233,9 @@ public sealed class RadioStateEntry
     public string? FilterPresetNameB { get; set; } = "VAR1";
     public Zeus.Contracts.Rx2AudioMode Rx2AudioMode { get; set; } = Zeus.Contracts.Rx2AudioMode.Both;
     public double Rx2AfGainDb { get; set; }
+    // RX2's own NR mode (per-receiver NR). Null on rows written before
+    // per-receiver NR — hydration then seeds RX2 from the shared NR mode.
+    public Zeus.Contracts.NrMode? Rx2NrMode { get; set; }
     public TxVfo TxVfo { get; set; } = TxVfo.A;
     // CTUN (click-tune / centred-tuning) toggle. See StateDto.CtunEnabled.
     // Persisted so the operator's preference survives a restart.

@@ -233,6 +233,7 @@ public static class StationEngineEndpoints
         endpoints.MapSerialPttEndpoints();
         endpoints.MapRadioAudioEndpoints();
         endpoints.MapPaThermalEndpoint();
+        endpoints.MapSupplyVoltsEndpoint();
         endpoints.MapRadioHardwareEndpoints();
         endpoints.MapRadioCalibrationEndpoints();
         endpoints.MapVnaEndpoints();

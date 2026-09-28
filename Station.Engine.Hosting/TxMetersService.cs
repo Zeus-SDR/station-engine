@@ -119,6 +119,17 @@ public sealed class TxMetersService : BackgroundService
     private const double PaTempCriticalC = 55.0;
     private static readonly TimeSpan PaTempFreshWindow = TimeSpan.FromSeconds(5);
 
+    // PA input-voltage (Thetis "Volts" meter). Thetis reads AIN3 ("MKII PA
+    // Volts", P1 user_adc0 on the 0x10 echo slot / P2 hi-priority AIN3) and
+    // converts with a 5 V 12-bit ADC behind a (22k + 1k) / 1.1k divider —
+    // console.cs convertToVolts. Only HasVolts boards wire that input.
+    private const double PaVoltsAdcRefVolts = 5.0;
+    private const double PaVoltsAdcFullScale = 4095.0;
+    private const double PaVoltsDividerRatio = (22.0 + 1.0) / 1.1;
+    // Heavier than SmoothAlpha: AIN3 arrives at hundreds of Hz on both
+    // protocols and Thetis averages ~1.2 s of samples for this meter.
+    private const double PaVoltsSmoothAlpha = 0.99;
+
     private readonly StreamingHub _hub;
     private readonly RadioService _radio;
     private readonly TxService _tx;
@@ -149,6 +160,9 @@ public sealed class TxMetersService : BackgroundService
     private double _paTempAdc;
     private bool _seenPaTempSample;
     private DateTimeOffset? _paTempUpdatedUtc;
+    private double _paVoltsAdc;
+    private bool _seenPaVoltsSample;
+    private DateTimeOffset? _paVoltsUpdatedUtc;
     private bool _seenSample;
     private ushort _latestRawFwd;
     private ushort _latestRawRef;
@@ -244,6 +258,9 @@ public sealed class TxMetersService : BackgroundService
                 _seenRawRef = true;
                 ApplySmoothed(ref _refAdc, reading.Ain0);
                 TrackPeak(ref _refAdcPeak, reading.Ain0);
+                // Ain1 on this slot is AIN3 — PA volts on HasVolts boards
+                // (HL2 carries ADC0 bias here; SupplyVoltsSnapshot gates it out).
+                ApplyPaVoltsSmoothed(reading.Ain1);
                 lock (_sync)
                 {
                     _diagRefSlotCount++;
@@ -332,6 +349,60 @@ public sealed class TxMetersService : BackgroundService
             _paTempAdc = SmoothAlpha * _paTempAdc + (1.0 - SmoothAlpha) * raw;
             _paTempUpdatedUtc = DateTimeOffset.UtcNow;
         }
+    }
+
+    internal void ApplyPaVoltsSmoothed(ushort raw)
+    {
+        lock (_sync)
+        {
+            _paVoltsAdc = _seenPaVoltsSample
+                ? PaVoltsSmoothAlpha * _paVoltsAdc + (1.0 - PaVoltsSmoothAlpha) * raw
+                : raw;
+            _seenPaVoltsSample = true;
+            _paVoltsUpdatedUtc = DateTimeOffset.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// Convert a raw AIN3 PA-volts ADC reading to volts. Pure function —
+    /// Thetis console.cs convertToVolts verbatim.
+    /// </summary>
+    internal static double ConvertPaVoltsAdcToVolts(double rawAdc) =>
+        rawAdc / PaVoltsAdcFullScale * PaVoltsAdcRefVolts * PaVoltsDividerRatio;
+
+    /// <summary>
+    /// Live PA input voltage for the Meter Group volts meter. Unsupported
+    /// (and never populated) on boards without <c>HasVolts</c>, so the HL2's
+    /// bias ADC on the same slot is never shown as a voltage.
+    /// </summary>
+    public RadioSupplyVoltsDto SupplyVoltsSnapshot()
+    {
+        var caps = BoardCapabilitiesTable.For(
+            _radio.EffectiveBoardKind,
+            _radio.EffectiveOrionMkIIVariant);
+        if (!caps.HasVolts)
+            return new(Supported: false, Available: false, Volts: null, RawAdc: null, AgeMs: null);
+
+        bool seen;
+        double rawAdc;
+        DateTimeOffset? updatedUtc;
+        lock (_sync)
+        {
+            seen = _seenPaVoltsSample;
+            rawAdc = _paVoltsAdc;
+            updatedUtc = _paVoltsUpdatedUtc;
+        }
+
+        long? ageMs = updatedUtc is { } ts
+            ? Math.Max(0L, (long)(DateTimeOffset.UtcNow - ts).TotalMilliseconds)
+            : null;
+        bool available = seen && ageMs is { } age && age <= PaTempFreshWindow.TotalMilliseconds;
+        return new(
+            Supported: true,
+            Available: available,
+            Volts: available ? Round(ConvertPaVoltsAdcToVolts(rawAdc), 2) : null,
+            RawAdc: available ? Round(rawAdc, 1) : null,
+            AgeMs: ageMs);
     }
 
     /// <summary>
@@ -883,6 +954,9 @@ public sealed class TxMetersService : BackgroundService
             _paTempAdc = 0;
             _seenPaTempSample = false;
             _paTempUpdatedUtc = null;
+            _paVoltsAdc = 0;
+            _seenPaVoltsSample = false;
+            _paVoltsUpdatedUtc = null;
             _seenSample = false;
             _latestRawFwd = 0;
             _latestRawRef = 0;
@@ -915,6 +989,7 @@ public sealed class TxMetersService : BackgroundService
     public void OnP2Telemetry(Zeus.Protocol2.P2TelemetryReading reading)
     {
         OnTelemetryRaw(reading.FwdAdc, reading.RevAdc);
+        ApplyPaVoltsSmoothed(reading.UserAdc0);
     }
 
     private void OnP2Connected(Zeus.Protocol2.Protocol2Client client)
@@ -926,6 +1001,9 @@ public sealed class TxMetersService : BackgroundService
             _paTempAdc = 0;
             _seenPaTempSample = false;
             _paTempUpdatedUtc = null;
+            _paVoltsAdc = 0;
+            _seenPaVoltsSample = false;
+            _paVoltsUpdatedUtc = null;
             _diagPaTempSlotCount = 0;
         }
         _log.LogInformation("tx.meters subscribed to p2 hi-priority telemetry");
@@ -945,6 +1023,9 @@ public sealed class TxMetersService : BackgroundService
             _paTempAdc = 0;
             _seenPaTempSample = false;
             _paTempUpdatedUtc = null;
+            _paVoltsAdc = 0;
+            _seenPaVoltsSample = false;
+            _paVoltsUpdatedUtc = null;
             _seenSample = false;
             _latestRawFwd = 0;
             _latestRawRef = 0;

@@ -26,6 +26,15 @@ public static class RadioStatusEndpoints
         return endpoints;
     }
 
+    public static IEndpointRouteBuilder MapSupplyVoltsEndpoint(
+        this IEndpointRouteBuilder endpoints)
+    {
+        endpoints.MapGet("/api/radio/supply-volts", (TxMetersService txMeters) =>
+            Results.Ok(txMeters.SupplyVoltsSnapshot()));
+
+        return endpoints;
+    }
+
     public static IEndpointRouteBuilder MapRadioSelectionEndpoints(
         this IEndpointRouteBuilder endpoints)
     {

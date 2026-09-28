@@ -28,6 +28,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["multi-rx"] = "multi_rx_settings",
             ["analog-meter"] = "meter_ui_settings",
             ["s-meter-reading"] = "meter_ui_settings",
+            ["s-meter-settings"] = "meter_ui_settings",
             ["connect"] = "connect_settings",
             ["chat"] = "chat_settings",
             ["lightning"] = "lightning_alert_settings",
@@ -37,6 +38,9 @@ public sealed class OperatorSettingsStore : IDisposable
             ["spectrum-view-scope"] = "display_aux_settings",
             ["surface-opacity"] = "display_aux_settings",
             ["background-image-area"] = "display_aux_settings",
+            ["spectrum-display"] = "display_aux_settings",
+            ["spectrum-splits"] = "display_aux_settings",
+            ["vox"] = "vox_settings",
         };
 
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;

@@ -41,4 +41,7 @@ public sealed record CwEngineStatus(
     string Text,
     int Wpm,
     int QueueDepth,
-    string? Reason = null);
+    string? Reason = null,
+    // Bumps on every abort. A send that names a different value is refused.
+    // Older snapshots leave it at 0.
+    int AbortSeq = 0);

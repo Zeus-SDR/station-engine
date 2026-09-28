@@ -7,6 +7,11 @@ namespace Zeus.Server;
 /// <summary>Maps core CW and TX-control routes.</summary>
 public static class TxControlEndpoints
 {
+    // Serialises a CW settings PUT with the live keyer push that follows it.
+    // The store drops a stale revision; this keeps that revision from
+    // pushing the keyer after a newer one already has.
+    private static readonly object CwSettingsPutGate = new();
+
     /// <summary>Combine engine FM readouts with the effective repeater shift:
     /// active only while the TX mode is FM, split is off and the signed offset
     /// is non-zero; EffectiveShift is the direction actually applied
@@ -36,6 +41,57 @@ public static class TxControlEndpoints
             EffectiveShift: shift);
     }
 
+    /// <summary>
+    /// Merge one CW settings PUT, push an applied write to the live keyer,
+    /// and hand every connected client the settings on record. A field whose
+    /// revision the store has already passed is not written. When no field
+    /// in the patch is newer, the keyer is left alone. The broadcast is
+    /// still the stored snapshot, so a console that re-read before this PUT
+    /// landed replaces the stale copy. The broadcast runs inside
+    /// <see cref="CwSettingsPutGate"/> immediately after the save, so two
+    /// PUTs publish in the order they were saved.
+    /// </summary>
+    internal static CwSettingsDto ApplyCwSettingsPut(
+        CwSettingsSetRequest req,
+        CwSettingsStore store,
+        CwSidetoneSource sidetone,
+        Action<CwSettingsDto> pushKeyer,
+        Action<CwSettingsDto> publish)
+    {
+        ArgumentNullException.ThrowIfNull(req);
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(sidetone);
+        ArgumentNullException.ThrowIfNull(pushKeyer);
+        ArgumentNullException.ThrowIfNull(publish);
+
+        // Save first so the persisted view is the source of truth even
+        // if the live generator update races somehow. Then push the
+        // (post-clamp) values to the live generator so a slider drag
+        // updates pitch/gain without a restart.
+        CwSettingsWrite write;
+        lock (CwSettingsPutGate)
+        {
+            write = store.Write(req);
+            // Same lock as the save, and before the lock is released, so a
+            // second PUT cannot publish ahead of this one.
+            publish(write.Settings);
+            if (write.Applied)
+            {
+                var snapshot = write.Settings;
+                sidetone.SetPitchHz(snapshot.SidetoneHz);
+                sidetone.SetGainDb(snapshot.SidetoneGainDb);
+                // Forward keyer speed (WPM) + mode + sidetone to the radio's
+                // on-board iambic keyer so a paddle keys at the panel speed:
+                // P1 → C&C 0x0B; P2 → TxSpecific internal-keyer arm (#1032). No-op
+                // when no radio is connected (cached + re-pushed on the next
+                // connect). See zeus-bks.
+                pushKeyer(snapshot);
+            }
+        }
+
+        return write.Settings;
+    }
+
     public static IEndpointRouteBuilder MapTxControlEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
@@ -60,18 +116,25 @@ public static class TxControlEndpoints
             var leaseId = RemoteTxLease.TryGet(context, out var remoteLease)
                 ? remoteLease
                 : null;
-            await cw.SendAsync(req.Text ?? string.Empty, req.Wpm, default, leaseId).ConfigureAwait(false);
+            await cw.SendAsync(req.Text ?? string.Empty, req.Wpm, default, leaseId, req.ExpectedAbortSeq).ConfigureAwait(false);
             return Results.Accepted();
         });
 
         // Hard abort. Drops the queue and signals the in-flight playback to
         // cancel. MOX falls on the next playback tick (≤ ChunkSamples / SR ≈
-        // 10 ms). Returns 200 unconditionally — abort is best-effort.
+        // 10 ms). Returns 200 unconditionally — abort is best-effort — and
+        // the new abort counter so the client can fence the next send.
         endpoints.MapPost("/api/cw/abort", (CwEngine cw) =>
         {
-            cw.Abort("api.cw.abort");
-            return Results.Ok();
+            var abortSeq = cw.Abort("api.cw.abort");
+            return Results.Ok(new { abortSeq });
         });
+
+        // The abort counter for a page that has not seen a status frame yet:
+        // a reload, a reconnect, or a CW+ pop-out. Sending 0 in that case
+        // is refused once HALT has moved the engine on.
+        endpoints.MapGet("/api/cw/status", (CwEngine cw) =>
+            Results.Ok(new { abortSeq = cw.AbortSeq }));
 
         // Persisted CW operator settings (WPM, Farnsworth, 6 macros,
         // sidetone gain/pitch). PATCH-shaped PUT: every field nullable so
@@ -103,30 +166,28 @@ public static class TxControlEndpoints
         endpoints.MapGet("/api/cw/settings", (CwSettingsStore store) =>
             Results.Ok(store.Get()));
 
-        endpoints.MapPut("/api/cw/settings", (CwSettingsSetRequest req, CwSettingsStore store, CwSidetoneSource sidetone, RadioService radio) =>
+        endpoints.MapPut("/api/cw/settings", (
+            CwSettingsSetRequest req,
+            CwSettingsStore store,
+            CwSidetoneSource sidetone,
+            RadioService radio,
+            StreamingHub hub) =>
         {
-            // Save first so the persisted view is the source of truth even
-            // if the live generator update races somehow. Then push the
-            // (post-clamp) values to the live generator so a slider drag
-            // updates pitch/gain without a restart.
-            var snapshot = store.Save(req);
-            sidetone.SetPitchHz(snapshot.SidetoneHz);
-            sidetone.SetGainDb(snapshot.SidetoneGainDb);
-            // Forward keyer speed (WPM) + mode + sidetone to the radio's
-            // on-board iambic keyer so a paddle keys at the panel speed:
-            // P1 → C&C 0x0B; P2 → TxSpecific internal-keyer arm (#1032). No-op
-            // when no radio is connected (cached + re-pushed on the next
-            // connect). See zeus-bks.
-            radio.SetCwKeyerConfig(
-                snapshot.Wpm,
-                snapshot.KeyerMode,
-                snapshot.SidetoneHz,
-                snapshot.SidetoneGainDb,
-                snapshot.BreakIn,
-                snapshot.HangMs,
-                snapshot.Weight,
-                snapshot.PaddleReverse);
-            return Results.Ok(snapshot);
+            var saved = ApplyCwSettingsPut(
+                req,
+                store,
+                sidetone,
+                snapshot => radio.SetCwKeyerConfig(
+                    snapshot.Wpm,
+                    snapshot.KeyerMode,
+                    snapshot.SidetoneHz,
+                    snapshot.SidetoneGainDb,
+                    snapshot.BreakIn,
+                    snapshot.HangMs,
+                    snapshot.Weight,
+                    snapshot.PaddleReverse),
+                hub.BroadcastCwSettings);
+            return Results.Ok(saved);
         });
 
         // Mic-gain: N dB in [-40, +10], scales WDSP TXA panel-gain-1 the same
@@ -152,6 +213,17 @@ public static class TxControlEndpoints
         {
             var snap = r.SetAmCarrierLevel(req.CarrierLevelPercent);
             return Results.Ok(new { carrierLevelPercent = snap.AmCarrierLevelPercent });
+        });
+
+        // TX audio profile selection mirror for a host that owns the profiles
+        // itself (the product host). It reports the operator's profile and the
+        // auto-applied one so StateDto.TxAudioProfileId / TxAudioAutoProfileId
+        // reach every client, as the engine's own TxAudioProfileService does.
+        endpoints.MapPut("/api/tx/audio-profile-selection", (TxAudioProfileSelectionRequest req, RadioService r) =>
+        {
+            static string? Clean(string? id) => string.IsNullOrWhiteSpace(id) ? null : id.Trim();
+            r.SetTxAudioProfileSelection(Clean(req.ProfileId), Clean(req.AutoProfileId));
+            return Results.NoContent();
         });
 
         // Broadcast AM (AM/SAM TX modulator): asymmetric +pos/-neg modulation,
@@ -443,3 +515,6 @@ internal sealed record PreviewSetRequest(
     bool? MonitorOnTransmit = null);
 
 internal sealed record MonitorVolumeSetRequest(double VolumeDb);
+
+/// <summary>PUT body for /api/tx/audio-profile-selection.</summary>
+internal sealed record TxAudioProfileSelectionRequest(string? ProfileId, string? AutoProfileId);

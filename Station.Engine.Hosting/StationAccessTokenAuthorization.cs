@@ -76,6 +76,9 @@ public static class StationAccessTokenAuthorization
                 "/api/station/key",
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(
+                "/api/wspr/decoder",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
                 "/api/station/tx/safe-idle",
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(

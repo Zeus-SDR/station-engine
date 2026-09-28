@@ -93,7 +93,9 @@ public enum MsgType : byte
     // Client → server (control). Enables the first-party receive-side CW
     // decoder while at least one Telegraph Console panel is mounted. The
     // request is refcounted per connected session and unwound on disconnect.
-    // Payload: [type:1][enable:u8] (2 bytes).
+    // Payload: [type:1][enable:u8] (2 bytes). Optional extension, same type:
+    // [type:1][enable:u8][flags:u8][targetHz:u16 LE] (5 bytes). flags bit 0
+    // locks the tone; targetHz 0 follows the CW pitch, otherwise 200..3000.
     CwDecoderRequest = 0x25,
 
     // Server → client (TX telemetry + protection)
@@ -234,7 +236,8 @@ public enum MsgType : byte
     // Server → client (first-party CW receive decoder). Broadcast at no
     // more than 10 Hz while a client requests decoding and RX0 is in CWU/CWL.
     // Payload: [type:1][wpm:u16 LE][snrDb:f32 LE][confidence:f32 LE]
-    // [textLen:u16 LE][text:UTF-8…]. See CwDecodedTextFrame.cs.
+    // [textLen:u16 LE][text:UTF-8…][pitchHz:u16 LE][locked:u8]. The last two
+    // fields are an append-only trailer. See CwDecodedTextFrame.cs.
     CwDecodedText = 0x31,
 
     // Server → client (TCI spot list snapshot). Broadcast by SpotBroadcastService
@@ -351,4 +354,14 @@ public enum MsgType : byte
     // [generation:u32 LE] — the client discards stale generations the same
     // way it already does for NativeMicPcm (0x3D).
     NativeMicStreamDenied = 0x3E,
+
+    // Server → client (saved CW operator settings). Broadcast after
+    // PUT /api/cw/settings writes the row, so every connected console
+    // sees the WPM and macros the engine stored. The 0x3x nibble is full
+    // (0x30–0x3F), so this frame starts the next byte. Payload:
+    // [type:1][UTF-8 JSON CwSettingsDto]. Same camelCase JSON the REST
+    // snapshot uses, including the keyer mode as a string. Clients ignore
+    // unknown types, so an older build drops the frame and keeps polling.
+    // See CwSettingsFrame.cs.
+    CwSettings = 0x40,
 }

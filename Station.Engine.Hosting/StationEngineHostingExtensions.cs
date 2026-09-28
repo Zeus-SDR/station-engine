@@ -155,6 +155,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<OperatorSettingsStore>();
         services.AddSingleton<ToolbarSettingsStore>();
         services.AddSingleton<NrUiPrefsStore>();
+        services.AddSingleton<ClockSettingsStore>();
         services.AddSingleton<BottomPinStore>();
         services.AddSingleton<PanWfSplitStore>();
         services.AddSingleton<OperatorIdentityStore>();
@@ -261,6 +262,7 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<CwEngine>();
         services.AddSingleton<CwIdService>();
         services.AddSingleton<CwDecoderService>();
+        services.AddSingleton<WsprDecodeService>();
         services.AddSingleton<ExternalPttService>();
         services.AddHl2IoBoard();
         services.AddSingleton<SerialPttService>();
@@ -300,6 +302,7 @@ public static class StationEngineHostingExtensions
         services.AddHostedService(sp => sp.GetRequiredService<TxTuneDriver>());
         services.AddHostedService(sp => sp.GetRequiredService<CwEngine>());
         services.AddHostedService(sp => sp.GetRequiredService<CwDecoderService>());
+        services.AddHostedService(sp => sp.GetRequiredService<WsprDecodeService>());
         services.AddHostedService<PsAutoAttenuateService>();
         services.AddHostedService(sp => sp.GetRequiredService<ExternalPttService>());
         services.AddHostedService(sp => sp.GetRequiredService<SerialPttService>());

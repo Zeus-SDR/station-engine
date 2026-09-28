@@ -8,7 +8,7 @@ namespace Zeus.Server;
 
 /// <summary>
 /// The hosting assembly may register only one DllImport resolver. Dispatch all
-/// engine-owned native bindings here so miniaudio and RADE cannot race to own
+/// engine-owned native bindings here so miniaudio, RADE and WSPR cannot race to own
 /// the assembly-wide resolver slot.
 /// </summary>
 internal static class EngineNativeLibraryResolver
@@ -38,6 +38,8 @@ internal static class EngineNativeLibraryResolver
             return MiniAudioInterop.ResolveLibrary(assembly);
         if (libraryName == RadeNativeMethods.LibraryName)
             return RadeNativeLoader.ResolveLibrary(assembly);
+        if (libraryName == WsprNativeMethods.LibraryName)
+            return WsprNativeLoader.ResolveLibrary(assembly);
         if (libraryName == AsioInterop.LibraryName)
             return AsioInterop.ResolveLibrary(assembly);
         return IntPtr.Zero;

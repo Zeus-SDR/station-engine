@@ -6104,8 +6104,9 @@ public class DspPipelineService : BackgroundService,
         var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
         if (!nr.Equals(_appliedNr))
         {
+            // RX1 only — every secondary receiver applies its own NR mode via
+            // its per-RX latch in ApplyStateToSecondaryRxChannel.
             engine.SetNoiseReduction(channel, nr);
-            if (rx2Channel >= 0) engine.SetNoiseReduction(rx2Channel, nr);
             _appliedNr = nr;
         }
         // Diversity combiner — managed complex combine in the P2 ingest (see
@@ -6918,6 +6919,16 @@ public class DspPipelineService : BackgroundService,
             : (r.Mode, r.VfoHz, r.FilterLowHz, r.FilterHighHz, r.AfGainDb);
     }
 
+    // Per-receiver NR: the shared NrConfig (NR tunables, NB, ANF, SNB, NBP)
+    // with this receiver's own NR mode from its Receivers[] entry. RX1 keeps
+    // using StateDto.Nr directly.
+    internal static NrConfig SecondaryRxNrConfig(StateDto s, int rxIndex)
+    {
+        var shared = s.Nr ?? new NrConfig();
+        var r = s.Receivers is { } rs && rxIndex >= 0 && rxIndex < rs.Count ? rs[rxIndex] : null;
+        return NormalizeNrConfig(r is null ? shared : shared with { NrMode = r.NrMode });
+    }
+
     // Convenience helper: open/sync/close the WDSP channel for one secondary
     // receiver, mirroring RX1's lifecycle. Returns the channel id (or -1 when the
     // receiver is disabled). Generalised from the old EnsureRx2Channel.
@@ -7103,7 +7114,7 @@ public class DspPipelineService : BackgroundService,
     private void ApplyStateToSecondaryRxChannel(IDspEngine engine, int rxIndex, int channelId, StateDto s)
     {
         var rx = _secondaryRx[rxIndex];
-        var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
+        var nr = SecondaryRxNrConfig(s, rxIndex);
         var agc = EffectiveAgcConfig(
             s.Agc ?? new AgcConfig(AgcMode.Med),
             _appliedAgcCeilingDb);

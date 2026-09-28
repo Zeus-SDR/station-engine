@@ -170,6 +170,9 @@ public sealed class DisplaySettingsStore : IDisposable
                     WaterfallUpdatePeriod: DisplayPerformanceOptions.DefaultWaterfallUpdatePeriod,
                     WaterfallColormap: null,
                     WaterfallScrollSpeed: null,
+                    WaterfallLowColor: null,
+                    WaterfallMidColor: null,
+                    WaterfallHighColor: null,
                     BandOverlayEnabled: null,
                     BandEdgeAlertEnabled: null,
                     ChatRosterOverlayEnabled: null,
@@ -218,6 +221,9 @@ public sealed class DisplaySettingsStore : IDisposable
                 WidebandSignalMarkersEnabled: e.WidebandSignalMarkersEnabled,
                 WaterfallColormap: e.WaterfallColormap,
                 WaterfallScrollSpeed: e.WaterfallScrollSpeed,
+                WaterfallLowColor: NormalizeOptionalHexColor(e.WaterfallLowColor),
+                WaterfallMidColor: NormalizeOptionalHexColor(e.WaterfallMidColor),
+                WaterfallHighColor: NormalizeOptionalHexColor(e.WaterfallHighColor),
                 BandOverlayEnabled: e.BandOverlayEnabled,
                 BandEdgeAlertEnabled: e.BandEdgeAlertEnabled,
                 ChatRosterOverlayEnabled: e.ChatRosterOverlayEnabled,
@@ -271,7 +277,10 @@ public sealed class DisplaySettingsStore : IDisposable
         string? filterPanelBgMode = null,
         string? filterPanelBgColor = null,
         int? filterPanelBgBrightness = null,
-        int? rxDisplayFftSize = null)
+        int? rxDisplayFftSize = null,
+        string? waterfallLowColor = null,
+        string? waterfallMidColor = null,
+        string? waterfallHighColor = null)
     {
         lock (_sync)
         {
@@ -315,8 +324,13 @@ public sealed class DisplaySettingsStore : IDisposable
                 e.DisplayDecimation = DisplayPerformanceOptions.NormalizeDisplayDecimation(displayDecimation);
             if (waterfallUpdatePeriod.HasValue)
                 e.WaterfallUpdatePeriod = DisplayPerformanceOptions.NormalizeWaterfallUpdatePeriod(waterfallUpdatePeriod);
-            if (waterfallColormap is "blue" or "multicolor" or "viridis" or "inferno")
+            if (waterfallColormap is "blue" or "multicolor" or "viridis" or "inferno" or "custom")
                 e.WaterfallColormap = waterfallColormap;
+            // Each custom-palette colour is independent; an invalid value is
+            // ignored rather than resetting what the operator already chose.
+            if (NormalizeOptionalHexColor(waterfallLowColor) is { } low) e.WaterfallLowColor = low;
+            if (NormalizeOptionalHexColor(waterfallMidColor) is { } mid) e.WaterfallMidColor = mid;
+            if (NormalizeOptionalHexColor(waterfallHighColor) is { } high) e.WaterfallHighColor = high;
             if (waterfallScrollSpeed.HasValue && double.IsFinite(waterfallScrollSpeed.Value))
                 e.WaterfallScrollSpeed = Math.Clamp(waterfallScrollSpeed.Value, 0.25, 2.5);
             if (bandOverlayEnabled.HasValue) e.BandOverlayEnabled = bandOverlayEnabled;
@@ -472,6 +486,19 @@ public sealed class DisplaySettingsStore : IDisposable
         return raw.ToUpperInvariant();
     }
 
+    // #RRGGBB (upper-cased) or null when absent / malformed.
+    private static string? NormalizeOptionalHexColor(string? raw)
+    {
+        if (raw is null || raw.Length != 7 || raw[0] != '#') return null;
+        for (var i = 1; i < 7; i++)
+        {
+            var c = raw[i];
+            var ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!ok) return null;
+        }
+        return raw.ToUpperInvariant();
+    }
+
     private static string NormalizeFilterPanelColor(string? raw)
     {
         if (string.IsNullOrEmpty(raw)) return DefaultFilterPanelBgColor;
@@ -554,6 +581,9 @@ public sealed class DisplaySettingsEntry
     public int? WaterfallUpdatePeriod { get; set; }
     public string? WaterfallColormap { get; set; }
     public double? WaterfallScrollSpeed { get; set; }
+    public string? WaterfallLowColor { get; set; }
+    public string? WaterfallMidColor { get; set; }
+    public string? WaterfallHighColor { get; set; }
     public bool? BandOverlayEnabled { get; set; }
     public bool? BandEdgeAlertEnabled { get; set; }
     public bool? ChatRosterOverlayEnabled { get; set; }

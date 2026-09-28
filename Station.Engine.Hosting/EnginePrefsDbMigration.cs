@@ -41,6 +41,15 @@ internal static class EnginePrefsDbMigration
             yield return name;
     }
 
+    // Per-plugin settings collections (Zeus.Plugins.Host PluginSettingsStore
+    // names each one "plugin_" + sanitized plugin id). The set is dynamic, so
+    // it is matched by prefix instead of being listed. The desktop host keeps
+    // them in zeus-prefs.db and the standalone engine in station-engine.db.
+    internal const string PluginSettingsCollectionPrefix = "plugin_";
+
+    internal static bool IsPluginSettingsCollection(string collectionName) =>
+        collectionName.StartsWith(PluginSettingsCollectionPrefix, StringComparison.Ordinal);
+
     internal static readonly IReadOnlyList<string> StationControlCollectionNames =
         Array.AsReadOnly(
         [
@@ -66,6 +75,7 @@ internal static class EnginePrefsDbMigration
             "dsp_settings",
             "filter_presets",
             "hl2_gpio",
+            "hl2_io_bands",
             "pa_band_drive",
             "pa_bands",
             "pa_globals",

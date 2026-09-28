@@ -2015,8 +2015,15 @@ public sealed class TciSession : IDisposable
                 _ => NrMode.Anr,
             };
         }
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
-        _radio.SetNr(current with { NrMode = mode });
+        SetReceiverNrMode(rx, mode);
+    }
+
+    // NR mode is per receiver: rx 0 drives RX1 (the shared StateDto.Nr mode),
+    // rx 1 drives RX2's own mode. Other indices are ignored like rx_volume.
+    private void SetReceiverNrMode(int rx, NrMode mode)
+    {
+        if (rx is not (0 or 1)) return;
+        _radio.SetReceiver(rx, nrMode: mode);
     }
 
     private void HandleRxAntenna(string[] args)
@@ -2110,9 +2117,7 @@ public sealed class TciSession : IDisposable
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (!TciProtocol.TryParseBool(args[1], out bool enable)) return;
 
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
-        var updated = current with { NrMode = enable ? NrMode.Anr : NrMode.Off };
-        _radio.SetNr(updated);
+        SetReceiverNrMode(rx, enable ? NrMode.Anr : NrMode.Off);
     }
 
     private void HandleNbEnable(string[] args)

@@ -168,7 +168,15 @@ public sealed class TxAudioIngest : IDisposable
     private const int KeyDownPrimeBlocks = 12;
     private const float MonitorPreviewOpenPeak = 0.012f; // ~-38 dBFS
     private const float MonitorPreviewOpenRms = 0.003f;  // ~-50 dBFS
-    private const int MonitorPreviewHangBlocks = 15;     // ~320 ms at 1024/48k
+    // Hold the preview gate open across ordinary phrase pauses. A 300 ms hang
+    // (the original 15 blocks) closed on every breath between phrases, so the
+    // off-air MON preview sounded like a DEXP/noise gate even with DEXP off
+    // (#2515) while keyed TX monitoring stayed clean. Sustained idle still
+    // closes the gate, so an unattended mic never clocks noise through TXA.
+    private const int MonitorPreviewHangMs = 1500;
+    private const int MicSamplesPerMs = 48;              // mic path is fixed at 48 kHz
+    internal const int MonitorPreviewHangBlocks =
+        MonitorPreviewHangMs * MicSamplesPerMs / MicBlockSamples; // 75 blocks of 20 ms
     // All-zero mic block substituted for gated idle blocks so the monitor
     // stream stays gapless while the preview gate is closed. Never written.
     private static readonly float[] SilentMicBlock = new float[MicBlockSamples];
@@ -1392,8 +1400,9 @@ public sealed class TxAudioIngest : IDisposable
         // off, do not clock idle mic/noise through TXA: the leveler/CFC/
         // ALC stack can turn a tiny idle floor or plugin self-noise into an
         // audible, self-rising monitor tone. Speech opens the preview gate
-        // immediately and a short hang avoids chopping word tails. Keyed TX,
-        // TCI, and WAV playback bypass this gate entirely.
+        // immediately and the hang keeps it open through phrase pauses so the
+        // preview does not sound gated; only sustained idle closes it. Keyed
+        // TX, TCI, and WAV playback bypass this gate entirely.
         //
         // Substitute digital silence rather than dropping the block: while the
         // monitor is on it REPLACES the RX audio at every sink, so a dropped

@@ -762,6 +762,18 @@ public sealed record RadioSupplyAlarmsDto(
     string DiagnosticRecommendation,
     DateTimeOffset GeneratedUtc);
 
+/// <summary>
+/// Live PA input-voltage reading for the Meter Group "Input Voltage" meter.
+/// Mirrors Thetis's Volts meter: AIN3 ("MKII PA Volts"), only on boards that
+/// advertise <c>HasVolts</c>. <c>Volts</c> is null until a fresh sample lands.
+/// </summary>
+public sealed record RadioSupplyVoltsDto(
+    bool Supported,
+    bool Available,
+    double? Volts,
+    double? RawAdc,
+    long? AgeMs);
+
 public sealed record RadioPaThermalDiagnosticsDto(
     int SchemaVersion,
     string? ActiveProtocol,
@@ -1492,7 +1504,13 @@ public sealed record ReceiverDto(
     // SetZoom; RX2+ are independently settable via ReceiverSetRequest.ZoomLevel
     // and applied per-channel in DspPipelineService. Defaulted to 1x so
     // pre-zoom wire frames deserialize unchanged.
-    int ZoomLevel = 1);
+    int ZoomLevel = 1,
+    // Per-receiver noise-reduction mode. RX1 (index 0) mirrors StateDto.Nr.NrMode
+    // (still settable via POST /api/rx/nr); RX2+ are independent and settable via
+    // ReceiverSetRequest.NrMode. Every other NrConfig field (NR tunables, NB, ANF,
+    // SNB, NBP) stays shared across receivers. Defaulted Off so pre-per-RX-NR
+    // wire frames deserialize unchanged.
+    NrMode NrMode = NrMode.Off);
 
 public sealed record StateDto(
     ConnectionStatus Status,
@@ -2087,7 +2105,11 @@ public sealed record ReceiverSetRequest(
     // index 0, which stays on the legacy global StateDto.ZoomLevel via
     // POST /api/rx/zoom). Clamped to SyntheticDspEngine.MinZoomLevel..
     // MaxZoomLevel by RadioService.SetReceiver.
-    int? ZoomLevel = null);
+    int? ZoomLevel = null,
+    // Per-receiver noise-reduction mode. Index 0 updates StateDto.Nr.NrMode (the
+    // same value POST /api/rx/nr sets); RX2+ select their own mode. The rest of
+    // the NR/NB/ANF/SNB configuration stays shared.
+    NrMode? NrMode = null);
 
 /// <summary>Body of <c>POST /api/kiwi</c> — configure the KiwiSDR slice
 /// receiver. Every field is optional; only supplied fields change.
@@ -2534,7 +2556,10 @@ public sealed record TunSetRequest(bool On);
 // playback speed (PARIS-method words per minute, clamped to 5..50 at the
 // engine seam). Wpm null means "use the operator's stored CwSettings.Wpm
 // default" (CwSettingsStore — written by /api/cw/settings).
-public sealed record CwSendRequest(string Text, int? Wpm = null);
+// ExpectedAbortSeq is the abort counter the client last saw. Null keeps the
+// old contract: the engine queues the text. A value that is not the engine's
+// current counter is refused, so a send delayed past HALT cannot key.
+public sealed record CwSendRequest(string Text, int? Wpm = null, int? ExpectedAbortSeq = null);
 
 // Persisted CW operator settings. Wpm is the default speed for new sends
 // when /api/cw/send is called without an explicit wpm. FarnsworthWpm is
@@ -2562,11 +2587,41 @@ public sealed record CwSettingsDto(
     int Weight = 50,
     // Protocol-2 byte 5 bit 2 and Protocol-1 register 0x0B C2[6]. Default
     // false preserves the previously pinned unswapped paddle wiring.
-    bool PaddleReverse = false);
+    bool PaddleReverse = false,
+    // CW+ automatic operation. Off until the operator turns it on, and the
+    // client still requires TX ENABLE plus the control-operator acknowledgement
+    // before Auto-CQ can key. Messages are the sequencer templates.
+    bool AutoCq = false,
+    bool AutoLog = false,
+    bool ClickToArm = false,
+    int RepeatLimit = 3,
+    int PartnerIdleSec = 2,
+    bool FinalEe = false,
+    string SeqCq = "CQ CQ DE {MYCALL} {MYCALL} K",
+    string SeqAnswer = "{CALL} DE {MYCALL} {MYCALL} K",
+    string SeqReport = "{CALL} DE {MYCALL} TU {RST} {RST} BK",
+    string SeqConfirm = "{CALL} DE {MYCALL} TU 73 SK",
+    string RstToSend = "5NN",
+    // Monotonic snapshot version. The store starts at the persisted value,
+    // or 1 when nothing is stored, and adds 1 on every successful save.
+    // GET, the PUT response, and the settings push all carry it. 0 means
+    // unset and is left off the wire. Older clients ignore the extra field.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    long SettingsVersion = 0);
 
 // PATCH-shaped: every field nullable so the frontend can save one slider
 // (or one macro) without re-sending the whole record. Server merges on top
 // of the persisted row before applying.
+//
+// Rev is optional. Absent, the write applies as it always has (older
+// clients and the TCI bridge). When set it is "{session}:{seq}": a page
+// session id and a counter that only goes up. The engine remembers the
+// highest seq applied for each field of that session. A field applies
+// only when this seq is newer than that field's; the other fields in the
+// same patch are judged on their own. An equal seq is the same write
+// arriving twice and does not overwrite. The response is always the
+// settings on record. Another session is ordered on its own and does
+// not block this one.
 public sealed record CwSettingsSetRequest(
     int? Wpm = null,
     int? FarnsworthWpm = null,
@@ -2577,7 +2632,19 @@ public sealed record CwSettingsSetRequest(
     bool? BreakIn = null,
     int? HangMs = null,
     int? Weight = null,
-    bool? PaddleReverse = null);
+    bool? PaddleReverse = null,
+    bool? AutoCq = null,
+    bool? AutoLog = null,
+    bool? ClickToArm = null,
+    int? RepeatLimit = null,
+    int? PartnerIdleSec = null,
+    bool? FinalEe = null,
+    string? SeqCq = null,
+    string? SeqAnswer = null,
+    string? SeqReport = null,
+    string? SeqConfirm = null,
+    string? RstToSend = null,
+    string? Rev = null);
 
 // CW station ID timer (/api/cwid). The ID is mixed into the operator's own
 // voice transmission; it never keys the radio by itself. Wpm is capped at 20
@@ -3129,6 +3196,11 @@ public sealed record DisplaySettingsDto(
     bool WidebandSignalMarkersEnabled = false,
     string? WaterfallColormap = null,
     double? WaterfallScrollSpeed = null,
+    // Custom waterfall palette ("custom" colormap) — Thetis's Low / Mid / High
+    // waterfall colours as #RRGGBB. Null = never chosen (client default).
+    string? WaterfallLowColor = null,
+    string? WaterfallMidColor = null,
+    string? WaterfallHighColor = null,
     bool? BandOverlayEnabled = null,
     bool? BandEdgeAlertEnabled = null,
     bool? ChatRosterOverlayEnabled = null,
@@ -3165,6 +3237,11 @@ public sealed record DisplaySettingsSetRequest(
     bool? WidebandSignalMarkersEnabled = null,
     string? WaterfallColormap = null,
     double? WaterfallScrollSpeed = null,
+    // Custom waterfall palette ("custom" colormap) — Thetis's Low / Mid / High
+    // waterfall colours as #RRGGBB. Null = never chosen (client default).
+    string? WaterfallLowColor = null,
+    string? WaterfallMidColor = null,
+    string? WaterfallHighColor = null,
     bool? BandOverlayEnabled = null,
     bool? BandEdgeAlertEnabled = null,
     bool? ChatRosterOverlayEnabled = null,
@@ -3242,6 +3319,43 @@ public sealed record NrUiPrefsSetRequest(
     bool Nr1Expanded,
     bool Nr2Expanded,
     bool Nr4Expanded);
+
+// Clock tile preferences (which clock is big, local zone / label / 12- or
+// 24-hour format, date lines, station-ID cues). Persisted server-side so the
+// choice survives a relaunch: the SPA's loopback origin changes between the
+// launcher, a bench, and a LAN browser, and localStorage is per-origin.
+// `Primary` is "utc" | "local"; `LocalHourFormat` is "24h" | "12h";
+// `LocalTimeZone` is an IANA id or "" for the computer's zone. `Saved` is
+// false until an operator has stored a value, so a client can seed the server
+// from its existing local copy instead of overwriting it with defaults.
+public sealed record ClockSettingsDto(
+    bool Saved,
+    string Primary,
+    bool ShowLocal,
+    string LocalTimeZone,
+    string LocalLabel,
+    string LocalHourFormat,
+    bool ShowZoneName,
+    bool ShowSeconds,
+    bool ShowUtcDate,
+    bool ShowLocalDate,
+    bool ShowWeekday,
+    bool TenMinuteNotify,
+    bool TenMinuteFlash);
+
+public sealed record ClockSettingsSetRequest(
+    string Primary,
+    bool ShowLocal,
+    string LocalTimeZone,
+    string LocalLabel,
+    string LocalHourFormat,
+    bool ShowZoneName,
+    bool ShowSeconds,
+    bool ShowUtcDate,
+    bool ShowLocalDate,
+    bool ShowWeekday,
+    bool TenMinuteNotify,
+    bool TenMinuteFlash);
 
 // Operator UI theme + per-token colour overrides. `Theme` is one of "dark"
 // | "light" — the theme overlay attribute set on <html data-theme="…">.
@@ -3596,7 +3710,12 @@ public sealed record TxAudioProfileDto(
     AmBroadcastConfig? AmBroadcast = null,
     // Legacy symmetric AM carrier level (0..125 %). Null = leave the live
     // carrier level untouched on apply.
-    int? CarrierLevelPercent = null);
+    int? CarrierLevelPercent = null,
+    // Last TX drive % (the DRV slider) used with this profile per mode family
+    // ("SSB" -> 35). Tracked while the profile is live in that family and
+    // restored on entering the family with it. A missing family leaves the
+    // live drive untouched.
+    Dictionary<string, int>? DriveByFamily = null);
 
 public sealed record TxAudioProfilesResponse(IReadOnlyList<TxAudioProfileDto> Profiles);
 

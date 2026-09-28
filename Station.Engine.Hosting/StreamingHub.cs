@@ -112,6 +112,28 @@ public sealed class StreamingHub
     // readers can be on any hub caller.
     private volatile byte _wisdomPhase;
     private volatile string _wisdomStatus = string.Empty;
+    // Latest CW keyer status. State changes are edges, so a window that
+    // attaches mid-send would otherwise sit on Idle until the next edge
+    // and leave STOP disabled while the message is still keying.
+    //
+    // The cache update and the fan-out share _cwStatusGate with the attach
+    // path that registers a client and snapshots this cache. A replay that
+    // snapshotted an older edge waits outside the gate (wisdom priming, and
+    // the test barrier) and then skips itself when the client has already
+    // queued a higher sequence. Without that, attach can read Idle, a
+    // concurrent broadcast can enqueue Sending, and the replay can enqueue
+    // the stale Idle last — STOP stays disabled for the whole send.
+    private readonly object _cwStatusGate = new();
+    private long _cwEngineStatusSequence;
+    private byte[]? _cwEngineStatusPayload;
+    private readonly Dictionary<IClientSink, long> _cwStatusDelivered = new();
+
+    /// <summary>
+    /// Test barrier. Invoked after a replay snapshots the cached status and
+    /// before that snapshot is queued. Production leaves it null. The wait
+    /// must not run while <see cref="_cwStatusGate"/> is held.
+    /// </summary>
+    internal Action? BeforeCwStatusReplayEnqueue { get; set; }
 
     private readonly IProductStreamSource _productStreamSource;
     private readonly IClientDiagnosticSink _clientDiagnosticSink;
@@ -173,6 +195,48 @@ public sealed class StreamingHub
     // checks this with one volatile read; per-session state prevents duplicate
     // enables and disconnects from leaking demand.
     private int _cwDecodeRequests;
+    private CwDecodeAim _cwDecodeAim = CwDecodeAim.FollowPitch;
+    private long _cwDecodeAimSequence;
+    // Demand changes and aim publishes share this lock. The DSP tick only
+    // reads the volatile demand count and the published aim.
+    private readonly object _cwDecodeGate = new();
+
+    /// <summary>
+    /// Test seam. Runs after the last listener has dropped demand to zero and
+    /// before that release publishes follow-pitch. May re-enter
+    /// <see cref="AdjustCwDecodeRequests"/> and <see cref="SetCwDecodeTarget"/>
+    /// on this same thread. Must not wait on another thread that needs the aim lock.
+    /// </summary>
+    internal Action? BeforeLastListenerCwDecodeResetForTest;
+
+    /// <summary>One published decoder tone and its lock. Swapped as a whole.</summary>
+    internal sealed record CwDecodeAim(int TargetHz, bool Locked, long Sequence = 0)
+    {
+        internal static readonly CwDecodeAim FollowPitch = new(0, false);
+
+        /// <summary>
+        /// Replace <paramref name="slot"/> only when <paramref name="candidate"/>
+        /// has a higher sequence. A callback that observed an older aim loses.
+        /// </summary>
+        internal static bool TryStoreNewer(ref CwDecodeAim slot, CwDecodeAim candidate, out bool valuesChanged)
+        {
+            while (true)
+            {
+                CwDecodeAim current = Volatile.Read(ref slot);
+                if (candidate.Sequence <= current.Sequence)
+                {
+                    valuesChanged = false;
+                    return false;
+                }
+
+                CwDecodeAim seen = Interlocked.CompareExchange(ref slot, candidate, current);
+                if (!ReferenceEquals(seen, current)) continue;
+                valuesChanged = current.TargetHz != candidate.TargetHz
+                    || current.Locked != candidate.Locked;
+                return true;
+            }
+        }
+    }
 
     // Aggregate count of connected clients that need the high-rate display
     // stream (panadapter / waterfall / mini-pan). DspPipelineService reads
@@ -188,10 +252,31 @@ public sealed class StreamingHub
     /// </summary>
     internal bool AudioStreamRequested => Volatile.Read(ref _audioStreamRequests) > 0;
 
-    internal bool CwDecodeRequested => Volatile.Read(ref _cwDecodeRequests) > 0;
+    internal int CwDecodeSubscriberCount => Volatile.Read(ref _cwDecodeRequests);
+
+    internal bool CwDecodeRequested => CwDecodeSubscriberCount > 0;
+
+    /// <summary>Requested audio tone. 0 follows the radio CW pitch.</summary>
+    internal int CwDecodeTargetHz => Volatile.Read(ref _cwDecodeAim).TargetHz;
+
+    /// <summary>
+    /// True when the operator locked the decoder. Read this with the tone
+    /// through <see cref="ReadCwDecodeAim"/> so a concurrent retarget cannot
+    /// be observed as the other request's lock.
+    /// </summary>
+    internal bool CwDecodeLocked => Volatile.Read(ref _cwDecodeAim).Locked;
+
+    /// <summary>The tone and lock published by the latest request.</summary>
+    internal CwDecodeAim ReadCwDecodeAim() => Volatile.Read(ref _cwDecodeAim);
 
     /// <summary>Raised only when aggregate CW demand crosses zero.</summary>
     internal event Action? CwDecodeRequestChanged;
+
+    /// <summary>
+    /// Raised when a decoder tone is published, including a repeat of the tone
+    /// already stored. The decoder compares that request with the tone it is copying.
+    /// </summary>
+    internal event Action? CwDecodeTargetChanged;
 
     /// <summary>Raised after the last websocket client goes away, i.e. no UI is
     /// connected any more. Subscribers must be cheap and must not throw.</summary>
@@ -480,8 +565,11 @@ public sealed class StreamingHub
             suppressAudio,
             nativeMicStreamAuthorization
                 ?? (allowNativeMicStream ? static () => true : null));
-        _clients[id] = session;
-        _webSocketClients[id] = session;
+        var (cwSequence, cwSnapshot) = PublishClient(() =>
+        {
+            _clients[id] = session;
+            _webSocketClients[id] = session;
+        }, session);
         _log.LogInformation("ws.client.connected id={Id} total={Count}", id, _clients.Count);
 
         // Prime the new client with the current wisdom phase + status text.
@@ -490,6 +578,7 @@ public sealed class StreamingHub
         // joining mid-build needs both the phase byte and any status string
         // already accumulated so the body shows the current step.
         session.TryEnqueue(BuildWisdomPayload((Zeus.Contracts.WisdomPhase)_wisdomPhase, _wisdomStatus));
+        ReplayCwStatusSnapshot(session, cwSequence, cwSnapshot);
 
         // Product extensions are already encoded and own their snapshot/cache
         // policy outside the engine. Their source preserves the existing attach
@@ -509,8 +598,12 @@ public sealed class StreamingHub
             session.SetWantsCwDecode(false);
             session.SetWantsDisplay(false);
             session.SetWantsNativeMic(false);
-            _clients.TryRemove(id, out _);
-            _webSocketClients.TryRemove(id, out _);
+            lock (_cwStatusGate)
+            {
+                _cwStatusDelivered.Remove(session);
+                _clients.TryRemove(id, out _);
+                _webSocketClients.TryRemove(id, out _);
+            }
             _log.LogInformation("ws.client.disconnected id={Id} total={Count}", id, _clients.Count);
             // No UI left anywhere. Anything the UI was holding open now has
             // nobody who can release it — see TxService for the MOX case.
@@ -541,7 +634,14 @@ public sealed class StreamingHub
     /// (RemoteWebRtcSession) only attaches AFTER the SPAKE2+ password unlocks
     /// (ADR-0008), and the sink's send is gated again, so nothing leaks early.
     /// </summary>
-    internal void AttachSink(Guid id, IClientSink sink) => _clients[id] = sink;
+    internal void AttachSink(Guid id, IClientSink sink)
+    {
+        // Remote sessions join through a sink rather than AttachClientAsync.
+        // They need the same current keyer status a new websocket receives,
+        // under the same gate so a live edge cannot be overwritten by the replay.
+        var (sequence, payload) = PublishClient(() => _clients[id] = sink, sink);
+        ReplayCwStatusSnapshot(sink, sequence, payload);
+    }
 
     /// <summary>
     /// Bump the global display-stream gate by <paramref name="delta"/> (+1/−1).
@@ -563,15 +663,72 @@ public sealed class StreamingHub
     /// <summary>Adjust CW-decoder demand for a non-WebSocket remote sink.</summary>
     internal void AdjustCwDecodeRequests(int delta)
     {
-        int next = Interlocked.Add(ref _cwDecodeRequests, delta);
-        if ((delta > 0 && next == 1) || (delta < 0 && next == 0))
+        bool crossed;
+        bool targetChanged = false;
+        lock (_cwDecodeGate)
+        {
+            int next = _cwDecodeRequests + delta;
+            Volatile.Write(ref _cwDecodeRequests, next);
+            crossed = (delta > 0 && next == 1) || (delta < 0 && next == 0);
+            // The last listener released the decoder. A later legacy client
+            // sends no tone of its own, so a lock left behind would keep it
+            // off the CW pitch. Capture the aim now. Publish follow-pitch
+            // only if that aim is still current and demand is still zero: a
+            // listener that enables and aims in the gap keeps its tone.
+            if (delta < 0 && next == 0)
+            {
+                long captured = Volatile.Read(ref _cwDecodeAim).Sequence;
+                Action? pause = BeforeLastListenerCwDecodeResetForTest;
+                BeforeLastListenerCwDecodeResetForTest = null;
+                pause?.Invoke();
+                if (Volatile.Read(ref _cwDecodeRequests) == 0
+                    && Volatile.Read(ref _cwDecodeAim).Sequence == captured)
+                {
+                    targetChanged = PublishCwDecodeAim(0, locked: false);
+                }
+            }
+        }
+
+        if (targetChanged)
+            CwDecodeTargetChanged?.Invoke();
+        if (crossed)
             CwDecodeRequestChanged?.Invoke();
+    }
+
+    /// <summary>Last requested decoder tone. Does not change the enable refcount.</summary>
+    internal void SetCwDecodeTarget(int targetHz, bool locked)
+    {
+        bool changed;
+        lock (_cwDecodeGate)
+            changed = PublishCwDecodeAim(targetHz, locked);
+        if (changed)
+            CwDecodeTargetChanged?.Invoke();
+    }
+
+    /// <summary>Caller holds <see cref="_cwDecodeGate"/>.</summary>
+    private bool PublishCwDecodeAim(int targetHz, bool locked)
+    {
+        // The sequence is taken at the request, before the publish. A callback
+        // that read an earlier aim then loses to this one, including when the
+        // tone itself did not change. The notification follows every stored
+        // sequence. A repeated click is still a request: the decoder compares
+        // it with the tone being copied and decides whether to retarget.
+        long sequence = Interlocked.Increment(ref _cwDecodeAimSequence);
+        var next = new CwDecodeAim(targetHz, locked, sequence);
+        return CwDecodeAim.TryStoreNewer(ref _cwDecodeAim, next, out _);
     }
 
     /// <summary>Remove a previously-attached remote sink.</summary>
     internal void DetachSink(Guid id)
     {
-        if (!_clients.TryRemove(id, out _) || !_clients.IsEmpty) return;
+        bool lastClientLeft;
+        lock (_cwStatusGate)
+        {
+            var removed = _clients.TryRemove(id, out var sink);
+            if (sink is not null) _cwStatusDelivered.Remove(sink);
+            lastClientLeft = removed && _clients.IsEmpty;
+        }
+        if (!lastClientLeft) return;
         // Match the websocket-finally path: the last remote UI disappearing is
         // an independent in-process fail-safe for UI-owned MOX if its loopback
         // dead-man request could not reach Station Engine.
@@ -900,16 +1057,69 @@ public sealed class StreamingHub
 
     public void Broadcast(in CwEngineStatusFrame frame)
     {
-        if (_clients.IsEmpty) return;
-        // Variable-length: 9-byte header + UTF-8 text bytes (capped at
-        // MaxTextBytes). Compute exact size up front so the broadcast
-        // payload allocates once — same shape as AlertFrame above.
-        int textBytes = System.Text.Encoding.UTF8.GetByteCount(frame.Text ?? string.Empty);
-        if (textBytes > CwEngineStatusFrame.MaxTextBytes) textBytes = CwEngineStatusFrame.MaxTextBytes;
-        int total = CwEngineStatusFrame.HeaderByteLength + textBytes;
+        // Same length Serialize writes, reason tail included. A buffer that
+        // stops at the abort counter throws on HALT, refusal, and TX-dropped
+        // and that status never leaves the hub.
+        // Cache before the empty check so a client that attaches after the
+        // edge, including the first client, still receives this status.
+        int total = CwEngineStatusFrame.SerializedLength(frame);
         var payload = new byte[total];
         var writer = new FixedBufferWriter(payload, total);
         frame.Serialize(writer);
+        lock (_cwStatusGate)
+        {
+            var sequence = ++_cwEngineStatusSequence;
+            _cwEngineStatusPayload = payload;
+            foreach (var client in _clients.Values)
+                EnqueueCwStatusIfNewer(client, sequence, payload);
+        }
+    }
+
+    /// <summary>
+    /// Register <paramref name="sink"/> and snapshot the keyer status as one
+    /// step. A broadcast cannot land between the two, so the snapshot is the
+    /// status this client will miss on the live fan-out.
+    /// </summary>
+    private (long Sequence, byte[]? Payload) PublishClient(Action register, IClientSink sink)
+    {
+        lock (_cwStatusGate)
+        {
+            register();
+            _cwStatusDelivered.Remove(sink);
+            return (_cwEngineStatusSequence, _cwEngineStatusPayload);
+        }
+    }
+
+    /// <summary>
+    /// Queue a status snapshot taken at registration. A newer edge that won
+    /// the race while this replay waited is left as the client's last status.
+    /// </summary>
+    private void ReplayCwStatusSnapshot(IClientSink sink, long sequence, byte[]? payload)
+    {
+        if (payload is null) return;
+        BeforeCwStatusReplayEnqueue?.Invoke();
+        lock (_cwStatusGate)
+            EnqueueCwStatusIfNewer(sink, sequence, payload);
+    }
+
+    /// <summary>Caller holds <see cref="_cwStatusGate"/>.</summary>
+    private void EnqueueCwStatusIfNewer(IClientSink sink, long sequence, byte[] payload)
+    {
+        if (_cwStatusDelivered.TryGetValue(sink, out var seen) && seen >= sequence)
+            return;
+        _cwStatusDelivered[sink] = sequence;
+        if (!sink.TryEnqueue(payload)) System.Threading.Interlocked.Increment(ref _dropsOther);
+    }
+
+    /// <summary>
+    /// Fan a saved CW settings snapshot to every connected client. The PUT
+    /// handler calls this after the store write so a console that re-read
+    /// the old row still receives the copy the engine kept.
+    /// </summary>
+    public void BroadcastCwSettings(CwSettingsDto settings)
+    {
+        if (_clients.IsEmpty || settings is null) return;
+        var payload = CwSettingsFrame.Encode(settings);
         foreach (var client in _clients.Values)
         {
             if (!client.TryEnqueue(payload)) System.Threading.Interlocked.Increment(ref _dropsOther);
@@ -919,11 +1129,10 @@ public sealed class StreamingHub
     public void Broadcast(in CwDecodedTextFrame frame)
     {
         if (_clients.IsEmpty) return;
-        // Variable-length: 13-byte header + UTF-8 text bytes (capped at
-        // MaxTextBytes). Same shape as CwEngineStatus above.
+        // Variable-length: 13-byte header + UTF-8 text + 3-byte tone trailer.
         int textBytes = System.Text.Encoding.UTF8.GetByteCount(frame.Text ?? string.Empty);
         if (textBytes > CwDecodedTextFrame.MaxTextBytes) textBytes = CwDecodedTextFrame.MaxTextBytes;
-        int total = CwDecodedTextFrame.HeaderByteLength + textBytes;
+        int total = CwDecodedTextFrame.HeaderByteLength + textBytes + CwDecodedTextFrame.TrailerByteLength;
         var payload = new byte[total];
         var writer = new FixedBufferWriter(payload, total);
         frame.Serialize(writer);
@@ -1240,7 +1449,16 @@ public sealed class StreamingHub
             }
             if (frame.Length >= 1 && frame.Span[0] == MsgTypeCwDecoderRequest)
             {
-                SetWantsCwDecode(frame.Length > 1 && frame.Span[1] != 0);
+                if (!CwDecoderRequestParser.TryParse(frame.Span, out CwDecoderRequest request))
+                    return;
+                SetWantsCwDecode(request.Enable);
+                // A closing client does not publish its own tone. The latest
+                // enabling request keeps the target while anyone is still
+                // listening. The last release resets it to the CW pitch,
+                // inside AdjustCwDecodeRequests, including a disconnect that
+                // never sends this frame.
+                if (request.Enable && request.HasTarget)
+                    _hub.SetCwDecodeTarget(request.TargetHz, request.Locked);
                 return;
             }
             if (frame.Length >= 1 && frame.Span[0] == MsgTypeDisplayStreamRequest)

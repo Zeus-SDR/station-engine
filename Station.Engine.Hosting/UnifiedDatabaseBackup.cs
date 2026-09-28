@@ -131,7 +131,15 @@ internal static class UnifiedDatabaseBackup
                         fullPath,
                         store.StationOwned,
                         snapshotPath => liteDatabaseSnapshotObserver?.Invoke(store, snapshotPath))
-                    : File.ReadAllBytes(fullPath);
+                    : DatabaseBackupPolicy.StripJson(store.Key, File.ReadAllBytes(fullPath));
+                if (bytes is null)
+                {
+                    // Secrets cannot be stripped from unparsable JSON, so the
+                    // entry is left out rather than exported with them.
+                    ReportRestoreDiagnostic(
+                        $"database.export skipped '{store.Key}': the file is not valid JSON, so its secrets cannot be removed.");
+                    continue;
+                }
                 if (bytes.LongLength > MaximumEntryBytes)
                     throw new InvalidOperationException(
                         $"The '{store.Key}' store is too large to export safely.");
@@ -287,6 +295,21 @@ internal static class UnifiedDatabaseBackup
                 TryDeleteDirectory(rollbackDirectory);
             }
 
+            if (remaining.Count > 0 && ProductEntriesExpired(pendingDirectory))
+            {
+                // Only product-owned entries are left and the product host has
+                // not consumed them within the window (desktop-only install,
+                // or a product build that does not know these keys). Drop them
+                // so the staging directory is not retained forever.
+                ReportRestoreDiagnostic(
+                    $"database.restore discarded {remaining.Count} unclaimed product setting(s) " +
+                    $"staged more than {ProductEntryRetention.TotalDays:0} days ago: " +
+                    string.Join(", ", remaining.Select(entry => entry.Key)));
+                foreach (var entry in remaining)
+                    stagedPaths.Add(SafePendingEntryPath(pendingDirectory, entry.ArchivePath));
+                remaining.Clear();
+            }
+
             if (remaining.Count == 0)
                 DeleteIfExists(manifestPath);
             else
@@ -324,6 +347,39 @@ internal static class UnifiedDatabaseBackup
 
     }
 
+    /// <summary>How long product-owned entries may wait in the shared
+    /// staging directory for ZeusProduct to consume them.</summary>
+    internal static readonly TimeSpan ProductEntryRetention = TimeSpan.FromDays(7);
+    internal const string StagedMarkerName = "staged-utc.txt";
+
+    private static bool ProductEntriesExpired(string pendingDirectory)
+    {
+        var marker = Path.Combine(pendingDirectory, StagedMarkerName);
+        try
+        {
+            if (File.Exists(marker)
+                && DateTime.TryParse(
+                    File.ReadAllText(marker).Trim(),
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind,
+                    out var stagedUtc))
+            {
+                return DateTime.UtcNow - stagedUtc.ToUniversalTime() > ProductEntryRetention;
+            }
+            // Staged by an older engine: start the retention clock now.
+            WriteStagedMarker(pendingDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+        return false;
+    }
+
+    private static void WriteStagedMarker(string directory) =>
+        File.WriteAllText(
+            Path.Combine(directory, StagedMarkerName),
+            DateTime.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+
     internal static IReadOnlyList<StoreSpec> DiscoverStores()
     {
         return
@@ -336,6 +392,11 @@ internal static class UnifiedDatabaseBackup
             new("audio-suite", "file", ProductPreferencesPath() + ".audio-suite.json", StationOwned: false),
             new("audio-suite-quarantine", "file",
                 ProductPreferencesPath() + ".audio-suite.json.plugin-quarantine.json",
+                StationOwned: false),
+            .. DatabaseBackupPolicy.ProductSettingsFiles().Select(file =>
+                new StoreSpec(file.Key, "file", file.Path, StationOwned: false)),
+            new(DatabaseBackupPolicy.ProductBundleKey, "file",
+                Path.Combine(ProductDataDirectory(), DatabaseBackupPolicy.ProductBundleFileName),
                 StationOwned: false),
         ];
     }
@@ -352,16 +413,21 @@ internal static class UnifiedDatabaseBackup
         return Path.Combine(local, "Zeus", "zeus-link-product.db");
     }
 
-    private static string ProductLogbookPath()
+    private static string ProductLogbookPath() =>
+        Path.Combine(ProductDataDirectory(), "logbook", "zeus-logbook.db");
+
+    // Mirrors ZeusProduct's ProductBundleStore.ResolveDataDirectory; the
+    // host-parity test pins the two equal.
+    private static string ProductDataDirectory()
     {
         var configured = Environment.GetEnvironmentVariable(
             ProductDataDirectoryEnvironmentVariable);
-        var dataDirectory = !string.IsNullOrWhiteSpace(configured)
-            ? configured
-            : Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "ZeusProduct");
-        return Path.Combine(dataDirectory, "logbook", "zeus-logbook.db");
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured;
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(local))
+            local = AppContext.BaseDirectory;
+        return Path.Combine(local, "ZeusProduct");
     }
 
     private static byte[] SnapshotLiteDatabase(
@@ -423,6 +489,7 @@ internal static class UnifiedDatabaseBackup
         // PureSignal calibration and arm-related persistence never
         // leave the machine through this backup surface.
         snapshot.DropCollection(PureSignalCollection);
+        DatabaseBackupPolicy.StripLiteDatabase(snapshot);
         snapshot.Checkpoint();
     }
 
@@ -500,7 +567,18 @@ internal static class UnifiedDatabaseBackup
                 {
                     // Opaque product-owned state. Integrity and size were
                     // already checked above; the owning product validates it
-                    // when it opens the restored file.
+                    // when it opens the restored file. Backups written before
+                    // the secrets policy may still carry secrets: strip them.
+                    var stripped = DatabaseBackupPolicy.StripJson(
+                        entry.Key, File.ReadAllBytes(outputPath));
+                    if (stripped is null)
+                    {
+                        ReportRestoreDiagnostic(
+                            $"database.restore skipped '{entry.Key}': the file is not valid JSON, so its secrets cannot be removed.");
+                        File.Delete(outputPath);
+                        continue;
+                    }
+                    File.WriteAllBytes(outputPath, stripped);
                 }
                 else
                     throw new InvalidOperationException(
@@ -527,6 +605,7 @@ internal static class UnifiedDatabaseBackup
             WriteManifestAtomically(
                 Path.Combine(temporaryDirectory, ManifestEntryName),
                 manifest with { Entries = stagedEntries });
+            WriteStagedMarker(temporaryDirectory);
             using var restoreLock = TryAcquireRestoreLock(
                 pendingDirectory,
                 TimeSpan.FromSeconds(30))
@@ -565,6 +644,7 @@ internal static class UnifiedDatabaseBackup
                 Path.Combine(temporaryDirectory, "data", "station-engine.db"), engineBytes);
             WriteManifestAtomically(
                 Path.Combine(temporaryDirectory, ManifestEntryName), manifest);
+            WriteStagedMarker(temporaryDirectory);
             using var restoreLock = TryAcquireRestoreLock(
                 pendingDirectory,
                 TimeSpan.FromSeconds(30))
@@ -609,12 +689,31 @@ internal static class UnifiedDatabaseBackup
             using (var destination = new LiteDatabase(temporaryPath))
             {
                 var sourceNames = source.GetCollectionNames().ToHashSet(StringComparer.Ordinal);
-                foreach (var name in EnginePrefsDbMigration.AllEngineOwnedCollectionNames())
+                // Per-plugin settings are a dynamic name set. The standalone
+                // engine reads them from station-engine.db, while the desktop
+                // host keeps them in zeus-prefs.db (restored wholesale above).
+                // A legacy file cannot prove its plugin_* copies are newer than
+                // the engine's: product files never carry the engine migration
+                // markers and keep their frozen pre-split engine families after
+                // the split, so a desktop-era file and a split-era file (or an
+                // old merged profile export, which never merged plugin_*) look
+                // alike. Carry a plugin collection into the engine copy only to
+                // fill a gap — never over settings the engine already holds.
+                var engineOwned = EnginePrefsDbMigration.AllEngineOwnedCollectionNames()
+                    .Concat(sourceNames
+                        .Where(EnginePrefsDbMigration.IsPluginSettingsCollection)
+                        .Order(StringComparer.Ordinal))
+                    .Distinct(StringComparer.Ordinal);
+                foreach (var name in engineOwned)
                 {
                     // Older backups contain only the engine families known to the
                     // version that created them. Preserve newer local families
                     // instead of replacing them with empty collections.
                     if (!sourceNames.Contains(name))
+                        continue;
+                    if (EnginePrefsDbMigration.IsPluginSettingsCollection(name)
+                        && destination.CollectionExists(name)
+                        && destination.GetCollection<BsonDocument>(name).Count() > 0)
                         continue;
                     var documents = source.GetCollection<BsonDocument>(name)
                         .FindAll()
@@ -677,6 +776,8 @@ internal static class UnifiedDatabaseBackup
             {
                 SanitizeAndValidateLiteDatabase(temporaryPath);
                 PreserveLocalPureSignal(store.Path, temporaryPath);
+                DatabaseBackupPolicy.GraftLocalLiteDatabase(
+                    store.Path, temporaryPath, ReportRestoreDiagnostic);
             }
             else if (entry.Kind == "json")
             {
@@ -876,6 +977,7 @@ internal static class UnifiedDatabaseBackup
             foreach (var collectionName in database.GetCollectionNames().ToList())
                 _ = database.GetCollection(collectionName).FindAll().FirstOrDefault();
             database.DropCollection(PureSignalCollection);
+            DatabaseBackupPolicy.StripLiteDatabase(database);
             database.Checkpoint();
         }
         catch (Exception ex)

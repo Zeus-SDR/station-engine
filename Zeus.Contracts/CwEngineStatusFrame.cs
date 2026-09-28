@@ -16,23 +16,31 @@ namespace Zeus.Contracts;
 ///
 /// <code>
 /// [type:1=0x30][state:u8][wpm:u16 LE][queueDepth:u16 LE]
-/// [textLen:u16 LE][text:UTF-8 textLen bytes]
+/// [textLen:u16 LE][reserved:u8][text:UTF-8 textLen bytes][abortSeq:i32 LE]
+/// [reasonLen:u16 LE][reason:UTF-8]
 /// </code>
 ///
-/// 9-byte fixed header + variable text payload. Text is capped at
-/// <see cref="MaxTextBytes"/> so a runaway macro can't blow the wire — the
-/// frontend reconstructs per-character position from <see cref="Wpm"/> +
-/// the local-arrival timestamp (cheap to do client-side; no need to push
-/// per-character progress frames at audio rate).
+/// 9-byte fixed header + variable text payload + a 4-byte abort counter
+/// appended after the text. Text is capped at <see cref="MaxTextBytes"/> so
+/// a runaway macro can't blow the wire — the frontend reconstructs
+/// per-character position from <see cref="Wpm"/> + the local-arrival
+/// timestamp (cheap to do client-side; no need to push per-character
+/// progress frames at audio rate).
 ///
 /// Wire-frozen: state is <see cref="CwEngineState"/> as a byte; future
-/// additions append-only at the tail.
+/// additions append-only at the tail. <see cref="AbortSeq"/> follows the
+/// text. <see cref="Reason"/> follows the counter and is omitted when empty.
+/// A frame that ends at the text (older engines) reads as abort sequence 0
+/// and no reason. A playback cancelled without moving the counter puts the
+/// reason on the final Idle so a client that never sees Aborting still stops.
 /// </summary>
 public readonly record struct CwEngineStatusFrame(
     CwEngineState State,
     int Wpm,
     int QueueDepth,
-    string Text)
+    string Text,
+    int AbortSeq = 0,
+    string? Reason = null)
 {
     /// <summary>Hard cap on the text payload — well above any realistic CW
     /// macro length. Senders that hand us a longer string get truncated to
@@ -41,13 +49,39 @@ public readonly record struct CwEngineStatusFrame(
 
     public const int HeaderByteLength = 9;
 
+    /// <summary>Abort counter appended after the text. Older frames omit it.</summary>
+    public const int AbortSeqByteLength = 4;
+
+    /// <summary>Length prefix of the optional reason that follows the counter.</summary>
+    public const int ReasonLengthByteLength = 2;
+
+    /// <summary>Cap on the reason tail. Longer text is truncated.</summary>
+    public const int MaxReasonBytes = 128;
+
+    /// <summary>
+    /// Bytes <see cref="Serialize"/> writes, including the reason tail when
+    /// <see cref="Reason"/> is not empty. Callers that pre-size a buffer
+    /// must use this — the tail is omitted only when the reason is empty.
+    /// </summary>
+    public static int SerializedLength(in CwEngineStatusFrame frame)
+    {
+        int textBytes = Encoding.UTF8.GetByteCount(frame.Text ?? string.Empty);
+        if (textBytes > MaxTextBytes) textBytes = MaxTextBytes;
+        int reasonBytes = Encoding.UTF8.GetByteCount(frame.Reason ?? string.Empty);
+        if (reasonBytes > MaxReasonBytes) reasonBytes = MaxReasonBytes;
+        return HeaderByteLength + textBytes + AbortSeqByteLength
+            + (reasonBytes > 0 ? ReasonLengthByteLength + reasonBytes : 0);
+    }
+
     public void Serialize(IBufferWriter<byte> writer)
     {
         // Encode text first so we know the actual byte count (UTF-8 may be
         // longer than .Length for non-ASCII macros).
         var rawBytes = Encoding.UTF8.GetBytes(Text ?? string.Empty);
         int textBytes = Math.Min(rawBytes.Length, MaxTextBytes);
-        int total = HeaderByteLength + textBytes;
+        var reasonRaw = Encoding.UTF8.GetBytes(Reason ?? string.Empty);
+        int reasonBytes = Math.Min(reasonRaw.Length, MaxReasonBytes);
+        int total = SerializedLength(this);
         var span = writer.GetSpan(total);
         span[0] = (byte)MsgType.CwEngineStatus;
         span[1] = (byte)State;
@@ -58,8 +92,18 @@ public readonly record struct CwEngineStatusFrame(
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(2, 2), wpmU16);
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(4, 2), depthU16);
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(6, 2), (ushort)textBytes);
+        span[8] = 0;
         if (textBytes > 0)
             rawBytes.AsSpan(0, textBytes).CopyTo(span.Slice(HeaderByteLength, textBytes));
+        int abortAt = HeaderByteLength + textBytes;
+        BinaryPrimitives.WriteInt32LittleEndian(span.Slice(abortAt, AbortSeqByteLength), AbortSeq);
+        if (reasonBytes > 0)
+        {
+            int reasonAt = abortAt + AbortSeqByteLength;
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                span.Slice(reasonAt, ReasonLengthByteLength), (ushort)reasonBytes);
+            reasonRaw.AsSpan(0, reasonBytes).CopyTo(span.Slice(reasonAt + ReasonLengthByteLength, reasonBytes));
+        }
         writer.Advance(total);
     }
 
@@ -81,10 +125,24 @@ public readonly record struct CwEngineStatusFrame(
         string text = textLen == 0
             ? string.Empty
             : Encoding.UTF8.GetString(bytes.Slice(HeaderByteLength, textLen));
-        return new CwEngineStatusFrame(state, wpm, depth, text);
+        int tail = HeaderByteLength + textLen;
+        int abortSeq = bytes.Length >= tail + AbortSeqByteLength
+            ? BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(tail, AbortSeqByteLength))
+            : 0;
+        string? reason = null;
+        int reasonAt = tail + AbortSeqByteLength;
+        if (bytes.Length >= reasonAt + ReasonLengthByteLength)
+        {
+            int reasonLen = BinaryPrimitives.ReadUInt16LittleEndian(
+                bytes.Slice(reasonAt, ReasonLengthByteLength));
+            int reasonEnd = reasonAt + ReasonLengthByteLength + reasonLen;
+            if (reasonLen > 0 && bytes.Length >= reasonEnd)
+                reason = Encoding.UTF8.GetString(bytes.Slice(reasonAt + ReasonLengthByteLength, reasonLen));
+        }
+        return new CwEngineStatusFrame(state, wpm, depth, text, abortSeq, reason);
     }
 
     /// <summary>Lift a <see cref="CwEngineStatus"/> into the wire shape.</summary>
     public static CwEngineStatusFrame FromStatus(CwEngineStatus s) =>
-        new(s.State, s.Wpm, s.QueueDepth, s.Text ?? string.Empty);
+        new(s.State, s.Wpm, s.QueueDepth, s.Text ?? string.Empty, s.AbortSeq, s.Reason);
 }

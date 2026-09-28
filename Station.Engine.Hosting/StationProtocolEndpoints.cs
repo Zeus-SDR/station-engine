@@ -282,6 +282,38 @@ public static class StationProtocolEndpoints
                 : Results.StatusCode(StatusCodes.Status429TooManyRequests);
         });
 
+        // Held variant of the lease above for a long-lived local keying device
+        // in the product host (Bluetooth PTT button). The lease lives exactly
+        // as long as this request: when it ends for any reason, including a
+        // product crash, the engine forces safe idle for the lease.
+        endpoints.MapGet("/api/station/tx/lease/hold", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            if (!RemoteTxLease.TryGet(context, out var leaseId))
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+            var tx = context.RequestServices.GetService<TxService>();
+            if (tx is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+            var log = context.RequestServices.GetRequiredService<ILoggerFactory>()
+                .CreateLogger("Zeus.Server.RemoteTxLeaseHold");
+            await RemoteTxLeaseHold.RunAsync(
+                context,
+                leaseId,
+                tx.RegisterRemoteTxLease,
+                tx.ForceRemoteDisconnectSafeIdle,
+                log).ConfigureAwait(false);
+        });
+
         // Product-host remote dead-man seam. This route is both loopback-only
         // and covered by StationAccessTokenAuthorization; it is intentionally
         // stronger than the operator-facing MOX/TUN endpoints because a lost
@@ -299,6 +331,9 @@ public static class StationProtocolEndpoints
                 released = tx.ForceRemoteDisconnectSafeIdle(leaseId),
             });
         });
+
+        // Engine-hosted WSPR decoder (GPL); the product reads its spots here.
+        endpoints.MapWsprDecoderEndpoints();
 
         return endpoints;
     }

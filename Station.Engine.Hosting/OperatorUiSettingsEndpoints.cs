@@ -12,7 +12,7 @@ namespace Zeus.Server;
 
 /// <summary>
 /// Maps the operator UI preference routes (theme, display, toolbar, NR
-/// disclosure, operator identity, bottom-row pins, pan/waterfall split) on the
+/// disclosure, clock tile, operator identity, bottom-row pins, pan/waterfall split) on the
 /// standalone station engine. These families were previously product-host-only,
 /// so an attached SPA lost its saved theme / dB ranges / toolbar favorites /
 /// operator profile on every launch — localStorage is only a fast-paint cache
@@ -59,7 +59,10 @@ public static class OperatorUiSettingsEndpoints
                     req.FilterPanelBgMode,
                     req.FilterPanelBgColor,
                     req.FilterPanelBgBrightness,
-                    req.RxDisplayFftSize);
+                    req.RxDisplayFftSize,
+                    req.WaterfallLowColor,
+                    req.WaterfallMidColor,
+                    req.WaterfallHighColor);
             }
             catch (System.Text.Json.JsonException ex)
             {
@@ -196,6 +199,13 @@ public static class OperatorUiSettingsEndpoints
             store.Set(req.Nr1Expanded, req.Nr2Expanded, req.Nr4Expanded);
             return Results.Ok(store.Get());
         });
+
+        // Clock tile preferences. PUT replaces the whole snapshot; the store
+        // bounds every field. GET reports Saved=false until first written.
+        endpoints.MapGet("/api/clock-settings", (ClockSettingsStore store) => Results.Ok(store.Get()));
+
+        endpoints.MapPut("/api/clock-settings", (ClockSettingsSetRequest req, ClockSettingsStore store) =>
+            Results.Ok(store.Set(req)));
 
         // Operator UI theme ("dark" | "light") + per-CSS-variable colour
         // overrides. PUT replaces both atomically.

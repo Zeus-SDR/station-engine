@@ -23,6 +23,8 @@ license. Its full license text is preserved in
 | RNNoise | commit `70f1d256acd4b34a572f999a05c87bf00b67730d` | BSD-3-Clause | Statically embedded in WDSP for NR3. Source: `native/rnnoise/`. The bundled `rnnoise-default.bin` model uses the same license. | `RNNoise-COPYING` |
 | miniaudio | 0.11.25 | MIT-0 or public domain | `Zeus.Dsp/runtimes/**/native/{lib,}miniaudio.*`; loaded by the local-audio interop layer. Source: `native/miniaudio/`. This distribution uses the MIT-0 option. | `Miniaudio-LICENSE` |
 | Steinberg ASIO SDK | 2.3.4, official archive SHA-256 `d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca` | GPL-3.0-only option selected | `Zeus.Dsp/runtimes/win-*/native/zeus_asio.dll`; optional Windows low-latency local-audio host bridge. Complete SDK-derived source and build controls: `native/asio/`. Zeus does not rely on the proprietary ASIO SDK license. | `Steinberg-ASIO-SDK-LICENSE.txt` |
+| wsprd (WSPR decoder) | pavel-demin/wsprd extract of WSJT-X `wsprd`, commit `8aa903085479910c77de95f7e7c178f66a245ed3` | GPL-3.0-or-later | Compiled into `libzeus_wspr.so`, `libzeus_wspr.dylib`, or `zeus_wspr.dll` under `Zeus.Dsp/runtimes/**/native/`; loaded only by the engine's WSPR decoder service. Vendored source is kept byte-for-byte under `native/wspr/vendor/`; the Zeus shim and build recipe are `native/wspr/`. Its GPL-3.0-or-later terms make the conveyed engine GPL-3.0-or-later, as `SpeTaurus/` already does. | `wsprd-NOTICE`; `../LICENSE.GPL-3.0` |
+| PFFFT | as vendored in the wsprd extract above | BSD-style (FFTPACKv5 terms) | `pffft.c` is compiled into the same `zeus_wspr` shared library. | `pffft-LICENSE` |
 | codec2 | 1.2.0, commit `06d4c11e699b0351765f10398abb4f663a984f36` | LGPL-2.1 | `Zeus.Dsp/runtimes/**/native/{lib,}codec2.*`; conveyed by the exported DSP project. The pinned fetch recipe and Zeus build patch are in `native/codec2/`. | `Codec2-COPYING` |
 | RADE C modem | Thetis-RADE commit `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` | BSD-2-Clause | Compiled into `libzeus_rade.so`, `libzeus_rade.dylib`, or `zeus_rade.dll`, which is conveyed by the exported DSP project for four RIDs including osx-arm64. Build glue and pinned source provenance: `native/radae/`. | `RADE-radae_c-LICENSE` |
 | Opus DNN/FARGAN | Opus commit `940d4e5af64351ca8ba8390df3f555484c567fbb` through the pinned Thetis-RADE composition | BSD-3-Clause | Compiled into the RADE shared library; source provenance is in `native/radae/vendor/PROVENANCE.md`. | `RADE-opus_dnn-COPYING` |
@@ -47,8 +49,8 @@ license. Its full license text is preserved in
 - `Station.Engine.Hosting.csproj` explicitly copies the RNNoise model and WDSP
   `calculus` / `zetaHat.bin` data into build and publish output.
 - `Zeus.Dsp.csproj` explicitly includes every `*.dylib`, `*.so*`, and `*.dll`
-  below `Zeus.Dsp/runtimes/`; therefore even optional codec2 and RADE artifacts
-  are part of the conveyed source tree and this inventory.
+  below `Zeus.Dsp/runtimes/`; therefore even optional codec2, RADE, and WSPR
+  artifacts are part of the conveyed source tree and this inventory.
 - Native dependency inspection confirms `libwdsp` requires both FFTW precisions
   on the checked Linux and macOS builds. The Windows ARM64 WDSP build links FFTW
   statically, so the same FFTW license still applies there.
@@ -78,6 +80,7 @@ texts and upstream source links below.
 - Steinberg ASIO SDK: <https://www.steinberg.net/developers/asiosdk-open/>
 - codec2: <https://github.com/drowe67/codec2>
 - RADE composition: <https://github.com/sv1eia/Thetis-RADE>
+- wsprd extract: <https://github.com/pavel-demin/wsprd> (from WSJT-X: <https://sourceforge.net/projects/wsjt/>)
 - LiteDB: <https://github.com/mbdavid/LiteDB>
 - Vallado SGP4/SDP4 C# core: <https://github.com/aholinch/sgp4>
 - .NET: <https://github.com/dotnet/dotnet>

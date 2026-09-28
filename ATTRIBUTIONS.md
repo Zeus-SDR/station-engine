@@ -349,16 +349,21 @@ Steinberg's license notice is preserved at
 `packaging/station-engine/THIRD-PARTY-LICENSES/Steinberg-ASIO-SDK-LICENSE.txt`.
 The ASIO name is used descriptively; Zeus does not ship an ASIO logo.
 
-## ft8_lib / wsprd (moved to the Zeus Digital plugin)
+## wsprd (engine-hosted WSPR decoder)
 
-The native FT8/FT4 core (**ft8_lib**, Kārlis Goba, MIT) and the WSPR
-encoder/decoder (**wsprd**, Joe Taylor K1JT / Steven Franke K9AN, GPL-3)
-moved out of the Zeus tree together with the FT8/FT4/WSPR suite, which now
-ships as the installable **com.kb2uka.digital** plugin. Their vendored
-sources, build glue, and full attribution/licence statements live in the
-plugin repository:
-<https://github.com/Zeus-SDR/openhpsdr-zeus-plugins> under
-`modes/Digital/`.
+The WSPR decoder is **wsprd** by Joe Taylor (K1JT) and Steven Franke (K9AN),
+GPL-3.0-or-later, vendored byte-for-byte from the minimal
+[pavel-demin/wsprd](https://github.com/pavel-demin/wsprd) extract of WSJT-X at
+commit `8aa903085479910c77de95f7e7c178f66a245ed3` under
+[`native/wspr/vendor/`](native/wspr/vendor/), with Julien Pommier's PFFFT
+(BSD-style FFTPACK terms). It builds into the decode-only `zeus_wspr` library,
+which only the GPL station engine loads; the engine publishes decoded spots on
+loopback routes. The proprietary Zeus product and web client never load, link,
+or call it, and WSPR transmit is implemented separately without it. Provenance
+and build notes: [`native/wspr/README.md`](native/wspr/README.md).
+
+The FT8/FT4 core (**ft8_lib**, Kārlis Goba, MIT) ships with the Zeus Digital
+feature; see `ZeusProduct/Plugins/Digital/SOURCE.md`.
 
 ## RADE V1 (Radio Autoencoder — radae_c, opus_dnn, freedv_text)
 
