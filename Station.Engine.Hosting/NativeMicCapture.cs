@@ -46,11 +46,16 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 {
     private const int MicBlockSamples = 960;        // 20 ms @ 48 kHz, matches browser worklet
     private const int MicBlockBytes = MicBlockSamples * 4;
-    // Four blocks bound the worst-case queued mic age to 80 ms. If processing
-    // falls farther behind, keeping current audio is safer than transmitting
-    // stale speech after the stall clears.
-    private const int CaptureQueueBlocks = 4;
+    // The queue holds at most 80 ms of mic audio. If processing falls farther
+    // behind, keeping current audio is safer than transmitting stale speech
+    // after the stall clears. That is four 20 ms blocks, or proportionally
+    // more ASIO-buffer-sized blocks (see SetHostBlockSamples).
+    // Enough slots for 80 ms at the smallest honoured host block (32 frames).
+    private const int CaptureQueueBlocks = 128;
+    private const int MaximumQueuedSamples = 80 * 48;
     private static readonly TimeSpan MaximumCaptureBlockAge = TimeSpan.FromMilliseconds(80);
+    // Smallest host block honoured (0.67 ms); below this per-block overhead dominates.
+    internal const int MinHostBlockSamples = 32;
 
     // A native capture-device open can block inside miniaudio indefinitely when
     // Windows reports a stale / exclusive / malformed endpoint. Keep that off
@@ -100,6 +105,20 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly float[][] _captureQueue = CreateCaptureQueue();
     private readonly long[] _captureQueueGenerations = new long[CaptureQueueBlocks];
     private readonly long[] _captureQueueTimestamps = new long[CaptureQueueBlocks];
+    private readonly int[] _captureQueueLengths = new int[CaptureQueueBlocks];
+    // Host (ASIO) block size. 960 keeps the classic 20 ms contract; smaller
+    // values hand the mic to TX at the driver's buffer cadence.
+    private int _hostBlockSamples = MicBlockSamples;
+    private int _captureQueueLimit = MaximumQueuedSamples / MicBlockSamples;
+    // Plugin preview stays on whole 20 ms blocks; re-blocked on the worker.
+    private readonly float[] _previewAccum = new float[MicBlockSamples];
+    private int _previewAccumFill;
+    private long _previewAccumGeneration = -1;
+    // Host-cadence chunks count toward TotalBlocksOut per 960 samples so the
+    // diagnostic keeps meaning "20 ms blocks delivered".
+    private int _hostCadenceSamplesOut;
+    // Which ASIO session owns the current host block size (see SetHostBlockSamples).
+    private int _hostBlockOwner;
     private float[] _workerBlock = new float[MicBlockSamples];
     private readonly AutoResetEvent _captureQueueReady = new(false);
     private readonly Thread _captureWorker;
@@ -729,7 +748,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 // air, so its per-plugin IN / OUT / GR preview meters must not
                 // animate from it either (same source-awareness as the level
                 // meter above).
-                CompleteAccumulatedBlock(_accumGeneration);
+                CompleteAccumulatedBlock(_accumGeneration, MicBlockSamples);
                 _accumGeneration = callbackGeneration;
             }
         }
@@ -759,23 +778,61 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _accumGeneration = callbackGeneration;
         }
 
+        int blockSamples = Volatile.Read(ref _hostBlockSamples);
+        if (_accumFill >= blockSamples)
+        {
+            // Block size shrank since the last callback: flush what we hold.
+            CompleteAccumulatedBlock(_accumGeneration, _accumFill);
+            _accumGeneration = callbackGeneration;
+        }
         while (sourceIndex < monoSamples.Length)
         {
-            int take = Math.Min(MicBlockSamples - _accumFill, monoSamples.Length - sourceIndex);
+            int take = Math.Min(blockSamples - _accumFill, monoSamples.Length - sourceIndex);
             for (int i = 0; i < take; i++)
                 _accum[_accumFill + i] = SanitizeCapturedSample(monoSamples[sourceIndex + i]);
             _accumFill += take;
             sourceIndex += take;
             Interlocked.Add(ref _totalSamplesIn, take);
-            if (_accumFill == MicBlockSamples)
+            if (_accumFill == blockSamples)
             {
-                CompleteAccumulatedBlock(_accumGeneration);
+                CompleteAccumulatedBlock(_accumGeneration, blockSamples);
                 _accumGeneration = callbackGeneration;
             }
         }
     }
 
-    private void CompleteAccumulatedBlock(long blockGeneration)
+    /// <summary>
+    /// Sets the host (ASIO) capture block size to the driver's buffer frames,
+    /// so the mic reaches TX at the driver cadence instead of every 20 ms. Zero
+    /// (or anything at or above 960) restores the 20 ms block contract.
+    /// </summary>
+    internal int SetHostBlockSamples(int frames)
+    {
+        int block = frames <= 0 ? MicBlockSamples : Math.Clamp(frames, MinHostBlockSamples, MicBlockSamples);
+        lock (_captureQueueSync)
+        {
+            _captureQueueLimit = Math.Clamp(
+                (MaximumQueuedSamples + block - 1) / block, 4, CaptureQueueBlocks);
+            Volatile.Write(ref _hostBlockSamples, block);
+            return ++_hostBlockOwner;
+        }
+    }
+
+    /// <summary>Restore the 20 ms contract, but only if <paramref name="owner"/>
+    /// (a token from <see cref="SetHostBlockSamples"/>) still owns the setting —
+    /// a late-disposed ASIO session must not undo a newer session's cadence.</summary>
+    internal void ReleaseHostBlockSamples(int owner)
+    {
+        lock (_captureQueueSync)
+        {
+            if (owner != _hostBlockOwner) return;
+        }
+        SetHostBlockSamples(0);
+    }
+
+    internal int HostBlockSamples => Volatile.Read(ref _hostBlockSamples);
+
+    private void CompleteAccumulatedBlock(long blockGeneration, int length)
     {
         bool queued = false;
         long enqueuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -784,7 +841,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             if (!_captureWorkerStopping
                 && blockGeneration == Volatile.Read(ref _captureGeneration))
             {
-                if (_captureQueueCount == CaptureQueueBlocks)
+                while (_captureQueueCount >= _captureQueueLimit)
                 {
                     // Drop the oldest pending block, never the newest. A hard
                     // downstream stall is already unrecoverable in real time;
@@ -803,6 +860,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 _captureQueueGenerations[_captureQueueWrite] =
                     blockGeneration;
                 _captureQueueTimestamps[_captureQueueWrite] = enqueuedAt;
+                _captureQueueLengths[_captureQueueWrite] = length;
                 _captureQueueWrite = (_captureQueueWrite + 1) % CaptureQueueBlocks;
                 _captureQueueCount++;
                 queued = true;
@@ -839,6 +897,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             bool haveBlock;
             long generation = 0;
             long enqueuedAt = 0;
+            int length = 0;
             lock (_captureQueueSync)
             {
                 haveBlock = _captureQueueCount != 0;
@@ -849,6 +908,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                     _workerBlock = replacementWorker;
                     generation = _captureQueueGenerations[_captureQueueRead];
                     enqueuedAt = _captureQueueTimestamps[_captureQueueRead];
+                    length = _captureQueueLengths[_captureQueueRead];
                     _captureQueueRead = (_captureQueueRead + 1) % CaptureQueueBlocks;
                     _captureQueueCount--;
                 }
@@ -864,7 +924,10 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 continue;
             }
 
-            ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
+            if (length == MicBlockSamples)
+                ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
+            else
+                ProcessHostCadenceBlock(_workerBlock.AsSpan(0, length), generation, enqueuedAt);
             int overflows = Interlocked.Exchange(ref _captureQueueOverflows, 0);
             if (overflows != 0 && ++_captureQueueOverflowLogged <= 4)
                 _log.LogError(
@@ -932,6 +995,64 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _log.LogWarning(ex, "audio.native.tx ingest threw on flush");
         }
         Interlocked.Increment(ref _totalBlocksOut);
+    }
+
+    // ASIO cadence: the air path gets each driver-sized block immediately;
+    // TxAudioIngest re-blocks the fan-out, and the plugin preview is re-blocked
+    // here, both on the classic 20 ms contract.
+    private void ProcessHostCadenceBlock(
+        ReadOnlySpan<float> block,
+        long generation,
+        long enqueuedAt)
+    {
+        if (!IsCapturedBlockCurrent(generation, enqueuedAt))
+        {
+            _previewAccumFill = 0;
+            return;
+        }
+        try
+        {
+            _ingest.OnHostMicSamplesFromMic(
+                block,
+                new MicBlockValidity(_captureBlockValidator, generation, enqueuedAt));
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "audio.native.tx ingest threw on host-cadence flush");
+        }
+        _hostCadenceSamplesOut += block.Length;
+        while (_hostCadenceSamplesOut >= MicBlockSamples)
+        {
+            _hostCadenceSamplesOut -= MicBlockSamples;
+            Interlocked.Increment(ref _totalBlocksOut);
+        }
+
+        if (_ingest.ActiveSource != MicBlockSource.Host || generation != _previewAccumGeneration)
+        {
+            _previewAccumFill = 0;
+            _previewAccumGeneration = generation;
+            if (_ingest.ActiveSource != MicBlockSource.Host) return;
+        }
+        int offset = 0;
+        while (offset < block.Length)
+        {
+            int take = Math.Min(MicBlockSamples - _previewAccumFill, block.Length - offset);
+            block.Slice(offset, take).CopyTo(_previewAccum.AsSpan(_previewAccumFill));
+            _previewAccumFill += take;
+            offset += take;
+            if (_previewAccumFill < MicBlockSamples) continue;
+            _previewAccumFill = 0;
+            try
+            {
+                _previewProcessor.ProcessPreview(_previewAccum, sampleRate: 48_000);
+            }
+            catch (Exception ex)
+            {
+                if (++_previewErrLogged <= 4)
+                    _log.LogWarning(ex,
+                        "audio.native.tx plugin preview threw (suppressed after 4)");
+            }
+        }
     }
 
     private bool IsCapturedBlockCurrent(long generation, long enqueuedAt) =>

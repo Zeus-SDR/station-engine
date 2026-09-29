@@ -103,6 +103,13 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private const int HiPriSeqHeaderBytes = 4;
     private const int HiPriStatusMinBytes = HiPriSeqHeaderBytes + 20;
 
+    // Longest a coalesced hi-priority payload waits for the socket queue to
+    // drain before it is dispatched anyway (see HiPriStatusCoalescer). At the
+    // normal cadence (~1 ms keyed, ~200 ms idle) the RX loop keeps up, the
+    // queue is empty after every packet and nothing is held at all; this cap
+    // only bounds meter / PTT / overload latency during an overload flood.
+    internal const int HiPriMaxHoldMs = 2;
+
     // On ANAN G2 MkII (Orion-II / Saturn) the first two DDC slots are wired
     // to the PureSignal / diversity feedback path. User-visible receivers
     // start at DDC2. pihpsdr's `new_protocol_receive_specific` and
@@ -281,6 +288,33 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _displayDdcIndex = -1;
     private uint _displayDdcFreqHz = 30_000_000;
     private int _displayDdcAdcSource;
+    // Public-listening guest receivers (Phase 3a). Guests occupy the physical
+    // DDCs directly after the operator's contiguous run, in slot order, and the
+    // hidden display DDC moves up behind them. Orion/Saturn/G2 family only
+    // (RxBaseDdc == 2), so DDC0/1 and every PureSignal byte stay untouched: the
+    // guest bits are OR'd in after the RX composers have finished. The array is
+    // an immutable snapshot (sorted by slot, frequency already corrected),
+    // replaced under _guestDdcLock and read lock-free by the compose paths and
+    // the RX thread. Operator receivers always win: the placement is clamped
+    // against the live operator run at compose time.
+    public const int FirstGuestReceiverIndex = -2;
+    internal static readonly TimeSpan GuestRetuneMinInterval = TimeSpan.FromMilliseconds(200);
+    private readonly object _guestDdcLock = new();
+    private GuestDdcWire[] _guestDdcs = [];
+    private ITimer? _guestRetuneTimer;
+    private bool _guestRetunePending;
+    private bool _guestRetuneSent;
+    private long _guestRetuneLastSendTimestamp;
+    // Clock for the guest NCO-retune coalescer; replaced only by tests.
+    internal TimeProvider GuestRetuneTimeProvider { get; set; } = TimeProvider.System;
+    // Guest-set structural changes (a guest added or removed): for
+    // GuestStraySettleTime afterwards, IQ from a DDC port above the operator's
+    // run that is neither a current guest nor the current display DDC is
+    // dropped instead of taking the legacy "unknown port → RX1" route.
+    internal static readonly TimeSpan GuestStraySettleTime = TimeSpan.FromMilliseconds(250);
+    private long _guestStructuralChangeTimestamp;
+    private int _guestStructuralChangeSeen;
+    private long _strayGuestIqDropped;
     // Per-source-port IQ packet rate (packets in the last completed ~1 s
     // window) for UDP ports RxDataPortBase..RxDataPortBase+MaxRxDdc-1 (1035..1042)
     // → index 0..7 → DDC 0..7. Written by the single RX thread on each window
@@ -592,6 +626,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private long _txIqNotWritable;
     private long _txIqSocketErrors;
     private long _txIqSocketMaxTicks;
+    // Modeled radio TX FIFO ran dry mid-stream (the TX latency governor backs
+    // off on these).
+    private long _txIqUnderruns;
     private long _txIqSafetyRejected;
     private long _txIqStaleQueueDrops;
     private long _txIqTimingEpoch;
@@ -920,8 +957,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public void DetachRxSink() => Interlocked.Exchange(ref _rxSink, null);
 
     /// <summary>
-    /// Raised from the RX loop on every successfully received hi-priority
-    /// status packet (UDP 1025, 60 B). Carries the FWD/REF/exciter ADC
+    /// Raised from the RX loop for received hi-priority status packets (UDP
+    /// 1025, 60 B). When the radio floods them faster than the loop drains the
+    /// socket (Saturn sends one per ADC overflow detection), back-to-back
+    /// packets are coalesced first — see <see cref="HiPriStatusCoalescer"/>:
+    /// newest values win, overload bits are OR'd, and every PTT / dot / dash
+    /// / PLL edge is still raised in order. Carries the FWD/REF/exciter ADC
     /// readings that drive the operator's TX power meter, plus the PTT-in
     /// and PLL-lock status bits. Mirrors P1's
     /// <c>IProtocol1Client.TelemetryReceived</c> surface.
@@ -938,8 +979,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Raised with the raw Protocol-2 hi-priority status payload, excluding
-    /// the 4-byte sequence prefix. The byte array is copied from the RX loop's
-    /// reusable socket buffer so diagnostic consumers can build maps safely.
+    /// the 4-byte sequence prefix, raised alongside (and coalesced exactly like)
+    /// <see cref="TelemetryReceived"/>. The byte array is copied from the RX
+    /// loop's reusable buffer so diagnostic consumers can build maps safely.
     /// </summary>
     public event Action<byte[]>? HiPriorityStatusPayloadReceived;
 
@@ -1296,6 +1338,45 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Guest-aware overload. <paramref name="guestSlotByDdc"/> is indexed by
+    /// PHYSICAL DDC and holds the guest slot on that DDC, or -1. Like the
+    /// display DDC, a guest is recognised only on its exact physical port
+    /// (never through the logical-stream fallback) and is tagged
+    /// <see cref="GuestReceiverIndex"/>(slot). An empty table behaves exactly
+    /// like the display-aware overload.
+    /// </summary>
+    internal static int ReceiverIndexForRxStream(
+        int streamIndex,
+        HpsdrBoardKind board,
+        bool rx2Enabled,
+        int extraReceiverCount,
+        bool diversitySourceEnabled,
+        int displayDdcIndex,
+        ReadOnlySpan<int> guestSlotByDdc)
+    {
+        if (streamIndex >= 2
+            && streamIndex < guestSlotByDdc.Length
+            && guestSlotByDdc[streamIndex] >= 0)
+        {
+            return GuestReceiverIndex(guestSlotByDdc[streamIndex]);
+        }
+        return ReceiverIndexForRxStream(
+            streamIndex,
+            board,
+            rx2Enabled,
+            extraReceiverCount,
+            diversitySourceEnabled,
+            displayDdcIndex);
+    }
+
+    /// <summary>
+    /// <see cref="IqFrame.ReceiverIndex"/> carried by a guest slot's IQ:
+    /// -2 - slot (slot 0 = -2, slot 1 = -3, ...). Never collides with the
+    /// operator receivers (&gt;= 0) or <see cref="DisplayReceiverIndex"/> (-1).
+    /// </summary>
+    public static int GuestReceiverIndex(int slot) => FirstGuestReceiverIndex - slot;
+
+    /// <summary>
     /// IQ packet rate (packets in the last completed ~1 s window) per UDP
     /// source port 1035..1042 → index 0..7 → DDC 0..7. The RX2 DDC is
     /// <see cref="Rx2Ddc"/>. A zero at an enabled DDC's index means the radio
@@ -1458,13 +1539,254 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         SendCmdHighPriority(run: true);
     }
 
-    private int FirstFreeContiguousUserDdc()
+    /// <summary>
+    /// How many contiguous DDCs, counted from <see cref="RxBaseDdc"/>, the
+    /// operator's receivers occupy — exactly the run <see cref="SendCmdRx"/>
+    /// enables. With extra receivers (RX3..) the N-receiver composer always
+    /// emits RX1 + RX2 + every extra, whether or not RX2 itself is enabled;
+    /// otherwise the legacy composer emits RX1 plus RX2 when enabled. The
+    /// synchronized diversity pair lives on DDC0/1, outside this run (it
+    /// clears the RX1 bit but never claims RX2's DDC), so diversity does not
+    /// change the run. The G2E single-ADC PureSignal feedback burst is not
+    /// modelled: it applies only to Hermes-class boards (RxBaseDdc == 0),
+    /// which never host guests or the hidden display DDC run behind them.
+    /// Shared by the guest placement, the hidden display DDC and the
+    /// pipeline's wideband zoom policy so the three can never disagree.
+    /// </summary>
+    public static int OperatorDdcRunLength(bool rx2Enabled, int extraReceiverCount) =>
+        extraReceiverCount > 0 ? 2 + extraReceiverCount : rx2Enabled ? 2 : 1;
+
+    /// <summary>
+    /// First physical DDC after the operator run that starts at
+    /// <paramref name="rxBaseDdc"/> (see <see cref="OperatorDdcRunLength"/>).
+    /// </summary>
+    public static int FirstFreeOperatorDdc(int rxBaseDdc, bool rx2Enabled, int extraReceiverCount) =>
+        rxBaseDdc + OperatorDdcRunLength(rx2Enabled, extraReceiverCount);
+
+    /// <summary>
+    /// Guest DDCs that fit behind an operator run ending before
+    /// <paramref name="firstFreeOperatorDdc"/> without passing DDC7, keeping
+    /// one DDC for the hidden display DDC when <paramref name="displayDdcWanted"/>.
+    /// </summary>
+    public static int GuestDdcCapacityBehind(int firstFreeOperatorDdc, bool displayDdcWanted) =>
+        Math.Max(0, MaxRxDdc - firstFreeOperatorDdc - (displayDdcWanted ? 1 : 0));
+
+    /// <summary>
+    /// First physical DDC after the operator's contiguous receiver run as it
+    /// is on the wire right now (<see cref="OperatorDdcRunLength"/>). Guests
+    /// start here.
+    /// </summary>
+    public int FirstFreeOperatorDdc() =>
+        FirstFreeOperatorDdc(
+            RxBaseDdc(_boardKind),
+            Volatile.Read(ref _rx2Enabled) != 0,
+            Volatile.Read(ref _extraReceiverCount));
+
+    // The hidden display DDC sits directly behind the active guests.
+    private int FirstFreeContiguousUserDdc() =>
+        FirstFreeOperatorDdc() + ActiveGuestPlacement().Count;
+
+    /// <summary>
+    /// How many guest DDCs fit behind the operator's receivers without passing
+    /// DDC7 (only enable byte 7 is written). Reserves one DDC for the hidden
+    /// display DDC when <paramref name="displayDdcWanted"/>. Zero on the
+    /// Hermes-class boards (Hermes/HermesII/HermesC10, RxBaseDdc == 0): the
+    /// G2E time-multiplexes PureSignal feedback onto DDC0, so no guests there.
+    /// Guests are always placed with the display DDC reserved (true), so they
+    /// can never occupy the operator's display slot, even transiently.
+    /// </summary>
+    public int GuestDdcCapacity(bool displayDdcWanted)
     {
-        int occupied = 1; // RX1
-        if (Volatile.Read(ref _rx2Enabled) != 0) occupied++;
-        if (Volatile.Read(ref _rx2Enabled) != 0)
-            occupied += Math.Max(0, Volatile.Read(ref _extraReceiverCount));
-        return RxBaseDdc(_boardKind) + occupied;
+        if (RxBaseDdc(_boardKind) != G2RxDdc) return 0;
+        return GuestDdcCapacityBehind(FirstFreeOperatorDdc(), displayDdcWanted);
+    }
+
+    /// <summary>
+    /// The physical DDC carrying guest <paramref name="slot"/> right now, or
+    /// -1 when that slot is not on the wire. Moves whenever the operator's run
+    /// or a lower guest changes.
+    /// </summary>
+    public int GuestDdcIndex(int slot)
+    {
+        var placement = ActiveGuestPlacement();
+        for (int g = 0; g < placement.Count; g++)
+        {
+            if (placement.Guests[g].Slot != slot) continue;
+            int ddc = placement.FirstDdc + g;
+            return ddc is >= 3 and < MaxRxDdc ? ddc : -1;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// The connected board can host guest DDCs at all (DDC-slot firmware with
+    /// RX1 on DDC2: Orion/Saturn/G2). Hermes-class boards never can.
+    /// </summary>
+    public bool SupportsGuestDdcs => RxBaseDdc(_boardKind) == G2RxDdc;
+
+    /// <summary>Guest DDCs actually on the wire right now.</summary>
+    public int ActiveGuestDdcCount => ActiveGuestPlacement().Count;
+
+    /// <summary>
+    /// Replace the guest receiver set. Entries are placed contiguously from
+    /// <see cref="FirstFreeOperatorDdc"/> in ascending slot order; negative or
+    /// duplicate slots are ignored, and anything past
+    /// <see cref="GuestDdcCapacity"/>(true) — the display DDC slot is always
+    /// kept free for the operator — is refused; the lowest slots win.
+    /// Idempotent: no packet when nothing changed. A change of slots or ADCs
+    /// re-sends the RX command and high-priority packet at once; a frequency-
+    /// only change is coalesced to at most one high-priority packet per
+    /// <see cref="GuestRetuneMinInterval"/>, trailing edge, because every
+    /// high-priority packet re-latches the Alex/OC relays (see
+    /// <see cref="SetExtraReceiverFreqHz"/>). Returns the number of guests
+    /// placed on the wire.
+    /// </summary>
+    public int SetGuestDdcs(IReadOnlyList<GuestDdcSpec> guests)
+    {
+        ArgumentNullException.ThrowIfNull(guests);
+        double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
+        var sorted = new List<GuestDdcWire>(guests.Count);
+        foreach (var guest in guests)
+        {
+            if (guest.Slot < 0 || sorted.Exists(g => g.Slot == guest.Slot)) continue;
+            long corrected = (long)Math.Round(guest.FreqHz * factor, MidpointRounding.AwayFromZero);
+            sorted.Add(new GuestDdcWire(guest.Slot, (uint)Math.Clamp(corrected, 0L, uint.MaxValue), guest.Adc));
+        }
+        sorted.Sort((a, b) => a.Slot.CompareTo(b.Slot));
+        int capacity = GuestDdcCapacity(displayDdcWanted: true);
+        GuestDdcWire[] next = sorted.Count > capacity
+            ? sorted.GetRange(0, capacity).ToArray()
+            : sorted.ToArray();
+
+        bool structural;
+        lock (_guestDdcLock)
+        {
+            var previous = _guestDdcs;
+            structural = previous.Length != next.Length;
+            bool retuned = false;
+            for (int i = 0; !structural && i < next.Length; i++)
+            {
+                structural = previous[i].Slot != next[i].Slot || previous[i].Adc != next[i].Adc;
+                retuned |= previous[i].FreqHz != next[i].FreqHz;
+            }
+            if (!structural && !retuned) return ActiveGuestDdcCount;
+            Volatile.Write(ref _guestDdcs, next);
+            if (structural)
+            {
+                Interlocked.Exchange(ref _guestStructuralChangeTimestamp, GuestRetuneTimeProvider.GetTimestamp());
+                Volatile.Write(ref _guestStructuralChangeSeen, 1);
+                // The immediate high-priority packet below carries every
+                // pending guest frequency, so the trailing edge is redundant.
+                _guestRetunePending = false;
+                _guestRetuneTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                _guestRetuneSent = true;
+                _guestRetuneLastSendTimestamp = GuestRetuneTimeProvider.GetTimestamp();
+            }
+        }
+
+        if (!CanSendCmdHighPriority) return ActiveGuestDdcCount;
+        if (structural)
+        {
+            SendCmdRx();
+            SendCmdHighPriority(run: true);
+        }
+        else
+        {
+            RequestGuestRetune();
+        }
+        return ActiveGuestDdcCount;
+    }
+
+    private void RequestGuestRetune()
+    {
+        var clock = GuestRetuneTimeProvider;
+        lock (_guestDdcLock)
+        {
+            // A scheduled trailing edge reads the latest frequencies when it fires.
+            if (_guestRetunePending) return;
+            long now = clock.GetTimestamp();
+            TimeSpan since = _guestRetuneSent
+                ? clock.GetElapsedTime(_guestRetuneLastSendTimestamp, now)
+                : TimeSpan.MaxValue;
+            if (since < GuestRetuneMinInterval)
+            {
+                _guestRetunePending = true;
+                _guestRetuneTimer ??= clock.CreateTimer(
+                    static state => ((Protocol2Client)state!).OnGuestRetuneDue(),
+                    this,
+                    Timeout.InfiniteTimeSpan,
+                    Timeout.InfiniteTimeSpan);
+                _guestRetuneTimer.Change(GuestRetuneMinInterval - since, Timeout.InfiniteTimeSpan);
+                return;
+            }
+            _guestRetuneSent = true;
+            _guestRetuneLastSendTimestamp = now;
+        }
+        SendCmdHighPriority(run: true);
+    }
+
+    private void OnGuestRetuneDue()
+    {
+        lock (_guestDdcLock)
+        {
+            if (!_guestRetunePending) return;
+            _guestRetunePending = false;
+            _guestRetuneSent = true;
+            _guestRetuneLastSendTimestamp = GuestRetuneTimeProvider.GetTimestamp();
+        }
+        if (!CanSendCmdHighPriority) return;
+        try
+        {
+            SendCmdHighPriority(run: true);
+        }
+        catch (Exception ex)
+        {
+            // Timer callback: never let a teardown race escape onto the pool.
+            _log.LogDebug(ex, "p2.guest retune send failed");
+        }
+    }
+
+    // Live guest placement: the stored snapshot, clamped so that no guest ever
+    // overlaps an operator receiver (operator changes win immediately), the
+    // display DDC slot behind the guests stays free, and nothing passes DDC7;
+    // empty on boards without guest support.
+    private (GuestDdcWire[] Guests, int FirstDdc, int Count) ActiveGuestPlacement()
+    {
+        var guests = Volatile.Read(ref _guestDdcs);
+        if (guests.Length == 0) return (guests, -1, 0);
+        int first = FirstFreeOperatorDdc();
+        int count = Math.Min(guests.Length, GuestDdcCapacity(displayDdcWanted: true));
+        return (guests, first, count);
+    }
+
+    /// <summary>IQ packets dropped by <see cref="IsStrayGuestPort"/> (diagnostics / tests).</summary>
+    internal long StrayGuestIqDropped => Interlocked.Read(ref _strayGuestIqDropped);
+
+    /// <summary>
+    /// True for a non-PureSignal IQ packet that must be dropped because it may
+    /// belong to a guest receiver that just left (or moved): on a guest-capable
+    /// board (RxBaseDdc == 2), while guests are configured or within
+    /// <see cref="GuestStraySettleTime"/> of the last guest-set change, a port
+    /// at or above <see cref="FirstFreeOperatorDdc"/> that is neither a current
+    /// guest DDC nor the current display DDC. Operator ports (below the first
+    /// free DDC) are never affected, and with no guests ever configured this is
+    /// always false, so the operator routing is unchanged.
+    /// </summary>
+    private bool IsStrayGuestPort(int ddcIndex)
+    {
+        if (Volatile.Read(ref _guestStructuralChangeSeen) == 0) return false;
+        if (RxBaseDdc(_boardKind) != G2RxDdc) return false;
+        if (ddcIndex < FirstFreeOperatorDdc()) return false;
+        var placement = ActiveGuestPlacement();
+        if (placement.Guests.Length == 0)
+        {
+            var clock = GuestRetuneTimeProvider;
+            long changed = Interlocked.Read(ref _guestStructuralChangeTimestamp);
+            if (clock.GetElapsedTime(changed, clock.GetTimestamp()) >= GuestStraySettleTime) return false;
+        }
+        if (placement.Count > 0 && ddcIndex >= placement.FirstDdc && ddcIndex < placement.FirstDdc + placement.Count)
+            return false;
+        return ddcIndex != EffectiveDisplayDdcIndex();
     }
 
     private int EffectiveDisplayDdcIndex()
@@ -2292,6 +2614,17 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Queued-but-unsent DUC IQ, in 48 kHz-equivalent samples (the DAC runs at
+    /// 192 kHz). Excludes the paced radio-FIFO target, which is fixed.
+    /// </summary>
+    public int TxIqBacklogSamples48k =>
+        (int)(Math.Max(0, Volatile.Read(ref _txIqQueuedPackets))
+              * TxIqSamplesPerPacket * 48_000 / (long)TxDacSampleRate);
+
+    /// <summary>Times the modeled radio TX FIFO ran dry mid-over.</summary>
+    public long TxIqUnderruns => Interlocked.Read(ref _txIqUnderruns);
+
     private void DecrementTxIqQueuedPacketsIfPositive()
     {
         while (true)
@@ -2343,6 +2676,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         var reader = _txIqQueue.Reader;
         var ep = new IPEndPoint(_radioEndpoint!.Address, 1029);
         double fifoSamples = 0.0;
+        long primedEpoch = -1;
         long lastTicks = Stopwatch.GetTimestamp();
         double ticksPerSecond = Stopwatch.Frequency;
         // 1 Hz TX-IQ rate log (mirrors P1's p1.tx.rate). The radio's DUC needs
@@ -2384,7 +2718,13 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                         long now = Stopwatch.GetTimestamp();
                         double elapsedSec = (now - lastTicks) / ticksPerSecond;
                         fifoSamples -= elapsedSec * TxDacSampleRate;
-                        if (fifoSamples < 0.0) fifoSamples = 0.0;
+                        if (fifoSamples < 0.0)
+                        {
+                            // Emptied since a send in this same keying epoch:
+                            // the radio played out everything we gave it.
+                            if (primedEpoch == phaseEpoch) Interlocked.Increment(ref _txIqUnderruns);
+                            fifoSamples = 0.0;
+                        }
                         lastTicks = now;
 
                         // If the radio's FIFO would overflow, wait a tick before the
@@ -2431,6 +2771,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                                 }
                                 sendTiming.Record(Stopwatch.GetTimestamp(), timingEpoch);
                                 rateCount++;
+                                primedEpoch = timingEpoch;
                                 Interlocked.Increment(ref _txIqPacketsSent);
                             }
                         }
@@ -3539,6 +3880,16 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     internal readonly record struct DdcReceiverSpec(byte AdcSource, ushort SampleRateKhz);
 
     /// <summary>
+    /// One public-listening guest receiver for <see cref="SetGuestDdcs"/>:
+    /// the lease slot (tags its IQ with <see cref="GuestReceiverIndex"/>), the
+    /// DDC NCO centre in Hz (before frequency correction) and the physical ADC.
+    /// </summary>
+    public readonly record struct GuestDdcSpec(int Slot, long FreqHz, byte Adc);
+
+    // Wire form of a guest: frequency already corrected and clamped to u32.
+    private readonly record struct GuestDdcWire(int Slot, uint FreqHz, byte Adc);
+
+    /// <summary>
     /// Generalized "Receive Specific" composer for up to <see cref="MaxRxDdc"/>
     /// concurrent DDCs, each independently assignable to either ADC and to its
     /// own sample rate — the N-receiver foundation for full multi-RX operation.
@@ -3694,6 +4045,17 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         if (diversityPair)
             ConfigureSynchronizedDiversityPair(p, _boardKind, (ushort)_sampleRateKhz,
                 (byte)Volatile.Read(ref _diversitySourceAdcSource));
+        // Guests: only enable bits and config blocks at or above the first free
+        // operator DDC (>= 3 on the Orion family), after composition, so the
+        // PureSignal DDC0/1 bits, blocks and byte 1363 are never written here.
+        var guestPlacement = ActiveGuestPlacement();
+        for (int g = 0; g < guestPlacement.Count; g++)
+        {
+            int guestDdc = guestPlacement.FirstDdc + g;
+            if (guestDdc is < 3 or >= MaxRxDdc) break;
+            p[7] |= (byte)(1 << guestDdc);
+            WriteDdcConfigBlock(p, guestDdc, guestPlacement.Guests[g].Adc, (ushort)_sampleRateKhz);
+        }
         int displayDdc = EffectiveDisplayDdcIndex();
         if (displayDdc is >= 2 and < MaxRxDdc)
         {
@@ -3997,6 +4359,13 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             }
         }
 
+        var guestPlacement = ActiveGuestPlacement();
+        for (int g = 0; g < guestPlacement.Count; g++)
+        {
+            int guestDdc = guestPlacement.FirstDdc + g;
+            if (guestDdc is < 3 or >= MaxRxDdc) break;
+            WriteBeU32(p, 9 + guestDdc * 4, FrequencyHzToPhaseWord(guestPlacement.Guests[g].FreqHz));
+        }
         int displayDdc = EffectiveDisplayDdcIndex();
         if (displayDdc is >= 2 and < MaxRxDdc)
             WriteBeU32(p, 9 + displayDdc * 4, FrequencyHzToPhaseWord(_displayDdcFreqHz));
@@ -4929,11 +5298,17 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         long lastConnectionResetLogMs = 0;
         long lastNonIqErrorLogMs = 0;
         bool firstInboundPacketPending = true;
+        var hiPri = CreateHiPriStatusCoalescer(buf.Length);
 
         try
         {
             while (!ct.IsCancellationRequested)
             {
+                // Dispatch coalesced hi-priority telemetry once the socket queue
+                // has drained (we are current again) or the hold cap expires.
+                if (hiPri.HasPending)
+                    FlushHiPriStatusIfDue(hiPri, Stopwatch.GetTimestamp(), SocketHasQueuedDatagram(sock));
+
                 int n;
                 try
                 {
@@ -5105,7 +5480,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                             // surface drive the operator's TX power meter — without
                             // this, the bar reads zero on every P2-connected radio
                             // because TxMetersService had no telemetry feed.
-                            HandleHiPriStatusPacket(buf, n);
+                            // Queued into the coalescer; dispatched at the top of
+                            // the loop once the socket backlog has drained.
+                            QueueHiPriStatusPacket(
+                                hiPri,
+                                buf.AsSpan(HiPriSeqHeaderBytes, n - HiPriSeqHeaderBytes),
+                                Stopwatch.GetTimestamp());
                         }
                         else if (srcPort == 1026)
                         {
@@ -5301,6 +5681,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             _lastRxDiagSeq = seq;
         }
 
+        // Public Listening: IQ still in flight on a port that WAS a guest (or
+        // the display DDC displaced by guests) must never fall back to the
+        // operator's RX1 routing below. See IsStrayGuestPort.
+        if (!paired && IsStrayGuestPort(ddcIndex))
+        {
+            Interlocked.Increment(ref _strayGuestIqDropped);
+            return;
+        }
+
         // 238 complex words hold either one ADC or 119 simultaneous ADC pairs.
         int samplesPerPacket = paired ? DiscoverySamplesPerPacket / 2 : DiscoverySamplesPerPacket;
         int sampleDoubles = DiscoverySamplesPerPacket * 2;
@@ -5345,13 +5734,26 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // route RX2 to its own channel without per-board DDC knowledge. Some
         // firmware uses source port 1035 + logical stream index (RX2 == 1);
         // other builds expose the DDC slot number (Orion/G2 RX2 == DDC3).
+        var guestPlacement = ActiveGuestPlacement();
+        Span<int> guestSlotByDdc = guestPlacement.Count > 0 ? stackalloc int[MaxRxDdc] : [];
+        if (guestPlacement.Count > 0)
+        {
+            guestSlotByDdc.Fill(-1);
+            for (int g = 0; g < guestPlacement.Count; g++)
+            {
+                int guestDdc = guestPlacement.FirstDdc + g;
+                if (guestDdc is < 3 or >= MaxRxDdc) break;
+                guestSlotByDdc[guestDdc] = guestPlacement.Guests[g].Slot;
+            }
+        }
         int receiverIndex = ReceiverIndexForRxStream(
             ddcIndex,
             _boardKind,
             Volatile.Read(ref _rx2Enabled) != 0,
             Volatile.Read(ref _extraReceiverCount),
             diversitySourceEnabled: false,
-            EffectiveDisplayDdcIndex());
+            EffectiveDisplayDdcIndex(),
+            guestSlotByDdc);
 
         var frame = new IqFrame(
             InterleavedSamples: new ReadOnlyMemory<double>(samples, 0, samplesPerPacket * 2),
@@ -5439,22 +5841,76 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             ? BinaryPrimitives.ReadUInt16BigEndian(buf.Slice(offset, 2))
             : (ushort)0;
 
-    /// <summary>
-    /// RX-thread handler for the hi-priority status packet. Decodes via
-    /// <see cref="DecodeHiPriStatus"/>, throttle-logs at 1 Hz, and dispatches
-    /// to <see cref="TelemetryReceived"/> subscribers.
-    /// </summary>
-    private void HandleHiPriStatusPacket(byte[] buf, int length)
-    {
-        // Skip the 4-byte BE u32 sequence number that prefixes every P2 UDP
-        // packet (Thetis network.c:531 — `memcpy(bufp, readbuf + 4, 56)`).
-        // Without this slice the decoder reads the sequence bytes for
-        // exciter/fwd/rev — that's the bug behind issue #174's "exciter
-        // climbs by 1, FWD/REV stuck at zero" log signature.
-        var payload = buf.AsSpan(HiPriSeqHeaderBytes, length - HiPriSeqHeaderBytes);
-        var reading = DecodeHiPriStatus(payload);
+    // Radio packets folded into an earlier dispatch by the hi-priority
+    // coalescer. Written and read only on the RX thread (1 Hz log line).
+    private long _hiPriCoalescedPackets;
 
+    internal static HiPriStatusCoalescer CreateHiPriStatusCoalescer(int capacity) =>
+        new(capacity, Stopwatch.Frequency * HiPriMaxHoldMs / 1000);
+
+    /// <summary>
+    /// RX-thread intake for one hi-priority status payload (the bytes after
+    /// the 4-byte sequence header — Thetis network.c:531
+    /// <c>memcpy(bufp, readbuf + 4, 56)</c>; reading the sequence bytes as
+    /// exciter/fwd/rev was issue #174). Folds it into
+    /// <paramref name="coalescer"/>; a payload carrying a different PTT / key
+    /// / PLL / user-input state first flushes the pending one so no edge is
+    /// ever merged away.
+    /// </summary>
+    internal void QueueHiPriStatusPacket(HiPriStatusCoalescer coalescer, ReadOnlySpan<byte> payload, long nowTicks)
+    {
         Interlocked.Increment(ref _hiPriPackets);
+        if (coalescer.HasPending && !coalescer.CanMerge(payload))
+            FlushHiPriStatus(coalescer);
+        coalescer.Add(payload, nowTicks);
+    }
+
+    /// <summary>
+    /// Dispatch the pending hi-priority payload when the socket has no
+    /// further datagram queued (the loop is current) or the hold cap has
+    /// expired. While a backlog is still queued the newer packets behind it
+    /// supersede this one, so dispatching it would only replay stale meter
+    /// and protection data.
+    /// </summary>
+    internal void FlushHiPriStatusIfDue(HiPriStatusCoalescer coalescer, long nowTicks, bool moreDatagramsQueued)
+    {
+        if (!coalescer.HasPending) return;
+        if (moreDatagramsQueued && !coalescer.HeldTooLong(nowTicks)) return;
+        FlushHiPriStatus(coalescer);
+    }
+
+    private void FlushHiPriStatus(HiPriStatusCoalescer coalescer)
+    {
+        int packets = coalescer.PendingPacketCount;
+        try
+        {
+            _hiPriCoalescedPackets += packets - 1;
+            DispatchHiPriStatus(coalescer.Pending);
+        }
+        finally
+        {
+            coalescer.Clear();
+        }
+    }
+
+    // FIONREAD: > 0 whenever at least one datagram is queued on every
+    // platform (Windows / macOS report total bytes, Linux the next datagram).
+    private static bool SocketHasQueuedDatagram(Socket sock)
+    {
+        try { return sock.Available > 0; }
+        catch (SocketException) { return false; }
+        catch (ObjectDisposedException) { return false; }
+    }
+
+    /// <summary>
+    /// Decode one (possibly coalesced) hi-priority payload via
+    /// <see cref="DecodeHiPriStatus"/>, throttle-log at 1 Hz, and dispatch to
+    /// <see cref="HiPriorityStatusPayloadReceived"/> and
+    /// <see cref="TelemetryReceived"/> subscribers.
+    /// </summary>
+    private void DispatchHiPriStatus(ReadOnlySpan<byte> payload)
+    {
+        var reading = DecodeHiPriStatus(payload);
 
         var rawHandler = HiPriorityStatusPayloadReceived;
         if (rawHandler is not null)
@@ -5478,8 +5934,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         {
             _lastHiPriLogTicks = nowTicks;
             _log.LogInformation(
-                "p2.hi_pri.rx pkts={Pkts} fwd={Fwd} rev={Rev} exc={Exc} ptt={Ptt} pll={Pll} ov=0x{Ov:X2} supply={Supply}",
+                "p2.hi_pri.rx pkts={Pkts} coalesced={Coalesced} fwd={Fwd} rev={Rev} exc={Exc} ptt={Ptt} pll={Pll} ov=0x{Ov:X2} supply={Supply}",
                 Interlocked.Read(ref _hiPriPackets),
+                _hiPriCoalescedPackets,
                 reading.FwdAdc, reading.RevAdc, reading.ExciterAdc,
                 reading.PttIn, reading.PllLocked,
                 reading.AdcOverloadBits, reading.SupplyVoltsAdc);
@@ -5508,9 +5965,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     internal void RaiseHiPriStatusForTest(ReadOnlySpan<byte> bodyAfterSeqHeader)
     {
-        var buf = new byte[HiPriSeqHeaderBytes + bodyAfterSeqHeader.Length];
-        bodyAfterSeqHeader.CopyTo(buf.AsSpan(HiPriSeqHeaderBytes));
-        HandleHiPriStatusPacket(buf, buf.Length);
+        Interlocked.Increment(ref _hiPriPackets);
+        DispatchHiPriStatus(bodyAfterSeqHeader);
     }
 
     // PS-armed packet shape on UDP 1035: 16-byte header (4 seq, 8 timestamp,
@@ -5708,6 +6164,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public void Dispose()
     {
         try { StopAsync(CancellationToken.None).GetAwaiter().GetResult(); } catch { }
+        DisposeGuestRetuneTimer();
         _sock?.Dispose();
         _sock = null;
         _speakerAudioEndpoint = null;
@@ -5718,11 +6175,22 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         try { await StopAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+        DisposeGuestRetuneTimer();
         _sock?.Dispose();
         _sock = null;
         _speakerAudioEndpoint = null;
         _rxCts?.Dispose();
         _rxCts = null;
+    }
+
+    private void DisposeGuestRetuneTimer()
+    {
+        lock (_guestDdcLock)
+        {
+            _guestRetunePending = false;
+            _guestRetuneTimer?.Dispose();
+            _guestRetuneTimer = null;
+        }
     }
 
     private static void WriteBeU16(byte[] buf, int offset, int value)

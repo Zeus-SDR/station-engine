@@ -26,6 +26,27 @@ internal sealed class CwEnvelopeDecoder
     private double _snrSum;
     private int _snrCount;
     private int _raisedNoiseBlocks;
+    // Narrow blocks seen while the matched rails are still being measured.
+    // The first element of a weak sender is spent measuring them, so those
+    // blocks are re-read once the rails exist instead of being lost.
+    private const int OpeningCapacity = 384;
+    private readonly double[] _openingAmplitude = new double[OpeningCapacity];
+    private readonly double[] _openingSignalQuality = new double[OpeningCapacity];
+    // About 43 ms: shorter than a 50 WPM dah, longer than a noise crossing.
+    private const int OpeningMarkBlocks = 8;
+    private const double OpeningMarkCoherence = 0.9;
+    // The rail separation the matched threshold itself requires. A mark
+    // closer to the noise than that is copied no better by re-reading it.
+    private const double OpeningMarkOverNoise = 3.5;
+    // Keep the element space before the found mark: an opening dit can sit
+    // one element gap ahead of the first mark long enough to qualify.
+    private const int OpeningLeadBlocks = 48;
+    // Replay only after a real pause. With less history the rails separate
+    // almost at once and cost the sender nothing; a short buffer is a fade
+    // dip inside one transmission, where re-reading only adds noise.
+    private const int MinOpeningReplayBlocks = 128;
+    private int _openingCount;
+    private int _openingCursor;
 
     public CwEnvelopeDecoder(bool narrow)
     {
@@ -56,6 +77,13 @@ internal sealed class CwEnvelopeDecoder
         if (_narrow)
         {
             bool matched = _matched.Update(amplitude);
+            if (_matched.JustAcquired && !_open)
+            {
+                ReplayOpening(blockMs, output);
+                _signalQuality = signalQuality;
+                matched = _matched.Classify(amplitude);
+            }
+            else if (!_matched.Acquired && !_open) KeepOpeningBlock(amplitude, signalQuality);
             bool adaptive = _fadeThreshold.Update(amplitude);
             // Use the adaptive envelope to observe fresh fading evidence;
             // it can see a coherent mark below the old stable mark rail.
@@ -94,6 +122,11 @@ internal sealed class CwEnvelopeDecoder
             keyed = _threshold.Update(amplitude <= 1e-10 ? 0 : _smoother.Push(amplitude));
             if (amplitude <= 1e-10) _smoother.Clear();
         }
+        Advance(keyed, signalQuality, blockMs, output);
+    }
+
+    private void Advance(bool keyed, double blockQuality, double blockMs, Action<MorseDecodedSymbol> output)
+    {
         if (keyed)
         {
             _quietMs = 0;
@@ -105,7 +138,7 @@ internal sealed class CwEnvelopeDecoder
                 _snrCount++;
             }
             _openRun++;
-            _openingQuality += signalQuality;
+            _openingQuality += blockQuality;
         }
         else
         {
@@ -123,6 +156,95 @@ internal sealed class CwEnvelopeDecoder
             return;
         }
         Feed(keyed, blockMs, output);
+    }
+
+    private void KeepOpeningBlock(double amplitude, double signalQuality)
+    {
+        _openingAmplitude[_openingCursor] = amplitude;
+        _openingSignalQuality[_openingCursor] = signalQuality;
+        _openingCursor = (_openingCursor + 1) % OpeningCapacity;
+        if (_openingCount < OpeningCapacity) _openingCount++;
+    }
+
+    /// <summary>
+    /// The matched rails just separated. Re-read the opening marks they were
+    /// measured on, so this sender's first element reaches the clock and the
+    /// Morse state instead of being spent on the measurement. Only runs
+    /// before the envelope opens, so no block is fed twice.
+    /// </summary>
+    private void ReplayOpening(double blockMs, Action<MorseDecodedSymbol> output)
+    {
+        int oldest = (_openingCursor - _openingCount + OpeningCapacity) % OpeningCapacity;
+        if (_openingCount < MinOpeningReplayBlocks
+            || !TryFindOpeningMark(oldest, out int first, out double markLevel))
+        {
+            // No real pause before this sender, or rails that separated on
+            // noise alone. Re-reading either would turn quiet into letters;
+            // leave the live path in charge.
+            ClearOpening();
+            return;
+        }
+
+        // Replay from just before that mark. The quiet ahead of it is noise,
+        // and re-reading noise against any threshold is how letters appear
+        // out of nothing. The held rail is the mark itself, not a percentile
+        // of a buffer that is mostly quiet.
+        _matched.HoldMarkRail(markLevel);
+        for (int i = Math.Max(0, first - OpeningLeadBlocks); i < _openingCount; i++)
+        {
+            int index = (oldest + i) % OpeningCapacity;
+            _signalQuality = _openingSignalQuality[index];
+            Advance(_matched.Classify(_openingAmplitude[index]), _signalQuality, blockMs, output);
+        }
+        ClearOpening();
+    }
+
+    /// <summary>
+    /// First real opening element: <see cref="OpeningMarkBlocks"/> consecutive
+    /// blocks well clear of the noise floor whose tone phase holds.
+    /// Band-limited noise can cross an amplitude threshold for a block or
+    /// two, but it does not keep the tone's phase for that long.
+    /// <paramref name="first"/> is the run's first block, counted from the
+    /// oldest buffered block; <paramref name="markLevel"/> is its mean amplitude.
+    /// </summary>
+    private bool TryFindOpeningMark(int oldest, out int first, out double markLevel)
+    {
+        double threshold = OpeningMarkOverNoise * _matched.NoiseFloor;
+        int run = 0;
+        double quality = 0;
+        double amplitude = 0;
+        for (int i = 0; i < _openingCount; i++)
+        {
+            int index = (oldest + i) % OpeningCapacity;
+            if (_openingAmplitude[index] >= threshold)
+            {
+                run++;
+                quality += _openingSignalQuality[index];
+                amplitude += _openingAmplitude[index];
+                if (run >= OpeningMarkBlocks && quality / run >= OpeningMarkCoherence)
+                {
+                    first = i - run + 1;
+                    markLevel = amplitude / run;
+                    return true;
+                }
+            }
+            else
+            {
+                run = 0;
+                quality = 0;
+                amplitude = 0;
+            }
+        }
+
+        first = 0;
+        markLevel = 0;
+        return false;
+    }
+
+    private void ClearOpening()
+    {
+        _openingCount = 0;
+        _openingCursor = 0;
     }
 
     private void Feed(bool tone, double blockMs, Action<MorseDecodedSymbol> output)
@@ -153,6 +275,15 @@ internal sealed class CwEnvelopeDecoder
             // A matched floor belongs to one sender. Re-measure it during
             // the quiet interval rather than retaining a frozen low rail.
             _matched.Reset();
+            if (_narrow)
+            {
+                // The next sender opens again, so its first element can be
+                // re-read once the new rails are measured.
+                _open = false;
+                _openRun = 0;
+                _openingQuality = 0;
+                ClearOpening();
+            }
             ClearFade();
             _fsm.Reset();
             _snrSum = 0;
@@ -181,6 +312,7 @@ internal sealed class CwEnvelopeDecoder
         _snrSum = 0;
         _snrCount = 0;
         _raisedNoiseBlocks = 0;
+        ClearOpening();
     }
 
     private void ClearFade()

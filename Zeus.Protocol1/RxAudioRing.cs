@@ -72,6 +72,22 @@ public sealed class RxAudioRing : IRxAudioSource
     // single write-block stale. Keeps the TX loop's frequent polls off _gate
     // so they can never contend with the RX thread's Write().
     public int Count => Volatile.Read(ref _count);
+
+    private int _keyedDrainArmed;
+
+    /// <summary>
+    /// Armed only while full-duplex (DUP) receive audio is queued for the
+    /// current transmission. While MOX is set, the EP2 L/R slots drain this
+    /// ring ONLY when armed, so an ordinary half-duplex over never sends the
+    /// pre-key receive tail and its keyed frames stay byte-identical. The
+    /// radio-speaker sink arms it after its key-down clear and disarms it on
+    /// every MOX edge and on the return to receive.
+    /// </summary>
+    public bool KeyedDrainArmed
+    {
+        get => Volatile.Read(ref _keyedDrainArmed) != 0;
+        set => Volatile.Write(ref _keyedDrainArmed, value ? 1 : 0);
+    }
     public long TotalWritten { get { lock (_gate) return _totalWritten; } }
     public long TotalRead { get { lock (_gate) return _totalRead; } }
     public long Dropped { get { lock (_gate) return _dropped; } }

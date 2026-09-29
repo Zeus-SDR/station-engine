@@ -43,6 +43,7 @@
 // License for details.
 
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Zeus.Contracts;
 using Zeus.Dsp;
@@ -183,7 +184,9 @@ public sealed class TxAudioIngest : IDisposable
 
     private long _totalMicSamples;
     private long _totalTxBlocks;
-    private int _monitorPreviewHangBlocks;
+    // Hang countdown in samples so sub-block (ASIO-cadence) input times the
+    // same 1.5 s as 20 ms blocks.
+    private int _monitorPreviewHangSamples;
 
     internal bool IsFreeDvTailDraining => Volatile.Read(ref _tailDraining) != 0;
     private long _droppedFrames;
@@ -380,6 +383,8 @@ public sealed class TxAudioIngest : IDisposable
                drainTxTransport: pipeline.DrainTxIqTransportTail,
                txOwnedByTuneDriver: () => !tx.IsMicIqProducerAllowed,
                preKeyOpenAtTicks: () => tx.PreKeyOpenAtTicks,
+               txTransportLevel: pipeline.TxTransportLevel48k,
+               isVoiceTxMode: () => tx.IsVoiceTxModeNow,
                audioModem: audioModem,
                productAudio: productAudio,
                productPluginAudio: productPluginAudio,
@@ -407,9 +412,13 @@ public sealed class TxAudioIngest : IDisposable
         IAudioModemPort? audioModem = null,
         IProductTxAudioPort? productAudio = null,
         ProductPluginAudioPort? productPluginAudio = null,
-        CwIdService? cwId = null)
+        CwIdService? cwId = null,
+        Func<TxTransportLevel>? txTransportLevel = null,
+        Func<bool>? isVoiceTxMode = null)
     {
         _ring = ring;
+        _txTransportLevel = txTransportLevel ?? (static () => TxTransportLevel.Unknown);
+        _isVoiceTxMode = isVoiceTxMode ?? (static () => true);
         _cwId = cwId;
         _engineProvider = engineProvider;
         _isMoxOn = isMoxOn;
@@ -963,6 +972,9 @@ public sealed class TxAudioIngest : IDisposable
     /// </summary>
     public bool PrimeTxDspForKeyDown()
     {
+        // Every key-down starts the latency governor from scratch, even when
+        // the prime itself is skipped (FreeDV, TUN).
+        lock (_sync) _latencyGovernor.Reset();
         if (_audioModem.Active) return false;
         if (_txOwnedByTuneDriver()) return false;
 
@@ -1044,6 +1056,13 @@ public sealed class TxAudioIngest : IDisposable
 
     private readonly Action<ReadOnlyMemory<float>>? _forwardP2;
     private readonly Func<TimeSpan, bool>? _drainTxTransport;
+    // Live-voice latency governor (see TxLatencyGovernor). Guarded by _sync.
+    private readonly TxLatencyGovernor _latencyGovernor = new();
+    private readonly Func<TxTransportLevel> _txTransportLevel;
+    // Browser/mobile mic arrives over a network hop with no jitter buffer;
+    // start its cushion wider than a local sound card's.
+    private const int BrowserMicMinCushionSamples = 30 * TxLatencyGovernor.SamplesPerMs;
+    private readonly Func<bool> _isVoiceTxMode;
     // True while TUN or the two-tone test is active. TxTuneDriver is the sole TX
     // driver in those states; this mic-ingest path must NOT also run ProcessTxBlock
     // or push IQ, or two threads drive the same TXA (fexchange2) and BOTH feed the
@@ -1140,11 +1159,79 @@ public sealed class TxAudioIngest : IDisposable
         ReadOnlyMemory<byte> f32lePayload,
         MicBlockValidity validity)
     {
+        _hostFanoutFill = 0; // never splice a partial ASIO block into the fan-out
         long now = Environment.TickCount64;
         if (ShouldSuppressForAuthoritativeSource(now)) return;
         long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
         if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.Host, validity);
+    }
+
+    // ASIO fast-path state. Touched only by the single native-capture worker
+    // thread (the same thread that calls OnMicPcmBytesFromMic).
+    private readonly float[] _hostFanout = new float[MicBlockSamples];
+    private readonly byte[] _hostFanoutPayload = new byte[MicBlockBytes];
+    private int _hostFanoutFill;
+    private bool _hostFanoutAirPerChunk;
+    private long _hostFanoutGeneration = -1;
+
+    /// <summary>
+    /// Host mic at the ASIO driver's buffer cadence. Each chunk goes to the air
+    /// path (WDSP) as soon as it arrives instead of waiting for a 20 ms block,
+    /// while a 960-sample re-blocker keeps every fan-out consumer (friend-PTT
+    /// native mic, taps, meters, product-plugin publish) on its fixed 20 ms
+    /// contract. With a Product/VST chain leased the air path stays on whole
+    /// 960 blocks — that chain aligns wet/dry by block count — latched only at
+    /// block boundaries so no sample is ever sent twice or skipped.
+    /// </summary>
+    internal void OnHostMicSamplesFromMic(ReadOnlySpan<float> samples, MicBlockValidity validity)
+    {
+        if (samples.IsEmpty) return;
+        // A capture route change / ASIO restart bumps the generation: never
+        // splice the old partial 20 ms block onto the new stream.
+        if (!IsCurrent(validity) || validity.Generation != _hostFanoutGeneration)
+        {
+            _hostFanoutFill = 0;
+            _hostFanoutGeneration = validity.Generation;
+            if (!IsCurrent(validity)) return;
+        }
+        long now = Environment.TickCount64;
+        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
+        if (ShouldSuppressForAuthoritativeSource(now)
+            || (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs))
+        {
+            _hostFanoutFill = 0;
+            return;
+        }
+
+        int offset = 0;
+        while (offset < samples.Length)
+        {
+            if (_hostFanoutFill == 0) _hostFanoutAirPerChunk = !_productAudio.Active;
+            int take = Math.Min(MicBlockSamples - _hostFanoutFill, samples.Length - offset);
+            var chunk = samples.Slice(offset, take);
+            chunk.CopyTo(_hostFanout.AsSpan(_hostFanoutFill));
+            _hostFanoutFill += take;
+            offset += take;
+
+            // Cheap pre-check mirroring OnMicPcmBytes' early gate so an inactive
+            // host mic never touches the shared monitor-preview gate or the
+            // drop counters; ProcessMicPcm's in-lock gate stays authoritative.
+            if (_hostFanoutAirPerChunk
+                && Volatile.Read(ref _productPluginInjectionActive) == 0
+                && ActiveSource == MicBlockSource.Host)
+            {
+                ProcessMicPcm(chunk, MicBlockSource.Host, validity);
+            }
+
+            if (_hostFanoutFill == MicBlockSamples)
+            {
+                _hostFanoutFill = 0;
+                MemoryMarshal.AsBytes(_hostFanout.AsSpan()).CopyTo(_hostFanoutPayload);
+                OnMicPcmBytes(_hostFanoutPayload, MicBlockSource.Host, validity,
+                    processAir: !_hostFanoutAirPerChunk);
+            }
+        }
     }
 
     /// <summary>
@@ -1220,7 +1307,8 @@ public sealed class TxAudioIngest : IDisposable
     private void OnMicPcmBytes(
         ReadOnlyMemory<byte> f32lePayload,
         MicBlockSource source,
-        MicBlockValidity? validity)
+        MicBlockValidity? validity,
+        bool processAir = true)
     {
         if (!IsCurrent(validity)) return;
         if (f32lePayload.Length != MicBlockBytes)
@@ -1264,6 +1352,7 @@ public sealed class TxAudioIngest : IDisposable
             samples[index] = BinaryPrimitives.ReadSingleLittleEndian(
                 bytes.Slice(index * sizeof(float), sizeof(float)));
         _productPluginAudio?.PublishTxMic(TxRateHz, samples);
+        if (!processAir) return; // ASIO fast path already sent these samples
         if (Volatile.Read(ref _productPluginInjectionActive) != 0)
         {
             lock (_sync) _droppedFrames++;
@@ -1342,6 +1431,7 @@ public sealed class TxAudioIngest : IDisposable
             lock (_sync)
             {
                 if (_accumulatorFill > 0) _accumulatorFill = 0;
+                _latencyGovernor.Reset();
                 if (_fmBurst.IsActive || _fmBurstBypassApplied) CancelFmToneBurstLocked(engine);
                 if (_lastSeenMox)
                 {
@@ -1392,7 +1482,11 @@ public sealed class TxAudioIngest : IDisposable
         // native mic so only TxTuneDriver drove it → clean).
         if (_txOwnedByTuneDriver())
         {
-            lock (_sync) _accumulatorFill = 0;
+            lock (_sync)
+            {
+                _accumulatorFill = 0;
+                _latencyGovernor.Reset();
+            }
             return;
         }
 
@@ -1416,7 +1510,7 @@ public sealed class TxAudioIngest : IDisposable
             && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable
             && ShouldSuppressIdleMonitorPreviewBlock(samples))
         {
-            samples = SilentMicBlock;
+            samples = SilentMicBlock.AsSpan(0, samples.Length);
         }
 
         lock (_sync)
@@ -1458,7 +1552,9 @@ public sealed class TxAudioIngest : IDisposable
 
             // Decode f32le into accumulator. WDSP wants -1..+1 range; browser
             // ships the same convention.
-            int need = MicBlockSamples;
+            // 960 for every 20 ms source; the driver buffer size on the ASIO
+            // fast path (OnHostMicSamplesFromMic).
+            int need = samples.Length;
             if (_accumulatorFill + need > _accumulator.Length)
             {
                 // Should only happen if BlockSamples grew unexpectedly. Treat
@@ -1468,8 +1564,8 @@ public sealed class TxAudioIngest : IDisposable
                 _droppedFrames++;
                 return;
             }
-            var incoming = _accumulator.AsSpan(_accumulatorFill, MicBlockSamples);
-            for (int i = 0; i < MicBlockSamples; i++)
+            var incoming = _accumulator.AsSpan(_accumulatorFill, need);
+            for (int i = 0; i < need; i++)
                 incoming[i] = DspPipelineService.SanitizeAudioSample(samples[i]);
 
             // Product audio is paced by the native 20 ms microphone cadence,
@@ -1479,7 +1575,11 @@ public sealed class TxAudioIngest : IDisposable
             // that processed speech after reblocking, preserving the existing
             // Product -> modem -> WDSP ordering. Linear ProductPlugin sources
             // continue to bypass the operator's Audio Suite when requested.
+            // Whole 20 ms blocks only: the chain aligns wet/dry by block count.
+            // A sub-block ASIO chunk (only possible for the <=20 ms before the
+            // fast path latches onto a newly-leased chain) passes through dry.
             if (_productAudio.Active
+                && need == MicBlockSamples
                 && (source != MicBlockSource.ProductPlugin
                     || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
             {
@@ -1490,8 +1590,32 @@ public sealed class TxAudioIngest : IDisposable
                 _accumulatorFill = 0;
                 return;
             }
-            _accumulatorFill += MicBlockSamples;
-            _totalMicSamples += MicBlockSamples;
+            // Keep live voice near real time: trim transport backlog by
+            // dropping silent 1 ms chunks between words. Operator speech only —
+            // digital, FreeDV, TCI/WAV/cable and plugin audio are timing-exact
+            // streams and pass through untouched.
+            int kept = need;
+            if (moxNow
+                && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic
+                && !_audioModem.Active
+                && _isVoiceTxMode())
+            {
+                _latencyGovernor.ObserveTransport(
+                    _txTransportLevel(),
+                    source == MicBlockSource.BrowserMic
+                        ? BrowserMicMinCushionSamples
+                        : TxLatencyGovernor.DefaultMinTargetSamples,
+                    need);
+                kept = _latencyGovernor.Compact(incoming);
+            }
+            else
+            {
+                // Unkeyed, or a timing-exact source/mode took over mid-over:
+                // no stale budget may carry into the next governed block.
+                _latencyGovernor.Reset();
+            }
+            _accumulatorFill += kept;
+            _totalMicSamples += need;
 
             while (_accumulatorFill >= blockSize)
             {
@@ -1613,9 +1737,13 @@ public sealed class TxAudioIngest : IDisposable
                     var now = DateTime.UtcNow;
                     if (now - _lastPeakLogUtc >= TimeSpan.FromSeconds(1))
                     {
+                        int floor = _latencyGovernor.LastFloorSamples;
                         _log.LogInformation(
-                            "tx.peaks blocks={Blocks} mic={Mic:F4} iq={Iq:F4}",
-                            _peakBlocksAccum, _peakMicAccum, _peakIqAccum);
+                            "tx.peaks blocks={Blocks} mic={Mic:F4} iq={Iq:F4} backlogFloorMs={FloorMs} cushionMs={CushionMs} overTrimMs={TrimMs}",
+                            _peakBlocksAccum, _peakMicAccum, _peakIqAccum,
+                            floor < 0 ? "n/a" : (floor / (double)TxLatencyGovernor.SamplesPerMs).ToString("F1", System.Globalization.CultureInfo.InvariantCulture),
+                            _latencyGovernor.TargetSamples / TxLatencyGovernor.SamplesPerMs,
+                            _latencyGovernor.DroppedSamples / TxLatencyGovernor.SamplesPerMs);
                         _lastPeakLogUtc = now;
                         _peakMicAccum = 0f;
                         _peakIqAccum = 0f;
@@ -1639,7 +1767,7 @@ public sealed class TxAudioIngest : IDisposable
     {
         float peak = 0f;
         double sumSquares = 0.0;
-        for (int i = 0; i < MicBlockSamples; i++)
+        for (int i = 0; i < samples.Length; i++)
         {
             float sample = samples[i];
             if (!float.IsFinite(sample)) sample = 0f;
@@ -1647,18 +1775,18 @@ public sealed class TxAudioIngest : IDisposable
             if (abs > peak) peak = abs;
             sumSquares += sample * sample;
         }
-        float rms = (float)Math.Sqrt(sumSquares / MicBlockSamples);
+        float rms = (float)Math.Sqrt(sumSquares / Math.Max(1, samples.Length));
 
         lock (_sync)
         {
             if (peak >= MonitorPreviewOpenPeak || rms >= MonitorPreviewOpenRms)
             {
-                _monitorPreviewHangBlocks = MonitorPreviewHangBlocks;
+                _monitorPreviewHangSamples = MonitorPreviewHangBlocks * MicBlockSamples;
                 return false;
             }
-            if (_monitorPreviewHangBlocks > 0)
+            if (_monitorPreviewHangSamples > 0)
             {
-                _monitorPreviewHangBlocks--;
+                _monitorPreviewHangSamples -= samples.Length;
                 return false;
             }
             return true;

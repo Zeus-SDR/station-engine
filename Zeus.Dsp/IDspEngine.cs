@@ -98,6 +98,17 @@ public interface IDspEngine : IDisposable
 
     /// <summary>Close a channel opened by <see cref="OpenRxDisplayChannel"/>.</summary>
     void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
+
+    /// <summary>
+    /// Mark an RX channel (opened by <see cref="OpenChannel"/>) as not the
+    /// operator's: the operator's manual notches (<see cref="SetNotches"/>)
+    /// and FM receive settings (<see cref="SetFmConfig"/>) are never applied
+    /// to it, and what they already set at open is reset to stock. Used for
+    /// Public Listening guest receivers. Operator channels are unaffected;
+    /// the mark ends when the channel closes. Engines without those chains
+    /// may no-op.
+    /// </summary>
+    void IsolateChannelFromOperatorSettings(int channelId) { }
     void FeedIq(int channelId, ReadOnlySpan<double> interleavedIqSamples);
     void SetMode(int channelId, RxMode mode);
     void SetFilter(int channelId, int lowHz, int highHz);
@@ -156,6 +167,12 @@ public interface IDspEngine : IDisposable
     /// Re-asserted on every mode change so a fresh stage picks up the
     /// operator's squelch. No-op on Synthetic.</summary>
     void SetSquelch(int channelId, SquelchConfig cfg);
+
+    /// <summary>Enable the channel-local CW audio peak filter.</summary>
+    void SetAudioPeakFilter(int channelId, bool enabled) { }
+
+    /// <summary>Apply a channel-local three-band receive equalizer, with gains in dB.</summary>
+    void SetReceiveEqualizer(int channelId, bool enabled, int preampDb, int lowDb, int midDb, int highDb) { }
 
     /// <summary>Apply the TX leveling config (Thetis parity §6.1-6.3). Drives
     /// the ALC (SetTXAALCMaxGain/Decay — the ALC run state is left ON and is
@@ -314,6 +331,20 @@ public interface IDspEngine : IDisposable
     /// false so its live keyed audio remains unchanged.</summary>
     void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex) =>
         SetMox(moxOn, stopRxForPureSignal);
+
+    /// <summary>Flip MOX while optionally leaving TX-suspended receive DSP paused
+    /// until the host's post-TX settle interval completes. Engines that do not
+    /// suspend receive processing may use the default immediate transition.</summary>
+    void SetMox(
+        bool moxOn,
+        bool stopRxForPureSignal,
+        bool stopRxForHalfDuplex,
+        bool deferRxResume) =>
+        SetMox(moxOn, stopRxForPureSignal, stopRxForHalfDuplex);
+
+    /// <summary>Resume any receive DSP deliberately left paused by a deferred MOX-off
+    /// transition. No-op for engines without a suspended receive chain.</summary>
+    void CompletePostTxRxResume() { }
 
     /// <summary>Raw RXA signal-strength meter in dBm (Thetis rxaMeterType.RXA_S_AV, idx 1).
     /// Returns a frozen −140 dBm from the synthetic engine. Safe to call from the

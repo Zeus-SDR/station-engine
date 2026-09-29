@@ -33,7 +33,8 @@ namespace Zeus.Server;
 ///   • operator opted in (RadioSpeakerSettingsStore.Enabled, default off)
 ///   • a Protocol-1 client is connected (so the ring is actually drained)
 ///   • the board has a codec (including an explicitly configured HL2+)
-///   • not transmitting (don't push TX-monitor audio to the radio speaker)
+///   • not transmitting (don't push TX-monitor audio to the radio speaker),
+///     except full-duplex (DUP) receive audio on its own lane
 ///   • the frame is the expected 48 kHz mono RX audio
 /// When any check fails the frame is dropped and the ring is left to drain to
 /// silence, so the wire reverts to byte-identical "no RX audio" behaviour.
@@ -65,6 +66,7 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         _muteState.Changed += OnMuteChanged;
         _radio.Connected += OnConnected;
         _radio.AudioFrontEndChanged += OnAudioFrontEndChanged;
+        _radio.MoxChanged += OnMoxChanged;
         UpdateCodecSpeaker();
     }
 
@@ -97,16 +99,68 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         }
         if (_radio.IsMox)
         {
-            // While transmitting, the EP2 L/R slots carry no audio (WriteUsbFrame
-            // only fills them during RX) and the TX-monitor frames arriving here
-            // are not for the radio speaker. Drop the buffer so unkey resumes from
-            // live RX rather than replaying the pre-key tail still in the ring.
+            // While transmitting, the ordinary lane (TX-monitor, suppressed
+            // silence) is not for the radio speaker; only the DUP lane below
+            // reaches the EP2 L/R slots. Drop the pre-key tail once, on the
+            // key-down edge, so receive resumes from live audio rather than
+            // replaying it — without wiping DUP audio queued during the over.
+            EnterKeyedInterval();
+            return;
+        }
+        _keyedIntervalEntered = false;
+        _ring.KeyedDrainArmed = false;
+        if (!_radio.AudioCapabilities.HasOnboardCodec) return;
+
+        _ring.Write(frame.Samples.Span);
+    }
+
+    // Full-duplex (DUP) receive audio. Outside MOX (the post-TX drain) it is
+    // ordinary receive audio. While keyed it keeps feeding the EP2 L/R slots,
+    // which ControlFrame fills during MOX whenever this ring holds samples.
+    public void PublishDuplexRx(in AudioFrame frame)
+    {
+        if (!_radio.IsMox)
+        {
+            Publish(in frame);
+            return;
+        }
+        WriteKeyedDuplexRx(in frame);
+    }
+
+    // MON + DUP: host outputs hear receive inside the TX-monitor mix, which the
+    // radio speaker never plays; this receive-only block keeps it audible here.
+    // Outside MOX the TX-monitor lane already reaches this sink via Publish.
+    public void PublishDuplexRxBesideTxMonitor(in AudioFrame frame)
+    {
+        if (_radio.IsMox) WriteKeyedDuplexRx(in frame);
+    }
+
+    private void WriteKeyedDuplexRx(in AudioFrame frame)
+    {
+        if (frame.Channels != 1 || frame.SampleRateHz != ExpectedSampleRateHz) return;
+        if (!_settings.Enabled) return;
+        if (!_radio.IsProtocol1Active) return;
+        if (_muteState.IsMuted)
+        {
             _ring.Clear();
             return;
         }
         if (!_radio.AudioCapabilities.HasOnboardCodec) return;
 
+        EnterKeyedInterval();
         _ring.Write(frame.Samples.Span);
+        _ring.KeyedDrainArmed = true;
+    }
+
+    // DSP tick thread only (every Publish* runs there), so a plain field is
+    // enough to turn "clear on every keyed frame" into "clear on key-down".
+    private bool _keyedIntervalEntered;
+
+    private void EnterKeyedInterval()
+    {
+        if (_keyedIntervalEntered) return;
+        _keyedIntervalEntered = true;
+        _ring.Clear();
     }
 
     private void OnSettingsChanged()
@@ -131,6 +185,11 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
                 && _radio.AudioCapabilities.HasOnboardCodec && _settings.Enabled;
     }
 
+    // Disarm the keyed L/R drain on both MOX edges, from the thread that flips
+    // MOX. Until the DSP tick's key-down clear runs and DUP audio re-arms it,
+    // keyed EP2 frames must not drain the pre-key receive tail.
+    private void OnMoxChanged(bool on) => _ring.KeyedDrainArmed = false;
+
     private void OnMuteChanged()
     {
         // Rising edge: drop the buffered tail so an unmute starts clean.
@@ -144,5 +203,6 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         _muteState.Changed -= OnMuteChanged;
         _radio.Connected -= OnConnected;
         _radio.AudioFrontEndChanged -= OnAudioFrontEndChanged;
+        _radio.MoxChanged -= OnMoxChanged;
     }
 }

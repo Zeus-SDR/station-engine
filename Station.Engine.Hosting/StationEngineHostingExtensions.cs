@@ -30,6 +30,19 @@ public static class StationEngineHostingExtensions
 
         services.AddHttpClient();
 
+        // LAN Browser proxy: StationEngine is the API origin reached by local
+        // attach, Product's LAN HTTPS facade, and the remote API tunnel. Keep
+        // redirects manual so LanProxyService can re-validate every hop.
+        services.AddHttpClient(LanProxyService.HttpClientName,
+                client => client.Timeout = TimeSpan.FromSeconds(15))
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AllowAutoRedirect = false,
+                ServerCertificateCustomValidationCallback =
+                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
+            });
+        services.AddSingleton<LanProxyService>();
+
         services.AddSingleton(provider => new StationEngineCapabilitiesService(
             provider.GetRequiredService<IConfiguration>(),
             options.LanHttpsUrls));
@@ -201,6 +214,9 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<RxAudioMuteState>();
 
         services.AddSingleton<StreamingHub>();
+        // Public Listening engine feed (ADR-0010). Lazy and inert: nothing is
+        // constructed or produced unless a host resolves IPublicListenFeed.
+        Zeus.Server.PublicListen.PublicListenFeedServiceCollectionExtensions.AddPublicListenFeed(services);
         services.AddSingleton<RadioService>();
         services.AddSingleton<RadioReclaimService>();
         services.AddSingleton<

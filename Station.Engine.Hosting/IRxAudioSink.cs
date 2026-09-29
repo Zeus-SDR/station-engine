@@ -60,4 +60,21 @@ public interface IRxAudioSink
     /// native PC audio overrides this to select its low-latency lane.
     /// </summary>
     void PublishTxMonitorExempt(in AudioFrame frame) => PublishExempt(in frame);
+
+    /// <summary>
+    /// Publish live receive audio that full duplex (DUP) carries through a
+    /// keyed interval and its post-TX drain. The default is the ordinary lane,
+    /// so host outputs are unchanged. Radio-speaker sinks, which reject the
+    /// ordinary lane while transmitting, override this so DUP stays audible on
+    /// the radio's own speaker/headphone jack.
+    /// </summary>
+    void PublishDuplexRx(in AudioFrame frame) => Publish(in frame);
+
+    /// <summary>
+    /// Publish the receive-only block of a MON + DUP tick. Host outputs already
+    /// hear this audio inside the TX-monitor mix, so the default is a no-op.
+    /// Radio-speaker sinks, which never play TX-monitor audio, override this so
+    /// receive stays audible on the radio while MON is on.
+    /// </summary>
+    void PublishDuplexRxBesideTxMonitor(in AudioFrame frame) { }
 }

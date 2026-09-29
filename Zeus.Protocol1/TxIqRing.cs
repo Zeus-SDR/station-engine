@@ -87,6 +87,10 @@ public sealed class TxIqRing : ITxIqSource
     private long _totalWritten;
     private long _totalRead;
     private long _dropped;
+    // Consumer found the ring empty after it had carried samples: the radio
+    // was fed silence mid-stream. Re-armed by the next Write, cleared by Clear.
+    private bool _hadData;
+    private long _underruns;
     // Rolling energy of the last-served IQ: |i| + |q|, decayed. Exposed via
     // /api/tx/diag as a "are we serving silence or real samples?" probe. A
     // keyed transmission producing real RF should show values in the 1000s
@@ -107,6 +111,7 @@ public sealed class TxIqRing : ITxIqSource
     public long TotalWritten { get { lock (_gate) return _totalWritten; } }
     public long TotalRead { get { lock (_gate) return _totalRead; } }
     public long Dropped { get { lock (_gate) return _dropped; } }
+    public long Underruns { get { lock (_gate) return _underruns; } }
     public double RecentMag { get { lock (_gate) return _recentMag; } }
 
     public bool WaitForEmpty(TimeSpan timeout)
@@ -149,6 +154,7 @@ public sealed class TxIqRing : ITxIqSource
                 else _dropped++;   // overwrote the oldest
             }
             _totalWritten += iqInterleaved.Length / 2;
+            if (iqInterleaved.Length > 0) _hadData = true;
         }
     }
 
@@ -163,6 +169,7 @@ public sealed class TxIqRing : ITxIqSource
         {
             _count = 0;
             _head = 0;
+            _hadData = false;
         }
     }
 
@@ -170,7 +177,15 @@ public sealed class TxIqRing : ITxIqSource
     {
         lock (_gate)
         {
-            if (_count == 0) return (0, 0);
+            if (_count == 0)
+            {
+                if (_hadData)
+                {
+                    _underruns++;
+                    _hadData = false;
+                }
+                return (0, 0);
+            }
             int tail = (_head - _count + _capacity) % _capacity;
             short i = _iBuf[tail];
             short q = _qBuf[tail];

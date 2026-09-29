@@ -195,6 +195,9 @@ public sealed class TxService
     internal static bool IsVoiceTxMode(RxMode mode) =>
         mode is RxMode.LSB or RxMode.USB or RxMode.AM or RxMode.SAM or RxMode.DSB or RxMode.FM;
 
+    /// <summary>Lock-free voice-mode check for the per-block mic hot path.</summary>
+    internal bool IsVoiceTxModeNow => IsVoiceTxMode(_radio.CurrentMode);
+
     public TxService(RadioService radio, DspPipelineService pipeline, StreamingHub hub, IBandPlanService bandPlan, ILogger<TxService> log)
         : this(radio, pipeline, hub, bandPlan, log, System.Diagnostics.Stopwatch.GetTimestamp)
     {

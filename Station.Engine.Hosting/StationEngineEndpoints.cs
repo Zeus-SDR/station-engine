@@ -179,6 +179,7 @@ public static class StationEngineEndpoints
         // it 404'd against a standalone engine in attach mode.
         endpoints.MapWindowsFirewallEndpoints();
         endpoints.MapStationEngineCapabilitiesEndpoint();
+        endpoints.MapLanProxyEndpoint();
         endpoints.MapGodsEyeEndpoints();
         endpoints.MapNativeAudioEndpoints();
         endpoints.MapRadioStateEndpoint();
@@ -267,6 +268,10 @@ public static class StationEngineEndpoints
         endpoints.MapEngineLogDiagnosticsEndpoint();
         endpoints.MapEngineRadioDiagnosticsEndpoint();
         endpoints.MapEngineOperatorDiagnosticsEndpoint();
+        // Public Listening for the Zeus Link product host (ADR-0010): private,
+        // token-gated loopback routes. The Desktop host keeps its in-process
+        // feed and never maps these.
+        PublicListen.PublicListenStationEndpoints.MapPublicListenStationEndpoints(endpoints);
 
         endpoints.Map(
             "/ws",
@@ -285,6 +290,24 @@ public static class StationEngineEndpoints
         if (!context.WebSockets.IsWebSocketRequest)
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+
+        // ?feed=listener is the product host's Public Listening feed: a
+        // restricted, token-gated loopback socket that is never an operator
+        // client (it never joins StreamingHub._clients). Any other feed value
+        // is refused rather than falling through to an operator session.
+        if (PublicListen.PublicListenStationEndpoints.IsFeedSocketRequest(context.Request))
+        {
+            if (context.Request.Query["feed"] is { Count: 1 } feed
+                && string.Equals(feed[0], "listener", StringComparison.Ordinal))
+            {
+                await PublicListen.PublicListenStationEndpoints.HandleFeedSocketAsync(context).ConfigureAwait(false);
+            }
+            else
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            }
             return;
         }
 

@@ -507,5 +507,10 @@ public partial class Program
 
         var bandPlan = app.Services.GetRequiredService<BandPlanService>();
         bandPlan.PlanChanged += () => hub.BroadcastBandPlanChanged(bandPlan.CurrentRegion.Id);
+
+        // Public Listening (ADR-0010): the Zeus Link product host reaches the
+        // feed only over the loopback feed socket, so construct it here to
+        // install the hub tap. It produces nothing until a listener demands it.
+        Zeus.Server.PublicListen.PublicListenFeedServiceCollectionExtensions.ActivatePublicListenFeed(app.Services);
     }
 }

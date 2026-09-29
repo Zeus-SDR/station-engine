@@ -284,6 +284,23 @@ public sealed class StreamingHub
 
     public bool DisplayStreamRequested => Volatile.Read(ref _displayStreamRequests) > 0;
 
+    // Public Listening (ADR-0010) producer hook. Deliberately NOT an entry in
+    // _clients: listeners never receive operator frames, never count towards
+    // ClientCount, and never influence LastClientDisconnected.
+    private PublicListen.IListenerFeedTap? _listenerTap;
+
+    internal PublicListen.IListenerFeedTap? ListenerTap => Volatile.Read(ref _listenerTap);
+
+    internal void SetListenerTap(PublicListen.IListenerFeedTap? tap) => Volatile.Write(ref _listenerTap, tap);
+
+    /// <summary>
+    /// True when RX1 display frames must be produced at all: an operator
+    /// client wants them, or a public listener wants the operator view. What
+    /// operator clients receive is still gated by <see cref="DisplayStreamRequested"/>.
+    /// </summary>
+    public bool DisplayProductionRequested =>
+        DisplayStreamRequested || Volatile.Read(ref _listenerTap) is { WantsOperatorView: true };
+
     internal int DisplaySubscriberCount => Volatile.Read(ref _displayStreamRequests);
 
     internal int PreferredDisplaySubscriberCount => Volatile.Read(ref _preferredDisplayStreamRequests);
@@ -843,6 +860,15 @@ public sealed class StreamingHub
         // receiver routing before enqueueing them.
         if (payload[0] == (byte)MsgType.DisplayFrame)
         {
+            // Listener tap first, before any operator-demand early return: the
+            // tap gets the RX1 row only and never touches the operator fan-out.
+            if (payload.Length > WireFormat.HeaderSize
+                && payload[WireFormat.HeaderSize] == 0
+                && Volatile.Read(ref _listenerTap) is { WantsOperatorView: true } tap)
+            {
+                try { tap.OfferDisplayFrameBytes(payload); }
+                catch (Exception ex) { _log.LogDebug(ex, "listener feed tap threw (product display)"); }
+            }
             if (!DisplayStreamRequested || payload.Length <= WireFormat.HeaderSize) return;
             byte frameRxId = payload[WireFormat.HeaderSize];
             bool preferredDisplayRequested = Volatile.Read(ref _preferredDisplayStreamRequests) > 0;
@@ -878,6 +904,14 @@ public sealed class StreamingHub
 
     public void Broadcast(in DisplayFrame frame)
     {
+        // Listener tap first (RX1 only), before the operator-demand early return,
+        // so listeners are served when no operator panadapter is mounted.
+        if (frame.RxId == 0 && Volatile.Read(ref _listenerTap) is { WantsOperatorView: true } tap)
+        {
+            try { tap.OfferDisplayFrame(in frame); }
+            catch (Exception ex) { _log.LogDebug(ex, "listener feed tap threw (display)"); }
+        }
+
         if (!DisplayStreamRequested) return;
 
         int total = frame.TotalByteLength;

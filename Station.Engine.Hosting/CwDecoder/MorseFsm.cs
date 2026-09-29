@@ -38,6 +38,13 @@ internal sealed class MorseFsm
     private const int PendingCapacity = 128;
     // Below this, a lone E, T, or I between word gaps is noise, not a letter.
     private const double FragileSnrDb = 8.0;
+    // Any lone character this unsure on a weak tone, with a word gap on both
+    // sides, is a wrong fit on noise between overs. A real one-letter word
+    // (R, K, 5) fits its timing and scores well above this. On a clean tone
+    // low confidence means the clock is not known yet (a cold 5 WPM dah), not
+    // noise, and an unknown character a clean sender keyed is worth seeing.
+    private const float LoneConfidenceFloor = 0.2f;
+    private const double LoneConfidenceSnrDb = 12.0;
     // A locked dah longer than this is not the fist we locked. It may be a
     // slower sender, or one piece of carrier.
     private const double LongMarkDits = 6.0;
@@ -241,9 +248,9 @@ internal sealed class MorseFsm
     /// Close what is still open and hand it out, one symbol per call. The
     /// operator has moved to another station, so no later gap will end it.
     /// Marks still buffered before the dit locked are replayed on the
-    /// current estimate, then the open character is decoded. A lone E, T,
-    /// or I on a weak tone ends its word here and is dropped, as a word
-    /// gap would drop it. Returns false once nothing is left.
+    /// current estimate, then the open character is decoded. A lone
+    /// character <see cref="HoldsAlone"/> would hold ends its word here and is
+    /// dropped, as a word gap would drop it. Returns false once nothing is left.
     /// </summary>
     internal bool TryFlush(out MorseDecodedSymbol symbol)
     {
@@ -260,7 +267,7 @@ internal sealed class MorseFsm
             float confidence = ConfidenceFor(text);
             ClearPartial();
             _letterEmitted = true;
-            if (!(IsFragile(text) && _snrDb < FragileSnrDb && _charsInWord == 0))
+            if (!HoldsAlone(text, confidence))
             {
                 Enqueue(text, confidence);
                 _charsInWord++;
@@ -651,7 +658,7 @@ internal sealed class MorseFsm
             float confidence = ConfidenceFor(text);
             ClearPartial();
             _letterEmitted = true;
-            if (IsFragile(text) && _snrDb < FragileSnrDb && _charsInWord == 0)
+            if (HoldsAlone(text, confidence))
                 _held = new MorseDecodedSymbol(text, confidence);
             else
             {
@@ -668,7 +675,7 @@ internal sealed class MorseFsm
             _wordEmitted = true;
             if (_held is not null)
             {
-                // Lone E/T/I with a word gap on both sides, and a weak tone.
+                // A held lone character with a word gap on both sides.
                 _held = null;
                 _charsInWord = 0;
                 return;
@@ -750,4 +757,14 @@ internal sealed class MorseFsm
 
     private static bool IsFragile(string text) =>
         text is "E" or "T" or "I";
+
+    /// <summary>
+    /// The first character of a word that prints only if another character
+    /// joins it: a lone E, T, or I on a weak tone, or any character on a weak
+    /// tone decoded with less than <see cref="LoneConfidenceFloor"/> confidence.
+    /// </summary>
+    private bool HoldsAlone(string text, float confidence) =>
+        _charsInWord == 0
+        && ((IsFragile(text) && _snrDb < FragileSnrDb)
+            || (confidence < LoneConfidenceFloor && _snrDb < LoneConfidenceSnrDb));
 }

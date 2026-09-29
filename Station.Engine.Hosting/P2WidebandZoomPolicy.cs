@@ -118,15 +118,27 @@ internal static class P2WidebandZoomPolicy
         int extraReceiverCount,
         int sampleRateHz,
         long targetCenterHz,
-        double requestedSpanHz)
+        double requestedSpanHz,
+        int guestDdcCount = 0)
     {
-        // The hidden stream must extend the already-contiguous user run. RX2's
-        // DDC counts as occupied when diversity is consuming it even though the
-        // RX2 UI is off; extras are only valid behind a visible RX2.
-        int occupied = 1;
-        if (rx2Enabled || diversitySourceEnabled) occupied++;
-        if (rx2Enabled) occupied += Math.Max(0, extraReceiverCount);
-        int candidate = baseDdc + occupied;
+        // The hidden stream must extend the already-contiguous user run, which
+        // is exactly the run the protocol client composes
+        // (Protocol2Client.OperatorDdcRunLength): extras put RX2's DDC on the
+        // wire even with RX2 hidden, and the synchronized diversity pair lives
+        // on DDC0/1 outside the run, so diversity occupies nothing here.
+        //
+        // Public-listening guest DDCs sit directly behind the operator run and
+        // always yield to the display DDC: at most GuestDdcCapacityBehind(true)
+        // of them are counted (the client never places more), so guest
+        // presence can never make the detail source unavailable.
+        _ = diversitySourceEnabled;
+        int firstFree = Zeus.Protocol2.Protocol2Client.FirstFreeOperatorDdc(
+            baseDdc, rx2Enabled, Math.Max(0, extraReceiverCount));
+        int guests = Math.Clamp(
+            guestDdcCount,
+            0,
+            Zeus.Protocol2.Protocol2Client.GuestDdcCapacityBehind(firstFree, displayDdcWanted: true));
+        int candidate = firstFree + guests;
         if (candidate is >= 2 and < Zeus.Protocol2.Protocol2Client.MaxRxDdc)
         {
             return new P2WidebandDetailSource(

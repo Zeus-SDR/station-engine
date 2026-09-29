@@ -25,7 +25,8 @@ public static class StationAccessTokenAuthorization
             // it fails closed when no launcher token was provisioned.
             return app.Use(async (context, next) =>
             {
-                if (IsContributionPath(context.Request.Path))
+                if (IsContributionPath(context.Request.Path)
+                    || IsPublicListenFeedRequest(context.Request))
                 {
                     context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                     context.Response.Headers.WWWAuthenticate = "Bearer";
@@ -86,8 +87,21 @@ public static class StationAccessTokenAuthorization
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(
                 "/api/tdoa/contribution",
-                StringComparison.OrdinalIgnoreCase);
+                StringComparison.OrdinalIgnoreCase)
+            || IsPublicListenFeedRequest(request);
     }
+
+    /// <summary>
+    /// The Zeus Link Public Listening seam: <c>/api/station/public-listen/*</c>
+    /// and the <c>/ws?feed=…</c> listener feed socket. Product-host only, so,
+    /// like the contribution adapter, it fails closed without a launcher token.
+    /// </summary>
+    private static bool IsPublicListenFeedRequest(HttpRequest request) =>
+        request.Path.StartsWithSegments(
+            "/api/station/public-listen",
+            StringComparison.OrdinalIgnoreCase)
+        || (request.Path.Equals("/ws", StringComparison.OrdinalIgnoreCase)
+            && request.Query.ContainsKey("feed"));
 
     private static bool IsContributionPath(PathString path) =>
         path.StartsWithSegments("/api/tdoa/contribution", StringComparison.OrdinalIgnoreCase)

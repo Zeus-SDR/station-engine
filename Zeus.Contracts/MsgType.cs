@@ -364,4 +364,28 @@ public enum MsgType : byte
     // unknown types, so an older build drops the frame and keeps polling.
     // See CwSettingsFrame.cs.
     CwSettings = 0x40,
+
+    // ---- Public Listening (ADR-0010, docs/designs/public-listening.md) ----
+    // These frames flow ONLY on the listener feed (engine → host) and the
+    // listener WebRTC session (host → anonymous listener). They are never
+    // broadcast to operator /ws clients, and operator frames are never
+    // forwarded to listeners.
+
+    // Host → engine, listener feed socket only. Union of what the connected
+    // listeners want. Payload: [type:1][flags:u8] (ListenerFeedDemandFlags).
+    ListenerFeedDemand = 0x28,
+
+    // Engine → host → listener. Quantized u8 spectrum/waterfall row. Standard
+    // 16-byte header + 24-byte body header + u8 codes. See PublicSpectrumFrame.cs.
+    PublicSpectrum = 0x41,
+
+    // Engine → host → listener. Standard 16-byte header + UTF-8 JSON
+    // PublicStationStatusDto (camelCase). At most 2 Hz and on change.
+    PublicStationStatus = 0x42,
+
+    // Engine → host only. Same body layout as AudioPcm (0x02) with RxId
+    // carrying the PublicStreamId; a distinct type byte so an operator
+    // browser can never play it and the listener fan-out can never accept
+    // an operator 0x02 frame. The host Opus-encodes it for the listener track.
+    PublicAudioPcm = 0x43,
 }

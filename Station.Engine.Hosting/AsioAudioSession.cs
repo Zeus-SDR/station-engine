@@ -226,6 +226,7 @@ internal sealed class AsioAudioSession : IAsioSession
     private bool _started;
     private bool _disposed;
     private AsioSessionRuntime _runtime;
+    private int _hostBlockOwner;
 
     public event Action? RecoveryRequested;
 
@@ -259,6 +260,10 @@ internal sealed class AsioAudioSession : IAsioSession
             throw new InvalidOperationException(error);
         }
         _runtime = ReadRuntime();
+        // Realtime TX: hand the mic to the TX chain at the driver's buffer
+        // cadence rather than re-assembling 20 ms blocks.
+        if (config.EnableInput && _mic is not null)
+            _hostBlockOwner = _mic.SetHostBlockSamples(_runtime.BufferFrames);
     }
 
     public AsioSessionRuntime Runtime
@@ -472,6 +477,7 @@ internal sealed class AsioAudioSession : IAsioSession
         Exception? stopError = null;
         try { Stop(); }
         catch (Exception ex) { stopError = ex; }
+        if (_config.EnableInput) _mic?.ReleaseHostBlockSamples(_hostBlockOwner);
         lock (_lifecycleSync)
         {
             // A timed-out pump still owns the native handle. Quarantine it

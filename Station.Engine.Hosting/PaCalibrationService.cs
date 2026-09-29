@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Diagnostics;
 using System.Threading.Channels;
 using Zeus.Contracts;
 
@@ -17,6 +18,32 @@ public sealed record PaCalibrationStatus(
     string? Message);
 
 /// <summary>
+/// Timing knobs for the calibration controller. Production uses
+/// <see cref="Default"/>; tests shrink them so a full eleven-band run stays
+/// fast without changing the control logic.
+/// </summary>
+internal sealed record PaCalibrationTiming(
+    TimeSpan MinimumSettle,
+    TimeSpan PlateauSampleSpacing,
+    TimeSpan ResponseTimeout,
+    TimeSpan FloorResponseTimeout,
+    TimeSpan PlateauTimeout,
+    TimeSpan QuietSilence,
+    TimeSpan QuietTimeout,
+    TimeSpan TargetPause)
+{
+    public static PaCalibrationTiming Default { get; } = new(
+        MinimumSettle: TimeSpan.FromMilliseconds(300),
+        PlateauSampleSpacing: TimeSpan.FromMilliseconds(60),
+        ResponseTimeout: TimeSpan.FromSeconds(4),
+        FloorResponseTimeout: TimeSpan.FromSeconds(1),
+        PlateauTimeout: TimeSpan.FromSeconds(10),
+        QuietSilence: TimeSpan.FromSeconds(1),
+        QuietTimeout: TimeSpan.FromSeconds(15),
+        TargetPause: TimeSpan.FromMilliseconds(250));
+}
+
+/// <summary>
 /// Owns the RF-sensitive, single-flight PA calibration sequence. Calibration
 /// values live in PaSettingsStore's transient overlay and become durable only
 /// after every band and target converges.
@@ -25,18 +52,40 @@ public sealed class PaCalibrationService
 {
     private static readonly int[] TargetsWatts = [10, 25, 50];
     internal const double CalibrationToleranceFraction = 0.10d;
-    // Full-byte PA gain is attenuation: 70 dB is the least-drive value the
-    // encoder accepts. Each target must approach from here because neither a
-    // persisted seed nor the preceding target proves the PA's response.
-    private const double ConservativeStartGainDb = 70d;
+    // Converge tighter than the acceptance tolerance when the drive byte can
+    // resolve it; the 10% band is only the floor when trims stop helping.
+    internal const double FineToleranceFraction = 0.03d;
+    private const int MaxFineTrims = 2;
+    // Full-byte PA gain is attenuation. Every target restarts here and works
+    // down, because neither a persisted seed nor the preceding target proves
+    // the PA's response. The highest shipped seed is ~51 dB (Saturn/G2), so
+    // the first carrier lands at least ~9 dB under target; Hermes-class seeds
+    // (38.8-41.3 dB) start ~20 dB under, near the meter floor, and climb
+    // through FloorResponseTimeout-paced 1 dB steps until measurable.
+    internal const double ConservativeStartGainDb = 60d;
     private const double MinimumMeasurableWatts = 0.1d;
-    // A 1 dB output-raising correction changes ideal power by only ~26%.
-    // Real PA/meter paths are not linear across a large gain change, so this
-    // deliberately slow ramp prevents a low reading from commanding a leap
-    // past the configured safety limit.
+    // Output-raising steps stay small. A 1 dB step changes ideal power by only
+    // ~26%; a larger step is allowed only while a verified reading shows the
+    // PA is still far enough below target that the step cannot land within
+    // 3 dB of it.
     internal const double MaxGainAdjustmentDb = 1d;
-    private const int AdjustmentSampleCount = 3;
-    private static readonly TimeSpan AdjustmentSampleSpacing = TimeSpan.FromMilliseconds(75);
+    internal const double MaxCoarseGainAdjustmentDb = 3d;
+    private const double CoarseStepMarginDb = 3d;
+    private const int MaxAdjustmentsPerTarget = 40;
+    private const int PlateauSampleCount = 4;
+    private const double PlateauSpreadFraction = 0.06d;
+    private const double PlateauSpreadFloorWatts = 0.05d;
+    // Forward power below this after unkey counts as "carrier gone".
+    private const double QuietWatts = 0.5d;
+    private const int QuietSampleCount = 3;
+    private static readonly TimeSpan InvariantCheckInterval = TimeSpan.FromMilliseconds(50);
+    // Status/invariant refresh cadence on the consumer side, so a telemetry
+    // flood does not cost a StateDto projection per sample.
+    private static readonly TimeSpan ConsumerRefreshInterval = TimeSpan.FromMilliseconds(50);
+    // Monotonic: deadlines that keep RF keyed must not follow wall-clock
+    // steps (NTP on RTC-less Pi / CM5 hosts).
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+    private readonly PaCalibrationTiming _timing;
     private readonly RadioService _radio;
     private readonly TxService _tx;
     private readonly TxMetersService _meters;
@@ -48,10 +97,16 @@ public sealed class PaCalibrationService
     private CancellationTokenSource? _runCancellation;
     private PaCalibrationStatus _status = IdleStatus();
     private double? _armedSafetyTargetWatts;
+    private bool _armedSixMeters;
     private long? _expectedTxFrequencyHz;
     private RxMode? _expectedMode;
     private string? _safetyTripMessage;
     private string? _externalStateChangeMessage;
+    // Longest observed delay between a change and the meter showing it, for
+    // the current run. Response windows scale with it so telemetry that
+    // trails the radio by more than the configured window still cannot make
+    // the controller accept a stale plateau as current. Run task only.
+    private TimeSpan _observedLatency;
 
     public PaCalibrationService(
         RadioService radio,
@@ -61,7 +116,21 @@ public sealed class PaCalibrationService
         PaSettingsStore pa,
         IBandPlanService bandPlan,
         ILogger<PaCalibrationService> log)
+        : this(radio, tx, meters, pipeline, pa, bandPlan, log, PaCalibrationTiming.Default)
     {
+    }
+
+    internal PaCalibrationService(
+        RadioService radio,
+        TxService tx,
+        TxMetersService meters,
+        DspPipelineService pipeline,
+        PaSettingsStore pa,
+        IBandPlanService bandPlan,
+        ILogger<PaCalibrationService> log,
+        PaCalibrationTiming timing)
+    {
+        _timing = timing;
         _radio = radio;
         _tx = tx;
         _meters = meters;
@@ -190,6 +259,13 @@ public sealed class PaCalibrationService
             return "Enable the PA before starting calibration.";
         if (settings.Global.PaMaxPowerWatts < 50)
             return "Rated PA output must be at least 50 W.";
+        // The drive MAX ceiling clamps TUN drive at the final TX seam. If it
+        // sits below the highest target, the drive math aims at less power
+        // than the controller is converging on and the recorded gain is wrong.
+        int requiredDrivePct = TunePercentFor(
+            TargetsWatts[^1], settings.Global.PaMaxPowerWatts);
+        if (state.DriveMaxPct < requiredDrivePct)
+            return $"Raise the drive MAX limit to at least {requiredDrivePct}% so calibration can reach {TargetsWatts[^1]} W.";
 
         if (settings.Bands.Any(b => b.DisablePa))
             return "Enable the PA on every band before starting calibration.";
@@ -211,6 +287,11 @@ public sealed class PaCalibrationService
         int currentTune = originalTune;
         long expectedVfoHz = originalState.VfoHz;
         RxMode expectedMode = originalState.Mode;
+        // Board and variant are run invariants, so the meter calibration is
+        // resolved once instead of on every telemetry packet.
+        RadioCalibration calibration = RadioCalibrations.For(
+            invariant.Board, invariant.Variant);
+        long lastInvariantCheckMs = 0;
         var samples = Channel.CreateBounded<ForwardPowerSample>(
             new BoundedChannelOptions(64)
             {
@@ -219,51 +300,38 @@ public sealed class PaCalibrationService
                 FullMode = BoundedChannelFullMode.DropOldest,
             });
 
+        // Runs on the radio RX thread for every forward-power packet. At high
+        // power a G2 sends a hi-priority status packet on every ADC-overload
+        // event (thousands per second, P2_app OutHighPriority.c), and that
+        // thread also carries RX IQ. Keep the per-packet work to the over-power
+        // check; the state-invariant check needs a full StateDto projection
+        // and is rate-limited.
         void OnRawPower(ushort forwardAdc, ushort reflectedAdc)
         {
-            StateDto snap = _radio.Snapshot();
-            long txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(snap);
-            RadioCalibration calibration = RadioCalibrations.For(
-                _radio.ConnectedBoardKind,
-                _radio.EffectiveOrionMkIIVariant);
-            bool sixMeters = BandUtils.FreqToBand(txFrequencyHz) == "6m";
+            double? armedTarget;
+            bool sixMeters;
+            lock (_sync)
+            {
+                armedTarget = _armedSafetyTargetWatts;
+                sixMeters = _armedSixMeters;
+            }
             var (forwardWatts, _, _) = TxMetersService.ComputeMeters(
                 forwardAdc, reflectedAdc, calibration, sixMeters);
 
             string? trip = null;
+            long nowMs = Environment.TickCount64;
+            if (armedTarget is not null &&
+                nowMs - Interlocked.Read(ref lastInvariantCheckMs) >=
+                    (long)InvariantCheckInterval.TotalMilliseconds)
+            {
+                Interlocked.Exchange(ref lastInvariantCheckMs, nowMs);
+                trip = CheckExternalStateChange(invariant);
+            }
+
             lock (_sync)
             {
-                bool calibrationOwnsTun = _tx.TunOwner == MoxSource.Analyzer;
-                string? invariantError = CalibrationInvariantError(
-                    snap,
-                    _expectedTxFrequencyHz,
-                    _expectedMode,
-                    invariant);
-                if (_armedSafetyTargetWatts is not null &&
-                    invariantError is not null &&
-                    _externalStateChangeMessage is null)
-                {
-                    trip = invariantError;
-                    _externalStateChangeMessage = trip;
-                }
-                if (_armedSafetyTargetWatts is not null &&
-                    _tx.IsTunOn &&
-                    !calibrationOwnsTun &&
-                    _externalStateChangeMessage is null)
-                {
-                    _externalStateChangeMessage =
-                        "PA calibration stopped because TUN ownership changed outside calibration.";
-                }
-                if (_armedSafetyTargetWatts is not null &&
-                    calibrationOwnsTun &&
-                    (_expectedTxFrequencyHz != txFrequencyHz || _expectedMode != snap.Mode) &&
-                    _externalStateChangeMessage is null)
-                {
-                    trip = "PA calibration stopped because the transmit frequency or mode changed outside calibration.";
-                    _externalStateChangeMessage = trip;
-                }
                 if (_armedSafetyTargetWatts is double target &&
-                    calibrationOwnsTun &&
+                    _tx.TunOwner == MoxSource.Analyzer &&
                     IsOverPower(
                         forwardWatts,
                         target,
@@ -271,9 +339,8 @@ public sealed class PaCalibrationService
                         ratedOutputWatts) &&
                     _safetyTripMessage is null)
                 {
-                    double limit = SafetyLimitWatts(
-                        target, safetyPercent, ratedOutputWatts);
-                    trip = $"Safety stop: measured {forwardWatts:0.0} W exceeds the {limit:0.0} W limit ({safetyPercent}% of the {target:0.0} W target, capped at {ratedOutputWatts:0.0} W rated output).";
+                    trip = SafetyStopMessage(
+                        forwardWatts, target, safetyPercent, ratedOutputWatts);
                     _safetyTripMessage = trip;
                 }
             }
@@ -281,9 +348,17 @@ public sealed class PaCalibrationService
             if (trip is not null)
                 _tx.TrySetTun(false, MoxSource.UI, out _);
             samples.Writer.TryWrite(new ForwardPowerSample(
-                (float)forwardWatts, DateTimeOffset.UtcNow));
+                (float)forwardWatts, Clock.Elapsed));
         }
 
+        // Trips latch for the whole run: re-arming for the next band or
+        // target must never clear a trip that has not been acted on yet.
+        lock (_sync)
+        {
+            _safetyTripMessage = null;
+            _externalStateChangeMessage = null;
+        }
+        _observedLatency = TimeSpan.Zero;
         _meters.RawPowerTelemetryUpdated += OnRawPower;
         try
         {
@@ -297,6 +372,7 @@ public sealed class PaCalibrationService
             foreach (string band in BandUtils.HfBands)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                ThrowIfCalibrationAborted();
                 EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
                 CalibrationPoint point = frequencies[band];
                 // Apply the mode BEFORE pinning the exact VFO. Entering CW
@@ -315,15 +391,17 @@ public sealed class PaCalibrationService
                 _pa.SetCalibrationGain(band, ConservativeStartGainDb);
 
                 int firstTargetWatts = TargetsWatts[0];
-                int firstTunePct = Math.Clamp(
-                    (int)Math.Round(firstTargetWatts * 100d /
-                        originalSettings.Global.PaMaxPowerWatts), 1, 100);
+                int firstTunePct = TunePercentFor(firstTargetWatts, ratedOutputWatts);
                 if (!_radio.SetPaCalibrationTuneDriveIfCurrent(firstTunePct, currentTune))
                     throw new ExternalCalibrationStateChangedException(
                         "PA calibration stopped because TUN power changed outside calibration.");
                 currentTune = _radio.Snapshot().TunePct;
                 while (samples.Reader.TryRead(out _)) { }
-                ArmSafetyTarget(firstTargetWatts, expectedVfoHz, expectedMode);
+                ArmSafetyTarget(
+                    CommandedWatts(ratedOutputWatts, currentTune),
+                    expectedVfoHz,
+                    expectedMode);
+                ThrowIfCalibrationAborted();
                 Update("running", band, firstTargetWatts, null, completed,
                     $"Keying TUN for {band}; calibrating the shared band gain at {firstTargetWatts:0.0} W");
 
@@ -335,6 +413,11 @@ public sealed class PaCalibrationService
                     throw new InvalidOperationException(keyError ?? "TUN was refused.");
                 }
 
+                // The last plateau the controller trusted, and the drive model
+                // (commanded watts × gain) that produced it. Unknown right
+                // after key-up.
+                Plateau? previous = null;
+                double lastCommandedWatts = 0d;
                 try
                 {
                     foreach (int targetWatts in TargetsWatts)
@@ -348,30 +431,37 @@ public sealed class PaCalibrationService
                             // before raising TUN drive. The PA response between targets
                             // is not necessarily linear, so the preceding gain does not
                             // prove that the nominal higher drive is safe.
-                            ArmSafetyTarget(targetWatts, expectedVfoHz, expectedMode);
+                            int requestedTunePct = TunePercentFor(targetWatts, ratedOutputWatts);
+                            ArmSafetyTarget(
+                                CommandedWatts(ratedOutputWatts, requestedTunePct),
+                                expectedVfoHz,
+                                expectedMode);
                             _pa.SetCalibrationGain(band, ConservativeStartGainDb);
-                            int requestedTunePct = Math.Clamp(
-                                (int)Math.Round(targetWatts * 100d /
-                                    originalSettings.Global.PaMaxPowerWatts), 1, 100);
                             if (!_radio.SetPaCalibrationTuneDriveIfCurrent(requestedTunePct, currentTune))
                                 throw new ExternalCalibrationStateChangedException(
                                     "PA calibration stopped because TUN power changed outside calibration.");
                             currentTune = _radio.Snapshot().TunePct;
+                            ArmSafetyTarget(
+                                CommandedWatts(ratedOutputWatts, currentTune),
+                                expectedVfoHz,
+                                expectedMode);
                             while (samples.Reader.TryRead(out _)) { }
                             Update("running", band, targetWatts, null, completed,
                                 $"Calibrating {band} shared gain at {targetWatts:0.0} W");
                         }
 
-                        await ConvergeAsync(
-                            band, targetWatts, completed,
+                        lastCommandedWatts = CommandedWatts(ratedOutputWatts, currentTune);
+                        previous = await ConvergeAsync(
+                            band,
+                            targetWatts,
+                            currentTune,
+                            previous,
+                            completed,
                             expectedVfoHz, expectedMode,
                             invariant,
                             safetyPercent,
                             ratedOutputWatts,
                             samples.Reader,
-                            firstTarget
-                                ? TimeSpan.FromMilliseconds(700)
-                                : TimeSpan.FromMilliseconds(350),
                             cancellationToken).ConfigureAwait(false);
 
                         _pa.CaptureCalibrationGain(
@@ -382,9 +472,9 @@ public sealed class PaCalibrationService
                             originalSettings.Global.PaMaxPowerWatts);
 
                         completed++;
-                        Update("running", band, targetWatts, null, completed,
+                        Update("running", band, targetWatts, (float)previous.Watts, completed,
                             $"{band} {targetWatts:0.0} W complete");
-                        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                        await Task.Delay(_timing.TargetPause, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 finally
@@ -392,6 +482,26 @@ public sealed class PaCalibrationService
                     _tx.TrySetPaCalibrationTun(false, out _);
                     ArmSafetyTarget(null);
                 }
+                ThrowIfCalibrationAborted();
+                if (_tx.IsTunOn)
+                    throw new InvalidOperationException(
+                        $"TUN did not release after calibrating {band}.");
+
+                // Forward-power telemetry can trail the radio (a backlog of
+                // status packets on the shared RX thread). Readings from this
+                // band's highest target must not arrive after the next band has
+                // armed its lower limit, so wait until the meter shows the
+                // carrier gone. A late over-limit reading still fails the run.
+                Update("running", band, TargetsWatts[^1], null, completed,
+                    $"Waiting for {band} forward power to clear");
+                await WaitForCarrierClearAsync(
+                    band,
+                    lastCommandedWatts,
+                    safetyPercent,
+                    ratedOutputWatts,
+                    samples.Reader,
+                    cancellationToken).ConfigureAwait(false);
+                ThrowIfCalibrationAborted();
             }
 
             ThrowIfCalibrationAborted();
@@ -472,9 +582,61 @@ public sealed class PaCalibrationService
         }
     }
 
-    private async Task ConvergeAsync(
+    // Rate-limited external-interference check for the RX-thread handler.
+    // Returns the trip message the first time an invariant breaks.
+    private string? CheckExternalStateChange(RunInvariant invariant)
+    {
+        StateDto snap = _radio.Snapshot();
+        long txFrequencyHz = RadioFrequencyResolver.TxFrequencyHz(snap);
+        lock (_sync)
+        {
+            if (_armedSafetyTargetWatts is null || _externalStateChangeMessage is not null)
+                return null;
+            bool calibrationOwnsTun = _tx.TunOwner == MoxSource.Analyzer;
+            string? invariantError = CalibrationInvariantError(
+                snap,
+                _expectedTxFrequencyHz,
+                _expectedMode,
+                invariant);
+            if (invariantError is not null)
+            {
+                _externalStateChangeMessage = invariantError;
+                return invariantError;
+            }
+            if (_tx.IsTunOn && !calibrationOwnsTun)
+            {
+                // Not a trip: TUN belongs to someone else, so calibration must
+                // not release it, only stop.
+                _externalStateChangeMessage =
+                    "PA calibration stopped because TUN ownership changed outside calibration.";
+                return null;
+            }
+            if (calibrationOwnsTun &&
+                (_expectedTxFrequencyHz != txFrequencyHz || _expectedMode != snap.Mode))
+            {
+                _externalStateChangeMessage =
+                    "PA calibration stopped because the transmit frequency or mode changed outside calibration.";
+                return _externalStateChangeMessage;
+            }
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Drives one band/target to convergence with at most one gain change in
+    /// flight. After each change the controller waits until the meter shows
+    /// a stable plateau that reflects that change (the reading must move in
+    /// the direction and by at least half the size the drive bytes predict)
+    /// before it decides the next step. Telemetry that trails the radio,
+    /// which happens at high power when status packets back up on the RX
+    /// thread, therefore delays calibration instead of letting the controller
+    /// keep stepping on stale readings and overshoot.
+    /// </summary>
+    private async Task<Plateau> ConvergeAsync(
         string band,
-        double targetWatts,
+        int nominalTargetWatts,
+        int tunePct,
+        Plateau? previous,
         int completed,
         long expectedVfoHz,
         RxMode expectedMode,
@@ -482,119 +644,313 @@ public sealed class PaCalibrationService
         int safetyPercent,
         double ratedOutputWatts,
         ChannelReader<ForwardPowerSample> samples,
-        TimeSpan initialSettleDelay,
         CancellationToken cancellationToken)
     {
-        DateTimeOffset settleUntilUtc = DateTimeOffset.UtcNow + initialSettleDelay;
-        DateTimeOffset lastToleranceSampleUtc = DateTimeOffset.MinValue;
-        int consecutiveInTolerance = 0;
-        DateTimeOffset lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
-        var adjustmentSamples = new List<float>(AdjustmentSampleCount);
+        // Converge on the watts the drive math actually commands at this TUN
+        // percent, so the recorded gain is exact for the operating point it
+        // will be used at.
+        double targetWatts = CommandedWatts(ratedOutputWatts, tunePct);
+        IRadioDriveProfile drive = RadioDriveProfiles.For(invariant.Board);
+        // Relative output the radio will produce for a gain, from the drive
+        // output it will really be sent (8-bit quantisation included).
+        double OutputModel(double gain)
+        {
+            Zeus.Protocol1.TxDriveOutput output = drive.EncodeDrive(tunePct, gain, ratedOutputWatts);
+            double amplitude = output.DriveByte * output.IqScale;
+            return amplitude * amplitude;
+        }
 
-        for (int attempt = 0; attempt < 30; attempt++)
+        double gainDb = CurrentGainDb(band);
+        double model = OutputModel(gainDb);
+        // Output model before the most recent change, so verification can
+        // insist that the newest step itself is visible.
+        double modelBeforeLastChange = previous?.Model ?? 0d;
+        // Right after key-up there is no trusted baseline yet; the
+        // carrier needs longer to appear than a gain change needs to land.
+        TimeSpan settle = previous is null
+            ? _timing.MinimumSettle + _timing.MinimumSettle
+            : _timing.MinimumSettle;
+        int fineTrims = 0;
+        // Predictions are measured from the last plateau known to reflect its
+        // settings. An unverified plateau may be a trailing reading, so it
+        // never becomes the baseline while a verified one exists; otherwise a
+        // late response to an older step could "verify" a newer one.
+        Plateau? baseline = previous;
+
+        for (int adjustment = 0; ; adjustment++)
+        {
+            Plateau plateau = await AwaitPlateauAsync(
+                band, nominalTargetWatts, targetWatts, completed,
+                expectedVfoHz, expectedMode, invariant,
+                safetyPercent, ratedOutputWatts,
+                baseline, model, modelBeforeLastChange, gainDb,
+                settle,
+                samples, cancellationToken).ConfigureAwait(false);
+            if (plateau.Verified ||
+                baseline is null ||
+                baseline.Watts < MinimumMeasurableWatts)
+                baseline = plateau;
+            settle = _timing.MinimumSettle;
+
+            double measured = plateau.Watts;
+            if (measured >= MinimumMeasurableWatts &&
+                Math.Abs(measured - targetWatts) <= targetWatts * FineToleranceFraction)
+                return plateau;
+            bool withinTolerance = measured >= MinimumMeasurableWatts &&
+                IsWithinTolerance(measured, targetWatts);
+            if (withinTolerance && fineTrims >= MaxFineTrims)
+                return plateau;
+            if (adjustment >= MaxAdjustmentsPerTarget)
+            {
+                if (withinTolerance) return plateau;
+                throw new InvalidOperationException(
+                    $"{band} could not converge at {nominalTargetWatts:0.0} W (last reading {measured:0.0} W).");
+            }
+
+            double nextGain = Math.Round(NextGainDb(
+                gainDb, measured, targetWatts, plateau.Verified), 2);
+            if (OutputModel(nextGain) == model)
+            {
+                // The correction is finer than one drive-byte step, so it
+                // would change nothing on the wire.
+                if (withinTolerance) return plateau;
+                // Out of tolerance yet under one step: move to the adjacent
+                // byte in the needed direction.
+                double direction = Math.Sign(nextGain - gainDb);
+                if (direction == 0)
+                    direction = measured > targetWatts ? 1d : -1d;
+                for (int i = 0; i < 100 && OutputModel(nextGain) == model; i++)
+                    nextGain = Math.Round(nextGain + direction * 0.05, 2);
+                if (OutputModel(nextGain) == model)
+                    throw new InvalidOperationException(
+                        $"{band} could not converge at {nominalTargetWatts:0.0} W (last reading {measured:0.0} W).");
+            }
+            if (withinTolerance) fineTrims++;
+
+            EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
+            gainDb = nextGain;
+            _pa.SetCalibrationGain(band, gainDb);
+            while (samples.TryRead(out _)) { }
+            ThrowIfCalibrationAborted();
+            modelBeforeLastChange = model;
+            model = OutputModel(gainDb);
+        }
+    }
+
+    /// <summary>
+    /// Reads telemetry until a stable plateau appears that can be attributed
+    /// to the most recent change. Every sample is still checked against the
+    /// safety limit, stale or not.
+    /// </summary>
+    private async Task<Plateau> AwaitPlateauAsync(
+        string band,
+        int nominalTargetWatts,
+        double targetWatts,
+        int completed,
+        long expectedVfoHz,
+        RxMode expectedMode,
+        RunInvariant invariant,
+        int safetyPercent,
+        double ratedOutputWatts,
+        Plateau? previous,
+        double model,
+        double modelBeforeLastChange,
+        double gainDb,
+        TimeSpan settle,
+        ChannelReader<ForwardPowerSample> samples,
+        CancellationToken cancellationToken)
+    {
+        TimeSpan changedAt = Clock.Elapsed;
+        TimeSpan settleUntil = changedAt + settle;
+        // Scale with observed telemetry latency, but never beyond a fixed
+        // multiple of the configured window: keyed time stays bounded.
+        TimeSpan adaptive = Min(_observedLatency * 3, _timing.ResponseTimeout * 3);
+        TimeSpan responseDeadline = changedAt + Max(_timing.ResponseTimeout, adaptive);
+        TimeSpan floorResponseDeadline = changedAt + Max(_timing.FloorResponseTimeout, adaptive);
+        TimeSpan plateauDeadline = changedAt + Max(_timing.PlateauTimeout, adaptive + adaptive);
+        var window = new Queue<ForwardPowerSample>(PlateauSampleCount);
+        // Seeded one interval back (not MinValue): the subtractions below
+        // would overflow.
+        TimeSpan lastWindowSample = -_timing.PlateauSampleSpacing;
+        TimeSpan lastRefresh = -ConsumerRefreshInterval;
+
+        // How far, in dB, the drive output says this change should move the
+        // reading. Unknown when the previous plateau was below the meter
+        // floor or when this is the first reading after key-up.
+        double? expectedMoveDb =
+            previous is { } prior &&
+            prior.Watts >= MinimumMeasurableWatts &&
+            prior.Model > 0 && model > 0
+                ? 10d * Math.Log10(model / prior.Model)
+                : null;
+        // The newest change alone. Equal to expectedMoveDb unless unverified
+        // plateaus sit between the baseline and now.
+        double lastStepDb = modelBeforeLastChange > 0 && model > 0
+            ? 10d * Math.Log10(model / modelBeforeLastChange)
+            : expectedMoveDb ?? 0d;
+
+        while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
             ThrowIfCalibrationAborted();
-            EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
             if (!_radio.IsConnected || !_tx.IsTunOn)
                 throw new ExternalCalibrationStateChangedException(
                     "PA calibration stopped because the radio disconnected or TUN was released outside calibration.");
 
-            using var sampleTimeout =
-                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            sampleTimeout.CancelAfter(TimeSpan.FromSeconds(2));
-            ForwardPowerSample sample;
-            try
-            {
-                sample = await samples.ReadAsync(sampleTimeout.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                throw new TimeoutException("Forward-power telemetry became stale.");
-            }
+            ForwardPowerSample sample = await ReadSampleAsync(
+                samples, TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false)
+                ?? throw new TimeoutException("Forward-power telemetry became stale.");
             ThrowIfCalibrationAborted();
 
+            // Over-power is checked on every sample; the rest is refreshed at
+            // a bounded rate so a telemetry flood stays cheap.
             float measured = sample.Watts;
-            Update("running", band, targetWatts, measured, completed,
-                $"Adjusting {band}: {measured:0.0} W / {targetWatts:0.0} W");
-
-            if (IsOverPower(
-                measured,
-                targetWatts,
-                safetyPercent,
-                ratedOutputWatts))
+            if (IsOverPower(measured, targetWatts, safetyPercent, ratedOutputWatts))
             {
                 _tx.TrySetTun(false, MoxSource.UI, out _);
-                double limit = SafetyLimitWatts(
-                    targetWatts, safetyPercent, ratedOutputWatts);
-                throw new InvalidOperationException(
-                    $"Safety stop: measured {measured:0.0} W exceeds the {limit:0.0} W limit ({safetyPercent}% of the {targetWatts:0.0} W target, capped at {ratedOutputWatts:0.0} W rated output).");
+                throw new InvalidOperationException(SafetyStopMessage(
+                    measured, targetWatts, safetyPercent, ratedOutputWatts));
+            }
+            TimeSpan now = Clock.Elapsed;
+            if (now - lastRefresh >= ConsumerRefreshInterval)
+            {
+                lastRefresh = now;
+                EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
+                Update("running", band, nominalTargetWatts, measured, completed,
+                    $"Adjusting {band}: {measured:0.0} W / {targetWatts:0.0} W at {gainDb:0.0} dB");
             }
 
-            if (sample.SampledAtUtc < settleUntilUtc)
+            if (sample.SampledAt < settleUntil) continue;
+            if (sample.SampledAt - lastWindowSample < _timing.PlateauSampleSpacing)
+                continue;
+            lastWindowSample = sample.SampledAt;
+            if (window.Count == PlateauSampleCount) window.Dequeue();
+            window.Enqueue(sample);
+            if (window.Count < PlateauSampleCount) continue;
+
+            double min = window.Min(s => s.Watts);
+            double max = window.Max(s => s.Watts);
+            double median = window
+                .Select(s => (double)s.Watts)
+                .OrderBy(w => w)
+                .ElementAt(PlateauSampleCount / 2);
+            bool stable = max - min <=
+                Math.Max(median * PlateauSpreadFraction, PlateauSpreadFloorWatts);
+            if (!stable)
             {
-                attempt--;
+                if (sample.SampledAt >= plateauDeadline)
+                    throw new TimeoutException(
+                        $"Forward power on {band} did not settle at {targetWatts:0.0} W (readings {min:0.0}–{max:0.0} W).");
                 continue;
             }
 
-            if (measured > 0 && IsWithinTolerance(measured, targetWatts))
+            if (expectedMoveDb is double expected)
             {
-                adjustmentSamples.Clear();
-                lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
-                if (sample.SampledAtUtc - lastToleranceSampleUtc >=
-                    TimeSpan.FromMilliseconds(75))
+                // A reduction that falls under the meter floor still counts.
+                if (Math.Abs(expected) < 0.01 ||
+                    MovedAsExpected(previous!.Watts, median, expected, lastStepDb))
                 {
-                    lastToleranceSampleUtc = sample.SampledAtUtc;
-                    if (++consecutiveInTolerance >= 3) return;
+                    NoteLatency(window.Peek().SampledAt - changedAt);
+                    return new Plateau(median, model, Verified: true);
                 }
-                attempt--;
-                continue;
+                // Still showing the pre-change level: the reading may be
+                // trailing the radio. Keep waiting unless the PA genuinely
+                // is not responding (compression, foldback).
+                if (sample.SampledAt < responseDeadline) continue;
+                _log.LogInformation(
+                    "pa.calibration.unverified band={Band} target={Target:0.0} expectedMoveDb={Expected:0.00} prior={Prior:0.00} now={Now:0.00}",
+                    band, targetWatts, expected, previous!.Watts, median);
+                return new Plateau(median, model, Verified: false);
             }
-            consecutiveInTolerance = 0;
-            lastToleranceSampleUtc = DateTimeOffset.MinValue;
 
-            // A single low reading immediately after a key/re-key can be a
-            // stale meter value. Base corrections on three fresh readings so
-            // one transient cannot command a large drive change.
-            if (sample.SampledAtUtc - lastAdjustmentSampleUtc >= AdjustmentSampleSpacing)
+            // No measurable baseline: key-up, or the carrier was under the
+            // meter floor. Nothing else is in flight, so the first carrier
+            // above the floor reflects the current gain. Do not step blind on
+            // a trailing zero; only a carrier still under the floor after the
+            // floor window earns the next bounded 1 dB raise. Under the floor
+            // the PA is ~20 dB below target and there is no telemetry flood,
+            // so this window can be shorter than ResponseTimeout.
+            if (median >= MinimumMeasurableWatts)
             {
-                adjustmentSamples.Add(measured);
-                lastAdjustmentSampleUtc = sample.SampledAtUtc;
+                NoteLatency(window.Peek().SampledAt - changedAt);
+                return new Plateau(median, model, Verified: true);
             }
-            if (adjustmentSamples.Count < AdjustmentSampleCount)
-            {
-                attempt--;
-                continue;
-            }
-
-            double adjustmentWatts = adjustmentSamples
-                .OrderBy(watts => watts)
-                .ElementAt(adjustmentSamples.Count / 2);
-            adjustmentSamples.Clear();
-            lastAdjustmentSampleUtc = DateTimeOffset.MinValue;
-
-            PaBandSettingsDto row = _pa.GetAll(
-                    _radio.EffectiveBoardKind,
-                    _radio.EffectiveOrionMkIIVariant)
-                .Bands.First(b => b.Band == band);
-            double requestedGain = adjustmentWatts < MinimumMeasurableWatts
-                ? row.PaGainDb - MaxGainAdjustmentDb
-                : ComputeNextGainDb(row.PaGainDb, adjustmentWatts, targetWatts);
-            double nextGain = LimitGainAdjustment(row.PaGainDb, requestedGain);
-            if (Math.Abs(nextGain - row.PaGainDb) < 0.05)
-                throw new InvalidOperationException(
-                    $"{band} could not converge at {targetWatts:0.0} W.");
-
-            EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
-            _pa.SetCalibrationGain(band, Math.Round(nextGain, 2));
-            while (samples.TryRead(out _)) { }
-            ThrowIfCalibrationAborted();
-            settleUntilUtc = DateTimeOffset.UtcNow.AddMilliseconds(350);
+            if (sample.SampledAt < floorResponseDeadline) continue;
+            return new Plateau(median, model, Verified: false);
         }
-
-        throw new TimeoutException(
-            $"No fresh, converged forward-power reading for {band} at {targetWatts:0.0} W.");
     }
+
+    /// <summary>
+    /// After unkey, reads telemetry until the carrier is gone: several quiet
+    /// readings in a row, or silence (no backlog left to drain). Any late
+    /// reading above the last target's limit is a real past overshoot that
+    /// the meter reported late, so it fails the run.
+    /// </summary>
+    private async Task WaitForCarrierClearAsync(
+        string band,
+        double lastTargetWatts,
+        int safetyPercent,
+        double ratedOutputWatts,
+        ChannelReader<ForwardPowerSample> samples,
+        CancellationToken cancellationToken)
+    {
+        TimeSpan deadline = Clock.Elapsed + _timing.QuietTimeout;
+        int quiet = 0;
+        while (quiet < QuietSampleCount)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ForwardPowerSample? sample = await ReadSampleAsync(
+                samples, _timing.QuietSilence, cancellationToken).ConfigureAwait(false);
+            if (sample is null) return;
+            float watts = sample.Value.Watts;
+            if (lastTargetWatts > 0 &&
+                IsOverPower(watts, lastTargetWatts, safetyPercent, ratedOutputWatts))
+                throw new InvalidOperationException(
+                    $"Safety stop: a delayed {band} forward-power reading of {watts:0.0} W exceeded the {SafetyLimitWatts(lastTargetWatts, safetyPercent, ratedOutputWatts):0.0} W limit for the {lastTargetWatts:0.0} W target.");
+            quiet = watts < QuietWatts ? quiet + 1 : 0;
+            if (Clock.Elapsed >= deadline)
+                throw new TimeoutException(
+                    $"Forward power did not clear after unkeying {band} (still reading {watts:0.0} W).");
+        }
+    }
+
+    private static async Task<ForwardPowerSample?> ReadSampleAsync(
+        ChannelReader<ForwardPowerSample> samples,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        if (samples.TryRead(out ForwardPowerSample queued)) return queued;
+        using var sampleTimeout =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        sampleTimeout.CancelAfter(timeout);
+        try
+        {
+            return await samples.ReadAsync(sampleTimeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    // Latency is measured to the first sample of the qualifying window, so it
+    // excludes the controller's own settle and window-fill time.
+    private void NoteLatency(TimeSpan latency)
+    {
+        if (latency > _timing.ResponseTimeout * 2)
+            throw new TimeoutException(
+                $"Forward-power telemetry is running {latency.TotalSeconds:0.0} s behind the radio, too far to calibrate safely.");
+        if (latency > _observedLatency) _observedLatency = latency;
+    }
+
+    private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
+    private static TimeSpan Min(TimeSpan a, TimeSpan b) => a < b ? a : b;
+
+    private double CurrentGainDb(string band) =>
+        _pa.GetAll(
+                _radio.EffectiveBoardKind,
+                _radio.EffectiveOrionMkIIVariant)
+            .Bands.First(b => b.Band == band).PaGainDb;
 
     private Dictionary<string, CalibrationPoint> ResolveBandFrequencies()
     {
@@ -631,13 +987,14 @@ public sealed class PaCalibrationService
         long? expectedTxFrequencyHz = null,
         RxMode? expectedMode = null)
     {
+        bool sixMeters = expectedTxFrequencyHz is long hz &&
+            BandUtils.FreqToBand(hz) == "6m";
         lock (_sync)
         {
             _armedSafetyTargetWatts = targetWatts;
+            _armedSixMeters = sixMeters;
             _expectedTxFrequencyHz = expectedTxFrequencyHz;
             _expectedMode = expectedMode;
-            _safetyTripMessage = null;
-            _externalStateChangeMessage = null;
         }
     }
 
@@ -722,23 +1079,73 @@ public sealed class PaCalibrationService
             currentGainDb + 10d * Math.Log10(measuredWatts / targetWatts),
             0d, 70d);
 
-    internal static double LimitGainAdjustment(double currentGainDb, double requestedGainDb) =>
-        Math.Clamp(
-            requestedGainDb,
-            currentGainDb - MaxGainAdjustmentDb,
-            currentGainDb + MaxGainAdjustmentDb);
+    /// <summary>
+    /// Next gain from a trusted plateau. Reducing output (raising the gain
+    /// figure) is never rate-limited. Raising output is limited to
+    /// <see cref="MaxGainAdjustmentDb"/>, or up to
+    /// <see cref="MaxCoarseGainAdjustmentDb"/> when a verified reading shows
+    /// the PA is far enough below target that the step still lands at least
+    /// <see cref="CoarseStepMarginDb"/> under it.
+    /// </summary>
+    internal static double NextGainDb(
+        double currentGainDb,
+        double measuredWatts,
+        double targetWatts,
+        bool verified)
+    {
+        if (measuredWatts < MinimumMeasurableWatts)
+            return Math.Clamp(currentGainDb - MaxGainAdjustmentDb, 0d, 70d);
+        double requested = ComputeNextGainDb(currentGainDb, measuredWatts, targetWatts);
+        if (requested >= currentGainDb) return requested;
+        double deficitDb = 10d * Math.Log10(targetWatts / measuredWatts);
+        double limit = verified
+            ? Math.Clamp(
+                deficitDb - CoarseStepMarginDb,
+                MaxGainAdjustmentDb,
+                MaxCoarseGainAdjustmentDb)
+            : MaxGainAdjustmentDb;
+        return Math.Max(requested, currentGainDb - limit);
+    }
+
+    /// <summary>
+    /// True when a reading moved from <paramref name="priorWatts"/> in the
+    /// predicted direction by at least half the predicted dB, and by enough
+    /// that at least half of the newest step (<paramref name="lastStepDb"/>)
+    /// is visible. The second condition stops a late response to an older,
+    /// unverified step from confirming a newer one.
+    /// </summary>
+    internal static bool MovedAsExpected(
+        double priorWatts, double nowWatts, double expectedMoveDb, double? lastStepDb = null)
+    {
+        double observedDb = 10d * Math.Log10(Math.Max(nowWatts, 1e-6) / priorWatts);
+        double step = Math.Abs(lastStepDb ?? expectedMoveDb);
+        return expectedMoveDb > 0
+            ? observedDb >= Math.Max(expectedMoveDb / 2d, expectedMoveDb - step / 2d)
+            : observedDb <= Math.Min(expectedMoveDb / 2d, expectedMoveDb + step / 2d);
+    }
+
+    internal static int TunePercentFor(int targetWatts, double ratedOutputWatts) =>
+        Math.Clamp((int)Math.Round(targetWatts * 100d / ratedOutputWatts), 1, 100);
+
+    private static double CommandedWatts(double ratedOutputWatts, int tunePct) =>
+        ratedOutputWatts * tunePct / 100d;
+
+    private static string SafetyStopMessage(
+        double measuredWatts, double targetWatts, int safetyPercent, double ratedOutputWatts) =>
+        $"Safety stop: measured {measuredWatts:0.0} W exceeds the {SafetyLimitWatts(targetWatts, safetyPercent, ratedOutputWatts):0.0} W limit ({safetyPercent}% of the {targetWatts:0.0} W target, capped at {ratedOutputWatts:0.0} W rated output).";
 
     private static PaCalibrationStatus IdleStatus() =>
         new("idle", null, null, null, 0,
             BandUtils.HfBands.Count * TargetsWatts.Length, null);
 
+    private sealed record Plateau(double Watts, double Model, bool Verified);
     private sealed record CalibrationPoint(long FrequencyHz, RxMode Mode);
     private sealed record RunInvariant(
         HpsdrBoardKind Board,
         OrionMkIIVariant Variant,
         int DriveMaxPct);
     private readonly record struct ForwardPowerSample(
-        float Watts, DateTimeOffset SampledAtUtc);
+        float Watts, TimeSpan SampledAt);
     private sealed class ExternalCalibrationStateChangedException(string message)
         : InvalidOperationException(message);
 }

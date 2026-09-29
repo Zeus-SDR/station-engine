@@ -142,6 +142,12 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
     private volatile bool _drainRequested;
     private int _moxDrainRequests;
     private int _moxOffGeneration;
+    // Set when full-duplex (DUP) receive audio arrives while keyed; the sender
+    // then plays the RX ring (which carries any CW sidetone mixed in) instead
+    // of the sidetone-only ring for the rest of the over. Cleared on the
+    // key-up edge only: a key-down handler that runs after the DSP tick's
+    // first DUP block must not undo it.
+    private volatile bool _duplexRxThisTx;
 
     private const int DrainRxForMox = 1;
     private const int DrainSidetoneForRx = 2;
@@ -222,6 +228,46 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             return;
         }
 
+        WriteRxRing(in frame);
+    }
+
+    // Full-duplex (DUP) receive audio. Outside MOX (the post-TX drain) it is
+    // ordinary receive audio; while keyed it is the one RX source the speaker
+    // still plays, so DUP is audible on the radio's own speaker/headphones.
+    public void PublishDuplexRx(in AudioFrame frame)
+    {
+        if (!_radio.IsMox)
+        {
+            Publish(in frame);
+            return;
+        }
+        PublishKeyedDuplexRx(in frame);
+    }
+
+    // MON + DUP: host outputs hear receive inside the TX-monitor mix, which the
+    // radio speaker never plays while keyed; this receive-only block keeps it
+    // audible here. Outside MOX the TX-monitor lane reaches the ring via Publish.
+    public void PublishDuplexRxBesideTxMonitor(in AudioFrame frame)
+    {
+        if (_radio.IsMox) PublishKeyedDuplexRx(in frame);
+    }
+
+    private void PublishKeyedDuplexRx(in AudioFrame frame)
+    {
+        if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz) return;
+        if (!IsEligible()) return;
+        if (_muteState.IsMuted)
+        {
+            _drainRequested = true;
+            SignalWake();
+            return;
+        }
+        _duplexRxThisTx = true;
+        WriteRxRing(in frame);
+    }
+
+    private void WriteRxRing(in AudioFrame frame)
+    {
         var src = frame.Samples.Span;
         int written = _ring.Write(src);
         if (written < src.Length)
@@ -280,7 +326,11 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
         // Record the edge, not just the current radio level. A short key-down /
         // key-up can complete before the sender runs; retaining both requested
         // drains prevents pre-key RX or keyed sidetone from being replayed.
-        if (!on) Interlocked.Increment(ref _moxOffGeneration);
+        if (!on)
+        {
+            Interlocked.Increment(ref _moxOffGeneration);
+            _duplexRxThisTx = false;
+        }
         Interlocked.Or(
             ref _moxDrainRequests,
             on ? DrainRxForMox : DrainSidetoneForRx);
@@ -345,7 +395,9 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
             int moxDrainRequests = Interlocked.Exchange(ref _moxDrainRequests, 0);
             if (moxDrainRequests != 0)
             {
-                if ((moxDrainRequests & DrainRxForMox) != 0) _ring.Clear();
+                // DUP keeps receive continuous through key-down: the ring
+                // already holds live duplex audio, not a stale pre-key tail.
+                if ((moxDrainRequests & DrainRxForMox) != 0 && !_duplexRxThisTx) _ring.Clear();
                 if ((moxDrainRequests & DrainSidetoneForRx) != 0) _cwSidetoneRing.Clear();
                 _packetFrames = 0;
                 _nextSendTicks = 0;
@@ -401,13 +453,21 @@ internal sealed class SaturnSpeakerAudioSink : IRxAudioSink, IHostedService, IDi
         if (isMox != _lastDrainWasMox)
         {
             _lastDrainWasMox = isMox;
-            if (isMox) _ring.Clear();
-            else _cwSidetoneRing.Clear();
+            if (isMox)
+            {
+                if (!_duplexRxThisTx) _ring.Clear();
+            }
+            else
+            {
+                _cwSidetoneRing.Clear();
+            }
             _packetFrames = 0;
             _nextSendTicks = 0;
             _pacingWaitTicks = 0;
         }
-        var sourceRing = isMox ? _cwSidetoneRing : _ring;
+        // Keyed: the sidetone-only lane, unless DUP is carrying receive audio
+        // this over (that stream already includes the sidetone mix).
+        var sourceRing = isMox && !_duplexRxThisTx ? _cwSidetoneRing : _ring;
 
         long retryNow = _clock();
         if (_sendRetryAfterTicks > retryNow)

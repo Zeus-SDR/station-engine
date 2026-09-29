@@ -1189,7 +1189,18 @@ internal static class ControlFrame
             return;
         }
 
-        // From here MOX is engaged; the TX I/Q path needs a real source.
+        // MOX engaged. Full-duplex (DUP) receive audio keeps riding L/R to the
+        // radio's codec as Thetis does; the I/Q slots are independent. Only a
+        // ring the speaker sink has armed for this over is drained, so an
+        // ordinary half-duplex over never sends the pre-key receive tail and
+        // its keyed frames stay byte-identical. An armed-but-empty ring is not
+        // an underrun either (DUP audio can briefly starve while keyed).
+        if (rxAudioSource is RxAudioRing keyedRing
+            && keyedRing.KeyedDrainArmed
+            && keyedRing.Count > 0)
+            WriteRxAudioLr(frame[8..], keyedRing);
+
+        // From here the TX I/Q path needs a real source.
         if (source is null) return;
 
         // HL2's TX attenuator (DriveFilter C1 bits [7:4]) steps 0.5 dB from
@@ -1216,7 +1227,7 @@ internal static class ControlFrame
             if (aq > peak) peak = aq;
             sumAbs += ai + aq;
             int off = s * 8;
-            // Audio L/R stay zero (payload was cleared).
+            // Audio L/R (bytes 0..3) are left as filled above, or zero.
             payload[off + 4] = (byte)((iSample >> 8) & 0xFF);
             payload[off + 5] = (byte)(iSample & 0xFE);
             payload[off + 6] = (byte)((qSample >> 8) & 0xFF);

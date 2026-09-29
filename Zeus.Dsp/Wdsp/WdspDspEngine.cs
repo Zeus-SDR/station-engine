@@ -259,6 +259,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         long AudioOverrunPerWindow,
         long AgeMs);
 
+    private readonly record struct RxIqWorkItem(double[] Samples, bool SuppressDsp);
+
     private sealed class ChannelState
     {
         public required int Id;
@@ -268,13 +270,17 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         public required int PixelWidth;
         public required int OutDoubles;
         public required Thread Worker;
-        public required BlockingCollection<double[]> InQueue;
+        public required BlockingCollection<RxIqWorkItem> InQueue;
         // Rate-scaled bound of InQueue (frames). Captured so diagnostics can show
         // depth-vs-capacity; see ComputeInQueueCapacity.
         public required int InQueueCapacity;
         public readonly ConcurrentQueue<double[]> FreeFrames = new();
         public double[] PartialFrame = new double[2 * InSize];
         public int PartialFill;
+        // Sticky under FillGate: set when any sample of the frame being
+        // assembled arrived while receive DSP was suppressed, so a frame that
+        // straddles the post-TX resume is still quarantined as a whole.
+        public bool PartialFrameSuppressed;
         public readonly object FillGate = new();
         public volatile bool Stopped;
         public CancellationTokenSource Cts = new();
@@ -315,7 +321,13 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // Spectrum0 is independent of RXA processing. Half-duplex TX suspends
         // the audible chain so AM demodulator memory and AGC cannot accumulate
         // keyed leakage while the analyzer continues receiving raw IQ.
-        public bool RxStoppedForHalfDuplexMox;
+        public volatile bool RxDspSuppressedForMox;
+        // Resume-time native flush: while set (and still suppressed), the worker
+        // drives fexchange0 on silence so WDSP's channel-down slew and flush
+        // thread can discard receive state that ingested leakage before
+        // suppression began. Control path only, under MoxGate publication.
+        public volatile bool NativeFlushOnSilence;
+        public readonly object MoxGate = new();
         public bool IsTxMonitor;
         // RX squelch config last applied via SetSquelch. Default off/adaptive
         // so a fresh channel matches Thetis (all squelch off) while the UI
@@ -695,9 +707,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // returns without filling iout/qout and the monitor RXA hears silence
     // or stack garbage.
     private bool _moxOn;
-    // PureSignal still damps RXA on key-down. Remember that transition across
-    // an emergency mid-over PS disarm so key-up always restores RXA.
-    private bool _rxaStoppedForCurrentMox;
+    // PureSignal still pauses RX1 DSP on key-down. Remember that transition
+    // across an emergency mid-over PS disarm so key-up always restores it.
+    private bool _primaryRxDspSuppressedForCurrentMox;
     // Serialize ordinary MOX policy with publication of newly opened RXAs.
     // Private TX-monitor channels carry their role before publication.
     private readonly object _rxMoxGate = new();
@@ -715,6 +727,11 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // _notchDbUnavailable latches if the bundled libwdsp predates the notch-DB
     // exports (mirrors the SBNR guard) so we don't spam the worker with throws.
     private readonly object _notchLock = new();
+    // RX channels that are not the operator's (Public Listening guests): the
+    // operator's manual notches and FM receive settings are never applied to
+    // them. Written under _notchLock inside the native lifecycle section;
+    // removed when the channel closes.
+    private readonly ConcurrentDictionary<int, byte> _isolatedChannels = new();
     private readonly List<NotchDto> _manualNotches = new();
     private double _notchTuneFreqHz;
     private bool _notchDbUnavailable;
@@ -972,7 +989,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 SnrAnalyzerId = snrAnalyzerId,
                 SnrAnalyzerGeneration = Interlocked.Increment(ref s_snrAnalyzerGeneration),
                 OutDoubles = outDoubles,
-                InQueue = new BlockingCollection<double[]>(boundedCapacity: inQueueCapacity),
+                InQueue = new BlockingCollection<RxIqWorkItem>(boundedCapacity: inQueueCapacity),
                 InQueueCapacity = inQueueCapacity,
                 Worker = null!,
                 AnalyzerFftSize = _rxAnalyzerFftSize,
@@ -989,7 +1006,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
             lock (_rxMoxGate)
             {
-                state.RxStoppedForHalfDuplexMox =
+                state.RxDspSuppressedForMox =
                     _halfDuplexRxSuspended && !displayOnly && !isTxMonitor;
                 _channels[id] = state;
                 ConfigureMaxBinDetector(state);
@@ -1003,10 +1020,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // exec_bypass, and sets exchange (channel.c:278-283). After this
                 // returns, fexchange0's `if (_InterlockedAnd (&ch[channel].exchange, 1))`
                 // guard (iobuffs.c:484) will be satisfied and xrxa → xmeter will run.
-                // A receiver opened during half-duplex TX remains at its initial
-                // state=0 until unkey; it must not ingest keyed leakage first.
-                if (!state.RxStoppedForHalfDuplexMox)
-                    NativeMethods.SetChannelState(id, 1, 0);
+                // RXA stays natively open so its AM/SAM fade-leveler and AGC
+                // state survive MOX. RunWorker quarantines its demodulator while
+                // still feeding raw IQ to the independent display analyzer.
+                NativeMethods.SetChannelState(id, 1, 0);
             }
 
             // Re-apply any manual notches to the freshly-opened channel. A sample-
@@ -1043,8 +1060,29 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         if (!_channels.TryRemove(channelId, out var state)) return;
         Interlocked.CompareExchange(ref _primaryRxaChannelId, -1, channelId);
+        // Before the native slot can be reused by a new (operator) channel.
+        _isolatedChannels.TryRemove(channelId, out _);
         StopChannel(state);
     }
+
+    public void IsolateChannelFromOperatorSettings(int channelId)
+    {
+        if (_disposed != 0) return;
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            if (!_channels.ContainsKey(channelId)) return;
+            lock (_notchLock)
+            {
+                _isolatedChannels[channelId] = 0;
+                ClearNotchesOnChannelLocked(channelId);
+            }
+            // Stock FM receive (no operator deviation / tone squelch / notch
+            // tone); the operator's later SetFmConfig skips this channel.
+            ApplyFmRx(channelId, FmConfig.Default.Normalized());
+        });
+    }
+
+    internal bool IsChannelIsolatedForTests(int channelId) => _isolatedChannels.ContainsKey(channelId);
 
     public void CloseRxDisplayChannel(int channelId) => CloseChannel(channelId);
 
@@ -1199,6 +1237,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 interleavedIqSamples.Slice(offset, take).CopyTo(state.PartialFrame.AsSpan(state.PartialFill));
                 state.PartialFill += take;
                 offset += take;
+                if (state.RxDspSuppressedForMox) state.PartialFrameSuppressed = true;
 
                 if (state.PartialFill == state.PartialFrame.Length)
                 {
@@ -1207,9 +1246,17 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                         next = new double[2 * InSize];
                     state.PartialFrame = next;
                     state.PartialFill = 0;
+                    bool frameSuppressed = state.PartialFrameSuppressed || state.RxDspSuppressedForMox;
+                    state.PartialFrameSuppressed = false;
                     if (!state.InQueue.IsAddingCompleted)
                     {
                         state.DiagFramesIn++;
+                        // Capture suppression ownership once for this IQ frame.
+                        // If drop-oldest makes room while MOX resumes, the retry
+                        // must not relabel transition IQ as live receive data.
+                        var workItem = new RxIqWorkItem(
+                            frame,
+                            frameSuppressed);
                         try
                         {
                             if (BlockingIqFeed)
@@ -1219,7 +1266,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                                 // block until the worker makes room so no frame is
                                 // dropped. NEVER used on the realtime RX path — see
                                 // BlockingIqFeed.
-                                state.InQueue.Add(frame);
+                                state.InQueue.Add(workItem);
                             }
                             // Non-blocking hand-off with drop-OLDEST (default). FeedIq
                             // runs on the realtime P1/P2 RX sink thread; a blocking Add
@@ -1231,15 +1278,15 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                             // so display/audio latency stays bounded and the glitch is a
                             // single counted dropped frame rather than a stall. Pairs
                             // with the rate-scaled capacity (ComputeInQueueCapacity).
-                            else if (!state.InQueue.TryAdd(frame))
+                            else if (!state.InQueue.TryAdd(workItem))
                             {
                                 state.DiagEnqueueFull++;
                                 if (state.InQueue.TryTake(out var stale))
                                 {
                                     state.DiagDroppedOldest++;
-                                    state.FreeFrames.Enqueue(stale);
+                                    state.FreeFrames.Enqueue(stale.Samples);
                                 }
-                                if (!state.InQueue.TryAdd(frame))
+                                if (!state.InQueue.TryAdd(workItem))
                                     state.FreeFrames.Enqueue(frame);
                             }
                         }
@@ -1391,6 +1438,28 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation(
             "wdsp.setAgc channel={Id} mode={Mode} slope={Slope} decayMs={Decay} hangMs={Hang} hangThr={Thr} fixedDb={Fixed}",
             channelId, cfg.Mode, cfg.Slope, cfg.DecayMs, cfg.HangMs, cfg.HangThreshold, cfg.FixedGainDb);
+    }
+
+    public void SetAudioPeakFilter(int channelId, bool enabled)
+    {
+        if (!_channels.ContainsKey(channelId)) return;
+        // Thetis radio.cs RXAPFRun uses this per-RXA selector. The native
+        // channel owns its 600 Hz / 100 Hz double-pole filter; no global state.
+        NativeMethods.SetRXASPCWRun(channelId, enabled ? 1 : 0);
+    }
+
+    public unsafe void SetReceiveEqualizer(int channelId, bool enabled, int preampDb, int lowDb, int midDb, int highDb)
+    {
+        if (!_channels.ContainsKey(channelId)) return;
+        // Thetis RXEQ3 passes preamp, low, mid and high to this RXA-local API.
+        // WDSP eq.c owns the channel's coefficients and run flag.
+        int* gains = stackalloc int[4]
+        {
+            Math.Clamp(preampDb, -12, 12), Math.Clamp(lowDb, -12, 12),
+            Math.Clamp(midDb, -12, 12), Math.Clamp(highDb, -12, 12)
+        };
+        NativeMethods.SetRXAGrphEQ(channelId, gains);
+        NativeMethods.SetRXAEQRun(channelId, enabled ? 1 : 0);
     }
 
     public void SetSquelch(int channelId, SquelchConfig cfg)
@@ -1676,7 +1745,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // copy under the lock means the per-channel WDSP rewrite reads a
                 // stable snapshot even if another SetNotches races in.
                 foreach (var id in _channels.Keys)
+                {
+                    if (_isolatedChannels.ContainsKey(id)) continue;
                     ApplyNotchesToChannelLocked(id);
+                }
             }
         });
         _log.LogInformation("wdsp.setNotches count={Count}", notches.Count);
@@ -1694,7 +1766,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 try
                 {
                     foreach (var id in _channels.Keys)
+                    {
+                        if (_isolatedChannels.ContainsKey(id)) continue;
                         NativeMethods.RXANBPSetTuneFrequency(id, loHz);
+                    }
                 }
                 catch (EntryPointNotFoundException)
                 {
@@ -1741,6 +1816,25 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             }
 
             NativeMethods.RXANBPSetNotchesRun(channelId, anyActive ? 1 : 0);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            MarkNotchDbUnavailable();
+        }
+    }
+
+    // Empty `channelId`'s notch database and stop its notch run (a channel
+    // that must not carry the operator's notches). Under _notchLock.
+    private void ClearNotchesOnChannelLocked(int channelId)
+    {
+        if (_notchDbUnavailable) return;
+        try
+        {
+            int count = 0;
+            NativeMethods.RXANBPGetNumNotches(channelId, ref count);
+            for (int i = count - 1; i >= 0; i--)
+                NativeMethods.RXANBPDeleteNotch(channelId, i);
+            NativeMethods.RXANBPSetNotchesRun(channelId, 0);
         }
         catch (EntryPointNotFoundException)
         {
@@ -2807,7 +2901,14 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetMox(bool moxOn, bool stopRxForPureSignal) =>
         SetMox(moxOn, stopRxForPureSignal, stopRxForHalfDuplex: !stopRxForPureSignal);
 
-    public void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex)
+    public void SetMox(bool moxOn, bool stopRxForPureSignal, bool stopRxForHalfDuplex) =>
+        SetMox(moxOn, stopRxForPureSignal, stopRxForHalfDuplex, deferRxResume: false);
+
+    public void SetMox(
+        bool moxOn,
+        bool stopRxForPureSignal,
+        bool stopRxForHalfDuplex,
+        bool deferRxResume)
     {
         if (_disposed != 0) return;
 
@@ -2827,8 +2928,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 return;
         }
 
-        // Spectrum0 receives raw IQ independently of RXA, so stopping the
-        // audible chain preserves the analyzer and its averaging history.
+        // Spectrum0 receives raw IQ independently of RXA, so pausing only the
+        // audible chain preserves the analyzer, averaging, and receive DSP state.
         // Holding only AGC is insufficient: AM fade-leveler memory upstream
         // can retain strong keyed leakage for seconds after unkeying.
         // Full duplex leaves RXA live; PureSignal retains its RX1 transition.
@@ -2837,32 +2938,62 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // stay running so fexchange2 keeps producing IQ for the monitor
         // demod path. We re-derive TXA target = (MOX || monitor) so the
         // monitor path doesn't go silent when the operator releases MOX.
-        int rxaPrior = -1, txaPrior = -1;
+        int txaPrior = -1;
         bool wantTxa = moxOn || _monitorRequested;
         if (moxOn)
         {
             _moxOn = true;
             if (stopRxForPureSignal)
             {
-                rxaPrior = NativeMethods.SetChannelState(rxaId, 0, 1);
-                _rxaStoppedForCurrentMox = true;
+                lock (_rxMoxGate)
+                {
+                    // A new PureSignal over can supersede a deferred half-duplex
+                    // resume. Transfer suppression ownership to RX1 so secondary
+                    // receivers are not left muted by the preceding over.
+                    _halfDuplexRxSuspended = false;
+                    foreach (var receive in _channels.Values)
+                    {
+                        bool shouldSuppress = receive.Id == rxaId;
+                        if (shouldSuppress)
+                        {
+                            if (!receive.RxDspSuppressedForMox)
+                                SetReceiveMoxSuppressed(receive, suppressed: true);
+                        }
+                        else if (receive.RxDspSuppressedForMox && !receive.Stopped)
+                        {
+                            // Resuming a receiver the superseded over still
+                            // owns: same flush as any other resume.
+                            ResumeReceiveChannel(receive);
+                        }
+                    }
+                }
+                _primaryRxDspSuppressedForCurrentMox = true;
             }
             else
             {
-                _rxaStoppedForCurrentMox = false;
+                _primaryRxDspSuppressedForCurrentMox = false;
                 lock (_rxMoxGate)
                 {
                     _halfDuplexRxSuspended = stopRxForHalfDuplex;
-                    if (stopRxForHalfDuplex)
+                    if (!stopRxForHalfDuplex)
+                    {
+                        // Full duplex keeps receive live. A re-key before the
+                        // previous over's deferred resume must not inherit its
+                        // quarantine for the whole new transmission.
+                        foreach (var receive in _channels.Values)
+                        {
+                            if (receive.RxDspSuppressedForMox && !receive.Stopped)
+                                ResumeReceiveChannel(receive);
+                        }
+                    }
+                    else
                     {
                         foreach (var receive in _channels.Values)
                         {
                             if (receive.Stopped || receive.IsDisplayOnly || receive.IsTxMonitor)
                                 continue;
-                            if (receive.RxStoppedForHalfDuplexMox) continue;
-                            int prior = NativeMethods.SetChannelState(receive.Id, 0, 1);
-                            if (receive.Id == rxaId) rxaPrior = prior;
-                            receive.RxStoppedForHalfDuplexMox = true;
+                            if (receive.RxDspSuppressedForMox) continue;
+                            SetReceiveMoxSuppressed(receive, suppressed: true);
                         }
                     }
                 }
@@ -2893,40 +3024,118 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 txaPrior = NativeMethods.SetChannelState(txaId, 0, 1);
                 _txaRunning = false;
             }
-            if (_rxaStoppedForCurrentMox)
-            {
-                rxaPrior = NativeMethods.SetChannelState(rxaId, 1, 0);
-                _rxaStoppedForCurrentMox = false;
-                // PERF_PASS_3_DEBUG: t2 — WDSP RXA brought back up. Uncommitted.
-                _log.LogInformation("wdsp.rxa.up ts={Ts}",
-                    System.Diagnostics.Stopwatch.GetTimestamp());
-            }
-            else
-            {
-                lock (_rxMoxGate)
-                {
-                    _halfDuplexRxSuspended = false;
-                    foreach (var receive in _channels.Values)
-                    {
-                        if (!receive.RxStoppedForHalfDuplexMox || receive.Stopped) continue;
-                        int prior = NativeMethods.SetChannelState(receive.Id, 1, 0);
-                        if (receive.Id == rxaId) rxaPrior = prior;
-                        receive.RxStoppedForHalfDuplexMox = false;
-                    }
-                }
-            }
+            if (!deferRxResume)
+                ResumeReceiveAfterMox(rxaId);
             // Unkeying: clear the stage-meter snapshot so UI doesn't latch the
             // last-during-TX reading while idle. The next MOX-on will publish
             // fresh data on its first ProcessTxBlock.
             lock (_txMeterPublishLock) { _latestTxStageMeters = null; }
         }
-        // Diagnostic 2026-04-18: capture the prior-state return of every
-        // SetChannelState call so we can detect cases where the requested
-        // transition was a no-op (prior == new) — that's the failure mode that
-        // looks like "RX audio doesn't come back after MOX-off".
         _log.LogInformation(
-            "wdsp.setMox on={Mox} rxa={Rxa} (prior {RxaPrior}) txa={Txa} (prior {TxaPrior})",
-            moxOn, rxaId, rxaPrior, txaId, txaPrior);
+            "wdsp.setMox on={Mox} deferRx={DeferRx} rxa={Rxa} txa={Txa} (prior {TxaPrior})",
+            moxOn, deferRxResume, rxaId, txaId, txaPrior);
+    }
+
+    public void CompletePostTxRxResume()
+    {
+        if (_disposed != 0) return;
+        lock (_rxMoxGate)
+        {
+            // Recheck under the gate SetMox(true) takes before suppressing, so a
+            // new key-down either wins (and this returns) or re-suppresses and
+            // flushes after this resume.
+            if (_moxOn) return;
+            CompletePostTxRxResumeLocked();
+        }
+    }
+
+    private void CompletePostTxRxResumeLocked()
+    {
+
+        int rxaId;
+        lock (_txaLock)
+        {
+            rxaId = Volatile.Read(ref _primaryRxaChannelId);
+        }
+
+        // Half-duplex MOX suppresses every audible receiver, so completion
+        // cannot depend on RX1 still being present. ResumeReceiveAfterMox
+        // already handles a missing primary and resumes each surviving RX.
+        ResumeReceiveAfterMox(rxaId);
+        _log.LogInformation(
+            "wdsp.postTxRxResume rxa={Rxa}",
+            rxaId);
+    }
+
+    private void ResumeReceiveAfterMox(int primaryRxaId)
+    {
+        if (_primaryRxDspSuppressedForCurrentMox)
+        {
+            if (_channels.TryGetValue(primaryRxaId, out var receive) && !receive.Stopped)
+                ResumeReceiveChannel(receive);
+            _primaryRxDspSuppressedForCurrentMox = false;
+            // PERF_PASS_3_DEBUG: t2 — WDSP RXA processing resumed. Uncommitted.
+            _log.LogInformation("wdsp.rxa.up ts={Ts}",
+                System.Diagnostics.Stopwatch.GetTimestamp());
+        }
+        else
+        {
+            lock (_rxMoxGate)
+            {
+                _halfDuplexRxSuspended = false;
+                foreach (var receive in _channels.Values)
+                {
+                    if (!receive.RxDspSuppressedForMox || receive.Stopped) continue;
+                    ResumeReceiveChannel(receive);
+                }
+            }
+        }
+    }
+
+    private static void ResumeReceiveChannel(ChannelState receive)
+    {
+        // Non-blocking restart, the same SetChannelState(id,1,0) develop issued
+        // at unkey, now deferred to the end of the post-TX mute. The flush that
+        // discards pre-suppression leakage already ran at key-down (see
+        // SetReceiveMoxSuppressed), so this is safe on the realtime RX thread:
+        // it never waits on the worker. A receiver opened during the over is
+        // already natively running; the call is then a no-op.
+        NativeMethods.SetChannelState(receive.Id, 1, 0);
+        lock (receive.MoxGate) receive.RxDspSuppressedForMox = false;
+    }
+
+    private static void SetReceiveMoxSuppressed(ChannelState receive, bool suppressed)
+    {
+        lock (receive.MoxGate)
+        {
+            receive.RxDspSuppressedForMox = suppressed;
+            if (suppressed)
+            {
+                // No pre-MOX demodulated tail may become the first post-mute
+                // audio. RunWorker continues pushing clocked silence while its
+                // analyzer consumes raw IQ independently. Lifting suppression
+                // belongs to ResumeReceiveChannel, which flushes first.
+                lock (receive.AudioGate)
+                    receive.AudioCount = 0;
+            }
+        }
+        if (!suppressed) return;
+        // Discard receive state that may have ingested leakage before
+        // suppression began, as develop's key-down channel stop did: this is
+        // the same blocking SetChannelState(id,0,1) on the same control path.
+        // The worker drives WDSP's down-slew on silence while the flush runs,
+        // so no transition IQ reaches AM/SAM or AGC. The flush zeroes AM
+        // demodulator memory and the AGC look-ahead ring; AGC gain survives.
+        // If no IQ is flowing, WDSP times out (100 ms) exactly as on develop.
+        lock (receive.MoxGate) receive.NativeFlushOnSilence = true;
+        try
+        {
+            NativeMethods.SetChannelState(receive.Id, 0, 1);
+        }
+        finally
+        {
+            lock (receive.MoxGate) receive.NativeFlushOnSilence = false;
+        }
     }
 
     public void SetPsMox(bool moxOn)
@@ -3436,7 +3645,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         {
             int? monitorId = _monitorChannelId;
             foreach (var id in _channels.Keys)
+            {
+                if (_isolatedChannels.ContainsKey(id)) continue;
                 ApplyFmRx(id, clean, id == monitorId);
+            }
         });
         var caps = FmCaps;
         _log.LogInformation(
@@ -5227,11 +5439,13 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
         double[] audio = new double[state.OutDoubles];
         double[] spectrumIq = new double[2 * InSize];
+        double[] silence = new double[2 * InSize];
         int monoSamples = state.OutDoubles / 2;
         try
         {
-            foreach (var frame in state.InQueue.GetConsumingEnumerable(state.Cts.Token))
+            foreach (var workItem in state.InQueue.GetConsumingEnumerable(state.Cts.Token))
             {
+                double[] frame = workItem.Samples;
                 // TEMP diag (zeus-gdc7): time the per-frame WDSP work so we can
                 // tell whether the worker is the bottleneck (slow fexchange0 /
                 // Spectrum0 → queue fills → RX net thread blocks) or whether the
@@ -5243,28 +5457,58 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // both NBs are off so there's no WDSP call overhead in the common
                 // path. Non-enabled side stays at Run=0, so even if the mode
                 // changes mid-frame its xanb/xnob is a no-op pass-through.
-                switch (state.CurrentNbMode)
+                bool suppressDsp;
+                lock (state.MoxGate)
                 {
-                    case NbMode.Nb1:
-                        NativeMethods.XanbEXT(state.Id, ref frame[0], ref frame[0]);
-                        break;
-                    case NbMode.Nb2:
-                        NativeMethods.XnobEXT(state.Id, ref frame[0], ref frame[0]);
-                        break;
+                    // The per-item bit keeps IQ captured during the mute
+                    // quarantined even if it was queued behind the worker and
+                    // dequeued after RX resumes. The live bit also catches a
+                    // pre-MOX queued frame that had not begun DSP yet.
+                    suppressDsp = workItem.SuppressDsp || state.RxDspSuppressedForMox;
+                    if (!suppressDsp)
+                    {
+                        switch (state.CurrentNbMode)
+                        {
+                            case NbMode.Nb1:
+                                NativeMethods.XanbEXT(state.Id, ref frame[0], ref frame[0]);
+                                break;
+                            case NbMode.Nb2:
+                                NativeMethods.XnobEXT(state.Id, ref frame[0], ref frame[0]);
+                                break;
+                        }
+
+                        NativeMethods.fexchange0(
+                            state.Id,
+                            ref frame[0],
+                            ref audio[0],
+                            out _);
+                        // Publish under MoxGate so key-down cannot clear the
+                        // ring and then lose a race to this pre-MOX frame.
+                        PushAudio(state, audio, monoSamples);
+                    }
+                    else
+                    {
+                        // The resume flush only completes while fexchange0
+                        // keeps driving the channel-down slew. Feed it silence:
+                        // real transition IQ must not reach the demodulator
+                        // while WDSP discards pre-suppression receive state.
+                        if (state.NativeFlushOnSilence)
+                            NativeMethods.fexchange0(
+                                state.Id,
+                                ref silence[0],
+                                ref audio[0],
+                                out _);
+                        Array.Clear(audio);
+                        PushAudio(state, audio, monoSamples);
+                    }
                 }
 
-                NativeMethods.fexchange0(
-                    state.Id,
-                    ref frame[0],
-                    ref audio[0],
-                    out _);
                 // Deliver audio to the ring BEFORE taking AnalyzerLock. PushAudio
                 // only touches AudioGate + audio[]; it has no dependency on
                 // Spectrum0. Keeping it here means a SetZoom / SetRxDisplayFastAttack
                 // holding AnalyzerLock (heavy SetAnalyzer rebuild on zoom, tau
                 // reconfig on pan) cannot stall audio delivery — the ring keeps
                 // draining while the worker waits its turn to write spectrum.
-                PushAudio(state, audio, monoSamples);
                 // Empirical fix for HL2 panadapter sideband mirror: conjugate the
                 // IQ stream fed to the analyzer (I unchanged, Q negated). Audio
                 // path keeps the original IQ so demod stays correct. Without this
