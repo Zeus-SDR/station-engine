@@ -123,6 +123,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private readonly AutoResetEvent _captureQueueReady = new(false);
     private readonly Thread _captureWorker;
     private readonly Func<long, long, bool> _captureBlockValidator;
+    private readonly Func<long, bool> _bufferedCaptureValidator;
     private int _captureQueueRead;
     private int _captureQueueWrite;
     private int _captureQueueCount;
@@ -177,6 +178,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         _recoveryToken = _recoveryCancellation.Token;
         _inputChannel = deviceSettings?.Get().InputChannel ?? -1;
         _captureBlockValidator = IsCapturedBlockCurrent;
+        _bufferedCaptureValidator = generation => generation == Volatile.Read(ref _captureGeneration);
         _captureWorker = new Thread(CaptureWorkerLoop)
         {
             IsBackground = true,
@@ -988,7 +990,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 new MicBlockValidity(
                     _captureBlockValidator,
                     generation,
-                    enqueuedAt));
+                    enqueuedAt,
+                    _bufferedCaptureValidator));
         }
         catch (Exception ex)
         {
@@ -1014,7 +1017,8 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _ingest.OnHostMicSamplesFromMic(
                 block,
-                new MicBlockValidity(_captureBlockValidator, generation, enqueuedAt));
+                new MicBlockValidity(_captureBlockValidator, generation, enqueuedAt,
+                    _bufferedCaptureValidator));
         }
         catch (Exception ex)
         {

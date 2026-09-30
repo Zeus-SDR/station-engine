@@ -943,6 +943,10 @@ public partial class DspPipelineService : BackgroundService,
     // per-packet hot path. CurrentEngine and the IDspEngine endpoint setters
     // (e.g. /api/mic-gain) also fall outside the hot path and keep the lock.
     private readonly object _engineLock = new();
+    private Func<int>? _txPluginLatencyMs;
+
+    public void SetTxPluginLatencyProvider(Func<int>? provider) =>
+        Volatile.Write(ref _txPluginLatencyMs, provider);
     private IDspEngine? _engine;
     private int _channelId;
 
@@ -1622,6 +1626,9 @@ public partial class DspPipelineService : BackgroundService,
     private bool _resetDisplayPixelsForCurrentTx;
     private bool _p2DisplayDuplexForCurrentTx;
     private int _rxPostTxMuteBlocksRemaining;       // RXA transition-drain blocks after MOX↓
+    // Latched at MOX↓ (false for a PureSignal over): a leased product-plugin
+    // data tap may end WDSP's receive quarantine after the first drain block.
+    private volatile bool _rxPostTxDataTapEarlyResumeAllowed;
     private int _rxPostTxFadeInSamplesRemaining;    // final-output soft resume after post-TX drain
     private int _rxPostTxDisplayFramesRemaining;    // RXA analyzer transition frames after MOX↓
 
@@ -2117,7 +2124,8 @@ public partial class DspPipelineService : BackgroundService,
     /// operator delay, flushes the final partial mic block through TXA, and
     /// lets the P1/P2 transport drain before MOX drops.
     /// </summary>
-    public virtual bool DrainVoiceTxTail(int tailDelayMs) => ResolveTxIngest()?.DrainVoiceTxTail(tailDelayMs) ?? false;
+    public virtual bool DrainVoiceTxTail(int tailDelayMs, Func<bool>? shouldAbort = null) =>
+        ResolveTxIngest()?.DrainVoiceTxTail(tailDelayMs, shouldAbort) ?? false;
 
     /// <summary>
     /// Old-school roger beep tail. Called by TxService on an accepted local
@@ -2139,6 +2147,10 @@ public partial class DspPipelineService : BackgroundService,
     /// the radio wire MOX bit is asserted on a new key-down.
     /// </summary>
     public virtual bool PrimeTxDspForKeyDown() => ResolveTxIngest()?.PrimeTxDspForKeyDown() ?? false;
+
+    internal virtual void BeginVoiceOnsetBuffer() => ResolveTxIngest()?.BeginVoiceOnsetBuffer();
+
+    internal virtual void CancelVoiceOnsetBuffer() => ResolveTxIngest()?.CancelVoiceOnsetBuffer();
 
     /// <summary>Arm an FM access tone burst on the TX mic stream (see
     /// <see cref="FmToneBurstGenerator"/>). False when no TX ingest exists.</summary>
@@ -2191,6 +2203,8 @@ public partial class DspPipelineService : BackgroundService,
 
     public virtual bool DrainTxIqTransportTail(TimeSpan timeout)
     {
+        if (_radio.IsProtocol3Active)
+            return _externalRadioSidecar.WaitForTxIqIdle(timeout);
         var p2 = _p2Client;
         if (p2 is not null)
         {
@@ -2202,6 +2216,31 @@ public partial class DspPipelineService : BackgroundService,
             return _txIqRing.WaitForEmpty(timeout);
 
         return true;
+    }
+
+    // Three serial TX bandpass stages retain speech after the last mic block.
+    // The input cadence is always 48 kHz; P2's FIRs run at 96 kHz.
+    internal virtual int EstimateVoiceTxDspLatencyMs()
+    {
+        var state = _radio.Snapshot();
+        int delayMs = 0;
+        if (state.TxFilterPhase == FilterPhaseMode.Linear)
+        {
+            int taps = ResolveFilterTapCount(state.TxFilterWindow);
+            int dspRate = ResolveTxDspRateHz(_engine);
+            delayMs += (int)Math.Ceiling(3.0 * (taps - 1) * 500.0 / dspRate);
+        }
+        else
+        {
+            // Minimum-phase delay is frequency dependent, but the partition
+            // still needs several input blocks to move its final output.
+            delayMs += 3 * 512 * 1000 / ResolveTxDspRateHz(_engine);
+        }
+        var dexp = state.Dexp;
+        if (dexp is { Enabled: true, LookAheadEnabled: true })
+            delayMs += (int)Math.Ceiling(dexp.LookAheadMs);
+        delayMs += Math.Max(0, Volatile.Read(ref _txPluginLatencyMs)?.Invoke() ?? 0);
+        return delayMs;
     }
 
     // dB added to the TX panadapter/waterfall pixels (Thetis TXDisplayCalOffset).
@@ -3586,6 +3625,25 @@ public partial class DspPipelineService : BackgroundService,
             if (Interlocked.CompareExchange(ref _rxPostTxMuteBlocksRemaining, next, remaining) != remaining)
                 continue;
 
+            if (next > 0
+                && _rxPostTxDataTapEarlyResumeAllowed
+                && (_productPluginAudio?.HasLeasedRxDataTap ?? false))
+            {
+                // A modem (product-plugin data tap) is listening for the other
+                // station's reply, which can start well inside the operator's
+                // post-TX speaker mute. Keep WDSP's receive quarantine for this
+                // ONE drain block only: it is the block that carries the T/R
+                // switching transient and keyed leakage the quarantine exists
+                // for (#2569 - AGC/AM leveler memory), and it is already zeros
+                // in the data tap because WDSP fed the demodulator silence.
+                // Resume receive DSP now so every later drain block reaches the
+                // data tap as real receive audio. The speaker path is unchanged:
+                // it stays muted for the whole drain and fades in at the end.
+                _rxPostTxDataTapEarlyResumeAllowed = false;
+                if (!_rxAudioSuppressedForTx)
+                    _engine?.CompletePostTxRxResume();
+            }
+
             if (next == 0)
             {
                 // This runs inline on the P1/P2 receive thread, so it must not
@@ -3727,6 +3785,7 @@ public partial class DspPipelineService : BackgroundService,
         // are rare operator-edge events (not the per-frame hot path).
         if (on)
         {
+            _rxPostTxDataTapEarlyResumeAllowed = false;
             Volatile.Write(ref _rxPostTxMuteBlocksRemaining, 0);
             Volatile.Write(ref _rxPostTxFadeInSamplesRemaining, 0);
             Volatile.Write(ref _rxPostTxDisplayFramesRemaining, 0);
@@ -3790,6 +3849,10 @@ public partial class DspPipelineService : BackgroundService,
                 // wrapper that swallows exceptions, so a latch left high here
                 // would keep RX audio muted until a reconnect rebuilt the
                 // engine — the "no receive audio after TX" symptom (issue #993).
+                // PureSignal keeps its full RX1 transition: the data-tap early
+                // resume applies only to half-duplex / DUP overs. Published
+                // before the drain counter the RX thread reads.
+                _rxPostTxDataTapEarlyResumeAllowed = !_stopRxForPureSignalForCurrentTx;
                 Volatile.Write(ref _rxPostTxMuteBlocksRemaining, postTxMuteBlocks);
                 Volatile.Write(ref _rxPostTxDisplayFramesRemaining, postTxMuteBlocks);
                 _rxAudioSuppressedForTx = false;
@@ -9987,6 +10050,19 @@ public partial class DspPipelineService : BackgroundService,
         // local RX for "TX owns the audio" keys off this instead.
         bool duplexLocalRxLive = suppressRxAudioForTx && allowLocalRxDuringSuppression;
         int audioSampleCount = engine.ReadAudio(channel, audioBuf);
+        // Product-plugin "data" RX tap (modems such as the built-in ARDOP): the
+        // raw WDSP RX1 output, before the RX1 mute, the mix, local RX plugins /
+        // VST, squelch, leveler, monitor inject, limiter, post-TX fade and the
+        // master mute. While keyed half-duplex it publishes nothing, exactly as
+        // the default tap (RX1 is dropped from the published bus then); under
+        // DUP it carries the live keyed receive audio. It is NOT gated by the
+        // post-TX speaker mute: every drain block goes out as WDSP produced it.
+        // WDSP itself quarantines receive DSP until CompletePostTxRxResume
+        // (see MarkTxSuppressedAudioBlockPublished), which a leased data tap
+        // brings forward to the end of the first drain block.
+        if (audioSampleCount > 0 && (!activelyKeyed || fullDuplexRxActive))
+            _productPluginAudio?.PublishRxDataAudio(
+                0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
         // Public Listening listen-along tap (ADR-0010): the ONLY clean RX1
         // point — before the RX1 mute clear, the secondary mix, CW sidetone,
         // Recorder monitor-inject and the TX monitor below. The feed divides
@@ -10086,6 +10162,10 @@ public partial class DspPipelineService : BackgroundService,
             int n = want > 0 ? engine.ReadAudio(secChan, sec.AudioBuf.AsSpan(0, want)) : 0;
             if (n > 0)
             {
+                // Data tap: raw WDSP output, ahead of the open fade below. Like
+                // the default secondary tap, it publishes every drained block.
+                _productPluginAudio?.PublishRxDataAudio(
+                    ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
                 // Ramp the first blocks of a freshly opened channel so RX2-on
                 // enters the additive mix (below) smoothly instead of dumping an
                 // unconverged full-scale block. Applied before the plugin tap and

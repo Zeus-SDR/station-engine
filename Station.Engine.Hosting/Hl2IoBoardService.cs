@@ -21,6 +21,12 @@ public sealed record Hl2IoBoardView(Hl2IoBoardStatus Status, IReadOnlyList<Hl2Io
 /// <summary>Connection-scoped IO Board polling and explicitly requested operator commands.</summary>
 public sealed class Hl2IoBoardService : BackgroundService
 {
+    private const int RecoveryBackoffMinMs = 250;
+    private const int RecoveryBackoffMaxMs = 4000;
+    // Retries for a connection that has never detected a board are bounded: an
+    // HL2 without one that keeps timing out stops after this many attempts.
+    private const int UndetectedRecoveryAttempts = 5;
+
     private sealed record Command(string Action, byte Outputs, Protocol1Client Client, CancellationToken Token)
     {
         public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -71,7 +77,12 @@ public sealed class Hl2IoBoardService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         Protocol1Client? previous = null;
+        IHl2I2cTransport? transport = null;
         Hl2IoBoardSession? session = null;
+        bool recoveryPending = false;
+        bool boardDetected = false;
+        int recoveryFailures = 0;
+        long nextRecoveryMs = 0;
         int polls = 0;
         _tx.TransmitRequested += OnTransmitRequested;
         _settings.Changed += OnSettingsChanged;
@@ -81,7 +92,8 @@ public sealed class Hl2IoBoardService : BackgroundService
             {
                 var client = _radio.ActiveClient as Protocol1Client;
                 if (client?.BoardKind != HpsdrBoardKind.HermesLite2 || _radio.Snapshot().Status != ConnectionStatus.Connected) client = null;
-                if (!ReferenceEquals(previous, client))
+                bool clientChanged = !ReferenceEquals(previous, client);
+                if (clientChanged)
                 {
                     _tuner?.Disconnect();
                     _tuner?.Dispose();
@@ -90,30 +102,66 @@ public sealed class Hl2IoBoardService : BackgroundService
                     _tx.Safety.ClearHl2IoBoard();
                     previous = client;
                     session = null;
+                    transport = client is null ? null : TransportFactory(client);
+                    recoveryPending = false;
+                    boardDetected = false;
+                    recoveryFailures = 0;
+                    nextRecoveryMs = 0;
+                    polls = 0;
                     _status = new(Supported: client is not null);
-                    if (client is not null)
+                }
+
+                bool recoveringNow = recoveryPending && session is null && client is not null
+                    && Environment.TickCount64 >= nextRecoveryMs;
+                if (client is not null && transport is not null && (clientChanged || recoveringNow))
+                {
+                    var candidate = new Hl2IoBoardSession(transport);
+                    try
                     {
-                        var candidate = new Hl2IoBoardSession(TransportFactory(client));
-                        try
+                        if (recoveringNow)
+                            await transport.RecoverAsync(stoppingToken).ConfigureAwait(false);
+                        if (await candidate.DetectAsync(stoppingToken).ConfigureAwait(false))
                         {
-                            if (await candidate.DetectAsync(stoppingToken).ConfigureAwait(false))
+                            if (!IsCurrent(client)) { previous = null; continue; }
+                            session = candidate;
+                            recoveryPending = false;
+                            boardDetected = true;
+                            recoveryFailures = 0;
+                            polls = 0;
+                            _tx.Safety.InvalidateHl2IoBoard();
+                            _tuner = new Hl2IoBoardTuner(new TunerRadio(_tx, () => Interlocked.Read(ref _foreignIntent) == Interlocked.Read(ref _tuneIntentEpoch)), candidate.TunerCommandAsync);
+                            _status = candidate.Status;
+                            _log.LogInformation(recoveringNow
+                                    ? "hl2.io.recovered hardware={Hardware} firmware={Major}.{Minor}"
+                                    : "hl2.io.detect hardware={Hardware} firmware={Major}.{Minor}",
+                                _status.HardwareVersion, _status.FirmwareMajor, _status.FirmwareMinor);
+                        }
+                        else
+                        {
+                            _status = _status with { Present = false, Error = "IO Board not detected" };
+                            // A clean answer with no board is final for a client that never had one;
+                            // only a board this connection already detected is worth waiting for.
+                            if (recoveringNow && boardDetected)
                             {
-                                if (!IsCurrent(client)) { previous = null; continue; }
-                                session = candidate;
-                                _tx.Safety.InvalidateHl2IoBoard();
-                                _tuner = new Hl2IoBoardTuner(new TunerRadio(_tx, () => Interlocked.Read(ref _foreignIntent) == Interlocked.Read(ref _tuneIntentEpoch)), candidate.TunerCommandAsync);
-                                _status = candidate.Status;
-                                _log.LogInformation("hl2.io.detect hardware={Hardware} firmware={Major}.{Minor}",
-                                    _status.HardwareVersion, _status.FirmwareMajor, _status.FirmwareMinor);
+                                recoveryFailures++;
+                                nextRecoveryMs = Environment.TickCount64 + RecoveryBackoffMs(recoveryFailures);
                             }
-                            else _status = _status with { Error = "IO Board not detected" };
+                            else recoveryPending = false;
                         }
-                        catch (Exception ex) when (ex is IOException or TimeoutException)
+                    }
+                    catch (Exception ex) when (ex is IOException or TimeoutException)
+                    {
+                        if (!IsCurrent(client)) continue;
+                        if (recoveringNow) recoveryFailures++;
+                        else recoveryFailures = 0;
+                        recoveryPending = boardDetected || recoveryFailures < UndetectedRecoveryAttempts;
+                        _status = _status with
                         {
-                            if (!IsCurrent(client)) continue;
-                            _status = _status with { Error = "IO Board not detected; reconnect to retry" };
-                            _log.LogDebug(ex, "hl2.io.detect unavailable");
-                        }
+                            Present = false,
+                            Error = recoveryPending ? ex.Message : "IO Board not detected; reconnect to retry",
+                        };
+                        nextRecoveryMs = Environment.TickCount64 + RecoveryBackoffMs(recoveryFailures);
+                        _log.LogDebug(ex, recoveringNow ? "hl2.io.recovery unavailable" : "hl2.io.detect unavailable");
                     }
                 }
 
@@ -131,7 +179,6 @@ public sealed class Hl2IoBoardService : BackgroundService
                         }
                         else
                         {
-                            SetInhibit(null);
                             if (!Transmitting)
                             {
                                 var state = _radio.Snapshot();
@@ -153,6 +200,7 @@ public sealed class Hl2IoBoardService : BackgroundService
                                         }).ConfigureAwait(false);
                             }
                             if (!IsCurrent(client)) continue;
+                            if (!_tx.Safety.Hl2IoBoardNeedsSync(_radio.Snapshot())) SetInhibit(null);
                             if (_tuner is not null)
                             {
                                 if (Interlocked.Read(ref _foreignIntent) != Interlocked.Read(ref _tuneIntentEpoch))
@@ -169,8 +217,13 @@ public sealed class Hl2IoBoardService : BackgroundService
                         if (!IsCurrent(client)) continue;
                         SetInhibit("HL2 IO Board is unavailable; reconnect before transmitting");
                         _tuner?.Disconnect();
+                        _tuner?.Dispose();
+                        _tuner = null;
                         _status = session.Status with { Present = false, Error = ex.Message };
                         session = null;
+                        recoveryPending = ex is IOException or TimeoutException;
+                        recoveryFailures = 0;
+                        nextRecoveryMs = Environment.TickCount64 + RecoveryBackoffMs(recoveryFailures);
                         _log.LogWarning(ex, "hl2.io.connection lost");
                     }
                 }
@@ -232,6 +285,12 @@ public sealed class Hl2IoBoardService : BackgroundService
     }
 
     private bool Transmitting => _tx.IsMoxOn || _tx.IsTunOn || _tx.IsTwoToneOn;
+
+    private static int RecoveryBackoffMs(int failures)
+    {
+        int shift = Math.Min(Math.Max(failures, 0), 4);
+        return Math.Min(RecoveryBackoffMinMs << shift, RecoveryBackoffMaxMs);
+    }
 
     private void SetInhibit(string? reason)
     {

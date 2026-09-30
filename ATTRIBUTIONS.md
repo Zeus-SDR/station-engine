@@ -365,6 +365,23 @@ and build notes: [`native/wspr/README.md`](native/wspr/README.md).
 The FT8/FT4 core (**ft8_lib**, Kārlis Goba, MIT) ships with the Zeus Digital
 feature; see `ZeusProduct/Plugins/Digital/SOURCE.md`.
 
+## ardopcf (built-in Winlink ARDOP modem)
+
+The ARDOP modem built into Zeus Winlink is **ardopcf** by Rick Muething
+(KN6KB), John Wiseman (G8BPQ) and Peter LaRue, MIT licensed, vendored
+unmodified from [pflarue/ardop](https://github.com/pflarue/ardop) tag
+`1.0.4.1.3` (commit `96dec85fc96d7e6d3dd90379fd809ba6cf83b6cc`) under
+[`native/ardop/upstream/`](native/ardop/upstream/). It bundles two small
+external libraries: **zf_log** (© 2017 wonder-mice, MIT) and Simon
+Rockliff's Reed-Solomon coder (1989/1991, distributed on condition that the
+author is acknowledged; modified by Peter LaRue for ardopcf). A Zeus-written
+MIT backend in `native/ardop/zeus/` replaces ardopcf's sound-card, PTT and
+command-line layer; it builds into the `zeus_ardop` library loaded by the
+ZeusProduct Winlink feature. The licence notices ship as
+`ZeusProduct/Plugins/Ardop/ThirdParty/ardopcf-LICENSE.txt`; provenance and
+build notes: `ZeusProduct/Plugins/Ardop/SOURCE.md` and
+[`native/ardop/README.md`](native/ardop/README.md).
+
 ## RADE V1 (Radio Autoencoder — radae_c, opus_dnn, freedv_text)
 
 Zeus's RADE V1 (Radio Autoencoder) digital-voice mode builds a single shared

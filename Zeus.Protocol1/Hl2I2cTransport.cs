@@ -7,6 +7,7 @@ public interface IHl2I2cTransport
 {
     Task<uint> ReadAsync(byte address, byte register, CancellationToken cancellationToken);
     Task WriteAsync(byte address, byte register, byte value, CancellationToken cancellationToken);
+    Task RecoverAsync(CancellationToken cancellationToken);
 }
 
 /// <summary>One acknowledged bus-2 transaction at a time, carried by the existing EP2 loop.</summary>
@@ -46,6 +47,28 @@ internal sealed class Hl2I2cTransport : IHl2I2cTransport
 
     public async Task WriteAsync(byte address, byte register, byte value, CancellationToken cancellationToken) =>
         _ = await ExchangeAsync(address, register, value, read: false, cancellationToken).ConfigureAwait(false);
+
+    public async Task RecoverAsync(CancellationToken cancellationToken)
+    {
+        long generation;
+        lock (_sync)
+        {
+            generation = ++_generation;
+            _available = false;
+            _pending?.Completion.TrySetException(new IOException("HL2 I²C connection is recovering."));
+            _pending = null;
+            _lastSendMs = long.MinValue;
+        }
+
+        // Responses have no transaction identifier. Keep the receiver
+        // quarantined for one full request timeout so a delayed response from
+        // the retired generation cannot complete the first recovery request.
+        await Task.Delay(_timeout, cancellationToken).ConfigureAwait(false);
+        lock (_sync)
+        {
+            if (_generation == generation) _available = true;
+        }
+    }
 
     private async Task<uint> ExchangeAsync(byte address, byte register, byte value, bool read, CancellationToken ct)
     {

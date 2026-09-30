@@ -85,9 +85,11 @@ internal enum MicBlockSource
 internal readonly record struct MicBlockValidity(
     Func<long, long, bool> Validator,
     long Generation,
-    long EnqueuedAt)
+    long EnqueuedAt,
+    Func<long, bool>? BufferedValidator = null)
 {
     public bool IsCurrent => Validator(Generation, EnqueuedAt);
+    public bool IsBufferedCurrent => BufferedValidator?.Invoke(Generation) ?? IsCurrent;
 }
 
 /// <summary>
@@ -137,6 +139,17 @@ public sealed class TxAudioIngest : IDisposable
     // modulated samples in _scratchIq stay intact for the peak diagnostic — we
     // mute by writing FROM this buffer, not by zeroing _scratchIq in place.
     private readonly float[] _muteIq = new float[4096];
+    private const int IdlePreRollSamples = 3 * MicBlockSamples;
+    private const int MaxVoiceOnsetSamples = 10 * MicBlockSamples;
+    private readonly Queue<(float[] Samples, MicBlockSource Source, MicBlockValidity? Validity)> _idlePreRoll = new();
+    private readonly Queue<(float[] Samples, MicBlockSource Source, MicBlockValidity? Validity)> _voiceOnset = new();
+    private int _idlePreRollSamples;
+    private int _voiceOnsetSamples;
+    private int _preKeyZeroRemainder;
+    private bool _voiceOnsetArmed;
+    // While a tail replays held speech, a concurrent live mic callback must
+    // yield without erasing the replay's partial WDSP input block.
+    private bool _preserveOnsetAccumulatorDuringTail;
 
     // Exclusive TXA utility path. Non-zero while the mic hot path must yield TX
     // to a tail drain or key-down prime (no double-feed into WDSP fexchange2),
@@ -287,9 +300,163 @@ public sealed class TxAudioIngest : IDisposable
     {
         if (_activeSource == source) return;
         _activeSource = source;
+        _idlePreRoll.Clear();
+        _voiceOnset.Clear();
+        _idlePreRollSamples = 0;
+        _voiceOnsetSamples = 0;
+        _preKeyZeroRemainder = 0;
+        _voiceOnsetArmed = false;
             // Quiesce: drop any partially-accumulated old-source audio so it
             // can't stitch onto the post-switch source mid-WDSP-block.
         _accumulatorFill = 0;
+    }
+
+    internal void BeginVoiceOnsetBuffer()
+    {
+        lock (_sync)
+        {
+            _voiceOnset.Clear();
+            _voiceOnsetSamples = 0;
+            _preKeyZeroRemainder = 0;
+            while (_idlePreRoll.TryDequeue(out var block))
+            {
+                if (!IsBufferedCurrent(block.Validity)) continue;
+                _voiceOnset.Enqueue(block);
+                _voiceOnsetSamples += block.Samples.Length;
+            }
+            _idlePreRollSamples = 0;
+            _voiceOnsetArmed = true;
+        }
+    }
+
+    internal void CancelVoiceOnsetBuffer()
+    {
+        lock (_sync)
+        {
+            _voiceOnsetArmed = false;
+            _voiceOnset.Clear();
+            _idlePreRoll.Clear();
+            _voiceOnsetSamples = 0;
+            _idlePreRollSamples = 0;
+            _preKeyZeroRemainder = 0;
+        }
+    }
+
+    private void SendPreKeyZeroIq(int micSamples)
+    {
+        var engine = _engineProvider();
+        int blockSize = engine?.TxBlockSamples ?? 0;
+        int iqOut = engine?.TxOutputSamples ?? 0;
+        if (blockSize <= 0 || iqOut <= 0) return;
+
+        // Preserve the source's 48 kHz cadence even for ASIO chunks smaller
+        // than 960 samples. No WDSP mic block is processed here, so buffered
+        // speech cannot be consumed by the RF mute window or be preceded by
+        // a partially accumulated silent mic block when replay starts.
+        int scaled = micSamples * iqOut + _preKeyZeroRemainder;
+        int pairs = scaled / blockSize;
+        _preKeyZeroRemainder = scaled % blockSize;
+        int maxPairs = _muteIq.Length / 2;
+        while (pairs > 0)
+        {
+            int chunk = Math.Min(pairs, maxPairs);
+            _ring.Write(new ReadOnlySpan<float>(_muteIq, 0, 2 * chunk));
+            _forwardP2?.Invoke(new ReadOnlyMemory<float>(_muteIq, 0, 2 * chunk));
+            pairs -= chunk;
+        }
+    }
+
+    private int DrainVoiceOnsetPaced(long frequency, Func<bool>? shouldAbort)
+    {
+        lock (_sync) _voiceOnsetArmed = false;
+        long paceAt = _stopwatchTicks();
+        int drained = 0;
+        while (true)
+        {
+            if (shouldAbort?.Invoke() == true) break;
+            (float[] Samples, MicBlockSource Source, MicBlockValidity? Validity) block;
+            lock (_sync)
+            {
+                if (!_voiceOnset.TryDequeue(out block)) break;
+                _voiceOnsetSamples -= block.Samples.Length;
+                if (IsBufferedCurrent(block.Validity))
+                    ProcessMicPcm(block.Samples, block.Source, block.Validity,
+                        bypassOnset: true, tailReplay: true);
+            }
+            drained++;
+            paceAt += (long)(frequency * (double)block.Samples.Length / TxRateHz);
+            long waitTicks = paceAt - _stopwatchTicks();
+            if (waitTicks > 0)
+                SleepUnlessAborted((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
+        }
+        return drained;
+    }
+
+    private bool HoldOrReplayVoiceOnset(
+        ReadOnlySpan<float> samples, MicBlockSource source, MicBlockValidity? validity,
+        bool moxNow)
+    {
+        lock (_sync)
+        {
+            if (source is not (MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic))
+                return false;
+            if ((source == MicBlockSource.BrowserMic && _activeSource == MicBlockSource.VirtualCable)
+                || (source != MicBlockSource.BrowserMic && source != _activeSource))
+                return false;
+
+            if (!_voiceOnsetArmed)
+            {
+                if (!moxNow && IsBufferedCurrent(validity))
+                {
+                    if (_idlePreRoll.TryPeek(out var prior) && prior.Source != source)
+                    {
+                        _idlePreRoll.Clear();
+                        _idlePreRollSamples = 0;
+                    }
+                    while (_idlePreRollSamples + samples.Length > IdlePreRollSamples
+                           && _idlePreRoll.TryDequeue(out var old))
+                        _idlePreRollSamples -= old.Samples.Length;
+                    _idlePreRoll.Enqueue((samples.ToArray(), source, validity));
+                    _idlePreRollSamples += samples.Length;
+                }
+                return false;
+            }
+
+            if (!IsBufferedCurrent(validity)) return true;
+            if (_voiceOnset.TryPeek(out var previous) && previous.Source != source)
+            {
+                _voiceOnset.Clear();
+                _voiceOnsetSamples = 0;
+            }
+            long openAt = _preKeyOpenAtTicks();
+            bool gateOpen = moxNow && !TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks());
+            if (gateOpen)
+            {
+                if (!_voiceOnset.TryDequeue(out var oldest)) return false;
+                _voiceOnsetSamples -= oldest.Samples.Length;
+                // Replace exactly one queued frame with this arrival, then
+                // replay exactly one. A full queue does not shed an extra
+                // opening frame merely because the gate just opened.
+                _voiceOnset.Enqueue((samples.ToArray(), source, validity));
+                _voiceOnsetSamples += samples.Length;
+                if (IsBufferedCurrent(oldest.Validity))
+                    ProcessMicPcm(oldest.Samples, oldest.Source, oldest.Validity,
+                        bypassOnset: true);
+                return true;
+            }
+
+            while (_voiceOnsetSamples + samples.Length > MaxVoiceOnsetSamples
+                   && _voiceOnset.TryDequeue(out var old))
+            {
+                _voiceOnsetSamples -= old.Samples.Length;
+                _log.LogWarning("tx.voice.onset bounded queue overflow; oldest {Samples} samples dropped",
+                    old.Samples.Length);
+            }
+            _voiceOnset.Enqueue((samples.ToArray(), source, validity));
+            _voiceOnsetSamples += samples.Length;
+            if (moxNow) SendPreKeyZeroIq(samples.Length);
+            return true;
+        }
     }
 
     /// <summary>Sources whose audio is operator speech (or a recorded voice
@@ -385,6 +552,7 @@ public sealed class TxAudioIngest : IDisposable
                preKeyOpenAtTicks: () => tx.PreKeyOpenAtTicks,
                txTransportLevel: pipeline.TxTransportLevel48k,
                isVoiceTxMode: () => tx.IsVoiceTxModeNow,
+               voiceDspLatencyMs: pipeline.EstimateVoiceTxDspLatencyMs,
                audioModem: audioModem,
                productAudio: productAudio,
                productPluginAudio: productPluginAudio,
@@ -414,7 +582,8 @@ public sealed class TxAudioIngest : IDisposable
         ProductPluginAudioPort? productPluginAudio = null,
         CwIdService? cwId = null,
         Func<TxTransportLevel>? txTransportLevel = null,
-        Func<bool>? isVoiceTxMode = null)
+        Func<bool>? isVoiceTxMode = null,
+        Func<int>? voiceDspLatencyMs = null)
     {
         _ring = ring;
         _txTransportLevel = txTransportLevel ?? (static () => TxTransportLevel.Unknown);
@@ -427,6 +596,7 @@ public sealed class TxAudioIngest : IDisposable
         _productPluginAudio = productPluginAudio;
         _forwardP2 = forwardP2;
         _drainTxTransport = drainTxTransport;
+        _voiceDspLatencyMs = voiceDspLatencyMs ?? (static () => 0);
         _onWdspConsumed = onWdspConsumed;
         _txOwnedByTuneDriver = txOwnedByTuneDriver ?? (static () => false);
         _preKeyOpenAtTicks = preKeyOpenAtTicks ?? (static () => 0L);
@@ -566,9 +736,8 @@ public sealed class TxAudioIngest : IDisposable
     /// <see cref="_accumulator"/> forever and still be cut off even though MOX
     /// was held.
     /// </summary>
-    public bool DrainVoiceTxTail(int tailDelayMs)
+    public bool DrainVoiceTxTail(int tailDelayMs, Func<bool>? shouldAbort = null)
     {
-        if (tailDelayMs <= 0) return false;
         if (_audioModem.Active) return false;
         if (_txOwnedByTuneDriver()) return false;
 
@@ -586,16 +755,25 @@ public sealed class TxAudioIngest : IDisposable
         // Keep ingress open for the first third of the configured hold so
         // delayed capture/browser frames remain eligible, reserving the rest
         // for the final WDSP flush and transport drain before MOX drops.
-        int settleMs = tailDelayMs / 3;
-        if (settleMs > 0) Thread.Sleep(settleMs);
+        int settleMs = Math.Min(200, Math.Max(80, tailDelayMs / 3));
+        if (settleMs > 0) SleepUnlessAborted(settleMs, shouldAbort);
+        if (shouldAbort?.Invoke() == true) return false;
 
-        if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
+        lock (_sync)
+        {
+            if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
+            _preserveOnsetAccumulatorDuringTail = true;
+        }
 
         int residualSamples = 0;
         int produced = 0;
+        int onsetDrained = 0;
         bool transportDrained = true;
         try
         {
+            onsetDrained = DrainVoiceOnsetPaced(freq, shouldAbort);
+            if (shouldAbort?.Invoke() == true) return false;
+
             lock (_sync)
             {
                 residualSamples = _accumulatorFill;
@@ -623,15 +801,67 @@ public sealed class TxAudioIngest : IDisposable
                 }
             }
 
-            TimeSpan drainBudget = RemainingUntil(deadline, freq);
-            transportDrained = _drainTxTransport?.Invoke(drainBudget) ?? true;
-            SleepUntil(deadline, freq);
+            // A transport queue can be empty while the final syllable is still
+            // inside TXA's FIR/lookahead stages. Advance TXA with real-time
+            // silence before testing for quiet output. The initial output can
+            // itself be silent while a delayed syllable is still on its way.
+            int dspLatencyMs = Math.Clamp(_voiceDspLatencyMs(), 0, 2000);
+            int periodMs = Math.Max(1, (int)Math.Ceiling(blockSize * 1000.0 / TxRateHz));
+            int minFlushBlocks = Math.Max(2, (dspLatencyMs + 2 * periodMs + periodMs - 1) / periodMs);
+            int maxFlushBlocks = Math.Max(minFlushBlocks,
+                (Math.Min(5000, dspLatencyMs + 500) + periodMs - 1) / periodMs);
+            int quietBlocks = 0;
+            int flushBlocks = 0;
+            long paceAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            Array.Clear(_tailMic, 0, blockSize);
+            float iqPeak = 0f;
+            for (int b = 0; b < maxFlushBlocks; b++)
+            {
+                if (shouldAbort?.Invoke() == true) return false;
+                ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak);
+                flushBlocks++;
+                quietBlocks = b + 1 >= minFlushBlocks && blockPeak <= RogerBeepFlushIqThreshold
+                    ? quietBlocks + 1
+                    : 0;
+                paceAt += (long)(freq * (double)blockSize / TxRateHz);
+                long remaining = paceAt - System.Diagnostics.Stopwatch.GetTimestamp();
+                if (remaining > 0)
+                    SleepUnlessAborted((int)Math.Ceiling(remaining * 1000.0 / freq), shouldAbort);
+                else paceAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (quietBlocks >= RogerBeepFlushSilentBlocks) break;
+            }
+
+            if (shouldAbort?.Invoke() == true) return false;
+            int backlogSamples = _txTransportLevel().BacklogSamples;
+            int transportBudgetMs = Math.Clamp(
+                backlogSamples < 0 ? 5000
+                    : backlogSamples / TxLatencyGovernor.SamplesPerMs + 250,
+                RogerBeepTransportDrainTimeoutMs, 5000);
+            long transportStop = System.Diagnostics.Stopwatch.GetTimestamp()
+                + (long)(freq * transportBudgetMs / 1000.0);
+            do
+            {
+                if (shouldAbort?.Invoke() == true) return false;
+                transportDrained = _drainTxTransport?.Invoke(TimeSpan.FromMilliseconds(10)) ?? true;
+            } while (!transportDrained && System.Diagnostics.Stopwatch.GetTimestamp() < transportStop);
+            if (!transportDrained)
+                _log.LogWarning("tx.voice.tail transport did not drain before bounded timeout budgetMs={Budget}", transportBudgetMs);
+            // The radio FIFO can still hold the last emitted IQ after the
+            // host queue goes idle. Honor the operator's requested hold as a
+            // minimum, then leave a short post-drain guard before unkey.
+            SleepUnlessAborted(RogerBeepTailGuardMs, shouldAbort);
+            if (shouldAbort?.Invoke() == true) return false;
+            long holdRemaining = deadline - System.Diagnostics.Stopwatch.GetTimestamp();
+            if (holdRemaining > 0)
+                SleepUnlessAborted((int)Math.Ceiling(holdRemaining * 1000.0 / freq), shouldAbort);
+            if (shouldAbort?.Invoke() == true) return false;
 
             double elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - startTs)
                 * 1000.0 / freq;
             _log.LogInformation(
-                "tx.voice.tail dropping PTT: delayMs={Delay} residualSamples={Residual} produced={Produced} transportDrained={TransportDrained} elapsedMs={Elapsed:F1}",
-                tailDelayMs, residualSamples, produced, transportDrained, elapsedMs);
+                "tx.voice.tail dropping PTT: delayMs={Delay} onsetBlocks={OnsetBlocks} residualSamples={Residual} produced={Produced} dspLatencyMs={DspLatency} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} transportDrained={TransportDrained} elapsedMs={Elapsed:F1}",
+                tailDelayMs, onsetDrained, residualSamples, produced, dspLatencyMs, flushBlocks,
+                quietBlocks >= RogerBeepFlushSilentBlocks, transportDrained, elapsedMs);
             return true;
         }
         catch (Exception ex)
@@ -643,27 +873,16 @@ public sealed class TxAudioIngest : IDisposable
         {
             lock (_sync)
             {
+                _voiceOnsetArmed = false;
+                _voiceOnset.Clear();
+                _voiceOnsetSamples = 0;
+                _preserveOnsetAccumulatorDuringTail = false;
                 _ring.Clear();
                 _accumulatorFill = 0;
                 _lastSeenMox = false;
             }
             Volatile.Write(ref _tailDraining, 0);
         }
-    }
-
-    private static TimeSpan RemainingUntil(long deadlineTicks, long stopwatchFrequency)
-    {
-        long remaining = deadlineTicks - System.Diagnostics.Stopwatch.GetTimestamp();
-        if (remaining <= 0) return TimeSpan.Zero;
-        return TimeSpan.FromSeconds(remaining / (double)stopwatchFrequency);
-    }
-
-    private static void SleepUntil(long deadlineTicks, long stopwatchFrequency)
-    {
-        long remaining = deadlineTicks - System.Diagnostics.Stopwatch.GetTimestamp();
-        if (remaining <= 0) return;
-        int ms = (int)Math.Ceiling(remaining * 1000.0 / stopwatchFrequency);
-        if (ms > 0) Thread.Sleep(ms);
     }
 
     /// <summary>
@@ -793,18 +1012,14 @@ public sealed class TxAudioIngest : IDisposable
 
         // Barrier: the mic hot path checks _tailDraining under _sync, so from
         // here this thread is the only TXA feeder. The flag is raised under
-        // _sync so no mic frame can see it (and discard the accumulator)
-        // before the operator's final partial block is captured; the ID
-        // continues across that block without a gap.
-        int residualSamples;
+        // _sync so a late live mic frame cannot discard the accumulator
+        // while held onset frames are replayed and the final partial block
+        // is captured. The ID continues across that block without a gap.
+        int residualSamples = 0;
         lock (_sync)
         {
             if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
-            residualSamples = Math.Min(_accumulatorFill, blockSize);
-            Array.Clear(_tailMic, 0, blockSize);
-            if (residualSamples > 0)
-                Array.Copy(_accumulator, 0, _tailMic, 0, residualSamples);
-            _accumulatorFill = 0;
+            _preserveOnsetAccumulatorDuringTail = true;
         }
         long freq = System.Diagnostics.Stopwatch.Frequency;
         long startTs = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -813,8 +1028,22 @@ public sealed class TxAudioIngest : IDisposable
             try { onHold?.Invoke(); }
             catch (Exception ex) { _log.LogWarning(ex, "tx.cwid.tail hold notification threw"); }
 
+            // Finish voice already held by the UI key transaction before the
+            // station ID starts. The CW-ID tail otherwise skips the ordinary
+            // voice tail and would discard these final queued syllables.
+            int onsetDrained = DrainVoiceOnsetPaced(freq, shouldAbort);
+            if (shouldAbort?.Invoke() == true) return false;
+            lock (_sync)
+            {
+                residualSamples = Math.Min(_accumulatorFill, blockSize);
+                Array.Clear(_tailMic, 0, blockSize);
+                if (residualSamples > 0)
+                    Array.Copy(_accumulator, 0, _tailMic, 0, residualSamples);
+                _accumulatorFill = 0;
+            }
+
             long periodTicks = (long)(freq * (double)blockSize / TxRateHz);
-            long deadline = startTs;
+            long deadline = System.Diagnostics.Stopwatch.GetTimestamp();
             int idBlocks = 0;
             int blocks = 0;
             float iqPeak = 0f;
@@ -842,8 +1071,8 @@ public sealed class TxAudioIngest : IDisposable
             var flush = FlushTxTailAndTransport(
                 engine, blockSize, iqOut, periodTicks, freq, ref deadline, ref iqPeak, shouldAbort);
             _log.LogInformation(
-                "tx.cwid.tail dropping PTT: idBlocks={IdBlocks} residualSamples={Residual} blocks={Blocks} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} iqPeak={IqPeak:F4} transportDrained={TransportDrained} emergencyCut={EmergencyCut} elapsedMs={Elapsed:F1}",
-                idBlocks, residualSamples, blocks + flush.EmittedBlocks, flush.FlushBlocks, flush.DspFlushed,
+                "tx.cwid.tail dropping PTT: idBlocks={IdBlocks} onsetBlocks={OnsetBlocks} residualSamples={Residual} blocks={Blocks} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} iqPeak={IqPeak:F4} transportDrained={TransportDrained} emergencyCut={EmergencyCut} elapsedMs={Elapsed:F1}",
+                idBlocks, onsetDrained, residualSamples, blocks + flush.EmittedBlocks, flush.FlushBlocks, flush.DspFlushed,
                 iqPeak, flush.TransportDrained, shouldAbort?.Invoke() == true,
                 (System.Diagnostics.Stopwatch.GetTimestamp() - startTs) * 1000.0 / freq);
             return idBlocks > 0;
@@ -857,6 +1086,10 @@ public sealed class TxAudioIngest : IDisposable
         {
             lock (_sync)
             {
+                _voiceOnsetArmed = false;
+                _voiceOnset.Clear();
+                _voiceOnsetSamples = 0;
+                _preserveOnsetAccumulatorDuringTail = false;
                 _ring.Clear();
                 _accumulatorFill = 0;
                 _lastSeenMox = false;
@@ -1056,6 +1289,7 @@ public sealed class TxAudioIngest : IDisposable
 
     private readonly Action<ReadOnlyMemory<float>>? _forwardP2;
     private readonly Func<TimeSpan, bool>? _drainTxTransport;
+    private readonly Func<int> _voiceDspLatencyMs;
     // Live-voice latency governor (see TxLatencyGovernor). Guarded by _sync.
     private readonly TxLatencyGovernor _latencyGovernor = new();
     private readonly Func<TxTransportLevel> _txTransportLevel;
@@ -1410,8 +1644,12 @@ public sealed class TxAudioIngest : IDisposable
     private void ProcessMicPcm(
         ReadOnlySpan<float> samples,
         MicBlockSource source,
-        MicBlockValidity? validity = null)
+        MicBlockValidity? validity = null,
+        bool bypassOnset = false,
+        bool tailReplay = false)
     {
+        if (!bypassOnset && HoldOrReplayVoiceOnset(samples, source, validity, _isMoxOn()))
+            return;
 
         // Gate: process mic samples when MOX is on (normal TX) OR when the TX
         // monitor is on (preview without keying so the operator can hear
@@ -1521,7 +1759,11 @@ public sealed class TxAudioIngest : IDisposable
             // sets _tailDraining then takes _sync as a barrier, so any frame that
             // reaches here after that point bails. Drop the accumulator so no
             // pre-tail remainder stitches onto the next over.
-            if (Volatile.Read(ref _tailDraining) != 0) { _accumulatorFill = 0; return; }
+            if (!tailReplay && Volatile.Read(ref _tailDraining) != 0)
+            {
+                if (!_preserveOnsetAccumulatorDuringTail) _accumulatorFill = 0;
+                return;
+            }
 
             // ATOMIC single-select gate (external-audio-jacks re-port, the
             // crux). This is the AUTHORITATIVE host/radio arbitration: it runs
@@ -1585,7 +1827,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _productAudio.ProcessTx(incoming);
             }
-            if (!IsCurrent(validity))
+            if (!(bypassOnset ? IsBufferedCurrent(validity) : IsCurrent(validity)))
             {
                 _accumulatorFill = 0;
                 return;
@@ -1664,7 +1906,7 @@ public sealed class TxAudioIngest : IDisposable
                 // Product/WDSP calls may stall after the native capture route
                 // changed or the block deadline expired. Never publish their
                 // now-stale IQ to either radio transport.
-                if (!IsCurrent(validity))
+                if (!(bypassOnset ? IsBufferedCurrent(validity) : IsCurrent(validity)))
                 {
                     _accumulatorFill = 0;
                     return;
@@ -1762,6 +2004,9 @@ public sealed class TxAudioIngest : IDisposable
 
     private static bool IsCurrent(MicBlockValidity? validity) =>
         validity is not { } guarded || guarded.IsCurrent;
+
+    private static bool IsBufferedCurrent(MicBlockValidity? validity) =>
+        validity is not { } guarded || guarded.IsBufferedCurrent;
 
     private bool ShouldSuppressIdleMonitorPreviewBlock(ReadOnlySpan<float> samples)
     {

@@ -36,6 +36,8 @@ public sealed class ProductPluginAudioPort : IDisposable
     // = 240 ms absorbs real-world stalls yet still revokes a truly dead
     // producer within a quarter second.
     internal const int MaxToleratedUnderflowBlocks = 12;
+    /// <summary>Wire name of the clean RX data tap (capture attach field "tap").</summary>
+    public const string DataTapName = "data";
     private static readonly float[] UnderflowSilenceBlock =
         new float[AudioRingProtocol.NominalSamplesPerBlock];
 
@@ -110,6 +112,16 @@ public sealed class ProductPluginAudioPort : IDisposable
 
         ProductPluginCaptureSource source;
         int receiver;
+        ProductPluginRxTap tap;
+        if (request.Tap is null)
+            tap = ProductPluginRxTap.Processed;
+        else if (string.Equals(request.Tap, DataTapName, StringComparison.Ordinal))
+            tap = ProductPluginRxTap.Data;
+        else
+        {
+            error = $"tap must be omitted or \"{DataTapName}\"";
+            return false;
+        }
         if (string.Equals(request.Source, "rx-audio", StringComparison.Ordinal))
         {
             if (request.Receiver is not int requestedReceiver
@@ -123,14 +135,17 @@ public sealed class ProductPluginAudioPort : IDisposable
             receiver = requestedReceiver;
         }
         else if (string.Equals(request.Source, "tx-mic", StringComparison.Ordinal)
-                 && request.Receiver is null)
+                 && request.Receiver is null
+                 && tap == ProductPluginRxTap.Processed)
         {
             source = ProductPluginCaptureSource.TxMic;
             receiver = -1;
         }
         else
         {
-            error = "capture source must be rx-audio with a receiver or tx-mic without one";
+            error = tap == ProductPluginRxTap.Data
+                ? $"the {DataTapName} tap is only valid for rx-audio with a receiver"
+                : "capture source must be rx-audio with a receiver or tx-mic without one";
             return false;
         }
 
@@ -146,13 +161,16 @@ public sealed class ProductPluginAudioPort : IDisposable
 
             var session = new CaptureSession(
                 Guid.NewGuid().ToString("N"), request.Name, request.Version,
-                AudioRingOwner.Create(), source, receiver);
+                AudioRingOwner.Create(), source, receiver, tap);
             AddPendingLocked(session);
             if (source == ProductPluginCaptureSource.RxAudio)
                 Volatile.Write(ref _rxCapture[receiver], session);
             else
                 Volatile.Write(ref _txMicCapture, session);
-            response = new ProductPluginAudioAttachResponse(session.LeaseId, session.Owner.Endpoint);
+            response = new ProductPluginAudioAttachResponse(
+                session.LeaseId,
+                session.Owner.Endpoint,
+                AppliedTap: tap == ProductPluginRxTap.Data ? DataTapName : null);
             error = null;
             return true;
         }
@@ -421,6 +439,10 @@ public sealed class ProductPluginAudioPort : IDisposable
             session.ExpectedSequence = 0;
             session.HasPendingBlock = false;
             session.NextDeliveryTicks = 0;
+            // A tolerated underflow in this key-up must never replay audio
+            // from an earlier transmission: until a real block of this key-up
+            // is delivered, a miss emits silence.
+            session.LastDeliveredBlock = null;
         }
         bool moxGranted = false;
         string? requestError = null;
@@ -536,13 +558,49 @@ public sealed class ProductPluginAudioPort : IDisposable
         return true;
     }
 
-    public void PublishRxAudio(int receiver, int sampleRate, ReadOnlySpan<float> samples)
+    /// <summary>Publish the fully processed local RX audio (the default tap):
+    /// the block the operator hears, after local RX plugins, squelch, monitor
+    /// injection, the limiter and the post-TX fade. A data-tap lease ignores it.</summary>
+    public void PublishRxAudio(int receiver, int sampleRate, ReadOnlySpan<float> samples) =>
+        PublishRxTap(receiver, sampleRate, samples, ProductPluginRxTap.Processed);
+
+    /// <summary>Publish the receiver's raw WDSP RX output (the "data" tap),
+    /// taken straight from the engine read: before any local RX plugin/VST,
+    /// squelch, monitor injection, limiter, post-TX fade or master mute. A
+    /// default-tap lease ignores it.</summary>
+    public void PublishRxDataAudio(int receiver, int sampleRate, ReadOnlySpan<float> samples) =>
+        PublishRxTap(receiver, sampleRate, samples, ProductPluginRxTap.Data);
+
+    /// <summary>True while any receiver has a leased data-tap capture. The DSP
+    /// pipeline then ends the post-TX receive quarantine after its first block
+    /// so a modem hears the other station's reply.</summary>
+    public bool HasLeasedRxDataTap
+    {
+        get
+        {
+            for (int receiver = 0; receiver < _rxCapture.Length; receiver++)
+            {
+                if (Volatile.Read(ref _rxCapture[receiver]) is
+                    { Tap: ProductPluginRxTap.Data, IsLeased: true })
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    private void PublishRxTap(
+        int receiver,
+        int sampleRate,
+        ReadOnlySpan<float> samples,
+        ProductPluginRxTap tap)
     {
         if (sampleRate != AudioRingProtocol.SampleRate
             || receiver < 0
             || receiver >= _rxCapture.Length)
             return;
-        PublishCapture(Volatile.Read(ref _rxCapture[receiver]), samples);
+        var session = Volatile.Read(ref _rxCapture[receiver]);
+        if (session is null || session.Tap != tap) return;
+        PublishCapture(session, samples);
     }
 
     public void PublishTxMic(int sampleRate, ReadOnlySpan<float> samples)
@@ -731,7 +789,8 @@ public sealed class ProductPluginAudioPort : IDisposable
                         "product-plugin injection underflow tolerated session={SessionId} " +
                         "(holding the last block; revoking after {Cap} consecutive misses)",
                         session.Owner.Endpoint.SessionId, MaxToleratedUnderflowBlocks);
-                underflowSink(session.LastDeliveredBlock ?? UnderflowSilenceBlock);
+                var lastDelivered = session.LastDeliveredBlock;
+                underflowSink(lastDelivered ?? UnderflowSilenceBlock);
                 var recoveredDelivery = delivery > 0 ? delivery + BlockTicks : now + BlockTicks;
                 if (recoveredDelivery <= now) recoveredDelivery = now + BlockTicks;
                 Volatile.Write(ref session.NextDeliveryTicks, recoveredDelivery);
@@ -776,8 +835,10 @@ public sealed class ProductPluginAudioPort : IDisposable
                 // Keep the last real block for tolerated-miss replay. The
                 // buffer is allocated once per session (never per block) so
                 // the delivery path stays allocation-free.
-                session.LastDeliveredBlock ??= new float[pendingCount];
-                session.Scratch.AsSpan(0, pendingCount).CopyTo(session.LastDeliveredBlock);
+                // Read once: a key grant/release on another thread may reset it.
+                var lastDelivered = session.LastDeliveredBlock ?? new float[pendingCount];
+                session.Scratch.AsSpan(0, pendingCount).CopyTo(lastDelivered);
+                session.LastDeliveredBlock = lastDelivered;
             }
             else
             {
@@ -978,6 +1039,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         session.HasPendingBlock = false;
         session.NextDeliveryTicks = 0;
         session.KeyAdmissionPending = false;
+        session.LastDeliveredBlock = null;
         if (!ReferenceEquals(_keyedSession, session))
         {
             session.Keyed = false;
@@ -1154,12 +1216,15 @@ public sealed class ProductPluginAudioPort : IDisposable
         string version,
         AudioRingOwner owner,
         ProductPluginCaptureSource source,
-        int receiver) : Session(leaseId, name, version, owner)
+        int receiver,
+        ProductPluginRxTap tap) : Session(leaseId, name, version, owner)
     {
         public override string Kind => Source == ProductPluginCaptureSource.RxAudio
-            ? $"rx-audio:{Receiver}" : "tx-mic";
+            ? (Tap == ProductPluginRxTap.Data ? $"rx-audio:{Receiver}:data" : $"rx-audio:{Receiver}")
+            : "tx-mic";
         public ProductPluginCaptureSource Source { get; } = source;
         public int Receiver { get; } = receiver;
+        public ProductPluginRxTap Tap { get; } = tap;
         public float[] Pending { get; } = new float[AudioRingProtocol.NominalSamplesPerBlock];
         public int PendingCount;
         public int PublishBusy;
@@ -1207,17 +1272,32 @@ internal enum ProductPluginCaptureSource
     TxMic,
 }
 
+/// <summary>Which RX audio an rx-audio capture lease receives.</summary>
+internal enum ProductPluginRxTap
+{
+    /// <summary>Default (attach field "tap" absent): the fully processed local
+    /// audio, exactly as before the data tap existed.</summary>
+    Processed,
+
+    /// <summary>"data": raw WDSP RX output for modems (see PublishRxDataAudio).</summary>
+    Data,
+}
+
 internal enum ProductPluginInjectionDestination
 {
     LocalMonitor,
     Tx,
 }
 
+/// <summary>Capture attach request. <paramref name="Tap"/> is optional: absent
+/// (null) keeps the default processed-audio tap; "data" requests the raw WDSP
+/// RX output of an rx-audio receiver (ProductPluginAudioPort.PublishRxDataAudio).</summary>
 public sealed record ProductPluginCaptureAttachRequest(
     string Name,
     string Version,
     string Source,
-    int? Receiver);
+    int? Receiver,
+    string? Tap = null);
 
 public sealed record ProductPluginInjectionAttachRequest(
     string Name,
@@ -1234,10 +1314,14 @@ public sealed record ProductPluginAppliedInjectionOptions(
     int? DriveCapPct,
     ProductPluginTxChannelConstraint? TxChannelConstraint = null);
 
+/// <summary>Attach response. <paramref name="AppliedTap"/> echoes "data" when a
+/// capture lease was granted the data tap so the client can verify it; it is
+/// null for the default tap and for injection leases.</summary>
 public sealed record ProductPluginAudioAttachResponse(
     string LeaseId,
     AudioRingEndpoint Ring,
-    ProductPluginAppliedInjectionOptions? AppliedInjectionOptions = null);
+    ProductPluginAppliedInjectionOptions? AppliedInjectionOptions = null,
+    string? AppliedTap = null);
 
 public sealed record ProductPluginArmRequest(string LeaseId, string PluginId, bool Armed);
 

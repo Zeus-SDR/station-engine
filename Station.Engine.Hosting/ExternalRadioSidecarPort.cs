@@ -30,6 +30,7 @@ public interface IExternalRadioSidecar
     /// </summary>
     void ConfigureTxIqSafetyGate(Func<long, bool> gate);
     void ForwardTxIq(ReadOnlySpan<float> iqInterleaved, long safetyRevision);
+    bool WaitForTxIqIdle(TimeSpan timeout);
     void RevokeTxIq();
 }
 
@@ -46,5 +47,6 @@ public sealed class NullExternalRadioSidecar : IExternalRadioSidecar
 
     public void ConfigureTxIqSafetyGate(Func<long, bool> gate) { }
     public void ForwardTxIq(ReadOnlySpan<float> iqInterleaved, long safetyRevision) { }
+    public bool WaitForTxIqIdle(TimeSpan timeout) => true;
     public void RevokeTxIq() { }
 }

@@ -50,7 +50,7 @@ using Zeus.Contracts;
 
 namespace Zeus.Server;
 
-public sealed class StreamingHub
+public sealed class StreamingHub : IDisposable, IAsyncDisposable
 {
     // Attach primes wisdom, spots, diagnostics, and five chat snapshots before
     // the send loop starts. Keep enough bounded room for that control-plane
@@ -154,7 +154,7 @@ public sealed class StreamingHub
     //
     // A System.Threading.Timer fires every 1 s and logs deltas when any
     // bucket grew. Zero overhead when no drops are occurring. Single timer
-    // lives the lifetime of the hub (singleton); no Dispose needed.
+    // is drained when the owning host disposes the hub.
     private long _dropsAudio;
     private long _dropsDisplay;
     private long _dropsMeter;
@@ -180,6 +180,8 @@ public sealed class StreamingHub
     private long _micUplinkLastBytes;
     private long _micUplinkLastSamples;
     private readonly System.Threading.Timer _dropLogTimer;
+    private readonly object _disposeGate = new();
+    private Task? _disposeTask;
     private readonly RxAudioMuteState? _rxAudioMuteState;
     private long _rxAudioFramesObserved;
     private long _lastLoggedRxAudioFrames;
@@ -330,6 +332,22 @@ public sealed class StreamingHub
             null,
             1000,
             1000);
+    }
+
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    public ValueTask DisposeAsync()
+    {
+        lock (_disposeGate)
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        _productStreamSource.FrameAvailable -= BroadcastProductFrame;
+        // Timer.Dispose alone permits queued callbacks after it returns. Drain
+        // them before the service provider disposes the logging providers.
+        await _dropLogTimer.DisposeAsync().ConfigureAwait(false);
     }
 
     private void LogRxAudioBroadcastDiagnostics()

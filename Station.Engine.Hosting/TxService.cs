@@ -1031,11 +1031,21 @@ public sealed class TxService
         }
 
         int tailMs = _radio.TxMoxTailDelayMs;
-        if (!cwIdHeld && tailMs > 0 && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
+        if (!cwIdHeld && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
         {
             try
             {
-                if (!_pipeline.DrainVoiceTxTail(tailMs)) Thread.Sleep(tailMs);
+                if (IsVoiceTxMode(state.Mode))
+                {
+                    if (!_pipeline.DrainVoiceTxTail(tailMs, IsReleaseTailAbortRequested))
+                        HoldTailDelayUnlessAborted(tailMs);
+                }
+                else
+                {
+                    // Timing-exact digital modes keep their configured wire
+                    // hold without clocking synthetic voice audio through TXA.
+                    HoldTailDelayUnlessAborted(tailMs);
+                }
             }
             catch (Exception ex) { _log.LogWarning(ex, "tx.tail.voice.failed"); }
         }
@@ -1043,6 +1053,20 @@ public sealed class TxService
         {
             try { _pipeline.DrainRogerBeepTail(); }
             catch (Exception ex) { _log.LogWarning(ex, "tx.tail.roger.failed"); }
+        }
+    }
+
+    private void HoldTailDelayUnlessAborted(int tailMs)
+    {
+        if (tailMs <= 0) return;
+        long stop = System.Diagnostics.Stopwatch.GetTimestamp()
+            + (long)(tailMs / 1000.0 * System.Diagnostics.Stopwatch.Frequency);
+        while (!IsReleaseTailAbortRequested())
+        {
+            long remaining = stop - System.Diagnostics.Stopwatch.GetTimestamp();
+            if (remaining <= 0) break;
+            Thread.Sleep(Math.Min(10, Math.Max(1,
+                (int)Math.Ceiling(remaining * 1000.0 / System.Diagnostics.Stopwatch.Frequency))));
         }
     }
 
@@ -1093,6 +1117,7 @@ public sealed class TxService
         // potentially-blocking DSP teardown. Every action is independently
         // attempted; stale host booleans never suppress convergence.
         Safe("egress.revoke", _pipeline.RevokeTxEgress);
+        Safe("voice.onset.cancel", _pipeline.CancelVoiceOnsetBuffer);
         Safe("hardwareCw.disarm", () => _radio.SetHardwareCwSafetyBlocked(true));
         Safe("wire.mox.off", () =>
         {
@@ -1248,6 +1273,9 @@ public sealed class TxService
                 _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
+                if (source == MoxSource.UI && IsPreKeyVoiceMode(_radio.Snapshot().Mode)
+                    && preKeyMs <= 40)
+                    _pipeline.BeginVoiceOnsetBuffer();
                 PrepareTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
                 _radio.SetTxSafetyAuthority(true);

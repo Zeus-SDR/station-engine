@@ -98,7 +98,9 @@ public sealed record Ft8Settings(
     /// evolving this positional record never shifts existing parameters. Does
     /// not arm inbound replies, queue, macros, hydration, or mode switches.
     /// </summary>
-    bool ArmTxOnClick = false)
+    bool ArmTxOnClick = false,
+    /// <summary>Restrict automatic FT8/FT4 contact selection to a new state or country.</summary>
+    bool OnlyNewStateOrCountry = false)
 {
     public const int MinOffsetHz = 200;
     public const int MaxTxOffsetHz = 4000;
