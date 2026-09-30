@@ -2162,7 +2162,8 @@ public sealed record KiwiConfigDto(
 public sealed record SpotsSettings(
     bool Enabled = true,
     bool PotaEnabled = true,
-    bool SotaEnabled = true,
+    // --- SOTA disabled by default because leaving it on abuses the SOTA servers ---
+    bool SotaEnabled = false,
     int PollIntervalSeconds = 60,
     bool SetModeOnTune = true,
     bool TuneOnlyWhenConnected = true,
@@ -2176,7 +2177,7 @@ public sealed record SpotsSettings(
     // --- click-to-tune dial offsets (Hz, added to the spot frequency) ---
     int CwTuneOffsetHz = 0,
     int DigiTuneOffsetHz = 0,
-    // --- DX-cluster source (off by default; POTA + SOTA stay on) ---
+    // --- DX-cluster source (off by default; POTA stays on) ---
     bool DxEnabled = false,
     // --- per-source feed URLs (blank falls back to the built-in default) ---
     string PotaUrl = SpotsSettings.DefaultPotaUrl,
