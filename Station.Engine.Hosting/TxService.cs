@@ -1031,7 +1031,7 @@ public sealed class TxService
         }
 
         int tailMs = _radio.TxMoxTailDelayMs;
-        if (!cwIdHeld && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
+        if (!cwIdHeld && tailMs > 0 && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
         {
             try
             {
@@ -1274,7 +1274,7 @@ public sealed class TxService
             try
             {
                 if (source == MoxSource.UI && IsPreKeyVoiceMode(_radio.Snapshot().Mode)
-                    && preKeyMs <= 40)
+                    && preKeyMs <= 40 && _radio.TxMoxTailDelayMs > 0)
                     _pipeline.BeginVoiceOnsetBuffer();
                 PrepareTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();

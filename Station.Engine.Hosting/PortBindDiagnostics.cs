@@ -32,6 +32,9 @@ internal static class PortBindDiagnostics
         {
             using var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             socket.Bind(new IPEndPoint(address, port));
+            // On Windows a second socket can bind an occupied port but fail
+            // when it listens. Kestrel needs both steps to start successfully.
+            socket.Listen(1);
             return null;
         }
         catch (SocketException ex)

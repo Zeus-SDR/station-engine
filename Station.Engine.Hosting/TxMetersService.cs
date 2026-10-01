@@ -616,8 +616,9 @@ public sealed class TxMetersService : BackgroundService
 
                     bool isTun = _tx.IsTunOn;
                     DateTime keyedAt = (isTun ? _tx.TunStartedAt : _tx.MoxStartedAt) ?? DateTime.UtcNow;
-                    // Tune drive gates the low-power TUN SWR bypass; irrelevant
-                    // to MOX so only read it while tuning.
+                    // Tune drive is not a hard-drop input. A request above the
+                    // legacy edge can engage a non-persisted safety foldback;
+                    // it is irrelevant to MOX, so only read it while tuning.
                     int tuneDrivePct = isTun ? _radio.Snapshot().TunePct : 100;
                     // P3 display-only (2026-07): under Protocol 3 the FWD/REF ADCs
                     // feeding this meter arrive from the sidecar board-health
@@ -629,6 +630,11 @@ public sealed class TxMetersService : BackgroundService
                     // fail to protect. The TX-timeout guard above still runs under
                     // P3. Re-enable this trip once the P3 raw→watts calibration is
                     // confirmed against a known load.
+                    if (!_radio.IsProtocol3Active
+                        && ShouldEngageTunSwrFoldback(swr, isTun, fwdW, tuneDrivePct))
+                    {
+                        _radio.EngageTunSwrFoldback();
+                    }
                     if (!_radio.IsProtocol3Active
                         && EvaluateSwrTrip(swr, DateTime.UtcNow, isTun, keyedAt, fwdW, tuneDrivePct) is { } tripReason)
                     {
@@ -644,15 +650,14 @@ public sealed class TxMetersService : BackgroundService
                         _log.LogWarning(
                             "tx.trip.swr.inputs intent={Intent} swr={Swr:F2} fwdW={FwdWatts:F2} " +
                             "refW={RefWatts:F2} tunePct={TuneDrivePercent} board={Board} " +
-                            "bypassMaxW={BypassMax:F1} bypassMaxDrive={BypassDrive}",
+                            "bypassMaxW={BypassMax:F1}",
                             isTun ? "TUN" : "MOX",
                             swr,
                             fwdW,
                             refW,
                             tuneDrivePct,
                             _radio.ConnectedBoardKind,
-                            EngineTransmitSafetyModule.SwrTripTunBypassMaxFwdWatts,
-                            EngineTransmitSafetyModule.SwrTripTunBypassMaxDrivePercent);
+                            EngineTransmitSafetyModule.SwrTripTunBypassMaxFwdWatts);
 
                         // TryTripForAlert is idempotent — a second caller on the
                         // same tick (e.g. timeout firing concurrently) finds MOX
@@ -792,10 +797,12 @@ public sealed class TxMetersService : BackgroundService
     /// passes <see cref="DateTime.UtcNow"/>. Firing resets the timer so the
     /// caller gets exactly one trip per sustained excursion.
     /// </summary>
-    // fwdWatts/tuneDrivePercent feed the low-power TUN SWR bypass in
-    // EngineTransmitSafetyModule. They default to fail-safe "high power"
-    // sentinels so a caller that omits them never accidentally suppresses
-    // protection; the live meter loop always supplies the measured values.
+    // fwdWatts feeds the low-power TUN SWR bypass in
+    // EngineTransmitSafetyModule. tuneDrivePercent stays on this seam so the
+    // regression can pin that a requested percentage is not hard-drop input;
+    // the production loop separately uses it to engage safety foldback and
+    // logs it above. The power default is a fail-safe "high power" sentinel so
+    // a caller that omits it never accidentally suppresses protection.
     internal string? EvaluateSwrTrip(
         double swr,
         DateTime now,
@@ -811,10 +818,19 @@ public sealed class TxMetersService : BackgroundService
             isTun ? TransmitIntent.Tun : TransmitIntent.Mox,
             keyedAt,
             TimeoutSeconds: 0,
-            FwdWatts: fwdWatts,
-            TuneDrivePercent: tuneDrivePercent));
+            FwdWatts: fwdWatts));
         return decision.Trip ? decision.OperatorText : null;
     }
+
+    internal static bool ShouldEngageTunSwrFoldback(
+        double swr,
+        bool isTun,
+        double fwdWatts,
+        int tuneDrivePercent) =>
+        isTun
+        && swr > EngineTransmitSafetyModule.SwrTripThresholdTun
+        && fwdWatts <= EngineTransmitSafetyModule.SwrTripTunBypassMaxFwdWatts
+        && tuneDrivePercent > EngineTransmitSafetyModule.SwrTripTunFoldbackDriveThresholdPercent;
 
     /// <summary>
     /// PRD FR-6 TX timeout: returns a trip reason if MOX or TUN has been

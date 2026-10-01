@@ -172,6 +172,11 @@ public sealed class Protocol1Client : IProtocol1Client
     // byte that has actually been sent. Reset when the TX loop starts. VNA
     // clear and pre-start frames do not come through here.
     private readonly DriveWirePairing _driveWirePairing = new();
+    // TX-loop thread only. Tracks the gateware's internal_CW latch as last sent
+    // on the wire and picks each frame's keyer-bit IQ guard (issue #2644):
+    // zero IQ while the armed FPGA keyer owns CW, I[2:0] stripped whenever the
+    // latch is armed, unknown, or transitioning. Reset when the TX loop starts.
+    private readonly CwKeyerWireState _cwKeyerWireState = new();
     // IQ scale of the last MOX packet's odd USB frame. The RX thread reads it
     // to undo HL2 TX IQ scaling on the DDC3 PureSignal reference. 1.0 until
     // the first committed MOX packet, and again when the TX loop resets the
@@ -3572,6 +3577,10 @@ public sealed class Protocol1Client : IProtocol1Client
     /// write stays pending until <see cref="CommitDriveWirePairing"/>. Every
     /// other board and every non-MOX frame encodes the snapshot scale. The
     /// odd frame's scale is remembered for <see cref="PublishBuiltMoxIqScale"/>.
+    /// Each frame also gets its keyer-bit IQ guard from
+    /// <see cref="CwKeyerWireState"/> (issue #2644): the frame's own CwControl
+    /// payload is recorded as pending the same way, so a guard decision never
+    /// trusts a latch change that has not been sent.
     /// </summary>
     internal void BuildTxDataPacket(
         Span<byte> packet,
@@ -3583,8 +3592,17 @@ public sealed class Protocol1Client : IProtocol1Client
         IRxAudioSource? rxAudioSource = null)
     {
         _driveWirePairing.BeginPacket();
-        var even = state with { TxIqScale = _driveWirePairing.ScaleForFrame(evenRegister, in state) };
-        var odd = state with { TxIqScale = _driveWirePairing.ScaleForFrame(oddRegister, in state) };
+        _cwKeyerWireState.BeginPacket();
+        var even = state with
+        {
+            TxIqScale = _driveWirePairing.ScaleForFrame(evenRegister, in state),
+            KeyerIqGuard = _cwKeyerWireState.GuardForFrame(evenRegister, in state),
+        };
+        var odd = state with
+        {
+            TxIqScale = _driveWirePairing.ScaleForFrame(oddRegister, in state),
+            KeyerIqGuard = _cwKeyerWireState.GuardForFrame(oddRegister, in state),
+        };
         _builtOddTxIqScale = odd.TxIqScale.GetValueOrDefault(1.0);
         ControlFrame.BuildDataPacket(
             packet,
@@ -3598,9 +3616,15 @@ public sealed class Protocol1Client : IProtocol1Client
     }
 
     /// <summary>
-    /// The packet just built was accepted by the socket. Promote its drive pair.
+    /// The packet just built was accepted by the socket. Promote its drive pair
+    /// and its CW-keyer latch update (both track what the gateware has actually
+    /// been sent, so an unsent datagram must never commit either).
     /// </summary>
-    internal void CommitDriveWirePairing() => _driveWirePairing.Commit();
+    internal void CommitDriveWirePairing()
+    {
+        _driveWirePairing.Commit();
+        _cwKeyerWireState.Commit();
+    }
 
     private void RunTxLoop(CancellationToken ct)
     {
@@ -3610,7 +3634,11 @@ public sealed class Protocol1Client : IProtocol1Client
         // Before the first packet of this run. A reused client must not keep
         // the previous stream's register byte or its DDC3 compensation scale.
         // Unity here is not a sent-scale change and must not open the guard.
+        // The keyer latch tracker likewise forgets what earlier streams sent:
+        // P1 gateware resets internal_CW only at power-up, so until a CwControl
+        // frame of this run commits, MOX frames strip the I[2:0] keyer inputs.
         _driveWirePairing.Reset();
+        _cwKeyerWireState.Reset();
         ResetLastSentTxIqScaleForTxLoopStart();
         try
         {

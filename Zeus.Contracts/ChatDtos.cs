@@ -136,6 +136,9 @@ public sealed record ChatMessage(
 /// the operator joined.
 /// <paramref name="Admin"/> is true when the operator is a relay moderator, so
 /// clients can paint their callsign distinctly (gold).
+/// <paramref name="DevTester"/> is true when the operator carries the admin-site
+/// dev-tester role, so clients paint their callsign silver wherever moderators
+/// are gold (gold wins when an operator is both).
 /// </summary>
 public sealed record ChatOperator(
     string Callsign,
@@ -144,7 +147,8 @@ public sealed record ChatOperator(
     string? Mode,
     string? Status,
     long Since,
-    bool Admin = false);
+    bool Admin = false,
+    bool DevTester = false);
 
 /// <summary>
 /// Snapshot of the local chat node's state, surfaced via

@@ -229,6 +229,12 @@ public sealed class RadioService : IDisposable
     // the same per-band PA gain gives equal watts at equal percentages). piHPSDR
     // default is 10 — a 0 default would be "press TUN, nothing happens".
     private int _tunePct = 10;
+    // Non-persisted safety cap engaged when high SWR coincides with low
+    // measured forward power at a high TUN request. This keeps an external
+    // tuner keyed without trusting a potentially under-reading power channel.
+    // The cap is released only when TUN falls; the operator's TunePct is never
+    // changed.
+    private int _tunSwrFoldbackActive;
     // TX pre-key (MOX) delay ms (0..500) as the operator set it in PA Settings.
     // TxService reads EffectiveTxMoxPreKeyDelayMs on the MOX rising edge, which
     // clamps this strictly below the PS MOX hold-off only while PS is armed, so
@@ -1688,8 +1694,10 @@ public sealed class RadioService : IDisposable
             // Angelia and the other legacy P1 gateware reset internal_CW off
             // and only latch it from C&C address 0x0F. Seed both CW registers
             // before StartAsync so a cold connection in CW mode does not
-            // depend on another client having primed the radio first.
-            var connectCwState = Snapshot();
+            // depend on another client having primed the radio first. The arm
+            // carries the same gating as every other P1 push (issue #2644);
+            // the post-Connected push below re-evaluates once the connection
+            // is live.
             client.SetCwKeyerConfig(
                 Volatile.Read(ref _cwKeyerWpm),
                 (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
@@ -1699,7 +1707,7 @@ public sealed class RadioService : IDisposable
             double connectSidetoneGainDb;
             lock (_sync) { connectSidetoneHz = _cwSidetoneHz; connectSidetoneGainDb = _cwSidetoneGainDb; }
             client.SetCwSidetone(HardwareSidetoneLevel(connectSidetoneGainDb), connectSidetoneHz);
-            client.SetCwKeyerEnabled(IsCwMode(RadioFrequencyResolver.TxMode(connectCwState)));
+            PushCwKeyerEnabledToP1(client, unconditional: true);
             int restoredHz = ResolveConnectSampleRateHz(client.BoardKind, hpsdrRate.SampleRateHz(), protocol2: false);
             if (restoredHz != hpsdrRate.SampleRateHz())
             {
@@ -1764,6 +1772,11 @@ public sealed class RadioService : IDisposable
             ThrowIfSuperseded(attempt);
             Mutate(s => s with { Status = ConnectionStatus.Connected, PsEnabled = false });
             _log.LogInformation("radio.connected endpoint={Ep} rate={Rate}", ipEndpoint, hpsdrRate);
+            // The connect seed can legitimately have computed "disarmed" while
+            // the connection was still coming up; re-evaluate the P1 keyer arm
+            // now that it is live (mirrors the P2 connect push). Edge-triggered:
+            // when the seed already wrote the same value this sends nothing.
+            PushCwKeyerEnabledToP1OnEdge();
             Connected?.Invoke(client);
             // N2ADR 7-relay low-pass filter board is standard equipment on HL2.
             // Enable it unconditionally on connect so band changes immediately
@@ -2429,7 +2442,7 @@ public sealed class RadioService : IDisposable
                 : next;
         });
         var snap = Snapshot();
-        PushCwKeyerEnabledToP1(snap);
+        PushCwKeyerEnabledToP1();
         if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
         {
             RecomputePaAndPush();
@@ -2474,7 +2487,7 @@ public sealed class RadioService : IDisposable
                 };
         });
         var snap = Snapshot();
-        PushCwKeyerEnabledToP1(snap);
+        PushCwKeyerEnabledToP1();
         if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(snap)))
         {
             RecomputePaAndPush();
@@ -5176,11 +5189,65 @@ public sealed class RadioService : IDisposable
 
     private static bool IsCwMode(RxMode mode) => mode is RxMode.CWU or RxMode.CWL;
 
-    private void PushCwKeyerEnabledToP1(StateDto? state = null)
+    // P1 internal-keyer arm push ordering (issue #2644). Every push takes a
+    // monotonically increasing sequence BEFORE reading any input — Snapshot()
+    // included: a caller-captured snapshot would predate the sequence — and
+    // the client write happens under _cwPushSync only when the sequence is
+    // newer than the newest accounted one. A computation that started earlier
+    // must never overwrite one that started later (a stale "armed" landing
+    // after a safety trip's "disarmed" would leave the FPGA keyer live during
+    // the trip). _cwArmPushValue tracks the last value actually written so the
+    // edge-triggered push sites (safety block, host keying, post-Connected)
+    // only call the client when the computed arm value changes; the
+    // pre-existing sites (mode change, CW settings, connect seed) keep their
+    // unconditional re-assert.
+    private long _cwArmPushSequence;
+    private long _cwArmPushAccounted;
+    private bool _cwArmPushValue;
+    private bool _cwArmPushHasValue;
+
+    // Test hook for the stale-write race: invoked after the sequence is taken
+    // and the inputs are read, before the serialized write. Never set in
+    // production.
+    internal Action? CwArmPushBeforeWriteForTests { get; set; }
+
+    private void PushCwKeyerEnabledToP1() =>
+        PushCwKeyerEnabledToP1(ActiveClient, unconditional: true);
+
+    private void PushCwKeyerEnabledToP1OnEdge() =>
+        PushCwKeyerEnabledToP1(ActiveClient, unconditional: false);
+
+    private void PushCwKeyerEnabledToP1(IProtocol1Client? client, bool unconditional)
     {
-        var effectiveState = state ?? Snapshot();
-        ActiveClient?.SetCwKeyerEnabled(
-            IsCwMode(RadioFrequencyResolver.TxMode(effectiveState)));
+        if (client is null) return;
+        long sequence = Interlocked.Increment(ref _cwArmPushSequence);
+        var state = Snapshot();
+        bool armed = IsCwMode(RadioFrequencyResolver.TxMode(state));
+        // Hermes-Lite 2 keeps the pre-#2644 rule (CW TX mode alone arms): its
+        // gateware reads only I[0] as CWX (dsopenhpsdr1.v:360) and the wire
+        // LSB mask already covers it. Every other legacy P1 gateware reads
+        // I[2:0] as dot/dash/CWX (Hermes.v:1084-1089 and siblings), so arming
+        // additionally requires the host/intent gate the Protocol-2 keyer gets:
+        // host CW sender idle and no safety block latched — TUNE, two-tone,
+        // non-hardware MOX, CW+ and protection trips all set the block, so
+        // while disarmed the host owns the CW IQ exactly like P2 and Thetis's
+        // TUNE (console.cs:30041-30047). P1 deliberately does NOT consult the
+        // frequency/identity safety evaluator: nothing re-runs that evaluation
+        // on plain VFO tuning, so a "connect in CW off-band, tune into band"
+        // operator would find the paddle dead — P1 has always armed regardless
+        // of frequency and keeps that behavior.
+        if (armed && client.BoardKind != HpsdrBoardKind.HermesLite2)
+            armed = HardwareCwHostIdleAndUnblocked();
+        CwArmPushBeforeWriteForTests?.Invoke();
+        lock (_cwPushSync)
+        {
+            if (sequence <= _cwArmPushAccounted) return;
+            _cwArmPushAccounted = sequence;
+            if (!unconditional && _cwArmPushHasValue && armed == _cwArmPushValue) return;
+            client.SetCwKeyerEnabled(armed);
+            _cwArmPushValue = armed;
+            _cwArmPushHasValue = true;
+        }
     }
 
     // 1 while a host-driven CW source (CwEngine / MoxSource.Cwx — keyboard,
@@ -5192,13 +5259,22 @@ public sealed class RadioService : IDisposable
     // source (not host MOX) is deliberate: a paddle-driven internal-keyer TX
     // can raise host MOX via an opt-in PTT-IN→MOX setting, and gating on MOX
     // there would oscillate (disarm→drop→re-arm). Volatile int for lock-free
-    // cross-thread reads in PushCwToP2.
+    // cross-thread reads in PushCwToP2 / PushCwKeyerEnabledToP1.
     private int _hostCwKeying;
     private readonly object _cwPushSync = new();
     private Func<StateDto, bool>? _hardwareCwArmEvaluator;
     private int _hardwareCwSafetyBlocked;
     // Socketless observer of the exact config handed to the P2 client.
     internal Action<Zeus.Protocol2.CwKeyerWireConfig>? HardwareCwConfigSinkForTests { get; set; }
+
+    // The shared P1/P2 standing "no competing host transmission" gate: host CW
+    // sender idle and no hardware-CW safety block latched. Lock-free volatile
+    // reads only, and deliberately free of the frequency/identity evaluator —
+    // that gates the P2 arm alone (PushCwToP2); see PushCwKeyerEnabledToP1 for
+    // why P1 keeps its historic frequency-independent paddle.
+    private bool HardwareCwHostIdleAndUnblocked() =>
+        Volatile.Read(ref _hostCwKeying) == 0
+        && Volatile.Read(ref _hardwareCwSafetyBlocked) == 0;
 
     internal void ConfigureHardwareCwArmSafety(Func<StateDto, bool> evaluator)
     {
@@ -5210,6 +5286,7 @@ public sealed class RadioService : IDisposable
     {
         Volatile.Write(ref _hardwareCwSafetyBlocked, blocked ? 1 : 0);
         PushCwToP2();
+        PushCwKeyerEnabledToP1OnEdge();
     }
 
     internal void RefreshHardwareCwArmPermission() => PushCwToP2();
@@ -5219,12 +5296,17 @@ public sealed class RadioService : IDisposable
     /// keying or idle. While keying, the Protocol-2 internal keyer is disarmed
     /// (TxSpecific byte-5 cleared) so host-keyed and FPGA-keyed CW are mutually
     /// exclusive — the pihpsdr model. Re-pushes immediately so the arm state
-    /// tracks the host sender edge. No-op on P1 (no <c>_p2Client</c>).
+    /// tracks the host sender edge. The Protocol-1 arm (C&amp;C 0x0F) gets the
+    /// same host/intent gating on every P1 board except Hermes-Lite 2, whose
+    /// gateware reads only I[0] as CWX; unlike P2 it does not consult the
+    /// frequency/identity safety evaluator (issue #2644). No-op on P1 with no
+    /// P1 client.
     /// </summary>
     public void SetHostCwKeying(bool active)
     {
         Volatile.Write(ref _hostCwKeying, active ? 1 : 0);
         PushCwToP2();
+        PushCwKeyerEnabledToP1OnEdge();
     }
 
     /// <summary>
@@ -5265,10 +5347,8 @@ public sealed class RadioService : IDisposable
             sidetoneGainDb = _cwSidetoneGainDb;
             state = _state;
         }
-        bool requestedActive = mode is RxMode.CWU or RxMode.CWL
-            && Volatile.Read(ref _hostCwKeying) == 0
-            && Volatile.Read(ref _hardwareCwSafetyBlocked) == 0;
-        bool active = requestedActive
+        bool active = mode is RxMode.CWU or RxMode.CWL
+            && HardwareCwHostIdleAndUnblocked()
             && (_hardwareCwArmEvaluator?.Invoke(state) ?? true);
 
         lock (_cwPushSync)
@@ -5359,6 +5439,7 @@ public sealed class RadioService : IDisposable
         {
             tuneFell = _tunActive && !on;
             _tunActive = on;
+            if (!on) _tunSwrFoldbackActive = 0;
             _txFrequencyTransition = false;
         }
         // Latch the TUN flag on the P1 client so its ControlFrame OC composition
@@ -5379,6 +5460,7 @@ public sealed class RadioService : IDisposable
         {
             tuneFell = _tunActive;
             _tunActive = false;
+            _tunSwrFoldbackActive = 0;
             _txFrequencyTransition = false;
         }
         (ActiveClient as Zeus.Protocol1.Protocol1Client)?.SetTune(false);
@@ -5396,6 +5478,31 @@ public sealed class RadioService : IDisposable
 
     internal void ConfigureTxDriveSafety(Func<int, TransmitSafetyDecision> evaluator) =>
         _txDriveSafetyEvaluator = evaluator ?? throw new ArgumentNullException(nameof(evaluator));
+
+    internal void EngageTunSwrFoldback()
+    {
+        bool engaged = false;
+        lock (_sync)
+        {
+            if (_tunActive && _tunSwrFoldbackActive == 0)
+            {
+                _tunSwrFoldbackActive = 1;
+                engaged = true;
+            }
+        }
+        if (engaged)
+            RecomputePaAndPush();
+    }
+
+    internal static int TunSwrFoldbackPercent(int maxPowerWatts)
+    {
+        if (maxPowerWatts <= 0) return 1;
+        return Math.Clamp(
+            (int)Math.Floor(
+                EngineTransmitSafetyModule.SwrTripTunBypassMaxFwdWatts * 100d / maxPowerWatts),
+            1,
+            100);
+    }
 
     // DspPipelineService calls this right after a P2 client is created so the
     // fresh connection sees the current PA snapshot without waiting for the
@@ -5899,6 +6006,9 @@ public sealed class RadioService : IDisposable
         // prevents any racing legacy/internal source from producing a drive
         // byte above the persisted amplifier ceiling.
         int activePct = Math.Min(requestedPct, Math.Clamp(stateSnap.DriveMaxPct, 1, 100));
+        bool tunSwrFoldback = tunActive && Volatile.Read(ref _tunSwrFoldbackActive) != 0;
+        if (tunSwrFoldback)
+            activePct = Math.Min(activePct, TunSwrFoldbackPercent(cfg.Global.PaMaxPowerWatts));
         int productCap = Volatile.Read(ref _productPluginDriveCapPct);
         if (!tunActive && productCap >= 0)
             activePct = Math.Min(activePct, productCap);
@@ -5947,8 +6057,8 @@ public sealed class RadioService : IDisposable
             && (!txThroughTransverter || !txXvtrBand.DisablePa);
 
         _log.LogInformation(
-            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} iqScale={IqScale:F4} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
-            tunActive, requestedPct, activePct, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, driveOutput.IqScale, paEnabled,
+            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} swrFoldback={SwrFoldback} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} iqScale={IqScale:F4} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
+            tunActive, requestedPct, activePct, tunSwrFoldback, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, driveOutput.IqScale, paEnabled,
             bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
 
         ActiveClient?.SetDriveOutput(driveOutput);

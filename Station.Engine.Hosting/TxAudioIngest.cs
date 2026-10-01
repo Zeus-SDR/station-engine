@@ -177,6 +177,21 @@ public sealed class TxAudioIngest : IDisposable
     private const float RogerBeepFlushIqThreshold = 0.001f; // -60 dBFS
     private const int RogerBeepTransportDrainTimeoutMs = 500;
     private const int RogerBeepTailGuardMs = 120;
+    // Voice unkey tail. Only speech still inside TXA (EstimateVoiceTxDspLatencyMs)
+    // and the host transport backlog may lengthen a release; the rest is a small
+    // fixed margin, so the radio returns to receive without a felt hang.
+    private const int VoiceTailSettleMinMs = 20;   // one 20 ms mic frame still in capture
+    private const int VoiceTailSettleMaxMs = 200;
+    private const int VoiceTailQuietBlocks = 1;
+    // IQ the radio still holds after the host transport goes idle. HL2
+    // gateware buffers 20 ms by default (register 0x17 unset); the G2 Saturn
+    // DUC FIFO holds up to 4096 words (~28 ms at 192 kHz). The P2 pacer only
+    // targets ~6.5 ms of that, so bursts and clock drift can fill the rest.
+    internal const int VoiceTailRadioFifoGuardMs = 30;
+    // A flush block that wakes late is clocked immediately to catch up, so a
+    // coarse OS timer (15.6 ms on Windows) cannot stretch the flush; only a
+    // stall longer than this re-anchors the pace.
+    private const int VoiceTailMaxCatchUpMs = 50;
     private const double RogerBeepFrequencyHz = 1000.0;
     private const float RogerBeepMagnitude = 0.60f;
     private const int KeyDownPrimeBlocks = 12;
@@ -551,6 +566,7 @@ public sealed class TxAudioIngest : IDisposable
                txOwnedByTuneDriver: () => !tx.IsMicIqProducerAllowed,
                preKeyOpenAtTicks: () => tx.PreKeyOpenAtTicks,
                txTransportLevel: pipeline.TxTransportLevel48k,
+               setP2TimingExact: pipeline.SetTxIqTimingExact,
                isVoiceTxMode: () => tx.IsVoiceTxModeNow,
                voiceDspLatencyMs: pipeline.EstimateVoiceTxDspLatencyMs,
                audioModem: audioModem,
@@ -583,7 +599,9 @@ public sealed class TxAudioIngest : IDisposable
         CwIdService? cwId = null,
         Func<TxTransportLevel>? txTransportLevel = null,
         Func<bool>? isVoiceTxMode = null,
-        Func<int>? voiceDspLatencyMs = null)
+        Func<int>? voiceDspLatencyMs = null,
+        Func<int>? voiceRadioFifoGuardMs = null,
+        Action<bool>? setP2TimingExact = null)
     {
         _ring = ring;
         _txTransportLevel = txTransportLevel ?? (static () => TxTransportLevel.Unknown);
@@ -595,8 +613,11 @@ public sealed class TxAudioIngest : IDisposable
         _productAudio = productAudio ?? new NullProductTxAudioPort();
         _productPluginAudio = productPluginAudio;
         _forwardP2 = forwardP2;
+        _setP2TimingExact = setP2TimingExact;
         _drainTxTransport = drainTxTransport;
         _voiceDspLatencyMs = voiceDspLatencyMs ?? (static () => 0);
+        _voiceRadioFifoGuardMs = voiceRadioFifoGuardMs
+            ?? (static () => VoiceTailRadioFifoGuardMs);
         _onWdspConsumed = onWdspConsumed;
         _txOwnedByTuneDriver = txOwnedByTuneDriver ?? (static () => false);
         _preKeyOpenAtTicks = preKeyOpenAtTicks ?? (static () => 0L);
@@ -752,11 +773,12 @@ public sealed class TxAudioIngest : IDisposable
         long startTs = _stopwatchTicks();
         long deadline = startTs + (long)(freq * (tailDelayMs / 1000.0));
 
-        // Keep ingress open for the first third of the configured hold so
-        // delayed capture/browser frames remain eligible, reserving the rest
-        // for the final WDSP flush and transport drain before MOX drops.
-        int settleMs = Math.Min(200, Math.Max(80, tailDelayMs / 3));
-        if (settleMs > 0) SleepUnlessAborted(settleMs, shouldAbort);
+        // Keep ingress open for the first third of the configured hold (at
+        // least one mic frame) so delayed capture/browser frames remain
+        // eligible, reserving the rest for the WDSP flush and transport drain.
+        var plan = PlanVoiceTail(tailDelayMs, _voiceDspLatencyMs(), blockSize, _voiceRadioFifoGuardMs());
+        int settleMs = plan.SettleMs;
+        SleepUnlessAborted(settleMs, shouldAbort);
         if (shouldAbort?.Invoke() == true) return false;
 
         lock (_sync)
@@ -805,11 +827,11 @@ public sealed class TxAudioIngest : IDisposable
             // inside TXA's FIR/lookahead stages. Advance TXA with real-time
             // silence before testing for quiet output. The initial output can
             // itself be silent while a delayed syllable is still on its way.
-            int dspLatencyMs = Math.Clamp(_voiceDspLatencyMs(), 0, 2000);
-            int periodMs = Math.Max(1, (int)Math.Ceiling(blockSize * 1000.0 / TxRateHz));
-            int minFlushBlocks = Math.Max(2, (dspLatencyMs + 2 * periodMs + periodMs - 1) / periodMs);
-            int maxFlushBlocks = Math.Max(minFlushBlocks,
-                (Math.Min(5000, dspLatencyMs + 500) + periodMs - 1) / periodMs);
+            int dspLatencyMs = plan.DspLatencyMs;
+            int minFlushBlocks = plan.MinFlushBlocks;
+            int maxFlushBlocks = plan.MaxFlushBlocks;
+            long periodTicks = (long)(freq * (double)blockSize / TxRateHz);
+            long maxLagTicks = freq * VoiceTailMaxCatchUpMs / 1000;
             int quietBlocks = 0;
             int flushBlocks = 0;
             long paceAt = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -820,15 +842,14 @@ public sealed class TxAudioIngest : IDisposable
                 if (shouldAbort?.Invoke() == true) return false;
                 ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak);
                 flushBlocks++;
-                quietBlocks = b + 1 >= minFlushBlocks && blockPeak <= RogerBeepFlushIqThreshold
+                quietBlocks = b >= minFlushBlocks && blockPeak <= RogerBeepFlushIqThreshold
                     ? quietBlocks + 1
                     : 0;
-                paceAt += (long)(freq * (double)blockSize / TxRateHz);
-                long remaining = paceAt - System.Diagnostics.Stopwatch.GetTimestamp();
-                if (remaining > 0)
-                    SleepUnlessAborted((int)Math.Ceiling(remaining * 1000.0 / freq), shouldAbort);
-                else paceAt = System.Diagnostics.Stopwatch.GetTimestamp();
-                if (quietBlocks >= RogerBeepFlushSilentBlocks) break;
+                if (quietBlocks >= VoiceTailQuietBlocks) break;
+                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                paceAt = AdvanceFlushPace(paceAt, now, periodTicks, maxLagTicks);
+                if (paceAt > now)
+                    SleepUnlessAborted((int)Math.Ceiling((paceAt - now) * 1000.0 / freq), shouldAbort);
             }
 
             if (shouldAbort?.Invoke() == true) return false;
@@ -847,9 +868,10 @@ public sealed class TxAudioIngest : IDisposable
             if (!transportDrained)
                 _log.LogWarning("tx.voice.tail transport did not drain before bounded timeout budgetMs={Budget}", transportBudgetMs);
             // The radio FIFO can still hold the last emitted IQ after the
-            // host queue goes idle. Honor the operator's requested hold as a
-            // minimum, then leave a short post-drain guard before unkey.
-            SleepUnlessAborted(RogerBeepTailGuardMs, shouldAbort);
+            // host queue goes idle: hold for its depth, then honor the
+            // operator's requested hold as a minimum before unkey.
+            int guardMs = plan.GuardMs;
+            SleepUnlessAborted(guardMs, shouldAbort);
             if (shouldAbort?.Invoke() == true) return false;
             long holdRemaining = deadline - System.Diagnostics.Stopwatch.GetTimestamp();
             if (holdRemaining > 0)
@@ -859,9 +881,9 @@ public sealed class TxAudioIngest : IDisposable
             double elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - startTs)
                 * 1000.0 / freq;
             _log.LogInformation(
-                "tx.voice.tail dropping PTT: delayMs={Delay} onsetBlocks={OnsetBlocks} residualSamples={Residual} produced={Produced} dspLatencyMs={DspLatency} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} transportDrained={TransportDrained} elapsedMs={Elapsed:F1}",
-                tailDelayMs, onsetDrained, residualSamples, produced, dspLatencyMs, flushBlocks,
-                quietBlocks >= RogerBeepFlushSilentBlocks, transportDrained, elapsedMs);
+                "tx.voice.tail dropping PTT: delayMs={Delay} settleMs={Settle} onsetBlocks={OnsetBlocks} residualSamples={Residual} produced={Produced} dspLatencyMs={DspLatency} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} transportDrained={TransportDrained} guardMs={Guard} elapsedMs={Elapsed:F1}",
+                tailDelayMs, settleMs, onsetDrained, residualSamples, produced, dspLatencyMs, flushBlocks,
+                quietBlocks >= VoiceTailQuietBlocks, transportDrained, guardMs, elapsedMs);
             return true;
         }
         catch (Exception ex)
@@ -1169,6 +1191,40 @@ public sealed class TxAudioIngest : IDisposable
 
     private const int TailAbortPollMs = 10;
 
+    /// <summary>
+    /// Next flush deadline after clocking one block. A block that woke late is
+    /// caught up (the next one is clocked without sleeping) so timer overshoot
+    /// never accumulates; only a stall longer than
+    /// <paramref name="maxLagTicks"/> re-anchors the pace to now.
+    /// </summary>
+    internal static long AdvanceFlushPace(long paceAt, long now, long periodTicks, long maxLagTicks)
+    {
+        long next = paceAt + periodTicks;
+        return now - next > maxLagTicks ? now : next;
+    }
+
+    internal readonly record struct VoiceTailPlan(
+        int SettleMs, int DspLatencyMs, int MinFlushBlocks, int MaxFlushBlocks, int GuardMs);
+
+    /// <summary>
+    /// Fixed costs of a voice release. The flush covers the speech still inside
+    /// TXA (whole blocks at the 48 kHz input cadence) and then needs
+    /// <see cref="VoiceTailQuietBlocks"/> quiet block; settle and guard are the
+    /// only waits that do not carry speech.
+    /// </summary>
+    internal static VoiceTailPlan PlanVoiceTail(
+        int tailDelayMs, int dspLatencyMs, int blockSize, int radioFifoGuardMs)
+    {
+        int settleMs = Math.Clamp(tailDelayMs / 3, VoiceTailSettleMinMs, VoiceTailSettleMaxMs);
+        int latencyMs = Math.Clamp(dspLatencyMs, 0, 2000);
+        double periodMs = blockSize * 1000.0 / TxRateHz;
+        int minFlushBlocks = Math.Max(1, (int)Math.Ceiling(latencyMs / periodMs));
+        int maxFlushBlocks = Math.Max(minFlushBlocks + VoiceTailQuietBlocks,
+            (int)Math.Ceiling(Math.Min(5000, latencyMs + 500) / periodMs));
+        return new VoiceTailPlan(settleMs, latencyMs, minFlushBlocks, maxFlushBlocks,
+            Math.Clamp(radioFifoGuardMs, 0, 200));
+    }
+
     /// <summary>Sleep <paramref name="ms"/>, returning early (within
     /// <see cref="TailAbortPollMs"/>) once <paramref name="shouldAbort"/> fires.</summary>
     private static void SleepUnlessAborted(int ms, Func<bool>? shouldAbort)
@@ -1288,8 +1344,10 @@ public sealed class TxAudioIngest : IDisposable
     private long _productPluginSpeechBypassGeneration;
 
     private readonly Action<ReadOnlyMemory<float>>? _forwardP2;
+    private readonly Action<bool>? _setP2TimingExact;
     private readonly Func<TimeSpan, bool>? _drainTxTransport;
     private readonly Func<int> _voiceDspLatencyMs;
+    private readonly Func<int> _voiceRadioFifoGuardMs;
     // Live-voice latency governor (see TxLatencyGovernor). Guarded by _sync.
     private readonly TxLatencyGovernor _latencyGovernor = new();
     private readonly Func<TxTransportLevel> _txTransportLevel;
@@ -1641,6 +1699,11 @@ public sealed class TxAudioIngest : IDisposable
     internal bool SetProductPluginSpeechBypassForTest(long generation, bool bypass) =>
         SetProductPluginSpeechBypass(generation, bypass);
 
+    internal static bool IsTimingExactSource(MicBlockSource source, bool modemActive, bool voiceMode) =>
+        source is not (MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic)
+        || modemActive
+        || !voiceMode;
+
     private void ProcessMicPcm(
         ReadOnlySpan<float> samples,
         MicBlockSource source,
@@ -1837,10 +1900,8 @@ public sealed class TxAudioIngest : IDisposable
             // digital, FreeDV, TCI/WAV/cable and plugin audio are timing-exact
             // streams and pass through untouched.
             int kept = need;
-            if (moxNow
-                && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic
-                && !_audioModem.Active
-                && _isVoiceTxMode())
+            bool timingExact = IsTimingExactSource(source, _audioModem.Active, _isVoiceTxMode());
+            if (moxNow && !timingExact)
             {
                 _latencyGovernor.ObserveTransport(
                     _txTransportLevel(),
@@ -1950,6 +2011,7 @@ public sealed class TxAudioIngest : IDisposable
                         // P2 path — Protocol2Client's 1029-port DUC sender. No-op
                         // when P2 isn't the active backend so both protocols share
                         // this seam cleanly. Mirrors TxTuneDriver's dual-write.
+                        _setP2TimingExact?.Invoke(timingExact);
                         _forwardP2?.Invoke(mute
                             ? new ReadOnlyMemory<float>(_muteIq, 0, 2 * produced)
                             : new ReadOnlyMemory<float>(_scratchIq, 0, 2 * produced));

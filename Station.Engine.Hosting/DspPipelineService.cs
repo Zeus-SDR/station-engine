@@ -2218,29 +2218,29 @@ public partial class DspPipelineService : BackgroundService,
         return true;
     }
 
-    // Three serial TX bandpass stages retain speech after the last mic block.
-    // The input cadence is always 48 kHz; P2's FIRs run at 96 kHz.
-    internal virtual int EstimateVoiceTxDspLatencyMs()
+    // How long speech can still be inside TXA after the last mic block: the
+    // measured TXA bound (bandpass stages, CFC, fixed pipeline lag) plus DEXP
+    // look-ahead and any reported TX plugin latency.
+    internal virtual int EstimateVoiceTxDspLatencyMs() =>
+        ComposeVoiceTxDspLatencyMs(
+            _radio.Snapshot(),
+            ResolveTxDspRateHz(_engine),
+            Math.Max(0, Volatile.Read(ref _txPluginLatencyMs)?.Invoke() ?? 0));
+
+    internal static int ComposeVoiceTxDspLatencyMs(StateDto state, int txDspRateHz, int pluginLatencyMs)
     {
-        var state = _radio.Snapshot();
-        int delayMs = 0;
-        if (state.TxFilterPhase == FilterPhaseMode.Linear)
-        {
-            int taps = ResolveFilterTapCount(state.TxFilterWindow);
-            int dspRate = ResolveTxDspRateHz(_engine);
-            delayMs += (int)Math.Ceiling(3.0 * (taps - 1) * 500.0 / dspRate);
-        }
-        else
-        {
-            // Minimum-phase delay is frequency dependent, but the partition
-            // still needs several input blocks to move its final output.
-            delayMs += 3 * 512 * 1000 / ResolveTxDspRateHz(_engine);
-        }
+        var leveling = state.TxLeveling ?? new TxLevelingConfig();
+        int delayMs = TxaVoiceLatencyModel.EstimateOnsetMs(
+            state.TxFilterPhase,
+            state.TxFilterWindow,
+            txDspRateHz,
+            leveling.CompressorEnabled,
+            leveling.CessbEnabled,
+            state.Cfc?.Enabled == true);
         var dexp = state.Dexp;
         if (dexp is { Enabled: true, LookAheadEnabled: true })
             delayMs += (int)Math.Ceiling(dexp.LookAheadMs);
-        delayMs += Math.Max(0, Volatile.Read(ref _txPluginLatencyMs)?.Invoke() ?? 0);
-        return delayMs;
+        return delayMs + Math.Max(0, pluginLatencyMs);
     }
 
     // dB added to the TX panadapter/waterfall pixels (Thetis TXDisplayCalOffset).
@@ -8251,6 +8251,12 @@ public partial class DspPipelineService : BackgroundService,
         // Measurement-only: record the egress instant for TX-turnaround stats
         // after the IQ has been forwarded, so observation never delays egress.
         _txTurnaround?.OnTxIqEgress();
+    }
+
+    internal void SetTxIqTimingExact(bool timingExact)
+    {
+        var p2 = _p2Client;
+        if (p2 is not null) p2.TxIqTimingExact = timingExact;
     }
 
     internal void CommitTxEgress(long revision) => _txEgressGate.Commit(revision);

@@ -399,7 +399,14 @@ internal static class ControlFrame
         // (DriveLevel == 0 → silence, otherwise unity). HL2's power-linear
         // path sets this because drive code 0 is -7.5 dB, not silence.
         // Trailing default keeps older CcState constructions valid.
-        double? TxIqScale = null);
+        double? TxIqScale = null,
+        // Per-frame keyer-bit hygiene for the TX IQ payload (issue #2644),
+        // computed by Protocol1Client.BuildTxDataPacket from CwKeyerWireState
+        // — what the gateware's internal_CW latch has actually been sent. The
+        // default None is the legacy encoding, so every caller that never sets
+        // this (tests, the VNA clear and pre-start frames) is byte-identical
+        // to before. ControlFrame only applies the decision; it never makes it.
+        KeyerIqGuard KeyerIqGuard = KeyerIqGuard.None);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -1165,9 +1172,32 @@ internal static class ControlFrame
         // [L_audio s16 BE][R_audio s16 BE][I s16 BE][Q s16 BE]
         // (both the audio ring fill and the IQ ring fill write into the same
         // 8-byte slot). Ordinary HL2 has no codec; the optional HL2+ uses
-        // these same L/R slots. The LSB of I and Q low bytes is masked off
-        // (`isample & 0xFE`) — originally an HL2 CWX workaround; harmless
-        // ≤1 LSB precision loss on other Protocol-1 boards.
+        // these same L/R slots. The I/Q low bytes are masked per
+        // state.KeyerIqGuard (issue #2644):
+        //
+        //   None         — legacy `sample & 0xFE` LSB clear on I and Q
+        //                  (originally an HL2 CWX workaround; harmless ≤1 LSB
+        //                  precision loss on other Protocol-1 boards).
+        //   MaskKeyerBits— `I & 0xF8`, `Q & 0xFE`. While its internal_CW latch
+        //                  (C&C 0x0F / wire 0x1E, C1[0]) is set, every legacy
+        //                  HPSDR P1 gateware reads the host I sample's three
+        //                  low bits as the keyer's dot/dash/CWX inputs
+        //                  (Hermes.v:1084-1089 — the same decoder in
+        //                  Angelia.v:1241, Orion.v:1315, Orion-MkII
+        //                  Orion.v:1404, HermesC10 Hermes.v:1095, Metis.v:970,
+        //                  HermesII Hermes.v:912). Stripping I[2:0] means
+        //                  streamed audio can never press the paddle inputs,
+        //                  so the self-key loop (paddle → CW_PTT → host MOX →
+        //                  mic IQ with random I[2:1] → the keyer keys itself)
+        //                  cannot start.
+        //   Silence      — zero every I/Q sample. While the gateware keyer is
+        //                  armed AND the host still wants it armed (a hardware
+        //                  paddle owns the transmission), the FPGA is the only
+        //                  CW source and host IQ must not reach air — Thetis
+        //                  likewise replaces every I/Q sample with just the
+        //                  keyer bits while cw_enable is set
+        //                  (networkproto1.c:738-741, `temp = (dot << 2 |
+        //                  dash << 1 | cwx) & 0b111`, all zero from Zeus).
         //
         // Pre-conditions for writing a non-zero payload: MOX engaged and an IQ
         // source is plumbed through. The wire format (L/R audio + I/Q s16 BE)
@@ -1217,21 +1247,29 @@ internal static class ControlFrame
         int peak = 0;
         long sumAbs = 0;
         int firstI = 0, firstQ = 0;
+        // The guard applies to what lands on the wire, never to the drain: the
+        // source is advanced for every sample so the TX ring and pacing are
+        // unchanged. The stats accumulate the written values, so an armed
+        // keyer (Silence) reports a silent wire, not the drained audio.
+        bool silence = state.KeyerIqGuard == KeyerIqGuard.Silence;
+        int iMask = state.KeyerIqGuard == KeyerIqGuard.MaskKeyerBits ? ~0x07 : ~0x01;
         for (int s = 0; s < IqSamplesPerUsbFrame; s++)
         {
             var (iSample, qSample) = source.Next(amplitude);
-            if (s == 0) { firstI = iSample; firstQ = qSample; }
-            int ai = Math.Abs((int)iSample);
-            int aq = Math.Abs((int)qSample);
+            int wireI = silence ? 0 : iSample & iMask;
+            int wireQ = silence ? 0 : qSample & ~0x01;
+            if (s == 0) { firstI = wireI; firstQ = wireQ; }
+            int ai = Math.Abs(wireI);
+            int aq = Math.Abs(wireQ);
             if (ai > peak) peak = ai;
             if (aq > peak) peak = aq;
             sumAbs += ai + aq;
             int off = s * 8;
             // Audio L/R (bytes 0..3) are left as filled above, or zero.
-            payload[off + 4] = (byte)((iSample >> 8) & 0xFF);
-            payload[off + 5] = (byte)(iSample & 0xFE);
-            payload[off + 6] = (byte)((qSample >> 8) & 0xFF);
-            payload[off + 7] = (byte)(qSample & 0xFE);
+            payload[off + 4] = (byte)((wireI >> 8) & 0xFF);
+            payload[off + 5] = (byte)(wireI & 0xFF);
+            payload[off + 6] = (byte)((wireQ >> 8) & 0xFF);
+            payload[off + 7] = (byte)(wireQ & 0xFF);
         }
         LastPeakAbs = peak;
         LastMeanAbs = (int)(sumAbs / (2 * IqSamplesPerUsbFrame));

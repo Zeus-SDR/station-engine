@@ -602,7 +602,20 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // Keep live TX realtime if the producer briefly overruns the paced DUC
     // sender. 32 packets is about 40 ms at 800 packets/s, enough for normal
     // WDSP bursts but too small to become audible delayed speech.
-    private const int TxIqMaxQueuedPackets = 32;
+    private const int TxIqVoiceMaxQueuedPackets = 32;
+    // TX_CHRONO backlog gating keeps the steady-state queue near one chunk.
+    // This 320 ms ceiling only needs to absorb large client chunks without
+    // dropping: an 8192-sample chunk at 48 kHz needs ~137 packets.
+    private const int TxIqTimingExactMaxQueuedPackets = 256;
+    private volatile bool _txIqTimingExact;
+    private bool _txIqTimingExactTailQueued; // Guarded by _txIqGate.
+
+    public bool TxIqTimingExact
+    {
+        get => _txIqTimingExact;
+        set => _txIqTimingExact = value;
+    }
+
     private readonly float[] _txIqScratch = new float[TxIqSamplesPerPacket * 2];
     private int _txIqScratchCount;
     private long _txIqScratchRevision;
@@ -2423,7 +2436,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     public void SendTxIq(ReadOnlySpan<float> iqInterleaved, long safetyRevision)
     {
-        if (_sock is null || _rxTask is null) return;
+        if (DatagramSinkForTesting is null && (_sock is null || _rxTask is null)) return;
         if (safetyRevision <= 0 || !(_txIqSafetyGate?.Invoke(safetyRevision) ?? true)) return;
         if ((iqInterleaved.Length & 1) != 0)
             throw new ArgumentException("interleaved length must be even (I,Q pairs)", nameof(iqInterleaved));
@@ -2535,6 +2548,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         {
             _txIqScratchCount = 0;
             _txIqScratchRevision = 0;
+            _txIqTimingExactTailQueued = false;
         }
         // Drain queued-but-unsent packets on BOTH transmit edges so a fresh
         // key-down starts from an empty client-side FIFO model and the radio
@@ -2605,7 +2619,18 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     private void DropStaleTxIqPacketsIfBackedUpLocked()
     {
-        while (Volatile.Read(ref _txIqQueuedPackets) >= TxIqMaxQueuedPackets
+        if (TxIqTimingExact)
+            _txIqTimingExactTailQueued = true;
+        else if (_txIqTimingExactTailQueued
+                 && Volatile.Read(ref _txIqQueuedPackets) < TxIqVoiceMaxQueuedPackets)
+            _txIqTimingExactTailQueued = false;
+
+        // Applying the voice cap to an unplayed digital tail would cause the
+        // exact phase jump the timing-exact cap exists to prevent.
+        int maxQueuedPackets = _txIqTimingExactTailQueued
+            ? TxIqTimingExactMaxQueuedPackets
+            : TxIqVoiceMaxQueuedPackets;
+        while (Volatile.Read(ref _txIqQueuedPackets) >= maxQueuedPackets
                && _txIqPacketPool.TryDrop(
                    _txIqQueue.Reader,
                    DecrementTxIqQueuedPacketsIfPositive))

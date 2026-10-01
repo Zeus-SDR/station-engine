@@ -82,12 +82,10 @@ internal readonly record struct ProtectionSample(
     TransmitIntent Intent,
     DateTime KeyedAt,
     int TimeoutSeconds,
-    // Measured forward power (W) and the current tune-drive request (%) gate
-    // the low-power TUN SWR bypass. Defaults are deliberately fail-safe — a
-    // sample built without power context reads as "high power", so protection
-    // is NOT bypassed unless a caller supplies genuinely low readings.
-    double FwdWatts = double.MaxValue,
-    int TuneDrivePercent = 100);
+    // Measured forward power (W) gates the low-power TUN SWR hard-drop bypass.
+    // The default is deliberately fail-safe, so a sample built without
+    // measured power reads as "high power" and never bypasses protection.
+    double FwdWatts = double.MaxValue);
 
 internal readonly record struct ProtectionDecision(
     bool Trip,
@@ -118,14 +116,14 @@ internal sealed class EngineTransmitSafetyModule
     // 6.0:1 TUN guard (issue #1659). Thetis suppresses SWR protection during
     // TUN, but only while the transmitted power stays low enough that a bad
     // match cannot harm the PA. Zeus mirrors that: while TUN is active AND
-    // both the measured forward power and the tune-drive request stay within
-    // these guarded limits, the SWR trip is suppressed so the tuner can hunt.
-    // Above either limit the normal 6.0:1 / 500 ms TUN trip still applies, MOX
-    // protection is untouched, and the overall TX timeout always bounds the
-    // transmission. This is NOT a blanket time grace — extreme SWR at real
-    // power still drops the PA on the normal 500 ms sustain window.
+    // measured forward power stays within this guarded limit, the SWR hard
+    // drop is suppressed so the tuner can hunt. Above the limit the normal
+    // 6.0:1 / 500 ms TUN trip still applies, MOX protection is untouched, and
+    // the overall TX timeout always bounds the transmission. This is NOT a
+    // blanket time grace — extreme SWR at real power still drops the PA on the
+    // normal 500 ms sustain window.
     internal const double SwrTripTunBypassMaxFwdWatts = 35.0;
-    internal const int SwrTripTunBypassMaxDrivePercent = 70;
+    internal const int SwrTripTunFoldbackDriveThresholdPercent = 70;
 
     private readonly object _sync = new();
     private DateTime? _swrAboveThresholdSince;
@@ -382,10 +380,9 @@ internal sealed class EngineTransmitSafetyModule
         // `alex_fwd >= 1.0f && alex_fwd <= 35.0f && tune <= 70`
         // (console.cs:26032), and, quite separately, a trip that cannot arm at
         // all below 5 W forward, `alex_fwd > alex_fwd_limit` (console.cs:26046).
-        // For any drive request inside the limit those two reduce to a single
-        // bound: suppress at or below 35 W. The `>= 1.0f` never decides
-        // anything, because everything it excludes is caught by the 5 W floor
-        // behind it.
+        // For a low drive request those two reduce to a single bound: suppress
+        // at or below 35 W. The `>= 1.0f` never decides anything, because
+        // everything it excludes is caught by the 5 W floor behind it.
         //
         // Transcribing the window alone is therefore not a faithful port, it is
         // a bug, and it was one: a lower bound copied here in isolation refused
@@ -397,17 +394,15 @@ internal sealed class EngineTransmitSafetyModule
         // Thetis line and not the other. Pinned by
         // EvaluateSwrTrip_Tun_SubWattBoard_DoesNotTrip_Hl2ExternalAtuRegression.
         //
-        // The drive limit is the one place Zeus is deliberately STRICTER than
-        // Thetis. Thetis suppresses below 5 W whatever the operator asked for;
-        // Zeus does not trust a low forward reading when a high tune power was
-        // requested, because that combination can mean the board is making its
-        // power and the telemetry is under-reading. Zeus drops TX where Thetis
-        // only folds power back, so it errs toward protecting. That backstop
-        // predates this bypass and is pinned by
-        // EvaluateSwrTrip_Tun_HighTuneDrive_StillTripsAt8To1.
-        if (isTun
-            && sample.FwdWatts <= SwrTripTunBypassMaxFwdWatts
-            && sample.TuneDrivePercent <= SwrTripTunBypassMaxDrivePercent)
+        // Thetis does not hard-unkey when a higher slider request falls outside
+        // that ignore window: it records high SWR and can fold output back. A
+        // requested percentage is not measured RF power, so using it to turn a
+        // low-power tune into Zeus's latched hard drop is stricter in the wrong
+        // dimension. Issue #2662 captured exactly that mismatch: 84% requested
+        // drive produced only 7.61 W while an external ATU hunted on 160 m.
+        // Keep the hard-drop decision on measured power; high-power TUN and all
+        // MOX mismatches remain protected below.
+        if (isTun && sample.FwdWatts <= SwrTripTunBypassMaxFwdWatts)
         {
             lock (_sync) _swrAboveThresholdSince = null;
             return ProtectionDecision.None;

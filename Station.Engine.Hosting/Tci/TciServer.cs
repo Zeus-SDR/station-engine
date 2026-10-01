@@ -95,8 +95,8 @@ public sealed class TciServer : IHostedService, IDisposable
     // Stopwatch so DateTime jumps can't disturb TX timing.
     private const int TciTxBlockSamples = 2048;
     private const int TciTxBlockRate = 48000;
-    private const int TciTxBurstCount = 3;
-    private static readonly long TciTxChronoSpacingSwTicks =
+    internal const int TciTxBurstCount = 3;
+    internal static readonly long TciTxChronoSpacingSwTicks =
         (long)Math.Round((double)TciTxBlockSamples * Stopwatch.Frequency / TciTxBlockRate);
 
     private int _tciTxSamplesInPipeline;
@@ -637,26 +637,12 @@ public sealed class TciServer : IHostedService, IDisposable
         while (sent < TciTxBurstCount)
         {
             long nowTicks = _txChronoClock.ElapsedTicks;
+            int transportBacklogSamples = _pipeline.TxTransportBacklogSamples48k();
             lock (_tciTxStateLock)
             {
-                // Rate-limit: don't send faster than real-time audio consumption.
-                // One TX_CHRONO = 2048 mono samples @ 48 kHz = 42.6667 ms.
-                long elapsed = nowTicks - _tciTxLastChronoSwTicks;
-                if (elapsed < TciTxChronoSpacingSwTicks)
+                if (!TryAdvanceTxChrono(nowTicks, transportBacklogSamples,
+                        _tciTxSamplesInPipeline, ref _tciTxLastChronoSwTicks))
                     break;
-
-                // Don't request more if pipeline already has enough buffered.
-                // Target: ~100 ms of audio ahead (4800 samples).
-                if (_tciTxSamplesInPipeline > 4800)
-                    break;
-
-                // Advance by one spacing in ticks (NOT to nowTicks): the OS
-                // timer fires unevenly, and resetting to nowTicks bakes the
-                // drift in permanently — causing FT8 audio rate to slip ~2%
-                // above real-time and overflow the TxAudioIngest accumulator
-                // every ~1.8 s. Fixed-increment advance lets a late tick
-                // catch up via the burst budget below.
-                _tciTxLastChronoSwTicks += TciTxChronoSpacingSwTicks;
             }
 
             foreach (var session in _clients.Values)
@@ -665,6 +651,34 @@ public sealed class TciServer : IHostedService, IDisposable
             }
             sent++;
         }
+    }
+
+    internal static bool TryAdvanceTxChrono(long nowTicks, int transportBacklogSamples,
+        int samplesInPipeline, ref long lastChronoTicks)
+    {
+        // WDSP consumes TCI input synchronously; its counter does not measure
+        // IQ still waiting for the radio. Stop requesting at one queued block.
+        // The P2 sender pulls ~5 packets into its radio-FIFO model at once,
+        // so one in-flight chunk reads ~1700 samples and normal pacing
+        // continues; the gate engages only once more than a chunk piles up.
+        if (transportBacklogSamples >= TciTxBlockSamples)
+        {
+            // Owe at most one chrono when the gate reopens: the backlog is
+            // still just under one block then, and a full burst on top of it
+            // would overrun the P2 timing-exact queue cap and drop audio.
+            lastChronoTicks = Math.Max(lastChronoTicks,
+                nowTicks - TciTxChronoSpacingSwTicks);
+            return false;
+        }
+
+        // Keep the stopwatch rate ceiling and the legacy pre-WDSP guard,
+        // including the original behaviour when transport backlog is unknown.
+        if (nowTicks - lastChronoTicks < TciTxChronoSpacingSwTicks || samplesInPipeline > 4800)
+            return false;
+
+        // Fixed increments preserve fractional credit across uneven OS ticks.
+        lastChronoTicks += TciTxChronoSpacingSwTicks;
+        return true;
     }
 
     public void Dispose()
