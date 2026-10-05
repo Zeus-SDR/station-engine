@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Text.Json;
 using Zeus.Contracts;
 using Zeus.Dsp;
 namespace Zeus.Server;
@@ -107,27 +108,33 @@ public static class TxControlEndpoints
             return Results.Ok(new { moxOn = tx.IsMoxOn });
         });
 
-        // CW keyer (zeus-drf). Body: { text, wpm? }. Returns 202 immediately;
-        // playback happens on the engine's worker. WPM null = engine default
-        // (currently 20); the engine clamps to 5..50. Empty text is allowed —
-        // produces no symbols and resolves to Idle without keying.
-        endpoints.MapPost("/api/cw/send", async (CwSendRequest req, CwEngine cw, HttpContext context) =>
+        // CW keyer (zeus-drf). Body: { text, wpm?, expectedAbortSeq?, receiver? }.
+        // Returns 202 when the text is queued or when HALT already superseded
+        // it. An explicit receiver that is not the current local CW TX target
+        // is 409 and is not queued. WPM null = engine default (currently 20);
+        // the engine clamps to 5..50. Empty text is allowed — produces no
+        // symbols and resolves to Idle without keying. The engine does not
+        // select the TX receiver.
+        endpoints.MapPost("/api/cw/send", (CwSendRequest req, CwEngine cw, HttpContext context) =>
         {
             var leaseId = RemoteTxLease.TryGet(context, out var remoteLease)
                 ? remoteLease
                 : null;
-            await cw.SendAsync(req.Text ?? string.Empty, req.Wpm, default, leaseId, req.ExpectedAbortSeq).ConfigureAwait(false);
-            return Results.Accepted();
+            return EnqueueCwSend(req, cw, leaseId);
         });
 
-        // Hard abort. Drops the queue and signals the in-flight playback to
-        // cancel. MOX falls on the next playback tick (≤ ChunkSamples / SR ≈
-        // 10 ms). Returns 200 unconditionally — abort is best-effort — and
-        // the new abort counter so the client can fence the next send.
-        endpoints.MapPost("/api/cw/abort", (CwEngine cw) =>
+        // Hard abort. An empty body is the historical global abort: it drops
+        // the queue, cancels the in-flight playback, and returns the new
+        // counter. A body that names job ids cancels only those jobs and
+        // does not move the counter. An invalid id is 400 and cancels nothing.
+        endpoints.MapPost("/api/cw/abort", async (CwEngine cw, HttpContext context) =>
         {
-            var abortSeq = cw.Abort("api.cw.abort");
-            return Results.Ok(new { abortSeq });
+            var result = await AbortCw(cw, context.Request);
+            if (result.StatusCode == StatusCodes.Status400BadRequest)
+                return Results.BadRequest(new { error = result.Error });
+            return result.Scoped
+                ? Results.Ok(new { abortSeq = result.AbortSeq, scoped = true })
+                : Results.Ok(new { abortSeq = result.AbortSeq });
         });
 
         // The abort counter for a page that has not seen a status frame yet:
@@ -135,6 +142,14 @@ public static class TxControlEndpoints
         // is refused once HALT has moved the engine on.
         endpoints.MapGet("/api/cw/status", (CwEngine cw) =>
             Results.Ok(new { abortSeq = cw.AbortSeq }));
+
+        // Present only on an engine that can select the CW decoder's receiver
+        // and can bind a CW send to that receiver. An older engine 404s.
+        // A client that wants RX3 must see this first and must not send an
+        // RX1 enable in its place. receiverBoundSend is the CW-send flag;
+        // receiverSelection alone is the decoder flag.
+        endpoints.MapGet("/api/cw/decoder/capabilities", () =>
+            Results.Ok(CwDecoderCapabilities()));
 
         // Persisted CW operator settings (WPM, Farnsworth, 6 macros,
         // sidetone gain/pitch). PATCH-shaped PUT: every field nullable so
@@ -507,7 +522,90 @@ public static class TxControlEndpoints
         return true;
     }
 
+    /// <summary>
+    /// Queue one CW send. <paramref name="remoteTxLeaseId"/> is the lease
+    /// already resolved by the route. A <c>receiver-*</c> refusal is HTTP 409;
+    /// a queued send and an abort-seq mismatch (<c>halted</c>) stay HTTP 202.
+    /// </summary>
+    internal static IResult EnqueueCwSend(CwSendRequest req, CwEngine cw, string? remoteTxLeaseId)
+    {
+        var refusal = cw.TryEnqueueSend(
+            req.Text ?? string.Empty,
+            req.Wpm,
+            default,
+            remoteTxLeaseId,
+            req.ExpectedAbortSeq,
+            req.Receiver,
+            req.JobId);
+        return CwSendHttpResult(refusal);
+    }
+
+    /// <summary>HTTP mapping for <see cref="CwEngine.TryEnqueueSend"/>.</summary>
+    internal static IResult CwSendHttpResult(string? refusal) =>
+        refusal == CwEngine.InvalidJobIdReason
+            ? Results.BadRequest(new { error = refusal })
+            : refusal is not null && refusal.StartsWith("receiver-", StringComparison.Ordinal)
+                ? Results.Conflict(new { error = refusal })
+                : Results.Accepted();
+
+    /// <summary>
+    /// Empty body and a JSON object with no job id are the global abort.
+    /// <c>jobIds: []</c> cancels nothing. Any invalid id rejects the whole
+    /// request before a job is cancelled.
+    /// </summary>
+    internal static async Task<CwAbortHttp> AbortCw(CwEngine cw, HttpRequest request)
+    {
+        if (!HasAbortBody(request))
+            return new CwAbortHttp(StatusCodes.Status200OK, cw.Abort("api.cw.abort"), false, null);
+        CwAbortRequest? body;
+        try
+        {
+            body = await request.ReadFromJsonAsync<CwAbortRequest>();
+        }
+        catch (JsonException)
+        {
+            return new CwAbortHttp(StatusCodes.Status400BadRequest, cw.AbortSeq, false, CwEngine.InvalidJobIdReason);
+        }
+        if (body is null || (body.JobId is null && body.JobIds is null))
+            return new CwAbortHttp(StatusCodes.Status200OK, cw.Abort("api.cw.abort"), false, null);
+        var ids = new List<string>();
+        if (body.JobId is not null) ids.Add(body.JobId);
+        if (body.JobIds is not null) ids.AddRange(body.JobIds);
+        if (ids.Count == 0)
+            return new CwAbortHttp(StatusCodes.Status200OK, cw.AbortSeq, true, null);
+        foreach (var id in ids)
+        {
+            if (!CwJobIds.IsValid(id))
+                return new CwAbortHttp(StatusCodes.Status400BadRequest, cw.AbortSeq, false, CwEngine.InvalidJobIdReason);
+        }
+        return new CwAbortHttp(StatusCodes.Status200OK, cw.TryCancelJobs(ids), true, null);
+    }
+
+    private static bool HasAbortBody(HttpRequest request)
+    {
+        if (request.ContentLength is long length) return length > 0;
+        var type = request.ContentType;
+        return type is not null && type.Contains("json", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Body of <c>GET /api/cw/decoder/capabilities</c>.
+    /// <c>maxReceivers</c> is <see cref="WireContract.MaxReceivers"/>.
+    /// </summary>
+    internal static object CwDecoderCapabilities() => new
+    {
+        receiverSelection = true,
+        maxReceivers = WireContract.MaxReceivers,
+        receiverBoundSend = true,
+        cwJobIds = true,
+        txReceiverIdleGuard = true,
+    };
+
 }
+
+internal readonly record struct CwAbortHttp(int StatusCode, int AbortSeq, bool Scoped, string? Error);
+
+internal sealed record CwAbortRequest(string? JobId = null, string[]? JobIds = null);
 
 internal sealed record PreviewSetRequest(
     bool Enabled,

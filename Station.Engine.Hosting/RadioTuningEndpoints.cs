@@ -167,10 +167,14 @@ public static class RadioTuningEndpoints
         // not-exposed index clamps to RX1 server-side.
         endpoints.MapPost("/api/tx/receiver", (TxReceiverSetRequest req, RadioService r) =>
         {
-            if (req.Index < 0 || req.Index >= Zeus.Contracts.WireContract.MaxReceivers)
-                return Results.BadRequest(new { error = $"tx receiver index out of range (0..{Zeus.Contracts.WireContract.MaxReceivers - 1})" });
-            log.LogInformation("api.tx.receiver index={Index}", req.Index);
-            return Results.Ok(r.SetTxReceiver(req.Index));
+            log.LogInformation(
+                "api.tx.receiver index={Index} requireIdle={RequireIdle}", req.Index, req.RequireIdle);
+            var selected = SelectTxReceiver(req, r);
+            if (selected.StatusCode == StatusCodes.Status400BadRequest)
+                return Results.BadRequest(new { error = selected.Error });
+            if (selected.StatusCode == StatusCodes.Status409Conflict)
+                return Results.Conflict(new { error = selected.Error });
+            return Results.Ok(selected.State);
         });
 
         endpoints.MapPost("/api/tx/split", (SplitSetRequest req, RadioService r) =>
@@ -212,6 +216,29 @@ public static class RadioTuningEndpoints
 
         return endpoints;
     }
+
+    /// <summary>
+    /// Map one transmitter select. <see cref="TxReceiverSetRequest.RequireIdle"/>
+    /// false keeps <see cref="RadioService.SetTxReceiver(int)"/>. True refuses
+    /// with 409 before the index changes.
+    /// </summary>
+    internal static TxReceiverSelection SelectTxReceiver(TxReceiverSetRequest req, RadioService radio)
+    {
+        if (req.Index < 0 || req.Index >= WireContract.MaxReceivers)
+        {
+            return new TxReceiverSelection(
+                StatusCodes.Status400BadRequest,
+                $"tx receiver index out of range (0..{WireContract.MaxReceivers - 1})",
+                null);
+        }
+        if (!req.RequireIdle)
+            return new TxReceiverSelection(StatusCodes.Status200OK, null, radio.SetTxReceiver(req.Index));
+        if (!radio.TrySetTxReceiver(req.Index, requireIdle: true, out var state, out var error))
+            return new TxReceiverSelection(StatusCodes.Status409Conflict, error, state);
+        return new TxReceiverSelection(StatusCodes.Status200OK, null, state);
+    }
+
+    internal readonly record struct TxReceiverSelection(int StatusCode, string? Error, StateDto? State);
 
     private static bool SplitReceiverAvailable(StateDto state, int receiver) =>
         receiver == 0 || receiver > 0

@@ -62,6 +62,7 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     internal Action? KeyReservedForTest { get; set; }
     internal Action? KeyActionEnteredForTest { get; set; }
+    internal Action? RevokedDrainEnteredForTest { get; set; }
 
     public ProductPluginAudioPort(ILogger<ProductPluginAudioPort> log)
     {
@@ -702,12 +703,24 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     private void PumpInjection(InjectionSession session, bool force)
     {
-        // A revoked session stays leased so the plugin can recover, but it
-        // delivers nothing until it explicitly re-arms.
-        if (session.IsRevoked) return;
         if (!session.TryAddRef()) return;
         try
         {
+            // A revoked session stays leased so the plugin can recover, but it
+            // delivers nothing until it explicitly re-arms. It must still
+            // discard what the producer writes meanwhile: a mid-over revoke
+            // does not stop the producer streaming the rest of its
+            // transmission, and an undrained ring fills, so the next key-up
+            // airs the previous over's stale blocks and then revokes on the
+            // sequence gap left by the producer's dropped writes. That repeats
+            // on every later key-up (issue 2706: WSPR keys cut at ~645 ms,
+            // 32 ring slots x 20 ms, until the beacon gave up).
+            if (session.IsRevoked)
+            {
+                DiscardBufferedInjection(session);
+                return;
+            }
+
             bool armed;
             bool keyed;
             lock (_gate)
@@ -855,6 +868,24 @@ public sealed class ProductPluginAudioPort : IDisposable
         finally
         {
             session.Release();
+        }
+    }
+
+    // Runs under _gate because a re-arm clears the latch under the same lock:
+    // the drain can therefore never read a block written after the re-arm
+    // (the next over's audio). Bounded by the ring depth so a producer
+    // writing concurrently can never hold the lock in this loop.
+    private void DiscardBufferedInjection(InjectionSession session)
+    {
+        lock (_gate)
+        {
+            if (!session.IsRevoked) return;
+            RevokedDrainEnteredForTest?.Invoke();
+            for (var i = 0;
+                 i < AudioRingProtocol.SlotCount
+                     && session.Owner.TryReadOutput(session.Scratch, out _, out _);
+                 i++)
+                Interlocked.Increment(ref _droppedInjectionBlocks);
         }
     }
 

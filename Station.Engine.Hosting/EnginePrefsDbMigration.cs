@@ -78,6 +78,7 @@ internal static class EnginePrefsDbMigration
             "hl2_io_bands",
             "pa_band_drive",
             "pa_bands",
+            "pa_digital_mode_drive",
             "pa_globals",
             "preferred_radio",
             "ptt_settings",

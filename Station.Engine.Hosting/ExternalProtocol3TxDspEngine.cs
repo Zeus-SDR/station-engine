@@ -169,7 +169,9 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
     public void SetTxAmFilter(int highPassHz, int lowPassHz) => _inner.SetTxAmFilter(highPassHz, lowPassHz);
     public bool TxAmBroadcastSupported => _inner.TxAmBroadcastSupported;
     public void SetTxDigitalBypass(bool bypass) => _inner.SetTxDigitalBypass(bypass);
+    public void SetRxDigitalBypass(int channelId, bool bypass) => _inner.SetRxDigitalBypass(channelId, bypass);
     public void SetTxInjectedAudioBypass(bool bypass) => _inner.SetTxInjectedAudioBypass(bypass);
+    public void SetTxRecordingBypass(bool bypass) => _inner.SetTxRecordingBypass(bypass);
     public void SetTxRogerBeepBypass(bool bypass) => _inner.SetTxRogerBeepBypass(bypass);
     public void SetTxFilter(int lowHz, int highHz) => _inner.SetTxFilter(lowHz, highHz);
     public void SetRxBandpassWindow(int channelId, BandpassWindow window) =>

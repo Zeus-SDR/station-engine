@@ -95,7 +95,16 @@ public sealed class CwEngine : BackgroundService
     // cancel applies — keyer:0 must not truncate an unrelated text send.
     private bool _currentIsRawKey;
     private string? _currentRemoteTxLeaseId;
+    // Identity of the job the worker has dequeued. Cleared with _currentAbort.
+    // Status after that clear uses the job's own id, not this field.
+    private string? _currentJobId;
     private readonly object _abortLock = new();
+    // Ids cancelled before or after they land. Bounded so a page that closes
+    // and retries cannot grow this without limit. A global abort tombstones
+    // the ids it drained so a late retry of the same id does not key.
+    private const int CancelledJobCapacity = 64;
+    private readonly Queue<string> _cancelledOrder = new();
+    private readonly HashSet<string> _cancelledIds = new(StringComparer.Ordinal);
     // Every Abort bumps this. A send that names a different value arrived
     // after HALT and must not be queued. Clients that omit it are unchanged.
     private int _abortSeq;
@@ -140,6 +149,31 @@ public sealed class CwEngine : BackgroundService
     /// Tests abort here between elements. Null in production.
     /// </summary>
     internal Action? BeforeElementForTest;
+
+    /// <summary>
+    /// Test seam after <c>TrySetMox(true)</c> returns and the abort recheck
+    /// has passed, before the post-MOX receiver check. The TX transition
+    /// lock is not held. Null in production.
+    /// </summary>
+    internal Action? AfterMoxForTest;
+
+    /// <summary>Explicit receiver is outside 0..MaxReceivers-1 and is not the Kiwi index.</summary>
+    internal const string ReceiverOutOfRangeReason = "receiver-out-of-range";
+
+    /// <summary>Kiwi index, or a named non-hardware slice. Not a local DDC.</summary>
+    internal const string ReceiverRemoteReason = "receiver-remote";
+
+    /// <summary>Index is in range but that slice is not enabled.</summary>
+    internal const string ReceiverUnavailableReason = "receiver-unavailable";
+
+    /// <summary>Accept-time: the slice exists but it is not the TX receiver.</summary>
+    internal const string ReceiverNotSelectedReason = "receiver-not-selected";
+
+    /// <summary>Bound slice is not CWU or CWL.</summary>
+    internal const string ReceiverModeReason = "receiver-mode";
+
+    /// <summary>Queued send: TX no longer points at the bound receiver.</summary>
+    internal const string ReceiverMovedReason = "receiver-moved";
 
     /// <summary>
     /// Test seam after Abort has cancelled the in-flight job and before it
@@ -190,45 +224,93 @@ public sealed class CwEngine : BackgroundService
     /// persisted default from <see cref="CwSettingsStore"/>; if the store
     /// hasn't been initialised yet (test seam) it falls back to
     /// <see cref="WpmDefault"/>. Returns immediately; keying happens on
-    /// the worker thread.
+    /// the worker thread. <paramref name="receiver"/> null keeps the legacy
+    /// global-TX send. An explicit index is carried on the job and is not
+    /// used to select the TX receiver.
     /// </summary>
     public ValueTask SendAsync(
         string text,
         int? wpm,
         CancellationToken ct,
         string? remoteTxLeaseId = null,
-        int? expectedAbortSeq = null)
+        int? expectedAbortSeq = null,
+        int? receiver = null,
+        string? jobId = null)
+    {
+        TryEnqueueSend(text, wpm, ct, remoteTxLeaseId, expectedAbortSeq, receiver, jobId);
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Accept one text send. Null means the job was queued. <c>halted</c> is
+    /// an abort-seq mismatch and is still reported as status, not as a
+    /// receiver refusal. Any <c>receiver-*</c> value was not queued.
+    /// </summary>
+    internal string? TryEnqueueSend(
+        string text,
+        int? wpm,
+        CancellationToken ct,
+        string? remoteTxLeaseId = null,
+        int? expectedAbortSeq = null,
+        int? receiver = null,
+        string? jobId = null)
     {
         ArgumentNullException.ThrowIfNull(text);
         ct.ThrowIfCancellationRequested();
         int requested = wpm ?? _settings?.Get().Wpm ?? WpmDefault;
         int effective = Math.Clamp(requested, WpmMin, WpmMax);
+        // Empty keeps the legacy send. Anything else must be a canonical id.
+        string? identity = string.IsNullOrEmpty(jobId) ? null : jobId;
         // Check and enqueue under the same lock Abort uses to bump the
         // counter and drain the queue. A send that passed the check and
-        // then lost the race would key after both aborts.
-        CwEngineStatus? refused = null;
+        // then lost the race would key after both aborts. HALT wins over a
+        // bad receiver: the client already asked not to queue.
+        string? refusal = null;
+        int depth;
+        bool quietRefusal = false;
         lock (_abortLock)
         {
-            if (expectedAbortSeq is int expected && expected != _abortSeq)
-            {
-                refused = MakeStatus(
-                    CwEngineState.Idle, text, effective,
-                    Volatile.Read(ref _pendingJobs), "halted");
-            }
-            else if (_jobs.Writer.TryWrite(
-                new CwJob(text, effective, RawKeyDown: false, DurationMs: null, remoteTxLeaseId, _abortSeq)))
+            if (identity is not null && !CwJobIds.IsValid(identity))
+                refusal = InvalidJobIdReason;
+            else if (identity is not null && _cancelledIds.Contains(identity))
+                refusal = CancelledJobReason;
+            else if (expectedAbortSeq is int expected && expected != _abortSeq)
+                refusal = "halted";
+            else if (receiver is int bound)
+                refusal = ClassifyAccept(_radio.Snapshot(), bound);
+            if (refusal is null && _jobs.Writer.TryWrite(
+                new CwJob(text, effective, false, null, remoteTxLeaseId, _abortSeq, receiver, identity)))
             {
                 Interlocked.Increment(ref _pendingJobs);
             }
+            depth = Volatile.Read(ref _pendingJobs);
+            // A late retry of a cancelled id must not replace a foreign
+            // Sending snapshot with Idle. The owner already released it.
+            quietRefusal = refusal is (InvalidJobIdReason or CancelledJobReason)
+                && (_currentAbort is not null || depth > 0);
         }
-        if (refused is not null)
+        if (refusal is not null)
         {
-            _log.LogInformation(
-                "cw.send.refused expectedAbortSeq={Expected} abortSeq={Seq} text={Text}",
-                expectedAbortSeq, refused.AbortSeq, Truncate(text));
-            PublishStatus(refused.State, refused.Text, refused.Wpm, refused.QueueDepth, refused.Reason);
+            if (refusal == "halted")
+            {
+                _log.LogInformation(
+                    "cw.send.refused expectedAbortSeq={Expected} abortSeq={Seq} text={Text}",
+                    expectedAbortSeq, AbortSeq, Truncate(text));
+            }
+            else
+            {
+                _log.LogInformation(
+                    "cw.send.refused receiver={Receiver} reason={Reason} text={Text}",
+                    receiver, refusal, Truncate(text));
+            }
+            if (!quietRefusal)
+            {
+                PublishStatus(
+                    CwEngineState.Idle, text, effective, depth, refusal,
+                    CwJobIds.IsValid(identity) ? identity : null);
+            }
         }
-        return ValueTask.CompletedTask;
+        return refusal;
     }
 
     /// <summary>
@@ -289,7 +371,12 @@ public sealed class CwEngine : BackgroundService
         lock (_abortLock)
         {
             seq = Interlocked.Increment(ref _abortSeq);
-            while (_jobs.Reader.TryRead(out _)) Interlocked.Decrement(ref _pendingJobs);
+            while (_jobs.Reader.TryRead(out var dropped))
+            {
+                Interlocked.Decrement(ref _pendingJobs);
+                RememberCancelled(dropped.JobId);
+            }
+            RememberCancelled(_currentJobId);
             _elementKeyOpen = false;
             _sidetone?.Up();
             var cts = _currentAbort;
@@ -338,6 +425,7 @@ public sealed class CwEngine : BackgroundService
                 remaining = Interlocked.Decrement(ref _pendingJobs);
                 jobCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
                 _currentAbort = jobCts;
+                _currentJobId = job.JobId;
                 _currentIsRawKey = job.RawKeyDown;
                 _currentRemoteTxLeaseId = job.RemoteTxLeaseId;
             }
@@ -367,11 +455,18 @@ public sealed class CwEngine : BackgroundService
                 // (UI unkey, a trip) still has to say so on the final Idle.
                 var droppedByMox = Interlocked.Exchange(ref _moxDropCancel, 0) == 1
                     && job.CreatedAbortSeq == Volatile.Read(ref _abortSeq);
-                endReason = droppedByMox ? TxDroppedReason : "aborted";
+                bool scopedCancel;
+                lock (_abortLock)
+                    scopedCancel = job.JobId is not null && _cancelledIds.Contains(job.JobId);
+                var seqMoved = job.CreatedAbortSeq != Volatile.Read(ref _abortSeq);
+                endReason = droppedByMox
+                    ? TxDroppedReason
+                    : scopedCancel && !seqMoved ? CancelledJobReason : "aborted";
                 PublishStatus(
                     CwEngineState.Aborting, job.Text, job.Wpm,
                     Volatile.Read(ref _pendingJobs),
-                    endReason);
+                    endReason,
+                    job.JobId);
                 TryReleaseMox(endReason, job.RemoteTxLeaseId);
             }
             catch (Exception ex)
@@ -383,7 +478,11 @@ public sealed class CwEngine : BackgroundService
             {
                 lock (_abortLock)
                 {
-                    if (ReferenceEquals(_currentAbort, jobCts)) _currentAbort = null;
+                    if (ReferenceEquals(_currentAbort, jobCts))
+                    {
+                        _currentAbort = null;
+                        _currentJobId = null;
+                    }
                     _currentIsRawKey = false;
                     _currentRemoteTxLeaseId = null;
                     _elementKeyOpen = false;
@@ -396,7 +495,7 @@ public sealed class CwEngine : BackgroundService
             // into the next iteration without a flicker. Sequenced with
             // Abort's status so a late Aborting cannot replace this Idle.
             if (!refused && Volatile.Read(ref _pendingJobs) == 0)
-                PublishStatus(CwEngineState.Idle, string.Empty, 0, 0, endReason);
+                PublishStatus(CwEngineState.Idle, string.Empty, 0, 0, endReason, job.JobId);
         }
     }
 
@@ -438,12 +537,24 @@ public sealed class CwEngine : BackgroundService
             if (CarrierBlockedUnderLock(job, ct))
                 throw new OperationCanceledException(ct);
         }
+        if (QueuedReceiverRefusal(job) is { } beforeHook)
+        {
+            err = beforeHook;
+            return false;
+        }
         // Outside the lock so a test can abort here without deadlocking.
         BeforeMoxForTest?.Invoke();
         lock (_abortLock)
         {
             if (CarrierBlockedUnderLock(job, ct))
                 throw new OperationCanceledException(ct);
+        }
+        // The hook can move TX after the check above. That must not reach
+        // TrySetMox, and it is not an abort.
+        if (QueuedReceiverRefusal(job) is { } afterHook)
+        {
+            err = afterHook;
+            return false;
         }
 
         Interlocked.Increment(ref _moxRiseAttempts);
@@ -456,20 +567,37 @@ public sealed class CwEngine : BackgroundService
         bool aborted;
         lock (_abortLock)
             aborted = CarrierBlockedUnderLock(job, ct);
-        if (!aborted) return keyed;
-        // Lock is released before the drop. TrySetMox takes TxService's
-        // transition lock and can call back into _abortLock.
-        if (keyed) DropCarrier(job);
-        throw new OperationCanceledException(ct);
+        if (aborted)
+        {
+            // Lock is released before the drop. TrySetMox takes TxService's
+            // transition lock and can call back into _abortLock.
+            if (keyed) DropCarrier(job);
+            throw new OperationCanceledException(ct);
+        }
+
+        // Transition lock is free here. A receiver move is dropped before
+        // host keying or the first element. Do not call TryReleaseMox:
+        // host CW keying has not been armed yet.
+        AfterMoxForTest?.Invoke();
+        if (QueuedReceiverRefusal(job) is { } afterMox)
+        {
+            if (keyed) DropCarrier(job);
+            err = afterMox;
+            return false;
+        }
+        return keyed;
     }
 
     /// <summary>
     /// Authoritative fence. Called at the moment an element envelope starts,
     /// and at the raw-key closure, with <see cref="_abortLock"/> held for the
-    /// seq check. False means HALT has landed and this element must not key.
+    /// seq check. False with a null <paramref name="receiverRefusal"/> means
+    /// HALT has landed and the caller must abort. A <c>receiver-*</c> value
+    /// means this element must not key and must not be reported as aborted.
     /// </summary>
-    private bool TryElementKeyDown(CwJob job, CancellationToken ct)
+    private bool TryElementKeyDown(CwJob job, CancellationToken ct, out string? receiverRefusal)
     {
+        receiverRefusal = null;
         lock (_abortLock)
         {
             if (CarrierBlockedUnderLock(job, ct))
@@ -477,6 +605,17 @@ public sealed class CwEngine : BackgroundService
                 _elementKeyOpen = false;
                 _sidetone?.Up();
                 return false;
+            }
+            if (job.Receiver is int bound)
+            {
+                var refusal = ClassifyQueued(_radio.Snapshot(), bound);
+                if (refusal is not null)
+                {
+                    receiverRefusal = refusal;
+                    _elementKeyOpen = false;
+                    _sidetone?.Up();
+                    return false;
+                }
             }
             _elementKeyOpen = true;
             return true;
@@ -500,6 +639,11 @@ public sealed class CwEngine : BackgroundService
     {
         if (SupersededByAbort(job, ct))
             throw new OperationCanceledException(ct);
+        // A bound job whose TX receiver moved must return before this retune.
+        // AlignLoForCwTx follows the receiver that owns TX now, so a queued
+        // RX3 send would otherwise move the operator's new RX1.
+        if (RefuseBeforeTransmit(job, queueDepth, job.Text, job.Wpm))
+            return false;
         // Before keying, force the hardware LO to the canonical CW offset
         // of the dial — eliminates CTUN drift so the carrier lands on the
         // operator's displayed VFO. No-op when CTUN wasn't in play; when it
@@ -524,13 +668,13 @@ public sealed class CwEngine : BackgroundService
             _log.LogWarning("cw.mox.refused text={Text} reason={Err}", Truncate(job.Text), err);
             PublishStatus(
                 CwEngineState.Idle, job.Text, job.Wpm, queueDepth,
-                err ?? "MOX refused");
+                err ?? "MOX refused", job.JobId);
             return false;
         }
         // Host CW now owns the air — disarm the P2 internal keyer so the
         // gateware doesn't self-key against this host-keyed send (#1032).
         _radio.SetHostCwKeying(true);
-        PublishStatus(CwEngineState.Sending, job.Text, job.Wpm, queueDepth);
+        PublishStatus(CwEngineState.Sending, job.Text, job.Wpm, queueDepth, jobId: job.JobId);
         var pump = new IqPump(_ring, ForwardToDuc, ResolveTxRateHz(snap), basebandHz);
         _log.LogInformation(
             "cw.send text={Text} wpm={Wpm} mode={Mode} txVfo={TxVfo} txHz={TxHz}Hz lo={Lo}Hz baseband={Bb}Hz rate={Rate}Hz p2Forward={P2} loRealigned={LoRealigned}",
@@ -547,8 +691,18 @@ public sealed class CwEngine : BackgroundService
                 if (symbol.KeyDown)
                 {
                     BeforeElementForTest?.Invoke();
-                    if (!TryElementKeyDown(job, ct))
+                    if (!TryElementKeyDown(job, ct, out var receiverRefusal))
+                    {
+                        if (receiverRefusal is not null)
+                        {
+                            // Host keying is already armed and MOX is up.
+                            TryReleaseMox(receiverRefusal, job.RemoteTxLeaseId);
+                            PublishStatus(
+                                CwEngineState.Idle, job.Text, job.Wpm, queueDepth, receiverRefusal, job.JobId);
+                            return false;
+                        }
                         throw new OperationCanceledException(ct);
+                    }
                     Interlocked.Increment(ref _keyAttempts);
                     _sidetone?.Down();
                 }
@@ -565,6 +719,29 @@ public sealed class CwEngine : BackgroundService
                 while (written < totalSamples)
                 {
                     ct.ThrowIfCancellationRequested();
+                    // TryElementKeyDown runs once per key-down. A 5 WPM dash
+                    // is many 10 ms chunks, and neither a TX move nor a mode
+                    // change cancels this job. Re-check each chunk. A null
+                    // receiver returns before any radio read. RefuseBeforeTransmit
+                    // publishes Idle and does not drop MOX, so an active mark
+                    // has to close its own envelope and release the carrier.
+                    // Do not Abort: a later queued job must still be played.
+                    if (QueuedReceiverRefusal(job) is { } chunkRefusal)
+                    {
+                        // Snapshot already ran outside this lock. MOX release
+                        // takes the TX transition lock, whose falling edge
+                        // re-enters _abortLock, so the envelope closes here
+                        // and the drop happens after the lock is released.
+                        lock (_abortLock)
+                        {
+                            _elementKeyOpen = false;
+                            _sidetone?.Up();
+                        }
+                        TryReleaseMox(chunkRefusal, job.RemoteTxLeaseId);
+                        PublishStatus(
+                            CwEngineState.Idle, job.Text, job.Wpm, queueDepth, chunkRefusal, job.JobId);
+                        return false;
+                    }
                     int n = Math.Min(pump.ChunkSamples, totalSamples - written);
                     int start = written;
                     // Abort forces key-up under _abortLock. Samples already
@@ -606,6 +783,10 @@ public sealed class CwEngine : BackgroundService
     {
         if (SupersededByAbort(job, ct))
             throw new OperationCanceledException(ct);
+        // Raw-key jobs are unbound today. The same guard still runs first so
+        // a bound raw job cannot retune a receiver the operator has left.
+        if (RefuseBeforeTransmit(job, queueDepth, string.Empty, 0))
+            return false;
         // Same LO-align and baseband math as PlayJobAsync — keep them in
         // step so the carrier lands at the operator's dial regardless of
         // the keying source (text macro vs. raw key from logger).
@@ -646,8 +827,16 @@ public sealed class CwEngine : BackgroundService
         // HALT that landed after MOX, or while we were between checks,
         // refuses the carrier before the first non-zero sample.
         BeforeElementForTest?.Invoke();
-        if (!TryElementKeyDown(job, ct))
+        if (!TryElementKeyDown(job, ct, out var rawRefusal))
+        {
+            if (rawRefusal is not null)
+            {
+                TryReleaseMox(rawRefusal, job.RemoteTxLeaseId);
+                PublishStatus(CwEngineState.Idle, string.Empty, 0, queueDepth, rawRefusal);
+                return false;
+            }
             throw new OperationCanceledException(ct);
+        }
         Interlocked.Increment(ref _keyAttempts);
         // Sidetone follows the raw key for its whole held duration. Down here,
         // Up in the finally so a cancel / duration-expiry / error all release
@@ -937,21 +1126,25 @@ public sealed class CwEngine : BackgroundService
         return buf.ToArray();
     }
 
-    private CwEngineStatus MakeStatus(CwEngineState state, string text, int wpm, int depth, string? reason = null)
-        => new(state, text, wpm, depth, reason, Volatile.Read(ref _abortSeq));
+    private CwEngineStatus MakeStatus(
+        CwEngineState state, string text, int wpm, int depth, string? reason = null, string? jobId = null)
+        => new(
+            state, text, wpm, depth, reason, Volatile.Read(ref _abortSeq),
+            CwJobIds.IsValid(jobId) ? jobId : null);
 
     /// <summary>
     /// Assign the next status sequence and emit it unless a newer status
     /// has already been claimed. Callers must not hold <see cref="_abortLock"/>.
     /// </summary>
-    private void PublishStatus(CwEngineState state, string text, int wpm, int depth, string? reason = null)
+    private void PublishStatus(
+        CwEngineState state, string text, int wpm, int depth, string? reason = null, string? jobId = null)
     {
         long seq;
         CwEngineStatus status;
         lock (_abortLock)
         {
             seq = ++_statusSeq;
-            status = MakeStatus(state, text, wpm, depth, reason);
+            status = MakeStatus(state, text, wpm, depth, reason, jobId);
         }
         EmitStatus(seq, status);
     }
@@ -999,11 +1192,138 @@ public sealed class CwEngine : BackgroundService
 
     private static string Truncate(string s) => s.Length <= 40 ? s : s[..40] + "…";
 
+    /// <summary>
+    /// Bound jobs only. A null receiver is the legacy global-TX send and
+    /// does not read the radio. True means the caller already published the
+    /// refusal and must not retune, key, or raise MOX.
+    /// </summary>
+    private bool RefuseBeforeTransmit(CwJob job, int queueDepth, string text, int wpm)
+    {
+        if (QueuedReceiverRefusal(job) is not { } refusal) return false;
+        _log.LogInformation(
+            "cw.send.refused receiver={Receiver} reason={Reason} text={Text}",
+            job.Receiver, refusal, Truncate(text));
+        PublishStatus(CwEngineState.Idle, text, wpm, queueDepth, refusal, job.JobId);
+        return true;
+    }
+
+    /// <summary>Null when the job is unbound or its receiver is still the CW TX target.</summary>
+    private string? QueuedReceiverRefusal(CwJob job)
+    {
+        if (job.Receiver is not int receiver) return null;
+        return ClassifyQueued(_radio.Snapshot(), receiver);
+    }
+
+    /// <summary>
+    /// Accept-time classification. Does not clamp onto RX1. Index 0 is
+    /// synthesized from the flat RX1 fields only when the receiver list has
+    /// no index-0 entry.
+    /// </summary>
+    internal static string? ClassifyAccept(StateDto state, int receiver)
+    {
+        if (receiver == WireContract.KiwiReceiverIndex) return ReceiverRemoteReason;
+        if ((uint)receiver >= (uint)WireContract.MaxReceivers) return ReceiverOutOfRangeReason;
+        var slice = FindHardwareSlice(state, receiver);
+        if (slice is null || !slice.Enabled) return ReceiverUnavailableReason;
+        if (slice.Name is not null) return ReceiverRemoteReason;
+        if (state.TxReceiverIndex != receiver) return ReceiverNotSelectedReason;
+        if (slice.Mode is not (RxMode.CWU or RxMode.CWL)) return ReceiverModeReason;
+        return null;
+    }
+
+    /// <summary>
+    /// Classification after the job is queued. A TX index change is
+    /// <see cref="ReceiverMovedReason"/> even when the old slice was also
+    /// disabled. A mode change that leaves the index alone stays
+    /// <see cref="ReceiverModeReason"/>.
+    /// </summary>
+    internal static string? ClassifyQueued(StateDto state, int receiver)
+    {
+        if (receiver == WireContract.KiwiReceiverIndex) return ReceiverRemoteReason;
+        if ((uint)receiver >= (uint)WireContract.MaxReceivers) return ReceiverOutOfRangeReason;
+        if (state.TxReceiverIndex != receiver) return ReceiverMovedReason;
+        var slice = FindHardwareSlice(state, receiver);
+        if (slice is null || !slice.Enabled) return ReceiverUnavailableReason;
+        if (slice.Name is not null) return ReceiverRemoteReason;
+        if (slice.Mode is not (RxMode.CWU or RxMode.CWL)) return ReceiverModeReason;
+        return null;
+    }
+
+    private static ReceiverDto? FindHardwareSlice(StateDto state, int index)
+    {
+        var list = state.Receivers;
+        if (list is not null)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i].Index == index) return list[i];
+            }
+        }
+        if (index != 0) return null;
+        return new ReceiverDto(
+            0, true, 0, state.VfoHz, state.Mode,
+            state.FilterLowHz, state.FilterHighHz,
+            state.FilterPresetName, state.Rx1AfGainDb, state.SampleRate,
+            state.Rx1Muted);
+    }
+
+    /// <summary>
+    /// Cancel only the named jobs. Does not move <see cref="AbortSeq"/> and
+    /// does not cancel a raw-key job or any other id. Unknown ids are
+    /// remembered so a request that lands after close is refused. Caller
+    /// must already have validated every id.
+    /// </summary>
+    internal int TryCancelJobs(IReadOnlyList<string> jobIds)
+    {
+        lock (_abortLock)
+        {
+            var wanted = new HashSet<string>(jobIds, StringComparer.Ordinal);
+            foreach (var id in wanted) RememberCancelled(id);
+            if (_currentJobId is { } current
+                && wanted.Contains(current)
+                && _currentAbort is { } cts)
+            {
+                try { cts.Cancel(); }
+                catch (ObjectDisposedException) { /* race with worker disposal */ }
+            }
+            if (Volatile.Read(ref _pendingJobs) == 0) return _abortSeq;
+            var keep = new List<CwJob>();
+            while (_jobs.Reader.TryRead(out var queued))
+            {
+                if (queued.JobId is { } id && wanted.Contains(id))
+                    Interlocked.Decrement(ref _pendingJobs);
+                else
+                    keep.Add(queued);
+            }
+            foreach (var queued in keep)
+            {
+                if (!_jobs.Writer.TryWrite(queued))
+                    Interlocked.Decrement(ref _pendingJobs);
+            }
+            return _abortSeq;
+        }
+    }
+
+    /// <summary>Caller holds <see cref="_abortLock"/>.</summary>
+    private void RememberCancelled(string? jobId)
+    {
+        if (!CwJobIds.IsValid(jobId)) return;
+        if (!_cancelledIds.Add(jobId!)) return;
+        _cancelledOrder.Enqueue(jobId!);
+        while (_cancelledOrder.Count > CancelledJobCapacity)
+            _cancelledIds.Remove(_cancelledOrder.Dequeue());
+    }
+
+    internal const string InvalidJobIdReason = "invalid-job-id";
+    internal const string CancelledJobReason = "cancelled";
+
     private readonly record struct CwJob(
         string Text,
         int Wpm,
         bool RawKeyDown,
         int? DurationMs,
         string? RemoteTxLeaseId,
-        int CreatedAbortSeq);
+        int CreatedAbortSeq,
+        int? Receiver = null,
+        string? JobId = null);
 }

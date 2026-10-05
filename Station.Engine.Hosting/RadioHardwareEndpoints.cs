@@ -295,8 +295,10 @@ public static class RadioHardwareEndpoints
             PaCalibrationStartRequest req,
             PaCalibrationService calibration) =>
         {
+            // The status lets the client show results still waiting to be
+            // saved when that is why the start was refused.
             if (!calibration.TryStart(req, out var error))
-                return Results.Conflict(new { error });
+                return Results.Conflict(new { error, status = calibration.Status });
             return Results.Accepted("/api/pa-settings/calibration", calibration.Status);
         });
 
@@ -304,6 +306,23 @@ public static class RadioHardwareEndpoints
         {
             calibration.Cancel();
             return Results.Accepted("/api/pa-settings/calibration", calibration.Status);
+        });
+
+        // After a run that did not calibrate every band: keep the bands that
+        // passed, or drop them. Failed bands keep their previous settings
+        // either way.
+        endpoints.MapPost("/api/pa-settings/calibration/save", (PaCalibrationService calibration) =>
+        {
+            if (!calibration.TrySavePassedBands(out var error))
+                return Results.Conflict(new { error });
+            return Results.Ok(calibration.Status);
+        });
+
+        endpoints.MapPost("/api/pa-settings/calibration/discard", (PaCalibrationService calibration) =>
+        {
+            if (!calibration.TryDiscardPassedBands(out var error))
+                return Results.Conflict(new { error });
+            return Results.Ok(calibration.Status);
         });
 
         return endpoints;

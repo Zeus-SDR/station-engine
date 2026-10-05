@@ -18,15 +18,19 @@ namespace Zeus.Contracts;
 /// <code>
 /// [type:1=0x31][wpm:u16 LE][snrDb:f32 LE][confidence:f32 LE]
 /// [textLen:u16 LE][text:UTF-8 textLen bytes]
-/// [pitchHz:u16 LE][locked:u8]
+/// [pitchHz:u16 LE][locked:u8][receiver:u8]
 /// </code>
 ///
-/// 13-byte fixed header + variable text payload + 3-byte trailer. The trailer
-/// is append-only: a decoder that stops after <c>textLen</c> bytes still reads
-/// the original fields, and a frame without the trailer decodes with
-/// <see cref="PitchHz"/> 0 and <see cref="Locked"/> false.
+/// 13-byte fixed header + variable text payload + 3-byte trailer + one
+/// receiver byte. The trailer is append-only: a decoder that stops after
+/// <c>textLen</c> bytes still reads the original fields, and a frame without
+/// the trailer decodes with <see cref="PitchHz"/> 0 and <see cref="Locked"/>
+/// false. The receiver byte after the trailer is also optional: a frame that
+/// ends on the tone trailer decodes as receiver 0.
 /// <see cref="PitchHz"/> is the audio tone the decoder is actually on.
 /// <see cref="Locked"/> is set when auto search is off.
+/// <see cref="Receiver"/> is the zero-based receiver whose audio produced the
+/// text. RX1 is 0.
 /// <see cref="Text"/> is the accumulated chunk of characters emitted by the
 /// decoder's rate-limited broadcaster at no more than 10 frames per second;
 /// the client appends them in order. Decoding happens server-side so it works
@@ -41,7 +45,8 @@ public readonly record struct CwDecodedTextFrame(
     float SnrDb,
     float Confidence,
     int PitchHz = 0,
-    bool Locked = false)
+    bool Locked = false,
+    int Receiver = 0)
 {
     /// <summary>Hard cap on the text payload. One broadcast decodes a handful
     /// of characters at most, so this is comfortably generous and keeps the
@@ -50,13 +55,14 @@ public readonly record struct CwDecodedTextFrame(
 
     public const int HeaderByteLength = 13; // type(1) + wpm(2) + snr(4) + conf(4) + textLen(2)
     public const int TrailerByteLength = 3; // pitchHz(2) + locked(1), appended after the text
+    public const int ReceiverSuffixLength = 1; // receiver index, appended after the tone trailer
 
     public void Serialize(IBufferWriter<byte> writer)
     {
         // Encode text first so we know the actual UTF-8 byte count.
         var rawBytes = Encoding.UTF8.GetBytes(Text ?? string.Empty);
         int textBytes = Math.Min(rawBytes.Length, MaxTextBytes);
-        int total = HeaderByteLength + textBytes + TrailerByteLength;
+        int total = HeaderByteLength + textBytes + TrailerByteLength + ReceiverSuffixLength;
         var span = writer.GetSpan(total);
         span[0] = (byte)MsgType.CwDecodedText;
         // Clamp Wpm to u16 so an upstream logic bug can't silently truncate.
@@ -71,6 +77,7 @@ public readonly record struct CwDecodedTextFrame(
         ushort pitch = (ushort)Math.Clamp(PitchHz, 0, ushort.MaxValue);
         BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(trailer, 2), pitch);
         span[trailer + 2] = (byte)(Locked ? 1 : 0);
+        span[trailer + 3] = (byte)Math.Clamp(Receiver, 0, byte.MaxValue);
         writer.Advance(total);
     }
 
@@ -95,11 +102,14 @@ public readonly record struct CwDecodedTextFrame(
         int trailer = HeaderByteLength + textLen;
         int pitch = 0;
         bool locked = false;
+        int receiver = 0;
         if (bytes.Length >= trailer + TrailerByteLength)
         {
             pitch = BinaryPrimitives.ReadUInt16LittleEndian(bytes.Slice(trailer, 2));
             locked = bytes[trailer + 2] != 0;
+            if (bytes.Length >= trailer + TrailerByteLength + ReceiverSuffixLength)
+                receiver = bytes[trailer + TrailerByteLength];
         }
-        return new CwDecodedTextFrame(text, wpm, snr, conf, pitch, locked);
+        return new CwDecodedTextFrame(text, wpm, snr, conf, pitch, locked, receiver);
     }
 }

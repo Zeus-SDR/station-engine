@@ -224,8 +224,20 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     }
 
     private readonly ILogger<Protocol2Client> _log;
-    private readonly Channel<IqFrame> _iqFrames = Channel.CreateUnbounded<IqFrame>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    // Fallback path for frames that arrive with no RX sink attached. Production
+    // never reads it, and on connect the sink attaches only after the WDSP engine
+    // is built, which can block for minutes while FFTW wisdom rebakes after an
+    // update. Unbounded, every packet in that window was retained for the life of
+    // the process (~12 MB/s at 768 kHz; multi-GB reports). Bounded drop-oldest
+    // like Protocol1Client: tools that drain it still see a live stream.
+    internal const int IqFrameChannelCapacity = 64;
+    private readonly Channel<IqFrame> _iqFrames = Channel.CreateBounded<IqFrame>(
+        new BoundedChannelOptions(IqFrameChannelCapacity)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = true,
+        });
 
     private Socket? _sock;
     private string _boundNicDisplay = "(none)";

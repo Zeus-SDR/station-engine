@@ -480,7 +480,7 @@ public sealed class TxAudioIngest : IDisposable
     /// (FT8); a tone summed into those would corrupt the data signal.</summary>
     private bool CarriesCwId(MicBlockSource source) => source switch
     {
-        MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.Wav => true,
+        MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic => true,
         MicBlockSource.ProductPlugin => Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0,
         _ => false,
     };
@@ -740,6 +740,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _ring.Clear();
                 _accumulatorFill = 0;
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
             _audioModem.FlushTx();
@@ -901,6 +902,7 @@ public sealed class TxAudioIngest : IDisposable
                 _preserveOnsetAccumulatorDuringTail = false;
                 _ring.Clear();
                 _accumulatorFill = 0;
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
             Volatile.Write(ref _tailDraining, 0);
@@ -999,6 +1001,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _ring.Clear();
                 _accumulatorFill = 0;
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
             Volatile.Write(ref _tailDraining, 0);
@@ -1114,6 +1117,7 @@ public sealed class TxAudioIngest : IDisposable
                 _preserveOnsetAccumulatorDuringTail = false;
                 _ring.Clear();
                 _accumulatorFill = 0;
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
             Volatile.Write(ref _tailDraining, 0);
@@ -1317,6 +1321,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _ring.Clear();
                 _accumulatorFill = 0;
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
             Volatile.Write(ref _tailDraining, 0);
@@ -1339,6 +1344,7 @@ public sealed class TxAudioIngest : IDisposable
     private readonly IAudioModemPort _audioModem;
     private readonly IProductTxAudioPort _productAudio;
     private readonly ProductPluginAudioPort? _productPluginAudio;
+    private IDspEngine? _recordingBypassEngine;
     private int _productPluginInjectionActive;
     private readonly object _productPluginSpeechBypassGate = new();
     private long _productPluginSpeechBypassGeneration;
@@ -1391,6 +1397,7 @@ public sealed class TxAudioIngest : IDisposable
     public void Dispose()
     {
         _hub.MicPcmReceived -= _handler;
+        lock (_sync) SetRecordingBypassLocked(null, false);
         lock (_productPluginSpeechBypassGate)
         {
             _engineProvider()?.SetTxInjectedAudioBypass(false);
@@ -1476,6 +1483,9 @@ public sealed class TxAudioIngest : IDisposable
     /// 960 blocks — that chain aligns wet/dry by block count — latched only at
     /// block boundaries so no sample is ever sent twice or skipped.
     /// </summary>
+    private static string FormatGapMs(double ms) =>
+        ms < 0 ? "n/a" : ms.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+
     internal void OnHostMicSamplesFromMic(ReadOnlySpan<float> samples, MicBlockValidity validity)
     {
         if (samples.IsEmpty) return;
@@ -1576,8 +1586,8 @@ public sealed class TxAudioIngest : IDisposable
     /// air (driven by the com.kb2uka.recorder plugin via
     /// <see cref="PluginPlaybackSink"/>'s over-air path). Stamps the
     /// WAV recency timestamp so the live native mic is suppressed for the clip,
-    /// then feeds the block through the same path as mic audio — so a recording
-    /// is processed by the normal TX chain exactly like live speech. The caller
+    /// then reblocks it for TX modulation with the audio suite and mic gain
+    /// bypassed so the recording retains its original audio. The caller
     /// keys MOX; this method does not touch MOX.</summary>
     internal void OnMicPcmBytesFromWav(ReadOnlyMemory<byte> f32lePayload)
     {
@@ -1696,6 +1706,33 @@ public sealed class TxAudioIngest : IDisposable
         }
     }
 
+    // Caller holds _sync. fexchange2 submits input before the WDSP worker
+    // consumes it, so recording bypass must remain latched between frames.
+    private void SetRecordingBypassLocked(IDspEngine? engine, bool recording)
+    {
+        if (_recordingBypassEngine is { } previous && (!recording || previous != engine))
+        {
+            _recordingBypassEngine = null;
+            RestoreRecordingBypass(previous);
+        }
+        if (!recording || engine is null || _recordingBypassEngine == engine) return;
+        _recordingBypassEngine = engine;
+        try { engine.SetTxRecordingBypass(true); }
+        catch
+        {
+            _recordingBypassEngine = null;
+            RestoreRecordingBypass(engine);
+            throw;
+        }
+    }
+
+    private void RestoreRecordingBypass(IDspEngine engine)
+    {
+        // Cleanup must never prevent a tail drain from relinquishing TXA.
+        try { engine.SetTxRecordingBypass(false); }
+        catch (Exception ex) { _log.LogWarning(ex, "tx.recording.bypass restore threw"); }
+    }
+
     internal bool SetProductPluginSpeechBypassForTest(long generation, bool bypass) =>
         SetProductPluginSpeechBypass(generation, bypass);
 
@@ -1733,6 +1770,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 if (_accumulatorFill > 0) _accumulatorFill = 0;
                 _latencyGovernor.Reset();
+                SetRecordingBypassLocked(null, false);
                 if (_fmBurst.IsActive || _fmBurstBypassApplied) CancelFmToneBurstLocked(engine);
                 if (_lastSeenMox)
                 {
@@ -1755,6 +1793,7 @@ public sealed class TxAudioIngest : IDisposable
                 _ring.Clear();
                 _audioModem.FlushTx();
                 CancelFmToneBurstLocked(engine);
+                SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
             }
         }
@@ -1787,6 +1826,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _accumulatorFill = 0;
                 _latencyGovernor.Reset();
+                SetRecordingBypassLocked(null, false);
             }
             return;
         }
@@ -1854,6 +1894,7 @@ public sealed class TxAudioIngest : IDisposable
             if (_accumulatorFill > 0 && _accumulatorSource != source)
                 _accumulatorFill = 0;
             _accumulatorSource = source;
+            SetRecordingBypassLocked(engine, source == MicBlockSource.Wav);
 
             // Decode f32le into accumulator. WDSP wants -1..+1 range; browser
             // ships the same convention.
@@ -1883,8 +1924,13 @@ public sealed class TxAudioIngest : IDisposable
             // Whole 20 ms blocks only: the chain aligns wet/dry by block count.
             // A sub-block ASIO chunk (only possible for the <=20 ms before the
             // fast path latches onto a newly-leased chain) passes through dry.
-            if (_productAudio.Active
+            // Voice shaping must never touch a data waveform: in DIGU/DIGL the
+            // suite steps aside, mirroring the in-engine plugin handler. FreeDV
+            // still gets processed speech — the codec encodes the voice.
+            if (source != MicBlockSource.Wav
+                && _productAudio.Active
                 && need == MicBlockSamples
+                && (_isVoiceTxMode() || _audioModem.Active)
                 && (source != MicBlockSource.ProductPlugin
                     || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
             {
@@ -1958,9 +2004,19 @@ public sealed class TxAudioIngest : IDisposable
                         && TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks());
                     cwId.MixTxBlock(new Span<float>(_scratchMic, 0, blockSize), canSend: !preKeyMuted);
                 }
-                int produced = engine.ProcessTxBlock(
-                    new ReadOnlySpan<float>(_scratchMic, 0, blockSize),
-                    new Span<float>(_scratchIq, 0, 2 * iqOut));
+                int produced;
+                bool recording = source == MicBlockSource.Wav;
+                try
+                {
+                    produced = engine.ProcessTxBlock(
+                        new ReadOnlySpan<float>(_scratchMic, 0, blockSize),
+                        new Span<float>(_scratchIq, 0, 2 * iqOut));
+                }
+                catch
+                {
+                    if (recording) SetRecordingBypassLocked(null, false);
+                    throw;
+                }
                 // Burst finished on this block: speech processing resumes.
                 if (_fmBurstBypassApplied && !_fmBurst.IsActive)
                     CancelFmToneBurstLocked(engine);
@@ -2042,12 +2098,32 @@ public sealed class TxAudioIngest : IDisposable
                     if (now - _lastPeakLogUtc >= TimeSpan.FromSeconds(1))
                     {
                         int floor = _latencyGovernor.LastFloorSamples;
-                        _log.LogInformation(
-                            "tx.peaks blocks={Blocks} mic={Mic:F4} iq={Iq:F4} backlogFloorMs={FloorMs} cushionMs={CushionMs} overTrimMs={TrimMs}",
-                            _peakBlocksAccum, _peakMicAccum, _peakIqAccum,
-                            floor < 0 ? "n/a" : (floor / (double)TxLatencyGovernor.SamplesPerMs).ToString("F1", System.Globalization.CultureInfo.InvariantCulture),
-                            _latencyGovernor.TargetSamples / TxLatencyGovernor.SamplesPerMs,
-                            _latencyGovernor.DroppedSamples / TxLatencyGovernor.SamplesPerMs);
+                        string floorMs = floor < 0 ? "n/a" : (floor / (double)TxLatencyGovernor.SamplesPerMs).ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+                        if (_productAudio.Active)
+                        {
+                            // prodDry > 0 during an over means unprocessed mic
+                            // blocks were spliced into the Audio Suite stream.
+                            // Logged at Warning then, so a problem report sent
+                            // long after the over still carries the evidence
+                            // (reports keep every WARN but only recent INFO).
+                            var prod = _productAudio.TakeTxWindowDiagnostics();
+                            _log.Log(
+                                prod.DryFallback > 0 && moxNow ? LogLevel.Warning : LogLevel.Information,
+                                "tx.peaks blocks={Blocks} mic={Mic:F4} iq={Iq:F4} backlogFloorMs={FloorMs} cushionMs={CushionMs} overTrimMs={TrimMs} prodBlocks={ProdBlocks} prodWet={ProdWet} prodDry={ProdDry} prodPriming={ProdPriming} prodBusy={ProdBusy} prodRingFull={ProdRingFull} prodGapMinMs={ProdGapMin} prodGapMaxMs={ProdGapMax}",
+                                _peakBlocksAccum, _peakMicAccum, _peakIqAccum, floorMs,
+                                _latencyGovernor.TargetSamples / TxLatencyGovernor.SamplesPerMs,
+                                _latencyGovernor.DroppedSamples / TxLatencyGovernor.SamplesPerMs,
+                                prod.Blocks, prod.Processed, prod.DryFallback, prod.Priming, prod.Busy, prod.RingFull,
+                                FormatGapMs(prod.MinGapMs), FormatGapMs(prod.MaxGapMs));
+                        }
+                        else
+                        {
+                            _log.LogInformation(
+                                "tx.peaks blocks={Blocks} mic={Mic:F4} iq={Iq:F4} backlogFloorMs={FloorMs} cushionMs={CushionMs} overTrimMs={TrimMs}",
+                                _peakBlocksAccum, _peakMicAccum, _peakIqAccum, floorMs,
+                                _latencyGovernor.TargetSamples / TxLatencyGovernor.SamplesPerMs,
+                                _latencyGovernor.DroppedSamples / TxLatencyGovernor.SamplesPerMs);
+                        }
                         _lastPeakLogUtc = now;
                         _peakMicAccum = 0f;
                         _peakIqAccum = 0f;

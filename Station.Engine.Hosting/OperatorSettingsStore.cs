@@ -37,6 +37,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["rx-wf-windows"] = "display_aux_settings",
             ["spectrum-view-scope"] = "display_aux_settings",
             ["surface-opacity"] = "display_aux_settings",
+            ["ui-text-size"] = "display_aux_settings",
             ["background-image-area"] = "display_aux_settings",
             ["spectrum-display"] = "display_aux_settings",
             ["spectrum-splits"] = "display_aux_settings",

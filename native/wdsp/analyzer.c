@@ -830,6 +830,18 @@ void SetupDetectMaxBin(int run, int disp, int ss, int LO, double rate,
   calc_dmb(a->dmb_disp, a->size);
 }
 
+// Zeus: one frame of the max-bin hold. A stronger live reading replaces the
+// held value at once. Otherwise the held value falls by (1 - decay) of its
+// magnitude, as in Thetis, but never by less than (1 - decay) * 20 dB. Thetis
+// subtracts fabs((1 - decay) * held), which shrinks a held value above 0 dB
+// toward 0 without ever crossing it, so one very strong signal pinned the
+// meter for good (#2681). At or below -20 dB the result is exactly Thetis's.
+PORT
+double DetectMaxBinNextHeld(double held_dB, double live_dB, double decay) {
+  double next = held_dB - (1.0 - decay) * fmax(fabs(held_dB), 20.0);
+  return live_dB > next ? live_dB : next;
+}
+
 // Call this function in 'Cspectra(...)', after the FFT.
 void DetectMaxBin(int disp, int ss, int LO) {
   DP a = pdisp[disp];
@@ -855,10 +867,8 @@ void DetectMaxBin(int disp, int ss, int LO) {
       if (mag > dmb_max) { dmb_max = mag; }
     }
 
-    a->dmb_max_dB -= fabs((1.0 - a->dmb_decay) * a->dmb_max_dB);
     dmb_max_dB = 10.0 * mlog10(a->scale * dmb_max);
-
-    if (dmb_max_dB > a->dmb_max_dB) { a->dmb_max_dB = dmb_max_dB; }
+    a->dmb_max_dB = DetectMaxBinNextHeld(a->dmb_max_dB, dmb_max_dB, a->dmb_decay);
 
     LeaveCriticalSection(&a->cs_dmb);
     // for test only.

@@ -18,4 +18,11 @@ public interface IClientSink
 
     /// <summary>Enqueue a serialized frame. Must be non-blocking (callers run on the DSP thread).</summary>
     bool TryEnqueue(byte[] payload);
+
+    /// <summary>
+    /// Whether this consumer should receive CW text for <paramref name="receiver"/>.
+    /// A sink that has not named a subscription still receives RX1, and never
+    /// another receiver's copy.
+    /// </summary>
+    bool AcceptsCwDecodedText(int receiver) => receiver == 0;
 }

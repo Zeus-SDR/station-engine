@@ -17,10 +17,14 @@ public static class StationProtocolEndpoints
     public static IEndpointRouteBuilder MapStationProtocolEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
+        // Additive. Old engines omit both fields and decode FreeDV on RX1 only.
+        // maxReceivers is the shared wire ceiling, not the connected board count.
         endpoints.MapGet("/api/station/version", () => Results.Ok(new
         {
             protocol = CurrentProtocolVersion,
             engine = EngineVersion,
+            freeDvReceiverSelection = true,
+            maxReceivers = WireContract.MaxReceivers,
         }));
 
         // The closed product bundle owns hardware-diagnostics interpretation.

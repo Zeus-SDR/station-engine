@@ -260,7 +260,13 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<TxService>();
         services.AddSingleton<IInstalledFeatureState, NoInstalledFeatureState>();
         services.AddSingleton<TuneCarrierCommandCoordinator>();
-        services.AddSingleton<TxAudioIngest>();
+        // The pipeline builds one TX-gated modem around the registered
+        // IAudioModemPort. Only TxAudioIngest receives that gate. Passing it
+        // here fills the public constructor's modem argument; the rest of the
+        // constructor is resolved from the container.
+        services.AddSingleton<TxAudioIngest>(sp =>
+            ActivatorUtilities.CreateInstance<TxAudioIngest>(
+                sp, sp.GetRequiredService<DspPipelineService>().TxAudioModem));
         services.AddSingleton<TxDiagnosticsService>();
         services.AddSingleton<TxAudioIngestStartup>();
         services.AddSingleton<TxMicMeterService>();

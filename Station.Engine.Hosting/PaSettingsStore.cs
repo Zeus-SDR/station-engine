@@ -41,6 +41,7 @@ public sealed class PaSettingsStore : IDisposable
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<PaBandEntry> _bands;
     private readonly ILiteCollection<PaBandDriveEntry> _bandDrive;
+    private readonly ILiteCollection<PaDigitalModeDriveEntry> _digitalModeDrive;
     private readonly ILiteCollection<PaGlobalEntry> _globals;
     private readonly ILogger<PaSettingsStore> _log;
     private readonly object _sync = new();
@@ -92,6 +93,8 @@ public sealed class PaSettingsStore : IDisposable
         _bands.EnsureIndex(x => x.Band, unique: true);
         _bandDrive = _db.GetCollection<PaBandDriveEntry>("pa_band_drive");
         _bandDrive.EnsureIndex(x => x.Band, unique: true);
+        _digitalModeDrive = _db.GetCollection<PaDigitalModeDriveEntry>("pa_digital_mode_drive");
+        _digitalModeDrive.EnsureIndex(x => x.Mode, unique: true);
         _globals = _db.GetCollection<PaGlobalEntry>("pa_globals");
 
         _log.LogInformation("PaSettingsStore initialized at {Path}", dbPath);
@@ -321,6 +324,38 @@ public sealed class PaSettingsStore : IDisposable
         }
     }
 
+    // Station-wide last Drive % per digital mode (DigitalDriveModes keys:
+    // FT8 / FT4 / WSPR / DIGU / DIGL / FREEDV). Null = never set, so entering
+    // that mode leaves the current slider alone.
+    public int? GetDigitalModeDrive(string mode)
+    {
+        lock (_sync)
+            return _digitalModeDrive.FindOne(x => x.Mode == mode)?.DrivePct;
+    }
+
+    public void SetDigitalModeDrive(string mode, int drivePct)
+    {
+        int clamped = Math.Clamp(drivePct, 0, 100);
+        lock (_sync)
+        {
+            var existing = _digitalModeDrive.FindOne(x => x.Mode == mode);
+            if (existing is null)
+            {
+                _digitalModeDrive.Insert(new PaDigitalModeDriveEntry
+                {
+                    Mode = mode,
+                    DrivePct = clamped,
+                    UpdatedUtc = DateTime.UtcNow,
+                });
+                return;
+            }
+            if (existing.DrivePct == clamped) return;
+            existing.DrivePct = clamped;
+            existing.UpdatedUtc = DateTime.UtcNow;
+            _digitalModeDrive.Update(existing);
+        }
+    }
+
     // TUN drive % counterpart to SetBandDrive.
     public void SetBandTune(string band, int tunePct)
     {
@@ -347,31 +382,44 @@ public sealed class PaSettingsStore : IDisposable
     public void Save(PaSettingsDto dto) =>
         Save(dto, calibrationCommit: false, calibrationGains: null);
 
+    // buildUnderLock, when given, produces the settings to write from inside
+    // the store lock (a read-modify-write that a concurrent Save cannot
+    // interleave with) and limits the write to the band rows it returns.
     private void Save(
-        PaSettingsDto dto,
+        PaSettingsDto? dto,
         bool calibrationCommit,
-        IReadOnlyDictionary<string, CalibrationGainCurve>? calibrationGains)
+        IReadOnlyDictionary<string, CalibrationGainCurve>? calibrationGains,
+        Func<PaSettingsDto>? buildUnderLock = null)
     {
         lock (_sync)
         {
-            if (!calibrationCommit &&
-                (_calibrationOverlay is not null || _calibrationCommitInProgress))
+            // A full calibration commit clears the overlay before saving, so a
+            // live overlay always means a run is still in progress, and a
+            // partial commit of passed bands must not land in the middle of it.
+            if (_calibrationOverlay is not null ||
+                (!calibrationCommit && _calibrationCommitInProgress))
                 throw new InvalidOperationException(
                     "PA settings are locked while calibration is running.");
+            bool bandsOnly = buildUnderLock is not null;
+            dto = buildUnderLock?.Invoke() ?? dto
+                ?? throw new ArgumentNullException(nameof(dto));
             if (!_db.BeginTrans())
                 throw new InvalidOperationException(
                     "Could not begin the PA settings transaction.");
             try
             {
-                var existingGlobal = _globals.FindAll().FirstOrDefault();
-                var g = existingGlobal ?? new PaGlobalEntry();
-                g.PaEnabled = dto.Global.PaEnabled;
-                g.PaMaxPowerWatts = Math.Max(0, dto.Global.PaMaxPowerWatts);
-                g.PaCalibrationSafetyPercent = NormalizeCalibrationSafetyPercent(
-                    dto.Global.PaCalibrationSafetyPercent);
-                g.UpdatedUtc = DateTime.UtcNow;
-                if (existingGlobal is null) _globals.Insert(g);
-                else _globals.Update(g);
+                if (!bandsOnly)
+                {
+                    var existingGlobal = _globals.FindAll().FirstOrDefault();
+                    var g = existingGlobal ?? new PaGlobalEntry();
+                    g.PaEnabled = dto.Global.PaEnabled;
+                    g.PaMaxPowerWatts = Math.Max(0, dto.Global.PaMaxPowerWatts);
+                    g.PaCalibrationSafetyPercent = NormalizeCalibrationSafetyPercent(
+                        dto.Global.PaCalibrationSafetyPercent);
+                    g.UpdatedUtc = DateTime.UtcNow;
+                    if (existingGlobal is null) _globals.Insert(g);
+                    else _globals.Update(g);
+                }
 
                 foreach (var band in dto.Bands)
                 {
@@ -488,6 +536,71 @@ public sealed class PaSettingsStore : IDisposable
                     "PA calibration only records the 10, 25, and 50 W targets."),
             };
         }
+    }
+
+    /// <summary>
+    /// The live calibration result (final shared gain plus the 10/25/50 W
+    /// curve) for each of <paramref name="bands"/>, read from the running
+    /// overlay so it can be offered for saving after the overlay is rolled
+    /// back. Bands without a captured curve are skipped.
+    /// </summary>
+    internal IReadOnlyDictionary<string, CalibrationBandResult> CalibrationResultsFor(
+        IEnumerable<string> bands)
+    {
+        lock (_sync)
+        {
+            var current = _calibrationOverlay
+                ?? throw new InvalidOperationException("PA calibration overlay is not active.");
+            var curves = _calibrationGainOverlay
+                ?? throw new InvalidOperationException("PA calibration gain overlay is not active.");
+            var results = new Dictionary<string, CalibrationBandResult>(StringComparer.Ordinal);
+            foreach (string band in bands)
+            {
+                if (!curves.TryGetValue(band, out var curve)) continue;
+                PaBandSettingsDto? row = current.Bands.FirstOrDefault(r => r.Band == band);
+                if (row is null) continue;
+                results[band] = new CalibrationBandResult(row.PaGainDb, curve);
+            }
+            return results;
+        }
+    }
+
+    /// <summary>
+    /// Persists calibration results for only the given bands, on top of the
+    /// current durable settings. Every other band row, its calibration curve,
+    /// and the global settings are left exactly as they are. Refused when the
+    /// rated output no longer matches the run.
+    /// </summary>
+    internal void CommitCalibrationResults(
+        IReadOnlyDictionary<string, CalibrationBandResult> results,
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant,
+        int expectedMaxPowerWatts)
+    {
+        Save(
+            dto: null,
+            calibrationCommit: true,
+            results.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value.Curve,
+                StringComparer.Ordinal),
+            buildUnderLock: () =>
+            {
+                if (_calibrationCommitInProgress)
+                    throw new InvalidOperationException(
+                        "PA settings are locked while calibration is running.");
+                PaSettingsDto current = GetAll(board, variant);
+                if (current.Global.PaMaxPowerWatts != expectedMaxPowerWatts)
+                    throw new InvalidOperationException(
+                        "The rated PA output changed since calibration; run calibration again.");
+                return current with
+                {
+                    Bands = current.Bands
+                        .Where(row => results.ContainsKey(row.Band))
+                        .Select(row => row with { PaGainDb = results[row.Band].PaGainDb })
+                        .ToArray(),
+                };
+            });
     }
 
     internal double ResolveCalibrationGain(
@@ -685,6 +798,10 @@ public sealed class PaBandEntry
     public DateTime UpdatedUtc { get; set; }
 }
 
+internal sealed record CalibrationBandResult(
+    double PaGainDb,
+    CalibrationGainCurve Curve);
+
 internal readonly record struct CalibrationGainCurve(
     double Gain10W,
     double Gain25W,
@@ -699,6 +816,14 @@ public sealed class PaBandDriveEntry
     public string Band { get; set; } = string.Empty;
     public int? DrivePct { get; set; }
     public int? TunePct { get; set; }
+    public DateTime UpdatedUtc { get; set; }
+}
+
+public sealed class PaDigitalModeDriveEntry
+{
+    public int Id { get; set; }
+    public string Mode { get; set; } = string.Empty;
+    public int DrivePct { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
 

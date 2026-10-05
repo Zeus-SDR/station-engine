@@ -66,6 +66,16 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     // TX counts input-ring-full events; RX counts closed->open leg transitions.
     // Kept as one stable diagnostic field for station API compatibility.
     private long _txLegOpenedCount;
+    // tx.peaks window counters (TakeTxWindowDiagnostics resets them).
+    private long _txWindowBlocks;
+    private long _txWindowProcessed;
+    private long _txWindowDryFallback;
+    private long _txWindowPriming;
+    private long _txWindowBusy;
+    private long _txWindowRingFull;
+    private long _txWindowMinGapTicks = long.MaxValue;
+    private long _txWindowMaxGapTicks = -1;
+    private long _txLastCallTimestamp;
     private long _rxLegOpenedCount;
     private int _rxLastRenderKind;
     private float _rxLastRenderedSample;
@@ -329,9 +339,12 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         }
 
         Interlocked.Increment(ref _attemptedBlocks);
+        Interlocked.Increment(ref _txWindowBlocks);
+        RecordTxCallGap(Stopwatch.GetTimestamp());
         if (Interlocked.CompareExchange(ref _audioBusy, 1, 0) != 0)
         {
             Interlocked.Increment(ref _bypassedBlocks);
+            Interlocked.Increment(ref _txWindowBusy);
             session.Release();
             return;
         }
@@ -355,17 +368,24 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             var published = session.Owner.TryPublish(block48k, out var submittedSequence);
             session.TxPipeline.RememberDry(submittedSequence, block48k);
             var status = session.TxPipeline.Render(submittedSequence, block48k, block48k);
+            if (!published)
+                Interlocked.Increment(ref _txWindowRingFull);
             if (status == ProductAudioTransportStatus.Processed)
             {
                 Interlocked.Increment(ref _processedBlocks);
+                Interlocked.Increment(ref _txWindowProcessed);
                 Interlocked.Exchange(ref _txConsecutiveMisses, 0);
                 return;
             }
 
             Interlocked.Increment(ref _bypassedBlocks);
             if (status == ProductAudioTransportStatus.Priming)
+            {
+                Interlocked.Increment(ref _txWindowPriming);
                 return;
+            }
 
+            Interlocked.Increment(ref _txWindowDryFallback);
             Interlocked.Increment(ref _txMissedDeadlineBlocks);
             Interlocked.Increment(ref _txConsecutiveMisses);
             if (!published)
@@ -377,6 +397,36 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
             session.Release();
         }
     }
+
+    public ProductTxWindowDiagnostics TakeTxWindowDiagnostics()
+    {
+        var minTicks = Interlocked.Exchange(ref _txWindowMinGapTicks, long.MaxValue);
+        var maxTicks = Interlocked.Exchange(ref _txWindowMaxGapTicks, -1);
+        return new ProductTxWindowDiagnostics(
+            Interlocked.Exchange(ref _txWindowBlocks, 0),
+            Interlocked.Exchange(ref _txWindowProcessed, 0),
+            Interlocked.Exchange(ref _txWindowDryFallback, 0),
+            Interlocked.Exchange(ref _txWindowPriming, 0),
+            Interlocked.Exchange(ref _txWindowBusy, 0),
+            Interlocked.Exchange(ref _txWindowRingFull, 0),
+            minTicks == long.MaxValue ? -1 : TicksToMs(minTicks),
+            maxTicks < 0 ? -1 : TicksToMs(maxTicks));
+    }
+
+    private void RecordTxCallGap(long now)
+    {
+        var previous = Interlocked.Exchange(ref _txLastCallTimestamp, now);
+        var gap = now - previous;
+        // First call, or the stream restarting after an idle stretch (unkeyed,
+        // source switch): not delivery jitter.
+        if (previous == 0 || gap > Stopwatch.Frequency) return;
+        if (gap < Volatile.Read(ref _txWindowMinGapTicks))
+            Volatile.Write(ref _txWindowMinGapTicks, gap);
+        if (gap > Volatile.Read(ref _txWindowMaxGapTicks))
+            Volatile.Write(ref _txWindowMaxGapTicks, gap);
+    }
+
+    private static double TicksToMs(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
     public void ProcessRx(Span<float> block48k)
         => ProcessBlock(
@@ -680,7 +730,7 @@ internal enum ProductAudioTransportStatus
 }
 
 /// <summary>
-/// Fixed one-block response runway for Station -&gt; Product TX audio. Responses
+/// Fixed two-block response runway for Station -&gt; Product TX audio. Responses
 /// and retained dry blocks are keyed by ring sequence. Every callback advances
 /// the render target exactly once; a late response is never retried after its
 /// aligned dry block has already been emitted.
@@ -689,7 +739,16 @@ internal sealed class ProductAudioTransportPipeline
 {
     internal const int SlotCount = AudioRingProtocol.SlotCount;
     internal const int TransitionSamples = 64;
-    internal const int InitialRenderDelayBlocks = 1;
+    // Two blocks, not one: mic blocks do not arrive every 20 ms on every host.
+    // The Windows ASIO path re-blocks driver buffers to 960 samples (a 512-frame
+    // driver gives seven 21.3 ms gaps then one 10.7 ms gap; 1024+ frames emit
+    // two blocks back to back), and the capture worker drains a backlog
+    // unpaced. With one block of runway any short gap left Product less time
+    // than its chain budget, so raw mic blocks were spliced between processed
+    // Audio Suite blocks: audible TX flutter (issue #2771). Costs 20 ms of
+    // voice TX latency while a product is attached.
+    internal const int TxRenderDelayBlocks = 2;
+    private readonly int _renderDelayBlocks;
     private readonly float[][] _dry = CreateBuffers();
     private readonly float[][] _processed = CreateBuffers();
     private readonly long[] _drySequences = new long[SlotCount];
@@ -704,7 +763,14 @@ internal sealed class ProductAudioTransportPipeline
     private ProductAudioTransportStatus _lastTargetStatus;
     private float _lastRenderedSample;
 
-    internal int RenderDelayBlocks => InitialRenderDelayBlocks;
+    internal ProductAudioTransportPipeline(int renderDelayBlocks = TxRenderDelayBlocks)
+    {
+        if (renderDelayBlocks < 1 || renderDelayBlocks > SlotCount / 2)
+            throw new ArgumentOutOfRangeException(nameof(renderDelayBlocks));
+        _renderDelayBlocks = renderDelayBlocks;
+    }
+
+    internal int RenderDelayBlocks => _renderDelayBlocks;
     internal long LastRenderedResponse => _lastRenderedResponse;
 
     internal void Reset()
@@ -736,7 +802,9 @@ internal sealed class ProductAudioTransportPipeline
         var index = Index(responseSequence);
         block.CopyTo(_processed[index]);
         _processedCounts[index] = block.Length;
-        _processedDelays[index] = Math.Clamp(processingDelayBlocks, 0, SlotCount - 2);
+        // The aligned dry source (target - delay) must still be retained: the
+        // current block has already overwritten slot (current - SlotCount).
+        _processedDelays[index] = Math.Clamp(processingDelayBlocks, 0, SlotCount - 1 - _renderDelayBlocks);
         Volatile.Write(ref _processedSequences[index], responseSequence);
     }
 
@@ -752,7 +820,7 @@ internal sealed class ProductAudioTransportPipeline
             return ProductAudioTransportStatus.Priming;
         }
 
-        var targetResponse = submittedSequence - InitialRenderDelayBlocks;
+        var targetResponse = submittedSequence - _renderDelayBlocks;
         if (targetResponse < _firstSequence)
         {
             currentDry.CopyTo(output);

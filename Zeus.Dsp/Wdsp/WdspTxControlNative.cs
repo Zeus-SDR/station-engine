@@ -4,6 +4,7 @@ namespace Zeus.Dsp.Wdsp;
 
 internal interface IWdspTxControlNative
 {
+    void SetTXAPanelGain1(int channel, double gain);
     void SetTXAMode(int channel, int mode);
     void SetTXAAMCarrierLevel(int channel, double carrierLevel);
     void SetTXAAMBroadcast(int channel, int run, double posLimit, double negLimit, int preemph, int invert);
@@ -45,6 +46,9 @@ internal interface IWdspTxControlNative
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
 {
+    public void SetTXAPanelGain1(int channel, double gain) =>
+        NativeMethods.SetTXAPanelGain1(channel, gain);
+
     public void SetTXAMode(int channel, int mode) =>
         NativeMethods.SetTXAMode(channel, mode);
 

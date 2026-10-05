@@ -30,11 +30,13 @@ namespace Zeus.Server;
 ///
 /// Gating (all must hold, re-checked per frame so a mid-session toggle or MOX
 /// transition takes effect immediately):
-///   • operator opted in (RadioSpeakerSettingsStore.Enabled, default off)
+///   • operator opted in (RadioSpeakerSettingsStore.Enabled, default off),
+///     except keyed CW sidetone on codec boards other than HL2+ (it stands in
+///     for the FPGA sidetone, which ignores the opt-in)
 ///   • a Protocol-1 client is connected (so the ring is actually drained)
 ///   • the board has a codec (including an explicitly configured HL2+)
 ///   • not transmitting (don't push TX-monitor audio to the radio speaker),
-///     except full-duplex (DUP) receive audio on its own lane
+///     except full-duplex (DUP) receive audio and CW sidetone on their own lanes
 ///   • the frame is the expected 48 kHz mono RX audio
 /// When any check fails the frame is dropped and the ring is left to drain to
 /// silence, so the wire reverts to byte-identical "no RX audio" behaviour.
@@ -114,6 +116,35 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         _ring.Write(frame.Samples.Span);
     }
 
+    // Host CW sidetone while keyed. CWX disarms the FPGA keyer, and with it the
+    // gateware's own headphone sidetone, so this lane stands in for it. The
+    // FPGA paddle sidetone plays at the radio jack whether or not the operator
+    // opted into radio-speaker receive audio, so this lane does too (issue
+    // #2766). HL2+ is the exception: its codec output is only enabled by that
+    // opt-in (UpdateCodecSpeaker).
+    public void PublishCwSidetone(in AudioFrame frame)
+    {
+        if (frame.Channels != 1 || frame.SampleRateHz != ExpectedSampleRateHz) return;
+        int moxOffGeneration = Volatile.Read(ref _moxOffGeneration);
+        if (!_settings.Enabled && _radio.ConnectedBoardKind == HpsdrBoardKind.HermesLite2) return;
+        if (!_radio.IsProtocol1Active || !_radio.IsMox) return;
+        if (_muteState.IsMuted) return;
+        if (!_radio.AudioCapabilities.HasOnboardCodec) return;
+
+        EnterKeyedInterval();
+        _beforeCwSidetoneWriteForTest?.Invoke();
+        _ring.Write(frame.Samples.Span);
+        _ring.KeyedDrainArmed = true;
+
+        // An unkey can race the gate above and land before this write. Drop
+        // that late block so it cannot replay on the next keyed interval.
+        if (!_radio.IsMox || Volatile.Read(ref _moxOffGeneration) != moxOffGeneration)
+        {
+            _ring.KeyedDrainArmed = false;
+            _ring.Clear();
+        }
+    }
+
     // Full-duplex (DUP) receive audio. Outside MOX (the post-TX drain) it is
     // ordinary receive audio. While keyed it keeps feeding the EP2 L/R slots,
     // which ControlFrame fills during MOX whenever this ring holds samples.
@@ -148,6 +179,7 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
         if (!_radio.AudioCapabilities.HasOnboardCodec) return;
 
         EnterKeyedInterval();
+        Volatile.Write(ref _duplexRxThisTx, 1);
         _ring.Write(frame.Samples.Span);
         _ring.KeyedDrainArmed = true;
     }
@@ -155,6 +187,11 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
     // DSP tick thread only (every Publish* runs there), so a plain field is
     // enough to turn "clear on every keyed frame" into "clear on key-down".
     private bool _keyedIntervalEntered;
+    private int _moxOffGeneration;
+    // 1 once DUP receive audio was queued during the current over. Written on
+    // the DSP tick, read and reset on the thread that flips MOX.
+    private int _duplexRxThisTx;
+    private Action? _beforeCwSidetoneWriteForTest;
 
     private void EnterKeyedInterval()
     {
@@ -188,13 +225,31 @@ public sealed class RadioSpeakerAudioSink : IRxAudioSink, IDisposable
     // Disarm the keyed L/R drain on both MOX edges, from the thread that flips
     // MOX. Until the DSP tick's key-down clear runs and DUP audio re-arms it,
     // keyed EP2 frames must not drain the pre-key receive tail.
-    private void OnMoxChanged(bool on) => _ring.KeyedDrainArmed = false;
+    // On unkey, drop a sidetone-only tail so it never plays after the over. DUP
+    // receive audio queued during the over is ordinary receive from here on and
+    // keeps draining; the pipeline never publishes the sidetone lane during a
+    // DUP over, so a ring that took DUP audio holds no sidetone-only samples.
+    private void OnMoxChanged(bool on)
+    {
+        bool duplexRxThisTx = Interlocked.Exchange(ref _duplexRxThisTx, 0) != 0;
+        if (!on)
+        {
+            Interlocked.Increment(ref _moxOffGeneration);
+            if (!duplexRxThisTx) _ring.Clear();
+        }
+        _ring.KeyedDrainArmed = false;
+    }
 
     private void OnMuteChanged()
     {
         // Rising edge: drop the buffered tail so an unmute starts clean.
         // Falling edge: no-op — the ring drains naturally.
         if (_muteState.IsMuted) _ring.Clear();
+    }
+
+    internal Action? BeforeCwSidetoneWriteForTest
+    {
+        set => _beforeCwSidetoneWriteForTest = value;
     }
 
     public void Dispose()

@@ -1285,6 +1285,12 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial double GetDetectMaxBin(int disp);
 
+    // One frame of the max-bin hold, exported so tests can pin the ballistics
+    // without depending on how many analyzer frames a feed produces.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial double DetectMaxBinNextHeld(double heldDb, double liveDb, double decay);
+
     // TXA side. Indices per Thetis TXA.h:49-68 txaMeterType — MIC_AV=1,
     // EQ_AV=3, LVLR_AV=5, LVLR_GAIN=6, CFC_AV=8, CFC_GAIN=9, COMP_AV=11,
     // ALC_AV=13, ALC_GAIN=14, OUT_AV=16. Used for per-stage TX diagnostics

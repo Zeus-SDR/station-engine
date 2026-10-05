@@ -72,7 +72,30 @@ public interface IProductTxAudioPort
     bool Active { get; }
     void ProcessTx(Span<float> block48k);
     void ProcessRx(Span<float> block48k) { }
+
+    /// <summary>
+    /// TX counters since the previous call, then reset. Read once per
+    /// <c>tx.peaks</c> log window on the TX ingest thread.
+    /// </summary>
+    ProductTxWindowDiagnostics TakeTxWindowDiagnostics() => default;
 }
+
+/// <summary>
+/// One <c>tx.peaks</c> window of product TX transport health. <c>DryFallback</c>
+/// counts unprocessed mic blocks spliced into the processed stream because
+/// Product's response was not back in time; nonzero during an over is audible.
+/// Gaps are between successive engaged TX callbacks; negative when fewer than
+/// two callbacks landed in the window.
+/// </summary>
+public readonly record struct ProductTxWindowDiagnostics(
+    long Blocks,
+    long Processed,
+    long DryFallback,
+    long Priming,
+    long Busy,
+    long RingFull,
+    double MinGapMs,
+    double MaxGapMs);
 
 /// <summary>Default product TX insert; always dead and always passthrough.</summary>
 public sealed class NullProductTxAudioPort : IProductTxAudioPort

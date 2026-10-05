@@ -8,6 +8,13 @@ namespace Zeus.Server;
 
 public sealed record PaCalibrationStartRequest(bool AmplifierOffConfirmed);
 
+public sealed record PaCalibrationBandFailure(string Band, string Reason);
+
+/// <summary>
+/// <see cref="PendingSave"/> is true when a run ended without calibrating
+/// every band but some bands passed all three targets: those results are held
+/// (neither live nor durable) until the operator saves or discards them.
+/// </summary>
 public sealed record PaCalibrationStatus(
     string State,
     string? Band,
@@ -15,7 +22,10 @@ public sealed record PaCalibrationStatus(
     float? MeasuredWatts,
     int CompletedSteps,
     int TotalSteps,
-    string? Message);
+    string? Message,
+    IReadOnlyList<string>? PassedBands = null,
+    IReadOnlyList<PaCalibrationBandFailure>? FailedBands = null,
+    bool PendingSave = false);
 
 /// <summary>
 /// Timing knobs for the calibration controller. Production uses
@@ -45,8 +55,11 @@ internal sealed record PaCalibrationTiming(
 
 /// <summary>
 /// Owns the RF-sensitive, single-flight PA calibration sequence. Calibration
-/// values live in PaSettingsStore's transient overlay and become durable only
-/// after every band and target converges.
+/// values live in PaSettingsStore's transient overlay. When every band
+/// converges they become durable automatically. Otherwise the overlay is
+/// rolled back and the bands that passed all three targets are held for the
+/// operator to save or discard; a band that failed always keeps its previous
+/// settings.
 /// </summary>
 public sealed class PaCalibrationService
 {
@@ -56,22 +69,33 @@ public sealed class PaCalibrationService
     // resolve it; the 10% band is only the floor when trims stop helping.
     internal const double FineToleranceFraction = 0.03d;
     private const int MaxFineTrims = 2;
-    // Full-byte PA gain is attenuation. Every target restarts here and works
-    // down, because neither a persisted seed nor the preceding target proves
-    // the PA's response. The highest shipped seed is ~51 dB (Saturn/G2), so
-    // the first carrier lands at least ~9 dB under target; Hermes-class seeds
-    // (38.8-41.3 dB) start ~20 dB under, near the meter floor, and climb
+    // Top of the PA gain slider range (PA_GAIN_MAX_DB in PaSettingsPanel).
+    internal const double MaxGainDb = 70d;
+    // Full-byte PA gain is attenuation. Every target restarts at maximum
+    // attenuation and works down, because neither a persisted seed nor the
+    // preceding target proves the PA's response. The highest shipped seed is
+    // ~51 dB (Saturn/G2), so the first carrier lands ~19 dB under target;
+    // Hermes-class seeds (38.8-41.3 dB) start under the meter floor and climb
     // through FloorResponseTimeout-paced 1 dB steps until measurable.
-    internal const double ConservativeStartGainDb = 60d;
+    internal const double ConservativeStartGainDb = MaxGainDb;
     private const double MinimumMeasurableWatts = 0.1d;
     // Output-raising steps stay small. A 1 dB step changes ideal power by only
-    // ~26%; a larger step is allowed only while a verified reading shows the
-    // PA is still far enough below target that the step cannot land within
-    // 3 dB of it.
+    // ~26%; a 2 dB step is allowed only while a verified reading shows the PA
+    // is still far enough below target that the step lands at least 4 dB
+    // under it, so the final approach is always 1 dB at a time.
     internal const double MaxGainAdjustmentDb = 1d;
-    internal const double MaxCoarseGainAdjustmentDb = 3d;
-    private const double CoarseStepMarginDb = 3d;
-    private const int MaxAdjustmentsPerTarget = 40;
+    internal const double MaxCoarseGainAdjustmentDb = 2d;
+    private const double CoarseStepMarginDb = 4d;
+    private const double QuantizationSlopDb = 0.4d;
+    private const int MaxAdjustmentsPerTarget = 60;
+    // Without any measurable carrier, attenuation may come down at most this
+    // far from the start before the run stops. The lowest shipped seed is
+    // 38.8 dB, so a working PA shows forward power within ~12 dB; a dead
+    // meter or coupler reads 0 W forever and must not walk the drive up.
+    internal const double MaxBlindClimbDb = 25d;
+    // Two bands in a row failing points at the load or the meter, not at
+    // the bands themselves.
+    private const int MaxConsecutiveBandFailures = 2;
     private const int PlateauSampleCount = 4;
     private const double PlateauSpreadFraction = 0.06d;
     private const double PlateauSpreadFloorWatts = 0.05d;
@@ -107,6 +131,14 @@ public sealed class PaCalibrationService
     // trails the radio by more than the configured window still cannot make
     // the controller accept a stale plateau as current. Run task only.
     private TimeSpan _observedLatency;
+    // Per-band outcome of the current or most recent run. Guarded by _sync.
+    private readonly List<string> _passedBands = new();
+    private readonly List<PaCalibrationBandFailure> _failedBands = new();
+    // Results of bands that passed, held after a run that did not calibrate
+    // every band, until the operator saves or discards them. Guarded by _sync.
+    private PendingResults? _pending;
+    // True while held results are being committed. Guarded by _sync.
+    private bool _savingPending;
 
     public PaCalibrationService(
         RadioService radio,
@@ -164,6 +196,18 @@ public sealed class PaCalibrationService
                 error = "PA calibration is already running.";
                 return false;
             }
+            if (_savingPending)
+            {
+                error = "Calibration results are still being saved.";
+                return false;
+            }
+            // Held results are never dropped by a new start; the operator
+            // decides them first.
+            if (_pending is not null)
+            {
+                error = "Save or discard the results from the previous PA calibration before starting a new one.";
+                return false;
+            }
 
             if (!_tx.TryBeginPaCalibrationLease(out error))
                 return false;
@@ -212,6 +256,8 @@ public sealed class PaCalibrationService
                 _radio.EffectiveOrionMkIIVariant,
                 state.DriveMaxPct);
             _runCancellation = new CancellationTokenSource();
+            _passedBands.Clear();
+            _failedBands.Clear();
             _status = new(
                 "running", null, null, null, 0,
                 BandUtils.HfBands.Count * TargetsWatts.Length,
@@ -239,6 +285,98 @@ public sealed class PaCalibrationService
             };
             _runCancellation.Cancel();
         }
+    }
+
+    /// <summary>
+    /// Persists the bands that passed in the last run that did not calibrate
+    /// every band. Bands that failed or were never reached are untouched.
+    /// </summary>
+    public bool TrySavePassedBands(out string? error)
+    {
+        PendingResults pending;
+        lock (_sync)
+        {
+            if (_savingPending)
+            {
+                error = "Calibration results are already being saved.";
+                return false;
+            }
+            if (_pending is null)
+            {
+                error = "No PA calibration results are waiting to be saved.";
+                return false;
+            }
+            // Claimed under the lock: discard and a new run both refuse
+            // while the commit is in flight.
+            pending = _pending;
+            _savingPending = true;
+        }
+
+        bool committed = false;
+        try
+        {
+            if (!_radio.IsConnected ||
+                _radio.EffectiveBoardKind != pending.Board ||
+                _radio.EffectiveOrionMkIIVariant != pending.Variant)
+            {
+                error = "Reconnect the radio that was calibrated before saving; if the radio changed, run calibration again.";
+                return false;
+            }
+            // Committed outside _sync: the store notifies RadioService, which
+            // recomputes drive. The store re-checks the rated output inside
+            // its own lock.
+            _pa.CommitCalibrationResults(
+                pending.Results, pending.Board, pending.Variant, pending.MaxPowerWatts);
+            committed = true;
+        }
+        catch (InvalidOperationException ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                _savingPending = false;
+                if (committed)
+                {
+                    _pending = null;
+                    _status = _status with
+                    {
+                        State = "completed",
+                        PendingSave = false,
+                        Message = $"Saved calibration for {BandList(pending.Results.Keys)}. Every other band kept its previous settings.",
+                    };
+                }
+            }
+        }
+        error = null;
+        return true;
+    }
+
+    /// <summary>Drops results waiting for a decision; nothing is saved.</summary>
+    public bool TryDiscardPassedBands(out string? error)
+    {
+        lock (_sync)
+        {
+            if (_savingPending)
+            {
+                error = "Calibration results are already being saved.";
+                return false;
+            }
+            if (_pending is not null)
+            {
+                _pending = null;
+                _status = _status with
+                {
+                    PendingSave = false,
+                    Message = "Calibration results discarded. Original PA settings were kept.",
+                };
+            }
+        }
+        error = null;
+        return true;
     }
 
     private string? ValidateStart(StateDto state, PaSettingsDto settings)
@@ -281,6 +419,10 @@ public sealed class PaCalibrationService
         CancellationToken cancellationToken)
     {
         bool success = false;
+        // Set when the run stopped early (cancel, safety trip, fault): the
+        // terminal state and message to report.
+        string? abortState = null;
+        string? abortMessage = null;
         int safetyPercent = originalSettings.Global.PaCalibrationSafetyPercent;
         double ratedOutputWatts = originalSettings.Global.PaMaxPowerWatts;
         int originalTune = originalState.TunePct;
@@ -368,6 +510,8 @@ public sealed class PaCalibrationService
             EnsureCalibrationState(expectedVfoHz, expectedMode, invariant);
             Dictionary<string, CalibrationPoint> frequencies = ResolveBandFrequencies();
             int completed = 0;
+            int bandIndex = 0;
+            int consecutiveFailures = 0;
 
             foreach (string band in BandUtils.HfBands)
             {
@@ -418,6 +562,11 @@ public sealed class PaCalibrationService
                 // after key-up.
                 Plateau? previous = null;
                 double lastCommandedWatts = 0d;
+                // A band that cannot converge or settle fails on its own: it is
+                // unkeyed, keeps its previous settings, and the run moves on.
+                // Safety trips, telemetry faults, and outside interference
+                // still stop the whole run.
+                string? bandFailure = null;
                 try
                 {
                     foreach (int targetWatts in TargetsWatts)
@@ -477,6 +626,13 @@ public sealed class PaCalibrationService
                         await Task.Delay(_timing.TargetPause, cancellationToken).ConfigureAwait(false);
                     }
                 }
+                catch (BandCalibrationFailedException ex)
+                {
+                    bandFailure = ex.Message;
+                    _log.LogWarning(
+                        "pa.calibration.band_failed band={Band} reason={Reason}",
+                        band, ex.Message);
+                }
                 finally
                 {
                     _tx.TrySetPaCalibrationTun(false, out _);
@@ -502,6 +658,22 @@ public sealed class PaCalibrationService
                     samples.Reader,
                     cancellationToken).ConfigureAwait(false);
                 ThrowIfCalibrationAborted();
+
+                bandIndex++;
+                completed = bandIndex * TargetsWatts.Length;
+                lock (_sync)
+                {
+                    if (bandFailure is null) _passedBands.Add(band);
+                    else _failedBands.Add(new PaCalibrationBandFailure(band, bandFailure));
+                }
+                Update("running", band, null, null, completed,
+                    bandFailure is null
+                        ? $"{band} calibrated"
+                        : $"{band} did not pass and keeps its previous settings: {bandFailure}");
+                consecutiveFailures = bandFailure is null ? 0 : consecutiveFailures + 1;
+                if (consecutiveFailures >= MaxConsecutiveBandFailures)
+                    throw new InvalidOperationException(
+                        $"PA calibration stopped after {consecutiveFailures} bands in a row did not pass. Check the dummy load and the forward-power reading.");
             }
 
             ThrowIfCalibrationAborted();
@@ -510,21 +682,19 @@ public sealed class PaCalibrationService
         }
         catch (OperationCanceledException)
         {
-            Update("cancelled", null, null, null, Status.CompletedSteps,
-                "PA calibration stopped. Original settings were restored.");
+            abortState = "cancelled";
+            abortMessage = "PA calibration stopped.";
         }
         catch (ExternalCalibrationStateChangedException ex)
         {
-            Update("failed", Status.Band, Status.TargetWatts, Status.MeasuredWatts,
-                Status.CompletedSteps,
-                $"{ex.Message} Original PA settings were restored.");
+            abortState = "failed";
+            abortMessage = ex.Message;
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "pa.calibration.failed");
-            Update("failed", Status.Band, Status.TargetWatts, Status.MeasuredWatts,
-                Status.CompletedSteps,
-                $"{ex.Message} Original settings were restored.");
+            abortState = "failed";
+            abortMessage = ex.Message;
         }
         finally
         {
@@ -535,14 +705,39 @@ public sealed class PaCalibrationService
             try
             {
                 Exception? cleanupFailure = null;
+                string[] passed;
+                lock (_sync) passed = _passedBands.ToArray();
+                bool allPassed = success && passed.Length == BandUtils.HfBands.Count;
+                // Read the passed bands' results before the overlay goes away,
+                // so they can still be offered when they are not committed now.
+                IReadOnlyDictionary<string, CalibrationBandResult>? results = null;
+                if (passed.Length > 0)
+                {
+                    try { results = _pa.CalibrationResultsFor(passed); }
+                    catch (Exception ex) { _log.LogError(ex, "pa.calibration.results.failed"); }
+                }
+                bool committed = false;
                 try
                 {
-                    _pa.CompleteCalibrationOverlay(success);
+                    _pa.CompleteCalibrationOverlay(allPassed);
+                    committed = allPassed;
                 }
                 catch (Exception ex)
                 {
                     cleanupFailure = ex;
                     _log.LogError(ex, "pa.calibration.cleanup.failed");
+                }
+                if (!committed && results is { Count: > 0 })
+                {
+                    // Identity the curves were captured under; saving later
+                    // requires the same radio and rated output.
+                    CalibrationGainCurve captured = results.Values.First().Curve;
+                    lock (_sync)
+                        _pending = new PendingResults(
+                            results,
+                            captured.Board,
+                            captured.Variant,
+                            captured.MaxPowerWatts);
                 }
 
                 if (_radio.IsConnected)
@@ -555,18 +750,39 @@ public sealed class PaCalibrationService
                     catch (Exception ex) { cleanupFailure ??= ex; _log.LogError(ex, "pa.calibration.tune_restore.failed"); }
                 }
 
+                bool pendingSave;
+                PaCalibrationBandFailure[] failed;
+                lock (_sync)
+                {
+                    pendingSave = _pending is not null;
+                    failed = _failedBands.ToArray();
+                }
+                string savable = pendingSave
+                    ? $" {BandList(passed)} passed: save {(passed.Length == 1 ? "it" : "them")} or discard."
+                    : string.Empty;
                 if (cleanupFailure is not null)
                 {
-                    success = false;
                     Update("failed", Status.Band, Status.TargetWatts, Status.MeasuredWatts,
                         Status.CompletedSteps,
-                        $"PA calibration cleanup failed: {cleanupFailure.Message}");
+                        $"PA calibration cleanup failed: {cleanupFailure.Message}{savable}");
                 }
-                else if (success)
+                else if (abortState is not null)
+                {
+                    Update(abortState, Status.Band, Status.TargetWatts, Status.MeasuredWatts,
+                        Status.CompletedSteps,
+                        $"{abortMessage} Original PA settings were restored.{savable}");
+                }
+                else if (committed)
                 {
                     Update("completed", null, null, null,
                         BandUtils.HfBands.Count * TargetsWatts.Length,
                         "PA calibration applied successfully.");
+                }
+                else
+                {
+                    Update(passed.Length > 0 ? "partial" : "failed", null, null, null,
+                        BandUtils.HfBands.Count * TargetsWatts.Length,
+                        $"{BandList(failed.Select(f => f.Band))} did not pass and kept {(failed.Length == 1 ? "its" : "their")} previous settings.{savable}");
                 }
             }
             finally
@@ -676,16 +892,29 @@ public sealed class PaCalibrationService
         // never becomes the baseline while a verified one exists; otherwise a
         // late response to an older step could "verify" a newer one.
         Plateau? baseline = previous;
+        // Whether this target has produced any measurable forward power. A
+        // target that fails without ever showing a carrier is a meter,
+        // coupler, or load fault, not a band problem, so it stops the run.
+        bool sawCarrier = false;
 
         for (int adjustment = 0; ; adjustment++)
         {
-            Plateau plateau = await AwaitPlateauAsync(
-                band, nominalTargetWatts, targetWatts, completed,
-                expectedVfoHz, expectedMode, invariant,
-                safetyPercent, ratedOutputWatts,
-                baseline, model, modelBeforeLastChange, gainDb,
-                settle,
-                samples, cancellationToken).ConfigureAwait(false);
+            Plateau plateau;
+            try
+            {
+                plateau = await AwaitPlateauAsync(
+                    band, nominalTargetWatts, targetWatts, completed,
+                    expectedVfoHz, expectedMode, invariant,
+                    safetyPercent, ratedOutputWatts,
+                    baseline, model, modelBeforeLastChange, gainDb,
+                    settle,
+                    samples, cancellationToken).ConfigureAwait(false);
+            }
+            catch (BandCalibrationFailedException ex) when (!sawCarrier)
+            {
+                throw new InvalidOperationException(NoCarrierMessage(ex.Message));
+            }
+            if (plateau.Watts >= MinimumMeasurableWatts) sawCarrier = true;
             if (plateau.Verified ||
                 baseline is null ||
                 baseline.Watts < MinimumMeasurableWatts)
@@ -703,7 +932,7 @@ public sealed class PaCalibrationService
             if (adjustment >= MaxAdjustmentsPerTarget)
             {
                 if (withinTolerance) return plateau;
-                throw new InvalidOperationException(
+                throw BandFailure(
                     $"{band} could not converge at {nominalTargetWatts:0.0} W (last reading {measured:0.0} W).");
             }
 
@@ -722,8 +951,34 @@ public sealed class PaCalibrationService
                 for (int i = 0; i < 100 && OutputModel(nextGain) == model; i++)
                     nextGain = Math.Round(nextGain + direction * 0.05, 2);
                 if (OutputModel(nextGain) == model)
-                    throw new InvalidOperationException(
+                    throw BandFailure(
                         $"{band} could not converge at {nominalTargetWatts:0.0} W (last reading {measured:0.0} W).");
+            }
+            if (!sawCarrier && ConservativeStartGainDb - nextGain > MaxBlindClimbDb)
+                throw new InvalidOperationException(NoCarrierMessage(
+                    $"No forward power was measured on {band} at {nominalTargetWatts:0.0} W after lowering attenuation {MaxBlindClimbDb:0} dB."));
+            // Byte rounding normally adds a fraction of a dB to a step. Near
+            // maximum attenuation, though, the drive byte is small (2-5 at
+            // 10 W), so the smallest output-raising step can be well over the
+            // coarse limit (byte 3 -> 4 is +2.5 dB). Take such a step only
+            // while the reading is far enough below target that it still
+            // lands the margin under.
+            // A trailing (unverified) reading can understate the output, so it
+            // cannot justify such a step; a reading under the meter floor only
+            // understates the deficit, which is the safe direction.
+            double nextModel = OutputModel(nextGain);
+            if (nextModel > model && model > 0)
+            {
+                double raiseDb = 10d * Math.Log10(nextModel / model);
+                bool underFloor = measured < MinimumMeasurableWatts;
+                double deficitDb = underFloor
+                    ? 10d * Math.Log10(targetWatts / MinimumMeasurableWatts)
+                    : 10d * Math.Log10(targetWatts / measured);
+                if (raiseDb > MaxCoarseGainAdjustmentDb + QuantizationSlopDb &&
+                    (!(plateau.Verified || underFloor) ||
+                     deficitDb < raiseDb + CoarseStepMarginDb))
+                    throw BandFailure(
+                        $"{band} drive resolution is too coarse to approach {nominalTargetWatts:0.0} W safely (last reading {measured:0.0} W).");
             }
             if (withinTolerance) fineTrims++;
 
@@ -735,7 +990,14 @@ public sealed class PaCalibrationService
             modelBeforeLastChange = model;
             model = OutputModel(gainDb);
         }
+
+        Exception BandFailure(string message) => sawCarrier
+            ? new BandCalibrationFailedException(message)
+            : new InvalidOperationException(NoCarrierMessage(message));
     }
+
+    private static string NoCarrierMessage(string detail) =>
+        $"{detail} No forward power was measured; check the forward-power meter, the coupler, and the dummy load.";
 
     /// <summary>
     /// Reads telemetry until a stable plateau appears that can be attributed
@@ -839,7 +1101,7 @@ public sealed class PaCalibrationService
             if (!stable)
             {
                 if (sample.SampledAt >= plateauDeadline)
-                    throw new TimeoutException(
+                    throw new BandCalibrationFailedException(
                         $"Forward power on {band} did not settle at {targetWatts:0.0} W (readings {min:0.0}–{max:0.0} W).");
                 continue;
             }
@@ -979,7 +1241,31 @@ public sealed class PaCalibrationService
     {
         lock (_sync)
             _status = new(state, band, target, measured, completed,
-                BandUtils.HfBands.Count * TargetsWatts.Length, message);
+                BandUtils.HfBands.Count * TargetsWatts.Length, message,
+                _passedBands.ToArray(),
+                _failedBands.ToArray(),
+                _pending is not null);
+    }
+
+    // "160m", "160m and 80m", "160m, 80m and 40m", in band order.
+    private static string BandList(IEnumerable<string> bands)
+    {
+        string[] ordered = bands
+            .OrderBy(band => IndexOfBand(band))
+            .ToArray();
+        return ordered.Length switch
+        {
+            0 => "No band",
+            1 => ordered[0],
+            _ => $"{string.Join(", ", ordered[..^1])} and {ordered[^1]}",
+        };
+    }
+
+    private static int IndexOfBand(string band)
+    {
+        for (int i = 0; i < BandUtils.HfBands.Count; i++)
+            if (BandUtils.HfBands[i] == band) return i;
+        return int.MaxValue;
     }
 
     private void ArmSafetyTarget(
@@ -1077,7 +1363,7 @@ public sealed class PaCalibrationService
         double currentGainDb, double measuredWatts, double targetWatts) =>
         Math.Clamp(
             currentGainDb + 10d * Math.Log10(measuredWatts / targetWatts),
-            0d, 70d);
+            0d, MaxGainDb);
 
     /// <summary>
     /// Next gain from a trusted plateau. Reducing output (raising the gain
@@ -1094,7 +1380,7 @@ public sealed class PaCalibrationService
         bool verified)
     {
         if (measuredWatts < MinimumMeasurableWatts)
-            return Math.Clamp(currentGainDb - MaxGainAdjustmentDb, 0d, 70d);
+            return Math.Clamp(currentGainDb - MaxGainAdjustmentDb, 0d, MaxGainDb);
         double requested = ComputeNextGainDb(currentGainDb, measuredWatts, targetWatts);
         if (requested >= currentGainDb) return requested;
         double deficitDb = 10d * Math.Log10(targetWatts / measuredWatts);
@@ -1146,6 +1432,14 @@ public sealed class PaCalibrationService
         int DriveMaxPct);
     private readonly record struct ForwardPowerSample(
         float Watts, TimeSpan SampledAt);
+    private sealed record PendingResults(
+        IReadOnlyDictionary<string, CalibrationBandResult> Results,
+        HpsdrBoardKind Board,
+        OrionMkIIVariant Variant,
+        int MaxPowerWatts);
     private sealed class ExternalCalibrationStateChangedException(string message)
+        : InvalidOperationException(message);
+    // One band could not converge or settle; the run continues without it.
+    private sealed class BandCalibrationFailedException(string message)
         : InvalidOperationException(message);
 }

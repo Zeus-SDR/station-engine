@@ -181,6 +181,23 @@ public sealed class SpotManager
         SpotsChanged?.Invoke();
     }
 
+    /// <summary>Remove an owner's observation only if its current frequency
+    /// matches the deletion, so delayed frequency-specific deletes cannot
+    /// remove a newer report. The comparison and removal are atomic.</summary>
+    public bool RemoveByOwner(SpotSource source, string ownerId, string callsign, long freqHz)
+    {
+        var key = new ObservationKey(
+            (callsign ?? "").Trim().ToUpperInvariant(), source, NormalizeOwner(source, ownerId));
+        lock (_sync)
+        {
+            if (!_observations.TryGetValue(key, out var current) || current.Spot.FreqHz != freqHz)
+                return false;
+            _observations.Remove(key);
+        }
+        SpotsChanged?.Invoke();
+        return true;
+    }
+
     /// <summary>
     /// Clear all spots.
     /// </summary>

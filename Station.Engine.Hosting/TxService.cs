@@ -179,10 +179,11 @@ public sealed class TxService
 
     // Key sources that get the TX pre-key delay so an external amp's T/R relay
     // settles before RF: the operator's own keying (UI/MIDI, foot switch or mic
-    // PTT, CAT). TCI, CWX, and plugin keying drive digital/CW/clip playback
-    // and stay undelayed.
+    // PTT, CAT, and the HL2 I/O board tuner). TCI, CWX, analyzer, and plugin
+    // keying retain their own timing and stay undelayed.
     private static bool SourceArmsPreKey(MoxSource source) =>
-        source is MoxSource.UI or MoxSource.Hardware or MoxSource.Cat;
+        source is MoxSource.UI or MoxSource.Hardware or MoxSource.Midi
+            or MoxSource.Cat or MoxSource.Hl2IoBoard;
 
     // Only voice-mode MOX uses the pre-key window. CW would clip the first dit,
     // and digital/FreeDV timing is owned by external modem sequencing.
@@ -1804,6 +1805,8 @@ public sealed class TxService
                 // repeats this as an idempotent guard at the universal edge.
                 _radio.BeginTxFrequencyTransition();
                 _radio.AlignLoForTx();
+                if (!_pipeline.SanitizeProtocol2TxBeforeKeyDown())
+                    throw new InvalidOperationException("Protocol 2 pre-key TX-IQ sanitization failed");
                 _radio.NotifyTunActive(true);
                 _pipeline.SetMox(true);
                 if (!EvaluateAdmission(

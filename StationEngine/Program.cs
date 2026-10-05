@@ -147,6 +147,7 @@ public partial class Program
         // logging, so an unwritable log dir degrades to in-memory-only rather
         // than blocking launch.
         AudioDiagnosticLogging.Configure(builder.Logging);
+        EventLogLogging.Configure(builder.Logging);
         var diagnosticLogBuffer = new DiagnosticLogBuffer();
         builder.Services.AddSingleton(diagnosticLogBuffer);
         var sink = diagnosticLogFileSink ?? new DiagnosticLogFileSink(PrefsDbPath.AppLogPath());

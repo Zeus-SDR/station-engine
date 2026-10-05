@@ -164,7 +164,7 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
         if (receivers is null || receivers.Count == 0)
             return [new WsprReceiverTuning(true, state.VfoHz, state.Mode)];
 
-        var tuning = new WsprReceiverTuning[Math.Min(receivers.Count, WireContract.MaxReceivers)];
+        var tuning = new WsprReceiverTuning[WireContract.MaxReceivers];
         foreach (var receiver in receivers)
         {
             if ((uint)receiver.Index >= (uint)tuning.Length) continue;

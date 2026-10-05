@@ -55,7 +55,7 @@ using Zeus.Protocol2;
 
 namespace Zeus.Server;
 
-public sealed class RadioService : IDisposable
+public sealed partial class RadioService : IDisposable
 {
     private const int DefaultHpsdrPort = 1024;
     internal const int MinDisplayZoomLevel = SyntheticDspEngine.MinZoomLevel;
@@ -497,6 +497,8 @@ public sealed class RadioService : IDisposable
     internal void EndPaCalibrationInvariantLease()
     {
         lock (_sync) _paCalibrationInvariantLeaseActive = false;
+        // Settle the per-digital-mode Drive memory against the restored state.
+        ScheduleDigitalDriveRecall();
     }
 
     private void ThrowIfPaCalibrationInvariantMutation(string setting)
@@ -1127,6 +1129,8 @@ public sealed class RadioService : IDisposable
                 try { FlushState(); }
                 catch { /* never escape on a timer thread */ }
             }, null, 1_000, 1_000);
+
+        InitDigitalModeDrive();
     }
 
     /// <summary>
@@ -2495,6 +2499,60 @@ public sealed class RadioService : IDisposable
         return snap;
     }
 
+    /// <summary>
+    /// Select the transmit receiver. <paramref name="requireIdle"/> false
+    /// delegates to <see cref="SetTxReceiver(int)"/>. True runs the idle
+    /// check and the index change under the same <c>_sync</c> mutation.
+    /// The same target does not broadcast. A different target while MOX or
+    /// TUN is up, and a hidden index, return false before any change.
+    /// </summary>
+    public bool TrySetTxReceiver(int index, bool requireIdle, out StateDto state, out string? error)
+    {
+        if (!requireIdle)
+        {
+            state = SetTxReceiver(index);
+            error = null;
+            return true;
+        }
+        long previousTx = 0;
+        string? refused = null;
+        Mutate(s =>
+        {
+            int resolved = ClampTxReceiverIndexUnderLock(index);
+            if (resolved != index)
+            {
+                refused = "tx-receiver-unavailable";
+                return null;
+            }
+            if (s.TxReceiverIndex == index)
+                return null;
+            if (_mox || _tunActive)
+            {
+                refused = "tx-receiver-busy";
+                return null;
+            }
+            ThrowIfPaCalibrationInvariantMutation("TX receiver");
+            previousTx = TxFrequencyHzLocked(s);
+            return s with
+            {
+                TxReceiverIndex = index,
+                TxVfo = index == 1 ? TxVfo.B : TxVfo.A,
+            };
+        }, out bool applied);
+        state = Snapshot();
+        if (refused is not null)
+        {
+            error = refused;
+            return false;
+        }
+        error = null;
+        if (!applied) return true;
+        PushCwKeyerEnabledToP1();
+        if (RuntimeBandKey(previousTx) != RuntimeBandKey(RadioFrequencyResolver.TxFrequencyHz(state)))
+            RecomputePaAndPush();
+        return true;
+    }
+
     /// <summary>Enable or disable the independent split-TX dial. The selected
     /// receiver remains the RX/mode context; split only overrides the carrier
     /// frequency, matching Thetis VFO-A RX / VFO-B TX with RX2 disabled.</summary>
@@ -2881,7 +2939,8 @@ public sealed class RadioService : IDisposable
         if ((drive is int pendingDrive && pendingDrive != currentDrive) ||
             (tune is int pendingTune && pendingTune != currentTune))
             RecallRaceTestHook?.Invoke();
-        if (drive is int d && d != currentDrive)
+        // A digital mode owns its Drive across bands (DigitalModeDrive).
+        if (drive is int d && d != currentDrive && !IsDigitalDriveMode())
         {
             _log.LogInformation("band.drive.recall band={Band} drivePct={Drive}", newBand, d);
             if (SetDriveCore(d, persist: false, currentDrive, abortIfTxActive: true))
@@ -4853,6 +4912,8 @@ public sealed class RadioService : IDisposable
 
     private void SetMoxCore(bool on, long nowMs)
     {
+        // Per-digital-mode Drive lands before the first keyed block.
+        if (on) SettleDigitalModeDriveBeforeKey();
         // The hardware NCO can sit off the dial for RX (CTUN freeze, or an
         // autopan/pure-pan offset). Snap it to the dial before the wire MOX
         // bit flips so TX lands on frequency, and restore the parked centre
@@ -4967,13 +5028,20 @@ public sealed class RadioService : IDisposable
         RecomputePaAndPush();
         // Per-band Drive recall (#128). Persist public slider changes to the
         // current band; recall calls this core with persist=false.
+        // While transmitting in a digital mode the change belongs to that mode's
+        // own memory instead (RadioService.DigitalModeDrive.cs).
         if (persist)
         {
-            long vfoHz;
-            lock (_sync) { vfoHz = _state.VfoHz; }
-            var band = RuntimeBandKey(vfoHz);
-            if (band is not null)
+            StateDto snap;
+            lock (_sync) { snap = _state; }
+            if (CurrentDigitalDriveKey(snap) is { } digitalMode)
+            {
+                _paStore.SetDigitalModeDrive(digitalMode, clamped);
+            }
+            else if (RuntimeBandKey(snap.VfoHz) is { } band)
+            {
                 _paStore.SetBandDrive(band, clamped);
+            }
         }
         return true;
     }

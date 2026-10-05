@@ -738,8 +738,12 @@ public partial class DspPipelineService : BackgroundService,
     // so the gate opens/closes backwards (issue #2101) — so ForMode neutralizes
     // Adaptive in FM, leaving the managed gate fully open for WDSP's FMSQ to own
     // the squelch. Exposed internally so this resolution is unit-testable.
-    internal static SquelchConfig ResolveManagedSquelchForMode(SquelchConfig? cfg, RxMode mode) =>
-        (cfg ?? new SquelchConfig()).ForMode(mode);
+    // DIGU/DIGL resolve to a disabled gate (digital-mode DSP bypass).
+    internal static SquelchConfig ResolveManagedSquelchForMode(SquelchConfig? cfg, RxMode mode)
+    {
+        var resolved = (cfg ?? new SquelchConfig()).ForMode(mode);
+        return IsDigitalRxZeusMode(mode) ? resolved with { Enabled = false } : resolved;
+    }
 
     private static double AdaptiveSquelchCloseHysteresisDb(double marginDb) =>
         Math.Clamp(marginDb * 0.5, 1.5, 4.0);
@@ -1269,6 +1273,13 @@ public partial class DspPipelineService : BackgroundService,
     internal static bool IsDigitalTxZeusMode(RxMode mode) =>
         mode is RxMode.DIGU or RxMode.DIGL or RxMode.FreeDv;
 
+    // Data modes whose received audio feeds a decoder. Every managed RX audio
+    // insert (product RX suite, RX plugin, adaptive squelch, RX leveler) stands
+    // aside for them, matching the WDSP-side gate in WdspDspEngine. FreeDV is
+    // not listed: its managed inserts run on the already-decoded speech.
+    internal static bool IsDigitalRxZeusMode(RxMode mode) =>
+        mode is RxMode.DIGU or RxMode.DIGL;
+
     internal static (RxMode engineMode, int low, int high) SecondaryEngineFilterFor(
         RxMode mode, long vfoHz, int lowHz, int highHz)
     {
@@ -1324,8 +1335,16 @@ public partial class DspPipelineService : BackgroundService,
     // volume — the operator's AF is re-applied to the decoded speech here. Starts
     // at unity so a non-FreeDV channel (ApplyFreeDvAfGain never runs) is
     // byte-identical. See ApplyFreeDvAfGain and the FreeDV AF note in
-    // OnRadioStateChanged.
+    // OnRadioStateChanged. One slew continues across an owner change.
     private double _freeDvAfGainLinear = 1.0;
+    // -1 when no enabled receiver is FreeDV. Sticky while that owner stays
+    // enabled and FreeDV; otherwise the lowest enabled FreeDV index. The
+    // legacy API can leave more than one receiver in FreeDV — the UI moves
+    // a single workspace instead of treating the others as decoded.
+    private int _freeDvOwnerIndex = -1;
+    // Written under OnRadioStateChanged. The TX audio thread reads it through
+    // TxAudioModem and must not allocate a RadioFrequencyResolver fallback.
+    private volatile bool _txReceiverIsFreeDv;
 
     // Per-tick caps (dB) for the AF-gain and AGC-T register pushes to WDSP.
     // Both registers (panel.gain1, agc.max_gain) are applied by WDSP as
@@ -1370,6 +1389,79 @@ public partial class DspPipelineService : BackgroundService,
             block[i] = (float)(block[i] * g);
         }
         _freeDvAfGainLinear = endGain;
+    }
+
+    // Enabled receivers only. One owner: keep the current owner when it is
+    // still enabled and FreeDV, otherwise the lowest enabled FreeDV index.
+    // A second FreeDV receiver does not steal the modem.
+    private int SelectFreeDvOwner(StateDto state)
+    {
+        int current = _freeDvOwnerIndex;
+        int count = 0;
+        int sole = -1;
+        int lowest = -1;
+        bool currentHeld = false;
+        if (state.Mode == RxMode.FreeDv)
+        {
+            count = 1;
+            sole = 0;
+            lowest = 0;
+            currentHeld = current == 0;
+        }
+
+        for (int ri = 1; ri < MaxReceivers; ri++)
+        {
+            if (!ReceiverIsFreeDv(state, ri)) continue;
+            count++;
+            if (sole < 0) sole = ri;
+            if (lowest < 0) lowest = ri;
+            if (ri == current) currentHeld = true;
+        }
+
+        if (count == 0) return -1;
+        if (count == 1) return sole;
+        return currentHeld ? current : lowest;
+    }
+
+    private static bool ReceiverIsFreeDv(StateDto state, int rxIndex)
+    {
+        if (!SecondaryReceiverEnabled(rxIndex, state)) return false;
+        var receivers = state.Receivers;
+        if (receivers is null || (uint)rxIndex >= (uint)receivers.Count) return false;
+        var row = receivers[rxIndex];
+        // The row has to be the local receiver at this position. A Kiwi tail,
+        // a named external slice, or a sparse row whose Index is not this
+        // slot is not a local FreeDV owner.
+        return row.Index == rxIndex && row.Name is null && row.Mode == RxMode.FreeDv;
+    }
+
+    // Sync the shared modem to the owner. An owner-index change while the
+    // byte stays FreeDV is a no-op inside SyncMode, so flush the receiver
+    // once. The first acquire and a leave do not flush: enter-mode already
+    // resets the epoch, and leave-mode disengages. Idle ticks stay silent.
+    private void EngageFreeDvOwner(StateDto state)
+    {
+        int owner = SelectFreeDvOwner(state);
+        int previous = _freeDvOwnerIndex;
+        if (owner >= 0)
+        {
+            _audioModem.SyncMode((byte)RxMode.FreeDv);
+            if (previous >= 0 && previous != owner)
+                _audioModem.FlushRx();
+        }
+        else if (previous >= 0)
+        {
+            _audioModem.SyncMode((byte)RxMode.USB);
+        }
+
+        _freeDvOwnerIndex = owner;
+    }
+
+    private void DecodeFreeDvBlock(Span<float> block, double targetAfDb)
+    {
+        if (block.Length == 0 || !_audioModem.Active) return;
+        _audioModem.ProcessRx(block);
+        ApplyFreeDvAfGain(block, targetAfDb);
     }
     // TX mic gain change-detect cache. NaN sentinel forces the first apply
     // even when the persisted value happens to equal 0 dB (the engine seam
@@ -1881,10 +1973,11 @@ public partial class DspPipelineService : BackgroundService,
     // tests that build the pipeline without the CW services don't have
     // to register a stub. See CwSidetoneSource for the keying contract.
     private readonly CwSidetoneSource? _sidetone;
-    // Product-neutral audio modem coordinator. The null port is the no-plugin path.
-    // When FreeDV is the active RX0 mode, the post-demod insert below replaces
-    // the received modem audio with decoded speech.
+    // Product-neutral audio modem. One enabled FreeDV receiver owns it.
+    // Decode runs on that receiver's buffer before the mix. TxAudioModem is
+    // the same port gated by the TX receiver's mode, for TxAudioIngest only.
     private readonly IAudioModemPort _audioModem;
+    private readonly TxGatedAudioModemPort _txAudioModem;
     private readonly IProductTxAudioPort _productAudio;
     private readonly ProductPluginAudioPort? _productPluginAudio;
 
@@ -1920,6 +2013,7 @@ public partial class DspPipelineService : BackgroundService,
         _hub = hub;
         _txIqRing = txIqRing;
         _audioModem = audioModem ?? new NullAudioModemPort();
+        _txAudioModem = new TxGatedAudioModemPort(_audioModem, () => _txReceiverIsFreeDv);
         _productAudio = productAudio ?? new NullProductTxAudioPort();
         _productPluginAudio = productPluginAudio;
         _productPluginAudio?.ConfigureLocalMonitorSink(EnqueueMonitorAudio);
@@ -2114,10 +2208,14 @@ public partial class DspPipelineService : BackgroundService,
 
     public bool IsFreeDvTailDraining => ResolveTxIngest()?.IsFreeDvTailDraining ?? false;
 
-    /// <summary>True while FreeDV is the active TX modem. Used by
-    /// <see cref="TxService"/> to skip the plain voice-mode TX tail delay
-    /// (issue #1294) — FreeDV runs its own bounded end-of-over drain instead.</summary>
-    public bool IsFreeDvActive => _audioModem.Active;
+    /// <summary>True while the TX receiver is FreeDV and the modem is engaged.
+    /// Used by <see cref="TxService"/> to skip the plain voice-mode TX tail
+    /// delay (issue #1294) — FreeDV runs its own bounded end-of-over drain
+    /// instead. An RX owner on another receiver does not make this true.</summary>
+    public bool IsFreeDvActive => _txAudioModem.Active;
+
+    /// <summary>TX-gated modem. Injected into <see cref="TxAudioIngest"/> only.</summary>
+    public IAudioModemPort TxAudioModem => _txAudioModem;
 
     /// <summary>
     /// Voice-mode end-of-over tail. Holds the wire key for the configured
@@ -6063,6 +6161,7 @@ public partial class DspPipelineService : BackgroundService,
             txReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
         bool rxFreeDvMode = s.Mode == RxMode.FreeDv;
         bool txFreeDvMode = txReceiver.Mode == RxMode.FreeDv;
+        _txReceiverIsFreeDv = txFreeDvMode;
         var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, txEngineMode);
         bool txDigitalBypass = IsDigitalTxZeusMode(txReceiver.Mode);
         // Forward VFO changes to the P2 client when it's active. RadioService
@@ -6248,7 +6347,13 @@ public partial class DspPipelineService : BackgroundService,
         var engineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz);
         if (s.Mode != _appliedMode || engineMode != _appliedEngineMode)
         {
+            // The engine gates DIGU/DIGL RX DSP on its own; FreeDV reaches it
+            // as USB/LSB, so the modem's input needs the explicit flag. Raise
+            // it before the mode change and drop it after, so a hop between
+            // FreeDV and DIGU/DIGL never re-enables the stages in between.
+            if (rxFreeDvMode) engine.SetRxDigitalBypass(channel, true);
             engine.SetMode(channel, engineMode);
+            if (!rxFreeDvMode) engine.SetRxDigitalBypass(channel, false);
             _appliedMode = s.Mode;
             _appliedEngineMode = engineMode;
         }
@@ -6439,7 +6544,6 @@ public partial class DspPipelineService : BackgroundService,
         if (!agc.Equals(_appliedAgc))
         {
             engine.SetAgc(channel, agc);
-            if (rx2Channel >= 0) engine.SetAgc(rx2Channel, agc);
             _appliedAgc = agc;
         }
         var squelch = s.Squelch ?? new SquelchConfig();
@@ -7071,6 +7175,7 @@ public partial class DspPipelineService : BackgroundService,
             : effectiveTxAudio.TxLeveling;
         var txPhaseRotator = effectiveTxAudio.TxPhaseRotator;
         var cfc = effectiveTxAudio.Cfc;
+        engine.SetRxDigitalBypass(channelId, s.Mode == RxMode.FreeDv);
         engine.SetMode(channelId, openEngineMode);
         // Sync TXA modulator with RX mode at engine-open time so the first
         // key-down lands with the correct sideband (no-op on Synthetic / pre-
@@ -7431,11 +7536,16 @@ public partial class DspPipelineService : BackgroundService,
     {
         var rx = _secondaryRx[rxIndex];
         var nr = SecondaryRxNrConfig(s, rxIndex);
-        var agc = EffectiveAgcConfig(
-            s.Agc ?? new AgcConfig(AgcMode.Med),
-            _appliedAgcCeilingDb);
         var squelch = s.Squelch ?? new SquelchConfig();
         var (mode, vfoHz, filterLow, filterHigh, afGainDb) = SecondaryRxParams(s, rxIndex);
+        // FreeDV panel gain and AGC belong to this receiver only. A sibling
+        // that is not FreeDV keeps the operator AGC from this same method.
+        bool secFreeDv = mode == RxMode.FreeDv;
+        var agc = secFreeDv
+            ? new AgcConfig(AgcMode.Fixed, FixedGainDb: RadioService.AgcBaseline(s))
+            : EffectiveAgcConfig(
+                s.Agc ?? new AgcConfig(AgcMode.Med),
+                _appliedAgcCeilingDb);
         // FreeDV on a secondary RX follows the same band-convention sideband as the
         // primary (LSB < 10 MHz, USB ≥). The helper also repairs legacy
         // symmetric DIGU/DIGL state before it reaches the secondary engine.
@@ -7489,7 +7599,7 @@ public partial class DspPipelineService : BackgroundService,
         // (Receivers[i].AfGainDb) so the rate-cap state is per-SecondaryRx.
         // NaN sentinel = "no value applied yet" — snaps on the first push
         // after a fresh channel-open so we don't drag from a stale 0 dB.
-        double afTarget = EffectiveAfGainDb(s.RxAfGainDb, afGainDb);
+        double afTarget = secFreeDv ? 0.0 : EffectiveAfGainDb(s.RxAfGainDb, afGainDb);
         double afNext = double.IsNaN(rx.AppliedAfGainDb)
             ? afTarget
             : StepTowardCappedDb(rx.AppliedAfGainDb, afTarget, AfGainSlewMaxDbPerTick);
@@ -9609,9 +9719,10 @@ public partial class DspPipelineService : BackgroundService,
                 : 0;
             bool suppressPostTxRxDisplay = ShouldSuppressRxDisplayForCurrentTick();
 
-            // P2 display-DUP keeps both surfaces in one RX geometry across every
-            // keyed interval, including PureSignal. P1 retains its established
-            // keyed PS TX/feedback path until it has independent RX/TX tuning.
+            // P2 display-DUP normally keeps both surfaces in RX geometry. The
+            // single-ADC G2E loses its RX DDC during keyed PureSignal, so use
+            // the live TX/feedback geometry for that board. P1 retains its
+            // established keyed PS TX/feedback path.
             //
             // Issue #121 layered on top: if the operator has the "Monitor PA
             // output" toggle on AND PS is armed AND PS has converged
@@ -9621,7 +9732,10 @@ public partial class DspPipelineService : BackgroundService,
             // — same shape as the existing TX → RX fallback. Default-off
             // toggle: when off the codepath is identical to pre-#121, byte for
             // byte, on every board.
-            if (_keyed && _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx)
+            bool g2eP2PsDisplay = _keyed && _appliedPsEnabled
+                && _p2DisplayDuplexForCurrentTx
+                && _radio.ConnectedBoardKind == HpsdrBoardKind.HermesC10;
+            if (_keyed && _appliedPsEnabled && (!_p2DisplayDuplexForCurrentTx || g2eP2PsDisplay))
             {
                 if (_appliedPsEnabled && _psMonitorEnabled
                     && (psFeedbackCorrecting = engine.GetPsStageMeters().Correcting))
@@ -9711,7 +9825,7 @@ public partial class DspPipelineService : BackgroundService,
             {
                 _psMonitorTickCount = 0;
             }
-            if (!suppressPostTxRxDisplay)
+            if (!suppressPostTxRxDisplay && !g2eP2PsDisplay)
             {
                 if (!pan)
                 {
@@ -9724,18 +9838,17 @@ public partial class DspPipelineService : BackgroundService,
                     if (wf) wfSource = useWidebandDetail ? "wideband-detail" : "rx";
                 }
             }
-            else
+            else if (suppressPostTxRxDisplay)
             {
                 panSource = "post-tx-muted";
                 if (displayPlan.IncludeWaterfall)
                     wfSource = "post-tx-muted";
             }
 
-            // Preserve the legacy P1 keyed-PS fallback: if neither the TX nor
-            // RX analyzer produced pixels, use the live feedback analyzer. P2
-            // deliberately does not substitute this TX-centred geometry into
-            // the parked receive display.
-            if (_keyed && _appliedPsEnabled && !_p2DisplayDuplexForCurrentTx)
+            // If neither the TX nor RX analyzer produced pixels, use live
+            // feedback on P1 or the single-ADC P2 G2E. Other P2 boards keep
+            // their parked receive geometry.
+            if (_keyed && _appliedPsEnabled && (!_p2DisplayDuplexForCurrentTx || g2eP2PsDisplay))
             {
                 if (!pan)
                 {
@@ -9837,7 +9950,9 @@ public partial class DspPipelineService : BackgroundService,
                    ?? (CenterStampEmaLagMs
                        + (_p2Client is not null ? CenterStampTransportP2Ms : CenterStampTransportP1Ms)));
             long stampLagTicks = (long)(stampLagMs / 1000.0 * Stopwatch.Frequency);
-            long centerHz = useWidebandDetail
+            long centerHz = g2eP2PsDisplay
+                ? RadioService.TxEffectiveLoHz(state)
+                : useWidebandDetail
                 // Mid-pan frames carry the centre their pixels were captured
                 // at (glide), not the live target (stick-then-jump). Stable
                 // target ≥ stampLag ⇒ identical to the live target, matching
@@ -10069,12 +10184,17 @@ public partial class DspPipelineService : BackgroundService,
         if (audioSampleCount > 0 && (!activelyKeyed || fullDuplexRxActive))
             _productPluginAudio?.PublishRxDataAudio(
                 0, AudioOutputRateHz, audioBuf.AsSpan(0, audioSampleCount));
+        // One FreeDV receiver owns the modem. Engage before the listen-along
+        // offer so this tick's Active flag matches the owner, and before any
+        // ProcessRx. The data tap above stays the raw WDSP block.
+        EngageFreeDvOwner(state);
         // Public Listening listen-along tap (ADR-0010): the ONLY clean RX1
         // point — before the RX1 mute clear, the secondary mix, CW sidetone,
         // Recorder monitor-inject and the TX monitor below. The feed divides
-        // out the WDSP-applied AF gain, silences FreeDV (modem) audio and
-        // applies PublicTransmitHold. Under Protocol 3 the sidecar forwarder
-        // owns RX1 audio, so this lane stays silent there.
+        // out the WDSP-applied AF gain, silences listen-along only while RX1
+        // itself is FreeDV, and applies PublicTransmitHold. A FreeDV owner on
+        // another receiver leaves this RX1 feed live. Under Protocol 3 the
+        // sidecar forwarder owns RX1 audio, so this lane stays silent there.
         //
         // RX1 mute rule (docs/designs/public-listening.md, "Listen-along audio
         // source"): listener audio is independent of the operator's RX1 mute —
@@ -10093,7 +10213,7 @@ public partial class DspPipelineService : BackgroundService,
                     channels: 1,
                     AudioOutputRateHz,
                     _appliedRxAfGainDb,
-                    silence: _audioModem.Active,
+                    silence: _audioModem.Active && state.Mode == RxMode.FreeDv,
                     captureUnixMs: EstimateListenerCaptureUnixMs(
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                         audioSampleCount,
@@ -10119,6 +10239,14 @@ public partial class DspPipelineService : BackgroundService,
         bool streamLocalRx = txMonitorOn
             ? duplexLocalRxLive
             : !suppressRxAudioForTx || allowLocalRxDuringSuppression;
+        // Suppression drops the owner from the modem. Mute does not: the
+        // monitor below still hears decoded speech, and the mute clear after
+        // it keeps that speech out of the mix.
+        bool freeDvSuppressed = suppressRxAudioForTx && !allowLocalRxDuringSuppression;
+        if (_freeDvOwnerIndex == 0 && streamLocalRx && !freeDvSuppressed)
+            DecodeFreeDvBlock(
+                audioBuf.AsSpan(0, audioSampleCount),
+                EffectiveAfGainDb(state.RxAfGainDb, state.Rx1AfGainDb));
         if (streamLocalRx && audioSampleCount > 0)
             ReceiverAudioAvailable?.Invoke(
                 0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
@@ -10172,6 +10300,14 @@ public partial class DspPipelineService : BackgroundService,
                 // the default secondary tap, it publishes every drained block.
                 _productPluginAudio?.PublishRxDataAudio(
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
+                // Decode the owner before the open fade and the monitor publish
+                // so the fade ramps speech, not the OFDM modem signal. The data
+                // tap above stays raw. A non-owner keeps today's fade-then-publish
+                // order on its own buffer.
+                if (_freeDvOwnerIndex == ri && streamLocalRx && !freeDvSuppressed)
+                    DecodeFreeDvBlock(
+                        sec.AudioBuf.AsSpan(0, n),
+                        EffectiveAfGainDb(state.RxAfGainDb, SecondaryRxParams(state, ri).afGainDb));
                 // Ramp the first blocks of a freshly opened channel so RX2-on
                 // enters the additive mix (below) smoothly instead of dumping an
                 // unconverged full-scale block. Applied before the plugin tap and
@@ -10352,35 +10488,19 @@ public partial class DspPipelineService : BackgroundService,
                 // shapes received audio without distorting the clean local
                 // sidetone. Null handler (no RX plugin attached) is the common
                 // case and a no-op — the RX path stays bit-identical.
-                // FreeDV digital-voice insert (RX0 only). The radio runs USB
-                // underneath, so audioBuf currently holds the received FreeDV
-                // modem signal; when FreeDV is the active mode the modem
-                // demodulates+decodes it back to speech in place (same sample
-                // count, internally buffered, silence until sync). Runs BEFORE
-                // the RX audio plugin + squelch so those shape decoded speech.
-                _audioModem.SyncMode((byte)state.Mode);
-                if (_audioModem.Active)
-                {
-                    if (audioSampleCount > 0)
-                    {
-                        _audioModem.ProcessRx(audioBuf.AsSpan(0, audioSampleCount));
-                        // AF (listening) volume for FreeDV is applied HERE, on the
-                        // decoded speech. WDSP's panel gain ran on the pre-decode
-                        // modem audio that ProcessRx just discarded, so without
-                        // this the AF slider has no effect on FreeDV volume. Placed
-                        // before the RX audio plugin + squelch to match normal-mode
-                        // ordering (WDSP applies AF before those managed inserts).
-                        ApplyFreeDvAfGain(
-                            audioBuf.AsSpan(0, audioSampleCount),
-                            EffectiveAfGainDb(state.RxAfGainDb, state.Rx1AfGainDb));
-                    }
-                }
+                // FreeDV was decoded on the owning receiver's own buffer before
+                // the mix. This bus is decoded speech for that receiver and raw
+                // audio for every other receiver.
 
-                if (_productAudio.Active && audioSampleCount > 0)
+                // Digital-mode DSP bypass: DIGU/DIGL audio reaches the
+                // listener exactly as WDSP demodulated it (no RX suite, RX
+                // plugin, or RX leveler; the squelch resolves disabled above).
+                bool rxDigitalBypass = IsDigitalRxZeusMode(state.Mode);
+                if (!rxDigitalBypass && _productAudio.Active && audioSampleCount > 0)
                     _productAudio.ProcessRx(audioBuf.AsSpan(0, audioSampleCount));
 
                 var rxAudioHandler = _rxAudioPluginHandler;
-                if (rxAudioHandler is not null && audioSampleCount > 0)
+                if (!rxDigitalBypass && rxAudioHandler is not null && audioSampleCount > 0)
                     rxAudioHandler(audioBuf.AsSpan(0, audioSampleCount), audioSampleCount, AudioOutputRateHz);
 
                 ApplyAdaptiveSquelch(
@@ -10403,13 +10523,16 @@ public partial class DspPipelineService : BackgroundService,
                     // The operator AF control precedes this stage. Shift the
                     // reference by the same requested dB so constant-loudness
                     // makeup preserves AF changes 1:1 instead of cancelling them.
-                    double appliedAfDb = _audioModem.Active
+                    // Decoded-speech gain is that reference only while RX1 owns
+                    // an active modem. A mode-selected owner whose lease is
+                    // inactive leaves raw WDSP audio on this bus.
+                    double appliedAfDb = _freeDvOwnerIndex == 0 && _audioModem.Active
                         ? 20.0 * Math.Log10(Math.Max(_freeDvAfGainLinear, 1.0e-9))
                         : _appliedRxAfGainDb;
                     ApplyRxAudioLeveler(
                         audioBuf.AsSpan(0, audioSampleCount),
                         ref _rxAudioLeveler,
-                        enabled: state.RxLevelerEnabled,
+                        enabled: state.RxLevelerEnabled && !rxDigitalBypass,
                         rfSignalResolved: loudnessBoostAllowed,
                         adcOverloadRisk: !loudnessBoostAllowed,
                         levelReferenceOffsetDb: appliedAfDb,

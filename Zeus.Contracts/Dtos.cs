@@ -2211,7 +2211,7 @@ public sealed record SpotsSettings(
     // override any of these in Settings -> Spots to point at a mirror or an
     // alternative cluster that speaks the same JSON shape.
     public const string DefaultPotaUrl = "https://api.pota.app/spot/activator";
-    public const string DefaultSotaUrl = "https://api2.sota.org.uk/api/spots/50/all";
+    public const string DefaultSotaUrl = "https://api-db2.sota.org.uk/api/spots/50/all/all";
     public const string DefaultDxUrl = "http://www.dxsummit.fi/api/v1/spots?limit=50";
     private const string LegacyDefaultDxUrl = "https://www.dxsummit.fi/api/v1/spots?limit=50";
 
@@ -2230,7 +2230,7 @@ public sealed record SpotsSettings(
         CwTuneOffsetHz = Math.Clamp(CwTuneOffsetHz, -MaxTuneOffsetHz, MaxTuneOffsetHz),
         DigiTuneOffsetHz = Math.Clamp(DigiTuneOffsetHz, -MaxTuneOffsetHz, MaxTuneOffsetHz),
         PotaUrl = NormalizeUrl(PotaUrl, DefaultPotaUrl),
-        SotaUrl = NormalizeUrl(SotaUrl, DefaultSotaUrl),
+        SotaUrl = NormalizeSotaUrl(SotaUrl),
         DxUrl = NormalizeDxUrl(DxUrl),
         Watchlist = NormalizeCalls(Watchlist),
         ScanDwellSeconds = Math.Clamp(ScanDwellSeconds, MinScanDwellSeconds, MaxScanDwellSeconds),
@@ -2246,6 +2246,17 @@ public sealed record SpotsSettings(
             && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps)
             ? u
             : fallback;
+    }
+
+    private static string NormalizeSotaUrl(string? url)
+    {
+        var normalized = NormalizeUrl(url, DefaultSotaUrl);
+        if (!Uri.TryCreate(normalized, UriKind.Absolute, out var parsed)
+            || !string.Equals(parsed.Host, "api2.sota.org.uk", StringComparison.OrdinalIgnoreCase))
+            return normalized;
+
+        // API2 was retired; never keep sending saved feed URLs to that host.
+        return DefaultSotaUrl;
     }
 
     private static string NormalizeDxUrl(string? url)
@@ -2358,8 +2369,12 @@ public sealed record TxVfoSetRequest(TxVfo TxVfo);
 
 /// <summary>Body of <c>POST /api/tx/receiver</c> — select the transmit target by
 /// receiver index (0 = RX1, 1 = RX2, >= 2 = an extra DDC). Generalises
-/// <see cref="TxVfoSetRequest"/> beyond the A/B pair.</summary>
-public sealed record TxReceiverSetRequest(int Index);
+/// <see cref="TxVfoSetRequest"/> beyond the A/B pair.
+/// <see cref="RequireIdle"/> omitted or false keeps the historical select,
+/// including clamping a hidden index onto RX1. True refuses a different
+/// target while MOX or TUN is up and refuses a hidden index instead of
+/// clamping it.</summary>
+public sealed record TxReceiverSetRequest(int Index, bool RequireIdle = false);
 
 /// <summary>Enable or disable the independent TX dial. Enabling with no saved
 /// split frequency seeds it from the selected receiver's current RX VFO.</summary>
@@ -2559,7 +2574,20 @@ public sealed record TunSetRequest(bool On);
 // ExpectedAbortSeq is the abort counter the client last saw. Null keeps the
 // old contract: the engine queues the text. A value that is not the engine's
 // current counter is refused, so a send delayed past HALT cannot key.
-public sealed record CwSendRequest(string Text, int? Wpm = null, int? ExpectedAbortSeq = null);
+// Receiver is optional. Null (omitted or JSON null) keeps the legacy send:
+// it follows whichever receiver currently owns TX, including one selected
+// while the text is still queued. An explicit index binds that send (0 is
+// RX1). The engine does not select the receiver. A bound send is refused
+// when that receiver is not the TX target, is not a local enabled slice, or
+// is not CWU/CWL. It is never clamped onto RX1.
+public sealed record CwSendRequest(
+    string Text,
+    int? Wpm = null,
+    int? ExpectedAbortSeq = null,
+    int? Receiver = null,
+    // Empty or omitted keeps the legacy send. A present value must be a
+    // canonical UUID (see CwJobIds). The engine does not invent one.
+    string? JobId = null);
 
 // Persisted CW operator settings. Wpm is the default speed for new sends
 // when /api/cw/send is called without an explicit wpm. FarnsworthWpm is

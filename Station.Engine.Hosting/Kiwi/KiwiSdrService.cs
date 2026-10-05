@@ -161,9 +161,9 @@ public sealed class KiwiSdrService : BackgroundService,
     private int _wfFramesWindow;
     private int _audioFramesWindow;
     private long _audioSamplesWindow;
-    private double _resamplePhase;
-    private float _resamplePrev;
-    private int _resampleInRate;
+    // Native-rate -> 48 kHz band-limited resampler. Owned by the SND receive
+    // thread (OnAudio); reconnects only request a reset.
+    private readonly KiwiAudioResampler _resampler = new(OutRateHz);
 
     public event Action? ReceiverChanged;
 
@@ -741,7 +741,7 @@ public sealed class KiwiSdrService : BackgroundService,
             _client = client;
             _status = "connecting";
             _statusDetail = $"{host}:{port}";
-            _resamplePhase = 0; _resamplePrev = 0; _resampleInRate = 0;
+            _resampler.RequestReset();
             _pacer?.Dispose();
             _pacer = new KiwiFramePacer(DisplayWidth) { FrameReady = OnPacedFrame };
             _pacer.Start();
@@ -1079,8 +1079,8 @@ public sealed class KiwiSdrService : BackgroundService,
         // resampling, so the gate's attack/release constants match the ~12 kHz
         // native cadence.
         ApplySquelchGate(samples);
-        var output = Resample(samples, inRateHz);
-        if (output.Length == 0) return;
+        var output = _resampler.Process(samples, inRateHz);
+        if (output.IsEmpty) return;
 
         // Hand the demodulated audio to the RX mix bus; DspPipelineService drains
         // and averages it into the single RxId-0 output, so the
@@ -1111,41 +1111,6 @@ public sealed class KiwiSdrService : BackgroundService,
         double dt = (now - start) / 1000.0;
         _log.LogDebug("kiwi.rate wfFps={Wf:F1} audioFps={Af:F1} audioSps={Sps:F0}",
             wf / dt, af / dt, sps / dt);
-    }
-
-    // Linear-interpolation resampler from the native Kiwi rate (~12 kHz) to
-    // 48 kHz, carrying the fractional phase + last sample across frames so the
-    // stream stays continuous (no per-frame discontinuity click).
-    private float[] Resample(float[] input, int inRateHz)
-    {
-        if (inRateHz <= 0) inRateHz = 12_000;
-        if (inRateHz != _resampleInRate)
-        {
-            // Rate changed (or first frame): reset phase to avoid a transient.
-            _resampleInRate = inRateHz;
-            _resamplePhase = 0;
-            _resamplePrev = input[0];
-        }
-        double step = (double)inRateHz / OutRateHz; // input samples per output sample
-        // Worst-case output length plus a little slack.
-        var outList = new List<float>((int)(input.Length / step) + 2);
-        double phase = _resamplePhase;
-        float prev = _resamplePrev;
-        for (int i = 0; i < input.Length; i++)
-        {
-            float cur = input[i];
-            // Emit every output sample whose source position falls in [i-1, i].
-            while (phase < 1.0)
-            {
-                outList.Add(prev + (float)phase * (cur - prev));
-                phase += step;
-            }
-            phase -= 1.0;
-            prev = cur;
-        }
-        _resamplePhase = phase;
-        _resamplePrev = prev;
-        return outList.ToArray();
     }
 
     // -------------------------------------------------------------------------

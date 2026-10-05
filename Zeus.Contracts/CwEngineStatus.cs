@@ -44,4 +44,7 @@ public sealed record CwEngineStatus(
     string? Reason = null,
     // Bumps on every abort. A send that names a different value is refused.
     // Older snapshots leave it at 0.
-    int AbortSeq = 0);
+    int AbortSeq = 0,
+    // Optional identity of the job this snapshot describes. Null on a legacy
+    // engine and on a global abort, which still moves AbortSeq.
+    string? JobId = null);

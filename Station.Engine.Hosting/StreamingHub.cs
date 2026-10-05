@@ -193,11 +193,16 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     // disconnect/reload can't leak a pinned stream.
     private int _audioStreamRequests;
 
-    // Aggregate count of clients with a mounted CW Decoder panel. The DSP tap
-    // checks this with one volatile read; per-session state prevents duplicate
-    // enables and disconnects from leaking demand.
+    // Aggregate count of CW decoder subscriptions. One client can hold several
+    // receivers, and each receiver is counted on its own. The sum stays in
+    // _cwDecodeRequests so a single RX1 listener still reads as 1. The DSP tap
+    // reads one receiver with one volatile read. Index 0 of the aim array is
+    // unused: RX1's aim stays in _cwDecodeAim so concurrent publishes keep
+    // their existing slot.
     private int _cwDecodeRequests;
+    private readonly int[] _cwDecodeByReceiver = new int[WireContract.MaxReceivers];
     private CwDecodeAim _cwDecodeAim = CwDecodeAim.FollowPitch;
+    private readonly CwDecodeAim[] _cwDecodeAimByReceiver = CreateFollowPitchAims();
     private long _cwDecodeAimSequence;
     // Demand changes and aim publishes share this lock. The DSP tick only
     // reads the volatile demand count and the published aim.
@@ -258,6 +263,26 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
 
     internal bool CwDecodeRequested => CwDecodeSubscriberCount > 0;
 
+    /// <summary>
+    /// RX1 text still reaches a consumer that has not subscribed. Any other
+    /// receiver reaches only a consumer whose mask includes that receiver.
+    /// An empty mask therefore keeps the old RX1 fan-out and drops RX3.
+    /// </summary>
+    public static bool AcceptsCwText(int subscribedMask, int receiver)
+    {
+        if ((uint)receiver >= WireContract.MaxReceivers) return false;
+        if (receiver == 0) return subscribedMask == 0 || (subscribedMask & 1) != 0;
+        return (subscribedMask & (1 << receiver)) != 0;
+    }
+
+    /// <summary>Subscriptions held for one receiver. RX1 is 0.</summary>
+    internal int CwDecodeSubscriberCountOn(int receiver) =>
+        (uint)receiver >= WireContract.MaxReceivers
+            ? 0
+            : Volatile.Read(ref _cwDecodeByReceiver[receiver]);
+
+    internal bool CwDecodeRequestedOn(int receiver) => CwDecodeSubscriberCountOn(receiver) > 0;
+
     /// <summary>Requested audio tone. 0 follows the radio CW pitch.</summary>
     internal int CwDecodeTargetHz => Volatile.Read(ref _cwDecodeAim).TargetHz;
 
@@ -268,10 +293,18 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     /// </summary>
     internal bool CwDecodeLocked => Volatile.Read(ref _cwDecodeAim).Locked;
 
-    /// <summary>The tone and lock published by the latest request.</summary>
+    /// <summary>The tone and lock published by the latest RX1 request.</summary>
     internal CwDecodeAim ReadCwDecodeAim() => Volatile.Read(ref _cwDecodeAim);
 
-    /// <summary>Raised only when aggregate CW demand crosses zero.</summary>
+    /// <summary>The tone published for <paramref name="receiver"/>. RX1 reads the legacy slot.</summary>
+    internal CwDecodeAim ReadCwDecodeAim(int receiver) =>
+        receiver <= 0
+            ? Volatile.Read(ref _cwDecodeAim)
+            : (uint)receiver >= WireContract.MaxReceivers
+                ? CwDecodeAim.FollowPitch
+                : Volatile.Read(ref _cwDecodeAimByReceiver[receiver]);
+
+    /// <summary>Raised when one receiver's CW demand crosses zero, in either direction.</summary>
     internal event Action? CwDecodeRequestChanged;
 
     /// <summary>
@@ -695,31 +728,60 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     /// </summary>
     internal void AdjustAudioRequests(int delta) => Interlocked.Add(ref _audioStreamRequests, delta);
 
-    /// <summary>Adjust CW-decoder demand for a non-WebSocket remote sink.</summary>
-    internal void AdjustCwDecodeRequests(int delta)
+    /// <summary>Adjust RX1 CW-decoder demand for a non-WebSocket remote sink.</summary>
+    internal void AdjustCwDecodeRequests(int delta) => AdjustCwDecodeRequests(0, delta);
+
+    /// <summary>
+    /// Adjust demand for one receiver. The last listener of that receiver
+    /// returns its tone to the CW pitch. The RX1 release still runs
+    /// <see cref="BeforeLastListenerCwDecodeResetForTest"/> and skips the
+    /// reset when that hook re-enables or retargets before the lock is released.
+    /// </summary>
+    internal void AdjustCwDecodeRequests(int receiver, int delta)
     {
-        bool crossed;
+        if ((uint)receiver >= WireContract.MaxReceivers)
+            throw new ArgumentOutOfRangeException(nameof(receiver));
+        if (delta == 0) return;
+
+        bool crossed = false;
         bool targetChanged = false;
         lock (_cwDecodeGate)
         {
-            int next = _cwDecodeRequests + delta;
-            Volatile.Write(ref _cwDecodeRequests, next);
-            crossed = (delta > 0 && next == 1) || (delta < 0 && next == 0);
-            // The last listener released the decoder. A later legacy client
-            // sends no tone of its own, so a lock left behind would keep it
-            // off the CW pitch. Capture the aim now. Publish follow-pitch
-            // only if that aim is still current and demand is still zero: a
-            // listener that enables and aims in the gap keeps its tone.
-            if (delta < 0 && next == 0)
+            int previous = Volatile.Read(ref _cwDecodeByReceiver[receiver]);
+            int slot = previous + delta;
+            if (slot < 0) slot = 0;
+            int applied = slot - previous;
+            if (applied == 0) return;
+
+            Volatile.Write(ref _cwDecodeByReceiver[receiver], slot);
+            int sum = _cwDecodeRequests + applied;
+            if (sum < 0) sum = 0;
+            Volatile.Write(ref _cwDecodeRequests, sum);
+            crossed = (applied > 0 && slot == 1) || (applied < 0 && slot == 0);
+
+            // The last listener of this receiver released it. A later legacy
+            // client sends no tone of its own, so a lock left behind would
+            // keep it off the CW pitch. For RX1, capture the aim and publish
+            // follow-pitch only when that aim is still current and RX1 demand
+            // is still zero: a listener that enables and aims in the gap
+            // keeps its tone. Other receivers reset without that test hook.
+            if (applied < 0 && slot == 0)
             {
-                long captured = Volatile.Read(ref _cwDecodeAim).Sequence;
-                Action? pause = BeforeLastListenerCwDecodeResetForTest;
-                BeforeLastListenerCwDecodeResetForTest = null;
-                pause?.Invoke();
-                if (Volatile.Read(ref _cwDecodeRequests) == 0
-                    && Volatile.Read(ref _cwDecodeAim).Sequence == captured)
+                if (receiver == 0)
                 {
-                    targetChanged = PublishCwDecodeAim(0, locked: false);
+                    long captured = Volatile.Read(ref _cwDecodeAim).Sequence;
+                    Action? pause = BeforeLastListenerCwDecodeResetForTest;
+                    BeforeLastListenerCwDecodeResetForTest = null;
+                    pause?.Invoke();
+                    if (Volatile.Read(ref _cwDecodeByReceiver[0]) == 0
+                        && Volatile.Read(ref _cwDecodeAim).Sequence == captured)
+                    {
+                        targetChanged = PublishCwDecodeAim(0, locked: false);
+                    }
+                }
+                else
+                {
+                    targetChanged = PublishExtraAim(receiver, 0, locked: false);
                 }
             }
         }
@@ -730,12 +792,20 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             CwDecodeRequestChanged?.Invoke();
     }
 
-    /// <summary>Last requested decoder tone. Does not change the enable refcount.</summary>
-    internal void SetCwDecodeTarget(int targetHz, bool locked)
+    /// <summary>Last requested RX1 decoder tone. Does not change the enable refcount.</summary>
+    internal void SetCwDecodeTarget(int targetHz, bool locked) =>
+        SetCwDecodeTarget(0, targetHz, locked);
+
+    /// <summary>Last requested tone for one receiver. Does not change the enable refcount.</summary>
+    internal void SetCwDecodeTarget(int receiver, int targetHz, bool locked)
     {
+        if ((uint)receiver >= WireContract.MaxReceivers)
+            throw new ArgumentOutOfRangeException(nameof(receiver));
         bool changed;
         lock (_cwDecodeGate)
-            changed = PublishCwDecodeAim(targetHz, locked);
+            changed = receiver == 0
+                ? PublishCwDecodeAim(targetHz, locked)
+                : PublishExtraAim(receiver, targetHz, locked);
         if (changed)
             CwDecodeTargetChanged?.Invoke();
     }
@@ -751,6 +821,22 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         long sequence = Interlocked.Increment(ref _cwDecodeAimSequence);
         var next = new CwDecodeAim(targetHz, locked, sequence);
         return CwDecodeAim.TryStoreNewer(ref _cwDecodeAim, next, out _);
+    }
+
+    /// <summary>Caller holds <see cref="_cwDecodeGate"/>. Receivers other than RX1.</summary>
+    private bool PublishExtraAim(int receiver, int targetHz, bool locked)
+    {
+        long sequence = Interlocked.Increment(ref _cwDecodeAimSequence);
+        var next = new CwDecodeAim(targetHz, locked, sequence);
+        return CwDecodeAim.TryStoreNewer(ref _cwDecodeAimByReceiver[receiver], next, out _);
+    }
+
+    private static CwDecodeAim[] CreateFollowPitchAims()
+    {
+        var aims = new CwDecodeAim[WireContract.MaxReceivers];
+        for (int i = 0; i < aims.Length; i++)
+            aims[i] = CwDecodeAim.FollowPitch;
+        return aims;
     }
 
     /// <summary>Remove a previously-attached remote sink.</summary>
@@ -1181,15 +1267,23 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     public void Broadcast(in CwDecodedTextFrame frame)
     {
         if (_clients.IsEmpty) return;
-        // Variable-length: 13-byte header + UTF-8 text + 3-byte tone trailer.
+        // Variable-length: 13-byte header + UTF-8 text + 3-byte tone trailer
+        // + the receiver byte Serialize always appends.
         int textBytes = System.Text.Encoding.UTF8.GetByteCount(frame.Text ?? string.Empty);
         if (textBytes > CwDecodedTextFrame.MaxTextBytes) textBytes = CwDecodedTextFrame.MaxTextBytes;
-        int total = CwDecodedTextFrame.HeaderByteLength + textBytes + CwDecodedTextFrame.TrailerByteLength;
+        int total = CwDecodedTextFrame.HeaderByteLength
+            + textBytes
+            + CwDecodedTextFrame.TrailerByteLength
+            + CwDecodedTextFrame.ReceiverSuffixLength;
         var payload = new byte[total];
         var writer = new FixedBufferWriter(payload, total);
         frame.Serialize(writer);
         foreach (var client in _clients.Values)
         {
+            // Old clients ignore a receiver byte appended after the tone.
+            // Another receiver's copy must not reach a socket that did not
+            // subscribe to it. RX1 still reaches a socket with no subscription.
+            if (!client.AcceptsCwDecodedText(frame.Receiver)) continue;
             if (!client.TryEnqueue(payload)) System.Threading.Interlocked.Increment(ref _dropsOther);
         }
     }
@@ -1372,14 +1466,54 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             Interlocked.Add(ref _hub._audioStreamRequests, want ? 1 : -1);
         }
 
-        private bool _wantsCwDecode;
-        public bool WantsCwDecode => _wantsCwDecode;
+        // One bit per receiver this socket has enabled. A shared socket (the
+        // page, or the single Link session) can decode RX1 and RX3 together.
+        // Legacy 2-byte and 5-byte frames only move bit 0. Disconnect clears
+        // every bit. A repeated enable of a bit already set does not count twice.
+        private int _cwReceiverMask;
+        public bool WantsCwDecode => _cwReceiverMask != 0;
+
+        public bool AcceptsCwDecodedText(int receiver) =>
+            AcceptsCwText(_cwReceiverMask, receiver);
 
         public void SetWantsCwDecode(bool want)
         {
-            if (want == _wantsCwDecode) return;
-            _wantsCwDecode = want;
-            _hub.AdjustCwDecodeRequests(want ? 1 : -1);
+            if (want) SetCwReceiver(0, true, false, 0, false);
+            else ReleaseAllCwReceivers();
+        }
+
+        private void ReleaseAllCwReceivers()
+        {
+            int mask = _cwReceiverMask;
+            if (mask == 0) return;
+            _cwReceiverMask = 0;
+            for (int receiver = 0; receiver < WireContract.MaxReceivers; receiver++)
+            {
+                if ((mask & (1 << receiver)) != 0)
+                    _hub.AdjustCwDecodeRequests(receiver, -1);
+            }
+        }
+
+        private void SetCwReceiver(int receiver, bool enable, bool hasTarget, int targetHz, bool locked)
+        {
+            if ((uint)receiver >= WireContract.MaxReceivers) return;
+            int bit = 1 << receiver;
+            bool held = (_cwReceiverMask & bit) != 0;
+            if (enable)
+            {
+                if (!held)
+                {
+                    _cwReceiverMask |= bit;
+                    _hub.AdjustCwDecodeRequests(receiver, 1);
+                }
+                if (hasTarget)
+                    _hub.SetCwDecodeTarget(receiver, targetHz, locked);
+            }
+            else if (held)
+            {
+                _cwReceiverMask &= ~bit;
+                _hub.AdjustCwDecodeRequests(receiver, -1);
+            }
         }
 
         private int _wantsNativeMic;
@@ -1503,14 +1637,29 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             {
                 if (!CwDecoderRequestParser.TryParse(frame.Span, out CwDecoderRequest request))
                     return;
-                SetWantsCwDecode(request.Enable);
                 // A closing client does not publish its own tone. The latest
                 // enabling request keeps the target while anyone is still
-                // listening. The last release resets it to the CW pitch,
-                // inside AdjustCwDecodeRequests, including a disconnect that
-                // never sends this frame.
-                if (request.Enable && request.HasTarget)
-                    _hub.SetCwDecodeTarget(request.TargetHz, request.Locked);
+                // listening on that receiver. The last release resets it to
+                // the CW pitch, inside AdjustCwDecodeRequests, including a
+                // disconnect that never sends this frame. A legacy frame
+                // releases RX1 only. Disconnect releases every receiver.
+                if (request.HasReceiver)
+                {
+                    SetCwReceiver(
+                        request.Receiver,
+                        request.Enable,
+                        request.Enable && request.HasTarget,
+                        request.TargetHz,
+                        request.Locked);
+                }
+                else if (request.Enable)
+                {
+                    SetCwReceiver(0, true, request.HasTarget, request.TargetHz, request.Locked);
+                }
+                else
+                {
+                    SetCwReceiver(0, false, false, 0, false);
+                }
                 return;
             }
             if (frame.Length >= 1 && frame.Span[0] == MsgTypeDisplayStreamRequest)

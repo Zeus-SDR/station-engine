@@ -1620,7 +1620,7 @@ public sealed class TciSession : IDisposable
     private void HandleSpotClear(string[] args)
     {
         // spot_clear
-        _spots.ClearAll();
+        _spots.ClearBySource(SpotSource.Tci);
     }
 
     private void HandleIqStart(string[] args)

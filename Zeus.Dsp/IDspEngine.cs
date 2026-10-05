@@ -409,10 +409,23 @@ public interface IDspEngine : IDisposable
     /// open.</summary>
     void SetTxDigitalBypass(bool bypass);
 
+    /// <summary>
+    /// Force the RX digital-mode DSP bypass on one receive channel. DIGU/DIGL
+    /// channels are bypassed automatically from their mode; this flag covers
+    /// FreeDV, whose modem input the engine only sees as USB/LSB. While
+    /// bypassed, NR, blankers, ANF/SNB, notches, fixed squelch, RX EQ and APF
+    /// are held off; the operator's settings are restored when it clears.
+    /// </summary>
+    void SetRxDigitalBypass(int channelId, bool bypass) { }
+
     /// <summary>Temporarily bypass speech-only TX processing for a linear
     /// product-plugin injection source. The engine must restore the operator's
     /// configured stages when the source releases its lease.</summary>
     void SetTxInjectedAudioBypass(bool bypass) { }
+
+    /// <summary>Temporarily bypass the TX audio suite and microphone gain for
+    /// recording playback. Retain modulation, filtering and output protection.</summary>
+    void SetTxRecordingBypass(bool bypass) { }
 
     /// <summary>Temporarily bypass speech-only TX processing while a synthesized
     /// roger beep is clocked through TXA. Implementations must preserve the

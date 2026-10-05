@@ -340,6 +340,13 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // without a lock (worst case: one extra frame at the old setting on toggle).
         public volatile NbMode CurrentNbMode = NbMode.Off;
         public volatile NrMode CurrentNrMode = NrMode.Off;
+        // Operator RX DSP settings as last requested. DIGU/DIGL (or the FreeDV
+        // RxDigitalBypass flag) apply them as all-off; leaving digital re-applies
+        // these unchanged. Null = never set on this channel.
+        public NrConfig? OperatorNr;
+        public RxEqualizerSettings? OperatorRxEq;
+        public bool OperatorApf;
+        public bool RxDigitalBypass;
         // Zoom level (1..32). Changing it re-calls SetAnalyzer with shifted
         // fscLin/fscHin; the worker's Spectrum0 and the pixel drain's GetPixels
         // take this lock so they never interleave with an in-flight reconfig.
@@ -446,6 +453,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private bool _txDigitalBypass;
     private bool _txRogerBeepBypass;
     private bool _txInjectedAudioBypass;
+    private bool _txRecordingBypass;
+    private double _txPanelGain = 1.0;
     // Operator configs last applied to TXA. Digital TX modes gate the effective
     // run bits only; these cached configs keep voice-mode restore exact.
     private TxPhaseRotatorConfig _txPhaseRotatorConfig = new();
@@ -1313,9 +1322,11 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // unrelated control (notably a secondary VFO) is moving. Reapplying the
         // same mode is unnecessary and would discard queued demodulated audio
         // below, producing a short interruption on every tuning event.
+        bool wasDigitalBypassed;
         lock (state.FilterProfileGate)
         {
             if (state.CurrentMode == mapped) return;
+            wasDigitalBypassed = IsRxDigitalBypassed(state);
             RunNativeLifecycleCriticalSection(() =>
             {
                 NativeMethods.SetRXAMode(channelId, (int)mapped);
@@ -1328,6 +1339,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // Re-assert squelch on the stage matching the new mode and clear the
         // old one — squelch is mode-aware (SSQL/AMSQ/FMSQ) per Thetis §5.
         ApplySquelchLocked(state);
+        if (wasDigitalBypassed != IsRxDigitalBypassed(state))
+            ReapplyRxDspGate(state);
         // Drop up to ~1 s of already-demodulated audio queued with the old mode so
         // the user hears the new sideband immediately after clicking instead of
         // finishing the tail of the wrong one. AudioHead stays put; the read
@@ -1442,24 +1455,97 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public void SetAudioPeakFilter(int channelId, bool enabled)
     {
-        if (!_channels.ContainsKey(channelId)) return;
-        // Thetis radio.cs RXAPFRun uses this per-RXA selector. The native
-        // channel owns its 600 Hz / 100 Hz double-pole filter; no global state.
-        NativeMethods.SetRXASPCWRun(channelId, enabled ? 1 : 0);
+        if (!_channels.TryGetValue(channelId, out var state)) return;
+        state.OperatorApf = enabled;
+        ApplyAudioPeakFilter(state);
     }
 
-    public unsafe void SetReceiveEqualizer(int channelId, bool enabled, int preampDb, int lowDb, int midDb, int highDb)
+    // Thetis radio.cs RXAPFRun uses this per-RXA selector. The native channel
+    // owns its 600 Hz / 100 Hz double-pole filter; no global state.
+    private static void ApplyAudioPeakFilter(ChannelState state) =>
+        NativeMethods.SetRXASPCWRun(state.Id, state.OperatorApf && !IsRxDigitalBypassed(state) ? 1 : 0);
+
+    public void SetReceiveEqualizer(int channelId, bool enabled, int preampDb, int lowDb, int midDb, int highDb)
     {
-        if (!_channels.ContainsKey(channelId)) return;
+        if (!_channels.TryGetValue(channelId, out var state)) return;
+        state.OperatorRxEq = new RxEqualizerSettings(enabled, preampDb, lowDb, midDb, highDb);
+        ApplyReceiveEqualizer(state);
+    }
+
+    private static unsafe void ApplyReceiveEqualizer(ChannelState state)
+    {
+        if (state.OperatorRxEq is not { } eq) return;
         // Thetis RXEQ3 passes preamp, low, mid and high to this RXA-local API.
-        // WDSP eq.c owns the channel's coefficients and run flag.
+        // WDSP eq.c owns the channel's coefficients and run flag. The digital
+        // gate only clears the run flag; the operator's curve stays loaded.
         int* gains = stackalloc int[4]
         {
-            Math.Clamp(preampDb, -12, 12), Math.Clamp(lowDb, -12, 12),
-            Math.Clamp(midDb, -12, 12), Math.Clamp(highDb, -12, 12)
+            Math.Clamp(eq.PreampDb, -12, 12), Math.Clamp(eq.LowDb, -12, 12),
+            Math.Clamp(eq.MidDb, -12, 12), Math.Clamp(eq.HighDb, -12, 12)
         };
-        NativeMethods.SetRXAGrphEQ(channelId, gains);
-        NativeMethods.SetRXAEQRun(channelId, enabled ? 1 : 0);
+        NativeMethods.SetRXAGrphEQ(state.Id, gains);
+        NativeMethods.SetRXAEQRun(state.Id, eq.Enabled && !IsRxDigitalBypassed(state) ? 1 : 0);
+    }
+
+    private sealed record RxEqualizerSettings(bool Enabled, int PreampDb, int LowDb, int MidDb, int HighDb);
+
+    // ---- RX digital-mode DSP bypass ----
+    // Data modes (DIGU/DIGL, and FreeDV via SetRxDigitalBypass because the
+    // engine only sees its USB/LSB carrier mode) feed a decoder, not an ear:
+    // NR, blankers, ANF/SNB, notches, squelch, RX EQ and APF all damage weak
+    // decodes. The gate only changes what is applied to WDSP; the operator's
+    // settings are kept per channel and re-applied unchanged on the way out.
+    // AGC and the bandpass stay as configured.
+    private static bool IsDigitalRxMode(RxaMode mode) =>
+        mode is RxaMode.DIGU or RxaMode.DIGL;
+
+    private static bool IsRxDigitalBypassed(ChannelState state) =>
+        state.RxDigitalBypass || IsDigitalRxMode(state.CurrentMode);
+
+    /// <summary>The NR config actually applied to WDSP: the operator's config,
+    /// or every stage off while the channel is digitally bypassed. Tunables
+    /// ride through unchanged so leaving digital needs no re-derivation.</summary>
+    internal static NrConfig EffectiveRxNrConfig(NrConfig cfg, bool digitalBypassed) =>
+        digitalBypassed
+            ? cfg with
+            {
+                NrMode = NrMode.Off,
+                AnfEnabled = false,
+                SnbEnabled = false,
+                NbpNotchesEnabled = false,
+                NbMode = NbMode.Off,
+            }
+            : cfg;
+
+    public void SetRxDigitalBypass(int channelId, bool bypass)
+    {
+        if (!_channels.TryGetValue(channelId, out var state)) return;
+        bool before = IsRxDigitalBypassed(state);
+        state.RxDigitalBypass = bypass;
+        if (before == IsRxDigitalBypassed(state)) return;
+        ApplySquelchLocked(state);
+        ReapplyRxDspGate(state);
+        _log.LogInformation("wdsp.setRxDigitalBypass channel={Id} bypass={Bypass}", channelId, bypass);
+    }
+
+    // Re-push every gated RX stage after the channel enters or leaves the
+    // digital bypass. Squelch is re-planned by the caller (SetMode already
+    // re-asserts it on every mode change).
+    private void ReapplyRxDspGate(ChannelState state)
+    {
+        bool nrApplied = false;
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            // Read inside the section so a concurrent SetNoiseReduction can't
+            // be overwritten by the config it just replaced.
+            if (state.OperatorNr is not { } nr) return;
+            ApplyNoiseReductionLocked(state.Id, nr, state);
+            nrApplied = true;
+        });
+        if (!nrApplied && !_isolatedChannels.ContainsKey(state.Id))
+            ApplyNotchesToChannel(state.Id);
+        ApplyReceiveEqualizer(state);
+        ApplyAudioPeakFilter(state);
     }
 
     public void SetSquelch(int channelId, SquelchConfig cfg)
@@ -1587,11 +1673,19 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     {
         ArgumentNullException.ThrowIfNull(cfg);
         if (!_channels.TryGetValue(channelId, out var state)) return;
-        RunNativeLifecycleCriticalSection(() => ApplyNoiseReductionLocked(channelId, cfg, state));
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            state.OperatorNr = cfg;
+            ApplyNoiseReductionLocked(channelId, cfg, state);
+        });
     }
 
-    private void ApplyNoiseReductionLocked(int channelId, NrConfig cfg, ChannelState state)
+    // `operatorCfg` is what the operator asked for; the digital gate decides
+    // what actually runs (EffectiveRxNrConfig).
+    private void ApplyNoiseReductionLocked(int channelId, NrConfig operatorCfg, ChannelState state)
     {
+        bool digitalBypassed = IsRxDigitalBypassed(state);
+        var cfg = EffectiveRxNrConfig(operatorCfg, digitalBypassed);
 
         // Mutually-exclusive NR button. When switching to a mode, re-apply its
         // Thetis defaults before toggling Run=1 — matches Thetis setup.cs order
@@ -1692,9 +1786,13 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // notch database — so keep it on whenever active manual notches exist,
         // otherwise a routine NR change would silently disable the operator's
         // EMF notches. (RXANBPSetNotchesRun is the single WDSP gate for both.)
+        // Digital bypass parks both: a notch inside the data passband erases
+        // decodes. The notch database itself is left as-is.
         bool anyActiveNotch;
         lock (_notchLock) anyActiveNotch = _manualNotches.Exists(static n => n.Active);
-        NativeMethods.RXANBPSetNotchesRun(channelId, (cfg.NbpNotchesEnabled || anyActiveNotch) ? 1 : 0);
+        NativeMethods.RXANBPSetNotchesRun(
+            channelId,
+            !digitalBypassed && (cfg.NbpNotchesEnabled || anyActiveNotch) ? 1 : 0);
 
         // Mutually-exclusive pre-RXA blanker. Update threshold on whichever
         // path we're about to run (or both paths when switching off → on → the
@@ -1726,9 +1824,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         state.CurrentNbMode = cfg.NbMode;
 
         _log.LogInformation(
-            "wdsp.setNoiseReduction channel={Id} nr={Nr} anf={Anf} snb={Snb} notches={Notches} nb={Nb} thr={Thr:F2}",
+            "wdsp.setNoiseReduction channel={Id} nr={Nr} anf={Anf} snb={Snb} notches={Notches} nb={Nb} thr={Thr:F2} digitalBypass={Digital}",
             channelId, cfg.NrMode, cfg.AnfEnabled, cfg.SnbEnabled, cfg.NbpNotchesEnabled,
-            cfg.NbMode, scaledThreshold);
+            cfg.NbMode, scaledThreshold, digitalBypassed);
     }
 
 
@@ -1815,7 +1913,11 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 NativeMethods.RXANBPAddNotch(channelId, i, n.CenterHz, n.WidthHz, n.Active ? 1 : 0);
             }
 
-            NativeMethods.RXANBPSetNotchesRun(channelId, anyActive ? 1 : 0);
+            // The database stays loaded on a digitally bypassed channel so the
+            // notches come straight back when it leaves digital.
+            bool digitalBypassed = _channels.TryGetValue(channelId, out var state)
+                && IsRxDigitalBypassed(state);
+            NativeMethods.RXANBPSetNotchesRun(channelId, anyActive && !digitalBypassed ? 1 : 0);
         }
         catch (EntryPointNotFoundException)
         {
@@ -3168,7 +3270,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             if (_txaChannelId is not int txa) return;
-            NativeMethods.SetTXAPanelGain1(txa, linearGain);
+            _txPanelGain = linearGain;
+            _txControlNative.SetTXAPanelGain1(txa, _txRecordingBypass ? 1.0 : _txPanelGain);
         }
         _log.LogInformation("wdsp.setTxPanelGain linear={Gain:F3}", linearGain);
     }
@@ -3237,10 +3340,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // While keyed for TUN/two-tone the Leveler is forced off; don't let a
         // mid-key settings change re-enable it on the tune tone. Still record the
         // operator's intent below so the un-key restore lands correctly.
-        _txControlNative.SetTXALevelerSt(
-            txa,
-            (!_txLevelerForcedOff && !_txRogerBeepBypass
-                && !_txInjectedAudioBypass && cfg.LevelerEnabled) ? 1 : 0);
+        _txLevelerEnabled = cfg.LevelerEnabled;
+        ApplyTxLevelerRunLocked(txa);
         NativeMethods.SetTXALevelerDecay(txa, cfg.LevelerDecayMs);
         _txCompressorEnabled = cfg.CompressorEnabled;
         NativeMethods.SetTXACompressorGain(txa, cfg.CompressorGainDb);
@@ -3248,7 +3349,6 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _txCessbBandwidthHz = cfg.CessbBandwidthHz is 4000 ? 4000 : 3000;
         TrySetCessbBandwidth(txa, _txCessbBandwidthHz);
         ApplyTxCompressorAndCessbRuns(txa);
-        _txLevelerEnabled = cfg.LevelerEnabled;
     }
 
     // TX phase rotator (Thetis DSP->CFC->PhaseRot parity): all-pass speech
@@ -3321,15 +3421,34 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         && !_txDigitalBypass
         && !_txRogerBeepBypass
         && !_txInjectedAudioBypass
+        && !_txRecordingBypass
             ? 1
             : 0;
+
+    // Caller holds _txaLock. The Leveler's single run decision: the operator's
+    // switch, parked while TUN/two-tone is keyed, during roger-beep / injected
+    // audio, and in DIGU/DIGL so the data tones leave at exactly the level the
+    // app sends. FreeDV is deliberately NOT gated here (only the mode is
+    // checked, not _txDigitalBypass): its spec profile relies on the Leveler
+    // for linear OFDM makeup gain (DspPipelineService.FreeDvTxLevelingProfile).
+    private void ApplyTxLevelerRunLocked(int txa) =>
+        _txControlNative.SetTXALevelerSt(
+            txa,
+            _txLevelerEnabled
+            && !_txLevelerForcedOff
+            && !_txRogerBeepBypass
+            && !_txInjectedAudioBypass
+            && !_txRecordingBypass
+            && !IsDigitalTxMode(_txCurrentMode)
+                ? 1
+                : 0);
 
     // Caller holds _txaLock. Set shape before Run so enabling from OFF never
     // exposes a partial phase-rotator profile to a live TXA block.
     private void ApplyTxPhaseRotatorLocked(int txa, TxPhaseRotatorConfig cfg)
     {
         _txPhaseRotatorConfig = cfg;
-        _txControlNative.SetTXAPHROTReverse(txa, cfg.Reverse ? 1 : 0);
+        _txControlNative.SetTXAPHROTReverse(txa, cfg.Reverse && !_txRecordingBypass ? 1 : 0);
         _txControlNative.SetTXAPHROTCorner(txa, cfg.CornerHz);
         _txControlNative.SetTXAPHROTNstages(txa, cfg.Stages);
         _txControlNative.SetTXAPHROTAutoMode(txa, cfg.AutoMode ? 1 : 0);
@@ -3452,10 +3571,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // "on" — if the operator disabled the Leveler via SetTxLeveling,
                 // un-keying TUN must leave it disabled.
                 _txLevelerForcedOff = false;
-                _txControlNative.SetTXALevelerSt(
-                    txa,
-                    (_txLevelerEnabled && !_txRogerBeepBypass
-                        && !_txInjectedAudioBypass) ? 1 : 0);
+                ApplyTxLevelerRunLocked(txa);
                 _log.LogInformation("wdsp.setTxTune on=false leveler={Leveler}",
                     _txLevelerEnabled ? "on" : "off");
             }
@@ -3474,6 +3590,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
             ApplyCfcMasterRunLocked(txa, _cfcConfig);
             ApplyTxCompressorAndCessbRuns(txa);
+            ApplyTxLevelerRunLocked(txa);
             // TXA bandpass is now operator-controlled — DspPipelineService
             // asserts SetTxFilter after SetTxMode using the per-mode-family
             // memory in RadioService. No auto-apply here.
@@ -3837,6 +3954,25 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setTxDigitalBypass bypass={Bypass}", bypass);
     }
 
+    public void SetTxRecordingBypass(bool bypass)
+    {
+        if (_disposed != 0) return;
+        lock (_txaLock)
+        {
+            if (_txRecordingBypass == bypass) return;
+            _txRecordingBypass = bypass;
+            if (_txaChannelId is int txa)
+            {
+                _txControlNative.SetTXAPanelGain1(txa, bypass ? 1.0 : _txPanelGain);
+                _txControlNative.SetTXAPHROTReverse(txa, _txPhaseRotatorConfig.Reverse && !bypass ? 1 : 0);
+                _txControlNative.SetTXAPHROTRun(txa, EffectiveTxRun(_txPhaseRotatorConfig.Enabled));
+                ApplyCfcMasterRunLocked(txa, _cfcConfig);
+                ApplyTxCompressorAndCessbRuns(txa);
+                ApplyTxLevelerRunLocked(txa);
+            }
+        }
+    }
+
     public void SetTxInjectedAudioBypass(bool bypass)
     {
         if (_disposed != 0) return;
@@ -3849,10 +3985,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
                 ApplyTxCompressorAndCessbRuns(txa);
-                _txControlNative.SetTXALevelerSt(
-                    txa,
-                    (_txLevelerEnabled && !_txLevelerForcedOff
-                        && !_txRogerBeepBypass && !bypass) ? 1 : 0);
+                ApplyTxLevelerRunLocked(txa);
             }
         }
         _log.LogInformation("wdsp.setTxInjectedAudioBypass bypass={Bypass}", bypass);
@@ -3870,10 +4003,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 ApplyTxPhaseRotatorLocked(txa, _txPhaseRotatorConfig);
                 ApplyCfcMasterRunLocked(txa, _cfcConfig);
                 ApplyTxCompressorAndCessbRuns(txa);
-                _txControlNative.SetTXALevelerSt(
-                    txa,
-                    (_txLevelerEnabled && !_txLevelerForcedOff
-                        && !_txInjectedAudioBypass && !bypass) ? 1 : 0);
+                ApplyTxLevelerRunLocked(txa);
             }
         }
         _log.LogInformation("wdsp.setTxRogerBeepBypass bypass={Bypass}", bypass);
@@ -4246,10 +4376,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // Restore the Leveler to the operator's setting (see SetTxTune)
                 // rather than hardcoding "on".
                 _txLevelerForcedOff = false;
-                _txControlNative.SetTXALevelerSt(
-                    txa,
-                    (_txLevelerEnabled && !_txRogerBeepBypass
-                        && !_txInjectedAudioBypass) ? 1 : 0);
+                ApplyTxLevelerRunLocked(txa);
                 _log.LogInformation(
                     "wdsp.setTwoTone on=false f1={F1} f2={F2} mag={Mag:F3} leveler={Leveler}",
                     freq1, freq2, mag, _txLevelerEnabled ? "on" : "off");
@@ -4886,7 +5013,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             if (_txaChannelId is not int id) return 0;
             txa = id;
             skipTxAudioPlugins =
-                _txDigitalBypass || _txRogerBeepBypass || _txInjectedAudioBypass
+                _txDigitalBypass || _txRogerBeepBypass || _txInjectedAudioBypass || _txRecordingBypass
                 || IsDigitalTxMode(_txCurrentMode);
         }
 
@@ -5673,7 +5800,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // come from the pure PlanFixedSquelch so there is no un-resolved path
         // here to regress (issue #2101). This method is only native dispatch:
         // everything off first, then the owning stage on.
-        var plan = PlanFixedSquelch(state.CurrentSquelch, MapRxaToRxMode(state.CurrentMode));
+        var plan = PlanFixedSquelch(
+            state.CurrentSquelch, MapRxaToRxMode(state.CurrentMode), state.RxDigitalBypass);
 
         switch (plan.Stage)
         {
@@ -5714,11 +5842,17 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // detector regardless of the stored Adaptive preference (issue #2101) — a
     // web client that left Adaptive=true still gets a working FM squelch — while
     // SSB/AM keep the operator's choice. SSB/CW/DIG/DSB families all map to SSQL.
-    internal static FixedSquelchPlan PlanFixedSquelch(SquelchConfig currentSquelch, RxMode mode)
+    // DIGU/DIGL (and a FreeDV-bypassed channel) never run squelch: a decoder
+    // needs the noise floor too, and a closed gate drops weak decodes.
+    internal static FixedSquelchPlan PlanFixedSquelch(
+        SquelchConfig currentSquelch,
+        RxMode mode,
+        bool digitalBypassed = false)
     {
         var cfg = ResolveFixedSquelchForMode(currentSquelch, mode);
         int level = Math.Clamp(cfg.Level, 0, 100);
-        int run = ShouldRunFixedSquelch(cfg) ? 1 : 0;
+        bool digital = digitalBypassed || mode is RxMode.DIGU or RxMode.DIGL;
+        int run = !digital && ShouldRunFixedSquelch(cfg) ? 1 : 0;
         return mode switch
         {
             RxMode.AM or RxMode.SAM =>
