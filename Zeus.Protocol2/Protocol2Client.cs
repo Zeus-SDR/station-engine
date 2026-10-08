@@ -78,7 +78,7 @@ public readonly record struct Protocol2TxIqDiagnostics(
 /// overlaps; Protocol-1-only methods (HL2 dither, N2ADR filter board) are
 /// absent here. Wire format verified against Thetis ChannelMaster network.c.
 /// </summary>
-public sealed class Protocol2Client : IDisposable, IAsyncDisposable
+public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 {
     private const int SharedSendTimeoutMs = 10;
     private static readonly long SpeakerSendRetryTicks =
@@ -119,20 +119,22 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     // demux helper below accepts both forms for RX2.
     private const int G2RxDdc = 2;
 
-    // OpenHPSDR Protocol-2 "DDC Command" (port 1025) enables DDCs via a SINGLE
-    // bitmask byte at offset 7 → DDC0..DDC7, so 8 concurrent DDCs is the hard
-    // protocol ceiling (verified 2026-06-21 against the openHPSDR P2 spec and
-    // the matthew-wolf-n4mtt/openhpsdr-e Wireshark dissector; pihpsdr + Zeus
-    // both already use only byte[7]). There is no second enable byte — "10
-    // DDCs" is not representable in standard P2. On Orion-family boards DDC0/1
-    // are reserved for the PureSignal feedback pair when PS is armed, leaving 6
-    // user receivers; with PS off, all 8. Keep this P2 wire ceiling separate
-    // from WireContract.MaxReceivers, which is the shared state capacity for
-    // newer protocols such as P3.
+    // Saturn implements ten physical DDCs. Its Receive-Specific packet reads
+    // the little-endian enable word at bytes 7/8 (Saturn IncomingDDCSpecific.c).
+    // Arrays cover the supported maximum; all runtime allocation and port
+    // acceptance use the connected board/variant capacity. Reserved feedback
+    // and diversity slots keep their existing ownership.
     public const int MaxRxDdc = Zeus.Contracts.WireContract.Protocol2MaxDdc;
+    public const int StandardRxDdcCapacity = 8;
+
+    public static int RxDdcCapacityFor(HpsdrBoardKind board, OrionMkIIVariant variant) =>
+        board == HpsdrBoardKind.OrionMkII &&
+        variant is OrionMkIIVariant.G2 or OrionMkIIVariant.G2_1K ? 10 : StandardRxDdcCapacity;
+
+    public int RxDdcCapacity => RxDdcCapacityFor(_boardKind, _variant);
 
     // RX IQ data arrives on UDP source ports RxDataPortBase + ddcIndex, i.e.
-    // 1035 (DDC0) .. 1035 + MaxRxDdc - 1 (DDC7).
+    // 1035 (DDC0) .. 1044 (DDC9); acceptance uses the connected board capacity.
     private const int RxDataPortBase = 1035;
     private const int RxSilenceBeforeRecoveryMs = 3000;
     private const int RxRecoveryAttemptSpacingMs = 2000;
@@ -328,7 +330,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     private int _guestStructuralChangeSeen;
     private long _strayGuestIqDropped;
     // Per-source-port IQ packet rate (packets in the last completed ~1 s
-    // window) for UDP ports RxDataPortBase..RxDataPortBase+MaxRxDdc-1 (1035..1042)
+    // window) for all supported DDC ports (1035..1044)
     // → index 0..7 → DDC 0..7. Written by the single RX thread on each window
     // roll; read by the diagnostics thread under _rxPortRateLock. Surfaces
     // per-DDC RX streaming health (e.g. a receiver whose DDC the radio isn't
@@ -1475,8 +1477,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     {
         bool changed = Interlocked.Exchange(ref _rx1AdcSource, rx1AdcSource) != rx1AdcSource;
         changed |= Interlocked.Exchange(ref _rx2AdcSource, rx2AdcSource) != rx2AdcSource;
-        if (changed && _rxTask is not null)
+        if (changed && CanSendCmdHighPriority)
+        {
             SendCmdRx();
+            SendCmdHighPriority(run: true);
+        }
     }
 
     /// <summary>
@@ -1491,7 +1496,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetExtraReceivers(int count, IReadOnlyList<byte>? adcSources = null)
     {
-        int maxExtras = MaxRxDdc - RxBaseDdc(_boardKind) - 2;
+        int maxExtras = RxDdcCapacity - RxBaseDdc(_boardKind) - 2;
         int clamped = Math.Clamp(count, 0, Math.Max(0, maxExtras));
         bool adcChanged = false;
         for (int k = 0; k < clamped; k++)
@@ -1539,7 +1544,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Configure an analyzer-only physical DDC. Passing an index outside
-    /// DDC2..DDC7 disables it. This path is additive to the existing user DDC
+    /// the connected DDC range disables it. This path is additive to the existing user DDC
     /// composer and never writes DDC0/1, whose PureSignal ownership is
     /// unchanged. Incoming IQ is tagged with <see cref="DisplayReceiverIndex"/>
     /// so hosting can feed a display-only WDSP channel without audio routing.
@@ -1547,7 +1552,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public void SetDisplayDdc(int ddcIndex, long centerHz, byte adcSource)
     {
         int firstFree = FirstFreeContiguousUserDdc();
-        int nextIndex = ddcIndex == firstFree && ddcIndex is >= 2 and < MaxRxDdc
+        int nextIndex = ddcIndex == firstFree && ddcIndex >= 2 && ddcIndex < RxDdcCapacity
             ? ddcIndex
             : -1;
         double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
@@ -1590,11 +1595,12 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Guest DDCs that fit behind an operator run ending before
-    /// <paramref name="firstFreeOperatorDdc"/> without passing DDC7, keeping
+    /// <paramref name="firstFreeOperatorDdc"/> within the hardware capacity, keeping
     /// one DDC for the hidden display DDC when <paramref name="displayDdcWanted"/>.
     /// </summary>
-    public static int GuestDdcCapacityBehind(int firstFreeOperatorDdc, bool displayDdcWanted) =>
-        Math.Max(0, MaxRxDdc - firstFreeOperatorDdc - (displayDdcWanted ? 1 : 0));
+    public static int GuestDdcCapacityBehind(int firstFreeOperatorDdc, bool displayDdcWanted,
+        int ddcCapacity = StandardRxDdcCapacity) =>
+        Math.Max(0, ddcCapacity - firstFreeOperatorDdc - (displayDdcWanted ? 1 : 0));
 
     /// <summary>
     /// First physical DDC after the operator's contiguous receiver run as it
@@ -1613,7 +1619,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// How many guest DDCs fit behind the operator's receivers without passing
-    /// DDC7 (only enable byte 7 is written). Reserves one DDC for the hidden
+    /// the connected hardware capacity. Reserves one DDC for the hidden
     /// display DDC when <paramref name="displayDdcWanted"/>. Zero on the
     /// Hermes-class boards (Hermes/HermesII/HermesC10, RxBaseDdc == 0): the
     /// G2E time-multiplexes PureSignal feedback onto DDC0, so no guests there.
@@ -1623,7 +1629,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     public int GuestDdcCapacity(bool displayDdcWanted)
     {
         if (RxBaseDdc(_boardKind) != G2RxDdc) return 0;
-        return GuestDdcCapacityBehind(FirstFreeOperatorDdc(), displayDdcWanted);
+        return GuestDdcCapacityBehind(FirstFreeOperatorDdc(), displayDdcWanted, RxDdcCapacity);
     }
 
     /// <summary>
@@ -1638,7 +1644,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         {
             if (placement.Guests[g].Slot != slot) continue;
             int ddc = placement.FirstDdc + g;
-            return ddc is >= 3 and < MaxRxDdc ? ddc : -1;
+            return ddc >= 3 && ddc < RxDdcCapacity ? ddc : -1;
         }
         return -1;
     }
@@ -1773,7 +1779,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
 
     // Live guest placement: the stored snapshot, clamped so that no guest ever
     // overlaps an operator receiver (operator changes win immediately), the
-    // display DDC slot behind the guests stays free, and nothing passes DDC7;
+    // display DDC slot behind the guests stays free within the hardware capacity;
     // empty on boards without guest support.
     private (GuestDdcWire[] Guests, int FirstDdc, int Count) ActiveGuestPlacement()
     {
@@ -1818,7 +1824,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     {
         int configured = Volatile.Read(ref _displayDdcIndex);
         int expected = FirstFreeContiguousUserDdc();
-        return configured == expected && configured is >= 2 and < MaxRxDdc
+        return configured == expected && configured >= 2 && configured < RxDdcCapacity
             ? configured
             : -1;
     }
@@ -1910,6 +1916,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         if (_variant == variant) return;
         var previousGeometry = WidebandGeometryFor(_boardKind, _variant);
         _variant = variant;
+        int maxExtras = Math.Max(0, RxDdcCapacity - RxBaseDdc(_boardKind) - 2);
+        if (Volatile.Read(ref _extraReceiverCount) > maxExtras)
+            SetExtraReceivers(maxExtras, _extraRxAdc.Skip(2).ToArray());
         if (_rxTask is not null)
         {
             if (previousGeometry != WidebandGeometryFor(_boardKind, _variant))
@@ -2039,6 +2048,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         UpdateXvtrOutput();
         if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
     }
+
+    /// <summary>Applied receive attenuation on physical ADC1.</summary>
+    public int Rx1AttenuatorDb => _rx1StepAttnDb;
 
     /// <summary>
     /// Set the second-ADC RX step attenuator (0..31 dB), written to byte
@@ -3934,7 +3946,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
     /// special case and stays byte-pinned by the wire tests; this method
     /// produces byte-identical output for the equivalent single-/dual-receiver
     /// inputs (see ComposeCmdRxBufferForReceiversTests) and extends cleanly to
-    /// all 8 DDCs.
+    /// all DDCs within the connected hardware capacity.
     ///
     /// Receiver <c>i</c> is placed on DDC <c>RxBaseDdc(board) + i</c>.
     /// PureSignal, when armed on Orion-family boards, additionally claims
@@ -3949,7 +3961,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         bool psEnabled = false,
         HpsdrBoardKind boardKind = HpsdrBoardKind.OrionMkII,
         bool adcDitherEnabled = false,
-        bool adcRandomEnabled = false)
+        bool adcRandomEnabled = false,
+        int ddcCapacity = StandardRxDdcCapacity)
     {
         ArgumentNullException.ThrowIfNull(receivers);
         var p = new byte[BufLen];
@@ -3960,7 +3973,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         p[6] = adcRandomEnabled ? adcMask : (byte)0;
 
         int baseDdc = RxBaseDdc(boardKind);
-        byte ddcEnable = 0;
+        ushort ddcEnable = 0;
 
         // PS feedback pair (DDC0+DDC1, byte 1363 sync) — Zeus only composes it
         // for boards where it reserves the front DDCs for feedback (the dual-ADC
@@ -3984,14 +3997,15 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         for (int i = 0; i < receivers.Count; i++)
         {
             int ddc = baseDdc + i;
-            if (ddc > MaxRxDdc - 1)
+            if (ddc >= Math.Clamp(ddcCapacity, 1, MaxRxDdc))
                 throw new ArgumentOutOfRangeException(nameof(receivers),
-                    $"receiver {i} maps to DDC{ddc}, exceeding the {MaxRxDdc}-DDC protocol ceiling");
-            ddcEnable |= (byte)(1 << ddc);
+                    $"receiver {i} maps to DDC{ddc}, exceeding the {ddcCapacity}-DDC hardware capacity");
+            ddcEnable |= (ushort)(1 << ddc);
             WriteDdcConfigBlock(p, ddc, receivers[i].AdcSource, receivers[i].SampleRateKhz);
         }
 
-        p[7] = ddcEnable;
+        p[7] = (byte)ddcEnable;
+        p[8] = (byte)(ddcEnable >> 8);
         return p;
     }
 
@@ -4058,7 +4072,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                 psEnabled,
                 _boardKind,
                 _adcDitherEnabled,
-                _adcRandomEnabled);
+                _adcRandomEnabled,
+                RxDdcCapacity);
         }
         else
         {
@@ -4089,14 +4104,14 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         for (int g = 0; g < guestPlacement.Count; g++)
         {
             int guestDdc = guestPlacement.FirstDdc + g;
-            if (guestDdc is < 3 or >= MaxRxDdc) break;
-            p[7] |= (byte)(1 << guestDdc);
+            if (guestDdc < 3 || guestDdc >= RxDdcCapacity) break;
+            p[7 + guestDdc / 8] |= (byte)(1 << (guestDdc % 8));
             WriteDdcConfigBlock(p, guestDdc, guestPlacement.Guests[g].Adc, (ushort)_sampleRateKhz);
         }
         int displayDdc = EffectiveDisplayDdcIndex();
-        if (displayDdc is >= 2 and < MaxRxDdc)
+        if (displayDdc >= 2 && displayDdc < RxDdcCapacity)
         {
-            p[7] |= (byte)(1 << displayDdc);
+            p[7 + displayDdc / 8] |= (byte)(1 << (displayDdc % 8));
             WriteDdcConfigBlock(
                 p,
                 displayDdc,
@@ -4366,7 +4381,8 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // P2 state so the user RX DDC above remains parked while the carrier
         // follows CTUN, XIT, split, and the selected TX receiver. The fallback
         // remains RX0 for isolated callers that have not supplied a TX DUC.
-        WriteBeU32(p, 329, FrequencyHzToPhaseWord(_txDucFreqHz));
+        uint txDucCommandHz = _txDucFreqHz;
+        WriteBeU32(p, 329, FrequencyHzToPhaseWord(txDucCommandHz));
 
         // Second receiver (RX2): tune its own DDC's NCO to _rx2FreqHz so it
         // demodulates an independent band. Each DDC's phase word lives at
@@ -4400,11 +4416,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         for (int g = 0; g < guestPlacement.Count; g++)
         {
             int guestDdc = guestPlacement.FirstDdc + g;
-            if (guestDdc is < 3 or >= MaxRxDdc) break;
+            if (guestDdc < 3 || guestDdc >= RxDdcCapacity) break;
             WriteBeU32(p, 9 + guestDdc * 4, FrequencyHzToPhaseWord(guestPlacement.Guests[g].FreqHz));
         }
         int displayDdc = EffectiveDisplayDdcIndex();
-        if (displayDdc is >= 2 and < MaxRxDdc)
+        if (displayDdc >= 2 && displayDdc < RxDdcCapacity)
             WriteBeU32(p, 9 + displayDdc * 4, FrequencyHzToPhaseWord(_displayDdcFreqHz));
 
         // PureSignal feedback DDCs track the transmitted carrier during a keyed
@@ -4516,8 +4532,9 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // ANAN-200D filter board. Honor the operator's filter profile without
         // changing the discovered transport's DDC or feedback layout.
         var filterBoard = _rfFilterBoardKind ?? _boardKind;
+        uint alex0RxCenterHz = _rxFreqHz;
         uint alex0Common = ComputeAlexWord(
-            _rxFreqHz,
+            alex0RxCenterHz,
             txLpfFreqHz,
             txAnt: txAntWire,
             board: filterBoard,
@@ -4528,9 +4545,11 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         // state-correct antenna (clear [26:24], re-OR via the shared encoder).
         uint alex0 = (alex0Common & ~ALEX_TX_ANTENNA_MASK) | EncodeTxAntennaBits(alex0AntWire)
                      | (xmit ? ALEX_TX_RELAY : 0u);
+        uint alex1Rx1CenterHz = _rxFreqHz;
+        uint alex1Rx2CenterHz = _rx2FreqHz;
         uint alex1 = ComposeAlex1Word(
-            _rxFreqHz,
-            _rx2FreqHz,
+            alex1Rx1CenterHz,
+            alex1Rx2CenterHz,
             txLpfFreqHz,
             rx2Enabled,
             xmit,
@@ -4538,6 +4557,16 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             filterBoard,
             txAntWire,
             _rfFilters);
+        // Receive-bank arbitration operates on allocated, corrected NCO centers.
+        // Feedback and keyed packets retain their existing relay composition.
+        var rfDemands = CollectReceiveRfDemands(diversityPair);
+        uint? receiveAdc0FallbackHz = null;
+        uint? receiveAdc1FallbackHz = null;
+        string? receiveAdc0Reason = null;
+        string? receiveAdc1Reason = null;
+        if (!xmit && !psEnabled)
+            (receiveAdc0FallbackHz, receiveAdc1FallbackHz, receiveAdc0Reason, receiveAdc1Reason) = ApplyReceiveRfBanks(filterBoard, rfDemands, ref alex0, ref alex1);
+
         // RX auxiliary input select (external-ports plan — antenna slice, #804).
         // Emitted on alex0 — XVTR/EXT1/EXT2/BYPASS bits 8..11 (+ Saturn RX_SELECT
         // bit 14). ORDER IS LOAD-BEARING (the PS-K36 firewall): the operator aux
@@ -4573,6 +4602,10 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
         {
             alex0 |= AlexRxAntennaBypass;
         }
+        Volatile.Write(ref _receiveRfSnapshot, BuildReceiveRfSnapshot(
+            filterBoard, rfDemands, alex0, alex1, xmit, psEnabled, rx2Enabled,
+            alex0RxCenterHz, alex1Rx1CenterHz, alex1Rx2CenterHz, txDucCommandHz,
+            receiveAdc0FallbackHz, receiveAdc1FallbackHz, receiveAdc0Reason, receiveAdc1Reason));
         WriteBeU32(p, 1428, alex1);
         WriteBeU32(p, 1432, alex0);
         // The high-priority-only seam wins when it is the one installed; every
@@ -5415,7 +5448,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                         (streamStartTicks - preclearTicks) * 1000 / Stopwatch.Frequency);
                 }
 
-                if (srcPort >= RxDataPortBase && srcPort < RxDataPortBase + MaxRxDdc)
+                if (srcPort >= RxDataPortBase && srcPort < RxDataPortBase + RxDdcCapacity)
                 {
                     int ddc = srcPort - RxDataPortBase;
                     if (n == BufLen)
@@ -5501,7 +5534,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
                         gapRingPos = 0; gapRingFill = 0;
                     }
                 }
-                if (srcPort >= RxDataPortBase && srcPort < RxDataPortBase + MaxRxDdc && n == BufLen)
+                if (srcPort >= RxDataPortBase && srcPort < RxDataPortBase + RxDdcCapacity && n == BufLen)
                 {
                     int ddcIndex = srcPort - RxDataPortBase;
                     HandleRxDdcPacket(buf, ddcIndex);
@@ -5779,7 +5812,7 @@ public sealed class Protocol2Client : IDisposable, IAsyncDisposable
             for (int g = 0; g < guestPlacement.Count; g++)
             {
                 int guestDdc = guestPlacement.FirstDdc + g;
-                if (guestDdc is < 3 or >= MaxRxDdc) break;
+                if (guestDdc < 3 || guestDdc >= RxDdcCapacity) break;
                 guestSlotByDdc[guestDdc] = guestPlacement.Guests[g].Slot;
             }
         }

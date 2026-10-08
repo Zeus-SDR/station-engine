@@ -161,6 +161,14 @@ public static class TxControlEndpoints
         // transmission (TxAudioIngest); none of these routes key the radio.
         endpoints.MapGet("/api/cwid", (CwIdService cwId) => Results.Ok(cwId.Status()));
 
+        endpoints.MapPost("/api/cwid/instant", (CwIdStartRequest req, CwIdService cwId, TxService tx, HttpContext context) =>
+        {
+            var leaseId = RemoteTxLease.TryGet(context, out var remoteLease) ? remoteLease : null;
+            return tx.TrySendInstantCwId(cwId, req.Callsign, leaseId, out var error)
+                ? Results.Ok(cwId.Status())
+                : Results.Conflict(new { error });
+        });
+
         endpoints.MapPost("/api/cwid/start", (CwIdStartRequest req, CwIdService cwId) =>
             cwId.Start(req.Callsign, out var error)
                 ? Results.Ok(cwId.Status())

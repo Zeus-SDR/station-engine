@@ -767,6 +767,10 @@ public sealed partial class RadioService : IDisposable
         // Previously StateDto.AttenDb was hydrated while every wire/startup and
         // auto-ATT calculation still read this field's 0 dB initializer.
         _atten = new HpsdrAtten(rsSnap?.AttenDb ?? 0);
+        _physicalAttenBaselineDb[0] = Math.Clamp(rsSnap?.Adc0AttenBaselineDb ?? _atten.ClampedDb, 0, 31);
+        _physicalAttenBaselineDb[1] = Math.Clamp(rsSnap?.Adc1AttenBaselineDb
+            ?? _preferredRadioStore?.GetG2Rx1AttenuatorDb() ?? 0, 0, 31);
+        _atten = new HpsdrAtten(_physicalAttenBaselineDb[0]);
         _adcProtection = NormalizeAdcProtection(new AdcProtectionConfig(
             Enabled: rsSnap?.AutoAttEnabled ?? true,
             AttackMs: rsSnap?.AdcProtectionAttackMs ?? 100,
@@ -1663,6 +1667,7 @@ public sealed partial class RadioService : IDisposable
             };
             // Fresh connection — reset per-session auto-ATT state so a sticky
             // offset from a previous session doesn't leak onto new hardware.
+            ResetPhysicalProtectionNoLock();
             _attOffsetDb = 0;
             _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
@@ -2334,7 +2339,11 @@ public sealed partial class RadioService : IDisposable
             }
             if (adcSource is byte a)
             {
-                Mutate(s => WithReceiverAdcSource(s, index, a));
+                Mutate(s =>
+                {
+                    var next = WithReceiverAdcSource(s, index, a);
+                    return index == 0 && _p2Client is not null ? ProjectPhysicalPrimaryNoLock(next) : next;
+                });
                 if (index == 0) ApplyPrimaryAttenuatorToActiveClient(EffectiveAttenDb);
             }
             // RX1's zoom stays on the legacy global StateDto.ZoomLevel (SetZoom /
@@ -2370,11 +2379,10 @@ public sealed partial class RadioService : IDisposable
         bool enabling = enabled == true;
         lock (_sync)
         {
-            // Ordinary P1 currently has no RX3+ ingest path. Ignore an enable
-            // request rather than projecting a receiver that can never receive
-            // samples. Disabling or pre-configuring a hidden slot remains safe;
-            // P2/P3 can use that session-only configuration after reconnect.
-            if (_activeClient is not null && enabling)
+            // Do not expose a receiver without a reachable hardware DDC.
+            // Disabling or pre-configuring a hidden slot remains safe; saved
+            // configuration can be used after reconnecting a higher-capacity board.
+            if (enabling && index >= EffectiveMaxReceivers)
                 return Snapshot();
 
             var e = _extraReceivers[index];
@@ -3318,7 +3326,8 @@ public sealed partial class RadioService : IDisposable
                 // uses the physical ADC pair. ReferenceRx chooses the phase anchor.
                 SourceRx = 1,
             };
-            return s with { Diversity = next };
+            var updated = s with { Diversity = next };
+            return _p2Client is not null ? ProjectPhysicalPrimaryNoLock(updated) : updated;
         });
         return Snapshot();
     }
@@ -4387,6 +4396,10 @@ public sealed partial class RadioService : IDisposable
         Mutate(s =>
         {
             _atten = atten;
+            int adc = _p2Client is not null ? PrimaryAttenuationAdcNoLock(s) : ReceiverAdcSource(s, 0) == 1 ? 1 : 0;
+            _physicalAttenBaselineDb[adc] = atten.ClampedDb;
+            _physicalProtection[adc].ClampOffset(_adcProtection, atten.ClampedDb);
+            if (_p2Client is not null) _attOffsetDb = _physicalProtection[adc].OffsetDb;
             // An automatic offset cannot exceed the remaining 31 dB hardware
             // headroom. Trimming it here prevents a high manual baseline from
             // leaving a long tail of invisible release steps above saturation.
@@ -4411,6 +4424,7 @@ public sealed partial class RadioService : IDisposable
             // fast-attack and the floor follows it smoothly.)
         }
         ApplyPrimaryAttenuatorToActiveClient(effective);
+        ApplyPhysicalAttenuatorsToP2Client(_p2Client);
         return Snapshot();
     }
 
@@ -4454,6 +4468,7 @@ public sealed partial class RadioService : IDisposable
                 // Turning auto off: stop accumulating overload counters so the
                 // warning lamp doesn't linger and reset the offset to zero so
                 // the hardware comes back to the user's baseline immediately.
+                ResetPhysicalProtectionNoLock();
                 _attOffsetDb = 0;
                 _predictiveMagnitudeControlActive = false;
                 _adcOverloadLevel = 0;
@@ -4476,6 +4491,7 @@ public sealed partial class RadioService : IDisposable
                 _adcProtectionResumeAfterMs = long.MinValue;
             }
         }
+        ApplyPhysicalAttenuatorsToP2Client(_p2Client);
         var snap = Snapshot();
         if (changed)
         {
@@ -4512,6 +4528,7 @@ public sealed partial class RadioService : IDisposable
 
             if (next != _adcProtection)
             {
+                foreach (var controller in _physicalProtection) controller.ResetTimingForConfigurationChange();
                 _adcProtection = next;
                 _lastTickMs = long.MinValue;
                 _lastAttAttackMs = long.MinValue;
@@ -4527,6 +4544,7 @@ public sealed partial class RadioService : IDisposable
 
             if (!next.Enabled)
             {
+                ResetPhysicalProtectionNoLock();
                 _attOffsetDb = 0;
                 _predictiveMagnitudeControlActive = false;
                 _adcOverloadLevel = 0;
@@ -4562,6 +4580,17 @@ public sealed partial class RadioService : IDisposable
                 effectiveToApply = effective;
             }
 
+            if (_p2Client is not null)
+            {
+                for (int adc = 0; adc < 2; adc++)
+                {
+                    int priorOffset = _physicalProtection[adc].OffsetDb;
+                    _physicalProtection[adc].ClampOffset(next, _physicalAttenBaselineDb[adc]);
+                    stateBroadcastNeeded |= priorOffset != _physicalProtection[adc].OffsetDb;
+                }
+                _state = ProjectPhysicalPrimaryNoLock(_state);
+                ApplyPhysicalAttenuatorsToP2Client(_p2Client);
+            }
             status = BuildAdcProtectionStatusNoLock();
         }
 
@@ -4590,7 +4619,9 @@ public sealed partial class RadioService : IDisposable
             Adc1MaxMagnitude: _lastAdc1MaxMagnitude,
             Adc0MaxMagnitudeAtOverload: _adc0MaxMagnitudeAtOverload,
             Adc1MaxMagnitudeAtOverload: _adc1MaxMagnitudeAtOverload,
-            LastTelemetryUtc: _lastAdcTelemetryUtc);
+            LastTelemetryUtc: _lastAdcTelemetryUtc,
+            PrimaryAdcSource: ActualPrimaryPhysicalAdcNoLock(),
+            PhysicalAdcs: BuildPhysicalAdcStatusNoLock());
     }
 
     private static AdcProtectionConfig NormalizeAdcProtection(AdcProtectionConfig config) => config with
@@ -5583,7 +5614,10 @@ public sealed partial class RadioService : IDisposable
         if (_rfFilterStore is null)
             throw new InvalidOperationException("RF filter settings store is not configured.");
         var snap = Snapshot();
-        return _rfFilterStore.GetDto(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
+        return _rfFilterStore.GetDto(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled,
+            protocolSupported: snap.ConnectedProtocol is null or "P2",
+            hardware: _p2Client?.ReceiveFilters,
+            rx6mLnaControlSupported: _p2Client?.SupportsRx6mLnaControl == true);
     }
 
     public RfFilterSettingsDto SetRfFilterSettings(RfFilterSettingsSetRequest req)
@@ -5591,7 +5625,8 @@ public sealed partial class RadioService : IDisposable
         if (_rfFilterStore is null)
             throw new InvalidOperationException("RF filter settings store is not configured.");
         var snap = Snapshot();
-        return _rfFilterStore.Set(req, EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
+        _rfFilterStore.Set(req, EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
+        return GetRfFilterSettings();
     }
 
     public RfFilterSettingsDto ResetRfFilterSettings()
@@ -5599,7 +5634,8 @@ public sealed partial class RadioService : IDisposable
         if (_rfFilterStore is null)
             throw new InvalidOperationException("RF filter settings store is not configured.");
         var snap = Snapshot();
-        return _rfFilterStore.Reset(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
+        _rfFilterStore.Reset(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled);
+        return GetRfFilterSettings();
     }
 
     internal bool IsTxActive()
@@ -5862,7 +5898,7 @@ public sealed partial class RadioService : IDisposable
             RandomEnabled: _preferredRadioStore?.GetG2AdcRandomEnabled() ?? true,
             MaxRxFreqMHz: 60.0,
             Supported: options.Supported,
-            Rx1AttenuatorDb: _preferredRadioStore?.GetG2Rx1AttenuatorDb() ?? 0,
+            Rx1AttenuatorDb: _physicalAttenBaselineDb[1],
             Rx1AttenuatorMinDb: 0,
             Rx1AttenuatorMaxDb: 31,
             Rx1AttenuatorSupported: options.Rx1AttenuatorSupported);
@@ -5871,6 +5907,17 @@ public sealed partial class RadioService : IDisposable
     public G2OptionsDto SetG2Options(G2OptionsSetRequest req)
     {
         _preferredRadioStore?.SetG2AdcOptions(req.DitherEnabled, req.RandomEnabled, req.Rx1AttenuatorDb);
+        lock (_sync)
+        {
+            if (req.Rx1AttenuatorDb is int baseline)
+            {
+                _physicalAttenBaselineDb[1] = Math.Clamp(baseline, 0, 31);
+                _physicalProtection[1].ClampOffset(_adcProtection, _physicalAttenBaselineDb[1]);
+                if (_p2Client is not null && ReceiverAdcSource(_state, 0) == 1)
+                    _state = ProjectPhysicalPrimaryNoLock(_state);
+                _stateDirty = true;
+            }
+        }
         var options = GetG2Options();
         // Push to whichever protocol is live. ActiveClient is non-null only for
         // Protocol 1; _p2Client only for Protocol 2 — so at most one of these
@@ -5878,6 +5925,8 @@ public sealed partial class RadioService : IDisposable
         // to (HL2 for P1; non-G2 for P2).
         ApplyG2AdcOptionsToP2Client(_p2Client, ConnectedBoardKind);
         ApplyAdcOptionsToP1Client(_activeClient, ConnectedBoardKind);
+        FlushState();
+        StateChanged?.Invoke(Snapshot());
         return options;
     }
 
@@ -5886,18 +5935,7 @@ public sealed partial class RadioService : IDisposable
         if (client is null) return;
         var options = ResolveG2AdcOptionsForWire(connectedBoard);
         client.SetAdcDitherRandom(options.DitherEnabled, options.RandomEnabled);
-        int adc1Attenuation;
-        lock (_sync)
-        {
-            // ADC1's standalone G2 preference owns byte 1442 unless the
-            // primary receiver is explicitly sourced from ADC1. In that case
-            // the front-panel S-ATT baseline/Auto offset owns the same hardware
-            // attenuator and must remain authoritative across option replays.
-            adc1Attenuation = ReceiverAdcSource(_state, 0) == 1
-                ? Math.Clamp(_atten.ClampedDb + _attOffsetDb, 0, 31)
-                : options.Rx1AttenuatorSupported ? options.Rx1AttenuatorDb : 0;
-        }
-        client.SetRx1Attenuator(adc1Attenuation);
+        ApplyPhysicalAttenuatorsToP2Client(client);
     }
 
     /// <summary>
@@ -7432,7 +7470,8 @@ public sealed partial class RadioService : IDisposable
         // ends the run. Ordinary P1 deliberately projects no extras because its
         // current ingest path only supplies RX1/RX2. SampleRate is the shared
         // capture rate for now.
-        for (int i = 2; _activeClient is null && i < _extraReceivers.Length; i++)
+        for (int i = 2; _activeClient is null &&
+            i < Math.Min(_extraReceivers.Length, EffectiveMaxReceivers); i++)
         {
             var e = _extraReceivers[i];
             if (e is null || !e.Enabled) break;
@@ -7466,6 +7505,7 @@ public sealed partial class RadioService : IDisposable
         AdcProtectionConfig adcProtection;
         FamilyFilter ssb, dig, am, fm, cw, ssbTx, amTx, fmTx, cwTx;
         List<NotchDto> notches;
+        int[] physicalBaselines;
         lock (_sync)
         {
             snap = _state;
@@ -7473,6 +7513,7 @@ public sealed partial class RadioService : IDisposable
             ssb = _ssbFilter; dig = _digFilter; am = _amFilter; fm = _fmFilter; cw = _cwFilter;
             ssbTx = _ssbTxFilter; amTx = _amTxFilter; fmTx = _fmTxFilter; cwTx = _cwTxFilter;
             notches = _notches.ToList();
+            physicalBaselines = (int[])_physicalAttenBaselineDb.Clone();
         }
 
         var rx2Snap = snap.Rx2();
@@ -7498,6 +7539,8 @@ public sealed partial class RadioService : IDisposable
                 AdcProtectionMagnitudeSoftLimit = adcProtection.MagnitudeSoftLimit,
                 AdcProtectionReleaseHoldMs = adcProtection.ReleaseHoldMs,
                 AttenDb = snap.AttenDb,
+                Adc0AttenBaselineDb = physicalBaselines[0],
+                Adc1AttenBaselineDb = physicalBaselines[1],
                 AutoAgcEnabled = snap.AutoAgcEnabled,
                 RxLevelerEnabled = snap.RxLevelerEnabled,
                 RxLevelerMode = rxLeveler.Mode,
@@ -7601,6 +7644,7 @@ public sealed partial class RadioService : IDisposable
             _p3MaxReceivers = Zeus.Contracts.WireContract.MaxReceivers;
             // Record the discovered firmware for the diagnostics snapshot.
             _connectedFirmware = firmware;
+            ResetPhysicalProtectionNoLock();
             _attOffsetDb = 0;
             _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
@@ -7682,6 +7726,7 @@ public sealed partial class RadioService : IDisposable
             _p2Active = false;
             _p2BoardKind = HpsdrBoardKind.Unknown;
             _connectedFirmware = null;
+            ResetPhysicalProtectionNoLock();
             _attOffsetDb = 0;
             _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
@@ -7738,6 +7783,7 @@ public sealed partial class RadioService : IDisposable
             _p3Active = true;
             _p3MaxReceivers = Math.Clamp(maxReceivers, 1, Zeus.Contracts.WireContract.MaxReceivers);
             _connectedFirmware = firmware;
+            ResetPhysicalProtectionNoLock();
             _attOffsetDb = 0;
             _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
@@ -7779,6 +7825,7 @@ public sealed partial class RadioService : IDisposable
             _p3Active = false;
             _p3MaxReceivers = Zeus.Contracts.WireContract.MaxReceivers;
             _connectedFirmware = null;
+            ResetPhysicalProtectionNoLock();
             _attOffsetDb = 0;
             _predictiveMagnitudeControlActive = false;
             _adcOverloadLevel = 0;
@@ -7901,10 +7948,11 @@ public sealed partial class RadioService : IDisposable
     // Board-aware count of user-visible receivers the connected radio can
     // actually expose, advertised to the frontend via StateDto.MaxReceivers so
     // the Receivers menu renders exactly the reachable slots. On Protocol-2 the
-    // standard DDC enable byte addresses DDC0..DDC7 (MaxRxDdc = 8), but
+    // enable mask addresses the verified board capacity (10 on Saturn; 8 on
+    // other boards), but
     // Orion-family boards reserve the first RxBaseDdc slots (DDC0/1) for the
     // PureSignal feedback pair, leaving user RX = MaxRxDdc - RxBaseDdc(board):
-    // 8 on Hermes-class, 6 on G2/Orion. Ordinary Protocol-1 is capped to the two
+    // 8 on Hermes-class/Saturn, 6 on other Orion-family boards. Ordinary Protocol-1 is capped to the two
     // receivers Zeus currently feeds; this is a host-ingest capability limit,
     // not a claim about the P1 wire or board gateware. Disconnected state keeps
     // the flat wire ceiling so a later P2/P3 connection can be preconfigured.
@@ -7915,7 +7963,7 @@ public sealed partial class RadioService : IDisposable
             lock (_sync)
             {
                 if (_p2Active)
-                    return Zeus.Protocol2.Protocol2Client.MaxRxDdc
+                    return Zeus.Protocol2.Protocol2Client.RxDdcCapacityFor(ConnectedBoardKind, EffectiveOrionMkIIVariant)
                          - Zeus.Protocol2.Protocol2Client.RxBaseDdc(ConnectedBoardKind);
                 if (_p3Active)
                     return _p3MaxReceivers;
@@ -8112,6 +8160,11 @@ public sealed partial class RadioService : IDisposable
         bool transmitterActive,
         long nowMs)
     {
+        if (_p2Client is not null)
+        {
+            HandlePhysicalAdcProtection(overloadBits, adc0MaxMagnitude, adc1MaxMagnitude, transmitterActive, nowMs);
+            return;
+        }
         bool changedWarning = false;
         int? effectiveToApply = null;
         bool newWarning = false;

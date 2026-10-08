@@ -19,6 +19,9 @@ public static class EngineRadioDiagnosticsEndpoints
             Results.Ok(EngineRadioDiagnosticsSnapshot.Capture(
                 services.GetService<RadioService>(),
                 services.GetService<PreferredRadioStore>())));
+        endpoints.MapGet("/api/diagnostics/rx-ingest-health", (IServiceProvider services) =>
+            Results.Ok(services.GetService<DspPipelineService>()?.SnapshotRxIngestHealth()
+                ?? new { available = false, reason = "DspPipelineService is not registered in this engine host." }));
         return endpoints;
     }
 }

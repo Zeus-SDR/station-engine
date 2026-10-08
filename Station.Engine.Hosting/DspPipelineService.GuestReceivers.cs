@@ -539,7 +539,7 @@ public partial class DspPipelineService
                     {
                         double raw = tap.IsTransmitHeld ? double.NaN : engine.GetRxaSignalDbm(chan);
                         double dbm = double.IsFinite(raw) && raw > -399.0
-                            ? raw + RadioCalibrations.RxMeterOffsetDb(_radio.EffectiveBoardKind, _radio.EffectiveOrionMkIIVariant)
+                            ? CalibrateGuestSignalDbm(raw, slot)
                             : double.NaN;
                         long now = GuestClock.GetTimestamp();
                         long hang = (long)(ListenerSquelchHang.TotalSeconds * GuestClock.TimestampFrequency);
@@ -601,11 +601,26 @@ public partial class DspPipelineService
         double raw = engine.GetRxaSignalDbm(chan);
         // -400 = xmeter never ran (docs/lessons/wdsp-init-gotchas.md): no reading.
         if (!double.IsFinite(raw) || raw <= -399.0) return;
-        double dbm = raw + RadioCalibrations.RxMeterOffsetDb(
-            _radio.EffectiveBoardKind,
-            _radio.EffectiveOrionMkIIVariant);
+        double dbm = CalibrateGuestSignalDbm(raw, slot);
         _guestPool.PublishSignalDbm(slot, guest.Generation, dbm);
     }
+
+    private double CalibrateGuestSignalDbm(double raw, int slot)
+    {
+        if (_p2Client is not { } client || !client.TryGetGuestAdcSource(slot, out byte adc)) return double.NaN;
+        return CalibrateListenerSignalDbm(raw,
+            RadioCalibrations.RxMeterOffsetDb(_radio.EffectiveBoardKind, _radio.EffectiveOrionMkIIVariant),
+            PhysicalReceiveMeterAttenuationDb(adc));
+    }
+
+    private double PhysicalReceiveMeterAttenuationDb(byte adc) => _radio.EffectivePhysicalAdcAttenuationDb(adc);
+
+    internal static double CalibrateListenerSignalDbm(double raw, double boardOffsetDb, double effectiveAttenuationDb) =>
+        double.IsFinite(raw) && raw > -399.0 ? raw + boardOffsetDb + Math.Clamp(effectiveAttenuationDb, 0, 31) : double.NaN;
+
+    private byte ActualPrimaryReceiveAdcSource() => _p2Client?.ReceiveFilters?.Banks
+        .FirstOrDefault(b => b.Demands.Any(d => d.Role == "primary"))?.PhysicalAdcSource
+        ?? PrimaryReceiverAdcSource(_radio.Snapshot());
 
     private void ClearGuestMeter(int slot, GuestRx guest) =>
         _guestPool.PublishSignalDbm(slot, guest.Generation, double.NaN);

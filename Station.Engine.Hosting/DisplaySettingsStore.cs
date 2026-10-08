@@ -239,8 +239,32 @@ public sealed class DisplaySettingsStore : IDisposable
                 HasFilterPanelImage: e.FilterPanelImageBytes is { Length: > 0 },
                 FilterPanelImageMime: string.IsNullOrEmpty(e.FilterPanelImageMime)
                     ? null
-                    : e.FilterPanelImageMime);
+                    : e.FilterPanelImageMime,
+                BandwidthFilter: e.BandwidthFilter is null ? null : NormalizeBandwidthFilter(e.BandwidthFilter));
         }
+    }
+
+    private static BandwidthFilterSettingsDto NormalizeBandwidthFilter(BandwidthFilterSettingsDto value)
+    {
+        static double Bound(double number, double min, double max, double fallback) =>
+            double.IsFinite(number) ? Math.Clamp(number, min, max) : fallback;
+        return value with
+        {
+            RxRefreshFps = Math.Floor(Bound(value.RxRefreshFps, 5, 60, 30) + 0.5),
+            TxRefreshFps = Math.Floor(Bound(value.TxRefreshFps, 4, 30, 20) + 0.5),
+            ResponseSpeed = Bound(value.ResponseSpeed, 0.25, 4, 1),
+            PeakDecaySpeed = Bound(value.PeakDecaySpeed, 0.25, 4, 1),
+            EqAverageMs = Math.Floor(Bound(value.EqAverageMs, 250, 10000, 5000) + 0.5),
+            MarkerMinSnrDb = Math.Floor(Bound(value.MarkerMinSnrDb, 3, 20, 6) + 0.5),
+            SnapRadiusHz = Math.Floor(Bound(value.SnapRadiusHz, 0, 500, 150) + 0.5),
+            FitMarginHz = Math.Floor(Bound(value.FitMarginHz, 0, 500, 120) + 0.5),
+            TraceSmoothingMs = Math.Floor(Bound(value.TraceSmoothingMs, 0, 1000, 120) + 0.5),
+            SignalHeightPercent = Math.Floor(Bound(value.SignalHeightPercent, 30, 100, 80) + 0.5),
+            EqHoverMagnification = Bound(value.EqHoverMagnification ?? 1.5, 1, 3, 1.5),
+            InspectionRefreshHz = Math.Floor(Bound(value.InspectionRefreshHz ?? 2, 1, 8, 2) + 0.5),
+            InspectionAverageMs = Math.Floor(Bound(value.InspectionAverageMs ?? 1000, 0, 5000, 1000) + 0.5),
+            TxSpectrumAverageMs = Math.Floor(Bound(value.TxSpectrumAverageMs ?? 200, 0, 1000, 200) + 0.5),
+        };
     }
 
     public bool GetWidebandDisplayEnabled()
@@ -280,7 +304,8 @@ public sealed class DisplaySettingsStore : IDisposable
         int? rxDisplayFftSize = null,
         string? waterfallLowColor = null,
         string? waterfallMidColor = null,
-        string? waterfallHighColor = null)
+        string? waterfallHighColor = null,
+        BandwidthFilterSettingsDto? bandwidthFilter = null)
     {
         lock (_sync)
         {
@@ -288,6 +313,7 @@ public sealed class DisplaySettingsStore : IDisposable
             e.Mode = NormalizeMode(mode);
             e.Fit = NormalizeFit(fit);
             e.RxTraceColor = NormalizeHexColor(rxTraceColor);
+            if (bandwidthFilter is not null) e.BandwidthFilter = NormalizeBandwidthFilter(bandwidthFilter);
             // Accept a (min, max) pair only when it's a non-degenerate window.
             // The old code wrote whatever the client sent, so a dB drag that
             // hit the abs-limit on both endpoints persisted min == max == -200
@@ -524,6 +550,7 @@ public sealed class CombinedBackgroundImageStorageException : InvalidOperationEx
 
 public sealed class DisplaySettingsEntry
 {
+    public BandwidthFilterSettingsDto? BandwidthFilter { get; set; }
     public int Id { get; set; }
     public string Mode { get; set; } = "basic";
     public string Fit { get; set; } = "fill";

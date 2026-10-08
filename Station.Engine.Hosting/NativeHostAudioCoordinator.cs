@@ -11,7 +11,8 @@ internal sealed record NativeHostAudioState(
     AsioSessionRuntime? AsioRuntime,
     string? AsioError,
     bool InputEnabled,
-    bool OutputEnabled);
+    bool OutputEnabled,
+    string? AsioAttemptedDriverId = null);
 
 internal interface ISystemHostAudioController
 {
@@ -75,6 +76,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
     private AudioHostApi _activeBackend = AudioHostApi.System;
     private AudioDeviceSettings _activeSettings;
     private string? _asioError;
+    private string? _lastAsioAttemptDriverId;
     private int _recoveryScheduled;
     private bool _started;
     private bool _stopping;
@@ -128,7 +130,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 runtime,
                 Volatile.Read(ref _asioError),
                 InputEnabled: _mic is not null,
-                OutputEnabled: _sink?.OutputEnabled == true);
+                OutputEnabled: _sink?.OutputEnabled == true,
+                AsioAttemptedDriverId: Volatile.Read(ref _lastAsioAttemptDriverId));
         }
     }
 
@@ -143,6 +146,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             if (_activeSettings.Backend != AudioHostApi.Asio) return;
             try
             {
+                Volatile.Write(ref _lastAsioAttemptDriverId, _activeSettings.AsioDriverId);
                 StopSystem();
                 _activeSettings = PrepareAsioSettings(_activeSettings, forceRefresh: true);
                 StartAsio(_activeSettings);
@@ -225,6 +229,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         {
             var previous = _activeSettings;
             var previousBackend = _activeBackend;
+            if (proposed.Backend == AudioHostApi.Asio)
+                Volatile.Write(ref _lastAsioAttemptDriverId, proposed.AsioDriverId);
             StopActive();
             try
             {
@@ -251,6 +257,16 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 {
                     rollbackError = ex;
                     try { StartSystem(previous); } catch { /* no further fallback */ }
+                }
+
+                if (proposed.Backend == AudioHostApi.Asio)
+                {
+                    _log.LogWarning(
+                        applyError,
+                        "audio.asio apply failed driver={DriverName} id={DriverId}; restored {Backend}",
+                        AsioDriverName(proposed.AsioDriverId) ?? "unknown",
+                        proposed.AsioDriverId,
+                        _activeBackend);
                 }
 
                 if (rollbackError is not null)
@@ -340,9 +356,46 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
-            _probeFailures[driverId] = ex.Message;
-            throw;
+            var thrown = EnrichInstantiationFailure(ex, driverId);
+            _probeFailures[driverId] = thrown.Message;
+            if (ReferenceEquals(thrown, ex)) throw;
+            throw thrown;
         }
+    }
+
+    /// <summary>Best-effort display name for a driver id from the enumerated
+    /// driver list. Never throws: a name lookup must not mask the real error.</summary>
+    internal string? AsioDriverName(string? driverId)
+    {
+        if (string.IsNullOrWhiteSpace(driverId)) return null;
+        try
+        {
+            return _asioFactory.EnumerateDrivers()
+                .FirstOrDefault(driver => string.Equals(driver.Id, driverId, StringComparison.OrdinalIgnoreCase))
+                ?.Name;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// When a native probe or open failed because the ASIO driver could not be
+    /// instantiated, appends the registry-diagnosed plain-language cause to the
+    /// message, keeping the original exception as InnerException and the
+    /// InvalidOperationException type the endpoint maps to HTTP 400. Every other
+    /// failure flows through unchanged.
+    /// </summary>
+    private Exception EnrichInstantiationFailure(Exception error, string? driverId)
+    {
+        if (error is not InvalidOperationException || string.IsNullOrWhiteSpace(driverId))
+            return error;
+        var enriched = AsioDriverRegistrationDiagnostics.EnrichInstantiationFailureMessage(
+            error.Message, driverId, AsioDriverName(driverId));
+        return string.Equals(enriched, error.Message, StringComparison.Ordinal)
+            ? error
+            : new InvalidOperationException(enriched, error);
     }
 
     private static int? FirstSupportedOutputPair(IReadOnlyList<AsioChannelInfo> outputs)
@@ -425,7 +478,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             out var failure);
         if (session is null)
         {
-            if (failure is not null) throw failure;
+            if (failure is not null) throw EnrichInstantiationFailure(failure, settings.AsioDriverId);
             throw new TimeoutException($"The ASIO driver did not open within {OpenTimeout.TotalSeconds:0} seconds.");
         }
         AsioSessionRuntime runtime;

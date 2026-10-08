@@ -13,7 +13,7 @@ namespace Zeus.Server;
 /// in Morse at least every <see cref="CwIdSettingsDto.IntervalMinutes"/>
 /// minutes of operating, mixed into the operator's own voice transmission.
 ///
-/// <para><b>It never starts a transmission.</b> The ID reaches the air only
+/// <para><b>The timer never starts a transmission.</b> Its ID reaches the air only
 /// through <see cref="MixTxBlock"/>, which <see cref="TxAudioIngest"/> calls
 /// with mic blocks already on their way to a keyed TXA, and
 /// <see cref="MixTailBlock"/>, which finishes an ID already on the air while an
@@ -30,6 +30,8 @@ namespace Zeus.Server;
 /// it through <see cref="MixTailBlock"/>, so it goes out once instead of being
 /// cut and resent. Only an emergency release (trip, disconnect) cuts it short;
 /// that partial ID is cancelled and stays due.</para>
+/// <para>An explicit Instant ID request uses the transmit service's guarded
+/// key/send/release transaction and the same synthesized audio tail.</para>
 /// </summary>
 public sealed class CwIdService : IDisposable
 {
@@ -56,6 +58,31 @@ public sealed class CwIdService : IDisposable
     private long? _periodStartMs;
     private long? _keyedSinceMs;
     private DateTime? _lastIdUtc;
+    private bool _instantSending;
+    private long _instantLeadSamples;
+    private string? _instantCallsign;
+    internal bool InstantCompleted { get; private set; }
+
+    internal bool BeginInstant(string callsign, int settleMs, out string? error)
+    {
+        lock (_sync)
+        {
+            if (_mixer.Active)
+            {
+                error = "A CW ID is already being sent.";
+                return false;
+            }
+            _mixer.Begin(callsign, _settings.Wpm, _settings.ToneHz, _settings.LevelDb);
+            _instantSending = true;
+            _instantCallsign = callsign;
+            if (!_running) _callsign = callsign;
+            InstantCompleted = false;
+            _instantLeadSamples = Math.Max(StartHoldMs, settleMs) * 48;
+            _sendingFinal = _finalArmed;
+            error = null;
+            return true;
+        }
+    }
 
     public CwIdService(CwIdSettingsStore store, TxService tx, RadioService radio, ILogger<CwIdService> log)
         : this(store.Get(), () => radio.CurrentMode, () => Environment.TickCount64, log)
@@ -135,7 +162,7 @@ public sealed class CwIdService : IDisposable
                 secondsUntilDue = (int)Math.Max(0, (IntervalMs - (now - start) + 999) / 1000);
             return new CwIdStatusDto(
                 Running: _running,
-                Callsign: _callsign,
+                Callsign: _instantSending ? _instantCallsign : _callsign,
                 Due: IsDueLocked(now),
                 Sending: _mixer.Active,
                 FinalIdArmed: _finalArmed,
@@ -159,6 +186,9 @@ public sealed class CwIdService : IDisposable
         bool startedFinal = false;
         lock (_sync)
         {
+            // The manual transaction owns the synthesized tail, independently
+            // of microphone availability and the selected audio input.
+            if (_instantSending) return;
             if (!_running && !_finalArmed && !_mixer.Active) return;
             long now = _nowMs();
             _keyedSinceMs ??= now;
@@ -202,6 +232,14 @@ public sealed class CwIdService : IDisposable
         lock (_sync)
         {
             if (!_mixer.Active) return false;
+            if (_instantSending && _instantLeadSamples > 0)
+            {
+                int silence = (int)Math.Min(block.Length, _instantLeadSamples);
+                block.Clear();
+                _instantLeadSamples -= silence;
+                block = block[silence..];
+                if (block.IsEmpty) return true;
+            }
             if (_mixer.MixInto(block)) CompleteLocked(_nowMs());
             return true;
         }
@@ -220,6 +258,8 @@ public sealed class CwIdService : IDisposable
             // (a periodic ID because its period has not been reset, a final
             // ID by re-arming it).
             _mixer.Cancel();
+            _instantSending = false;
+            _instantLeadSamples = 0;
             if (_sendingFinal) _finalArmed = true;
             _sendingFinal = false;
         }
@@ -235,6 +275,13 @@ public sealed class CwIdService : IDisposable
 
     private void CompleteLocked(long now)
     {
+        if (_instantSending)
+        {
+            InstantCompleted = true;
+            if (_running) _transmittedSinceStart = true;
+        }
+        _instantSending = false;
+        _instantLeadSamples = 0;
         _lastIdUtc = DateTime.UtcNow;
         if (_sendingFinal)
         {

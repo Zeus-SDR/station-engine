@@ -1431,17 +1431,17 @@ public static class WireContract
     public const int Version = 3;
 
     /// <summary>Maximum hardware receiver/DDC count the state contract can
-    /// represent. Protocol 2 is lower on some boards because its DDC-enable byte
-    /// addresses only DDC0..DDC7; <see cref="StateDto.MaxReceivers"/> carries the
+    /// represent. Protocol 2 is lower on some boards because only
+    /// eight physical DDCs are implemented; <see cref="StateDto.MaxReceivers"/> carries the
     /// active protocol/board ceiling to the frontend. The shared contract keeps
     /// ten hardware slots so Protocol 3-capable G2/Saturn firmware can expose
     /// RX1..RX10 without colliding with software receiver slots.</summary>
     public const int MaxReceivers = 10;
 
-    /// <summary>Protocol 2 DDC-enable wire ceiling. The P2 command is still a
-    /// single byte, so DDC0..DDC7 is the hard P2 limit even though the shared
-    /// receiver state contract can represent more for Protocol 3.</summary>
-    public const int Protocol2MaxDdc = 8;
+    /// <summary>Maximum supported Protocol 2 DDC storage. Saturn has ten DDCs
+    /// enabled by the little-endian 16-bit mask at command bytes 7/8. Other
+    /// boards retain their verified eight-DDC capacity.</summary>
+    public const int Protocol2MaxDdc = 10;
 
     /// <summary>Reserved receiver index for the non-hardware KiwiSDR slice. It
     /// sits just above the hardware receiver range so RX10 remains available to
@@ -2553,7 +2553,13 @@ public sealed record AdcProtectionStatusDto(
     ushort? Adc1MaxMagnitude,
     ushort Adc0MaxMagnitudeAtOverload,
     ushort Adc1MaxMagnitudeAtOverload,
-    DateTimeOffset? LastTelemetryUtc);
+    DateTimeOffset? LastTelemetryUtc,
+    byte PrimaryAdcSource = 0,
+    IReadOnlyList<PhysicalAdcProtectionStatusDto>? PhysicalAdcs = null);
+
+public sealed record PhysicalAdcProtectionStatusDto(byte PhysicalAdcSource, int BaselineDb, int OffsetDb,
+    int EffectiveDb, bool ProtectionEnabled, bool ActiveReceiveDemand, bool Warning, int OverloadLevel,
+    bool HardOverload, ushort? PeakMagnitude, bool TelemetryFresh, double? PeakDbfs, double? HeadroomDb);
 
 public sealed record AutoAgcSetRequest(bool Enabled);
 
@@ -3134,7 +3140,12 @@ public sealed record RfFilterActiveDto(
     string Rx2Label,
     string TxKey,
     string TxLabel,
-    string Reason);
+    string Reason,
+    IReadOnlyList<RfFilterBankActiveDto>? Banks = null);
+
+public sealed record RfFilterDemandDto(string Role, int ReceiverIndex, long HardwareCenterHz);
+public sealed record RfFilterBankActiveDto(byte PhysicalAdcSource, long HardwareCenterHz,
+    string FilterKey, string FilterLabel, string Reason, IReadOnlyList<RfFilterDemandDto> Demands);
 
 public sealed record RfFilterSettingsDto(
     bool Supported,
@@ -3146,14 +3157,19 @@ public sealed record RfFilterSettingsDto(
     bool RxBypassOnPureSignal,
     IReadOnlyList<RfFilterProfileDto> Profiles,
     RfFilterActiveDto Active,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings,
+    bool Rx6mLnaControlSupported = false,
+    bool? Adc0Rx6mLnaDisabled = null,
+    bool? Adc1Rx6mLnaDisabled = null);
 
 public sealed record RfFilterSettingsSetRequest(
     bool CustomMatrixEnabled,
     bool RxBypassAll,
     bool RxBypassOnTx,
     bool RxBypassOnPureSignal,
-    IReadOnlyList<RfFilterProfileDto> Profiles);
+    IReadOnlyList<RfFilterProfileDto> Profiles,
+    bool? Adc0Rx6mLnaDisabled = null,
+    bool? Adc1Rx6mLnaDisabled = null);
 
 // Compact runtime shape pushed from RadioService to Protocol2Client. It keeps
 // Protocol2 free of LiteDB/store concerns while letting tests exercise the same
@@ -3166,7 +3182,9 @@ public sealed record RfFilterRuntimeSettings(
     bool RxBypassOnPureSignal,
     IReadOnlyList<RfFilterRangeDto> Anan7000RxFilters,
     IReadOnlyList<RfFilterRangeDto> ClassicAlexRxFilters,
-    IReadOnlyList<RfFilterRangeDto> TxFilters);
+    IReadOnlyList<RfFilterRangeDto> TxFilters,
+    bool? Adc0Rx6mLnaDisabled = null,
+    bool? Adc1Rx6mLnaDisabled = null);
 
 // Panadapter background settings — Mode is one of "basic" | "beam-map" |
 // "image"; Fit is one of "fit" | "fill" | "stretch". Image bytes are NOT
@@ -3182,6 +3200,26 @@ public sealed record RfFilterRuntimeSettings(
 // port on every launch, which orphans any per-origin localStorage value. The
 // FilterPanel* fields independently customize the Bandwidth Filter mini-pan;
 // its image bytes are fetched from /api/display-settings/filter-image.
+// Browser-rendered Bandwidth Filter preferences. These never configure DSP.
+public sealed record BandwidthFilterSettingsDto(
+    double RxRefreshFps = 30,
+    double TxRefreshFps = 20,
+    double ResponseSpeed = 1,
+    double PeakDecaySpeed = 1,
+    double EqAverageMs = 5000,
+    double MarkerMinSnrDb = 6,
+    double SnapRadiusHz = 150,
+    double FitMarginHz = 120,
+    bool ShowPeakTrail = true,
+    bool ShowSignalBrackets = true,
+    double TraceSmoothingMs = 120,
+    double SignalHeightPercent = 80,
+    // Null distinguishes older stored rows from an explicit numeric setting.
+    double? EqHoverMagnification = 1.5,
+    double? InspectionRefreshHz = 2,
+    double? InspectionAverageMs = 1000,
+    double? TxSpectrumAverageMs = 200);
+
 public sealed record DisplaySettingsDto(
     string Mode,
     string Fit,
@@ -3239,7 +3277,8 @@ public sealed record DisplaySettingsDto(
     string FilterPanelBgColor = "#262A33",
     int FilterPanelBgBrightness = 50,
     bool HasFilterPanelImage = false,
-    string? FilterPanelImageMime = null);
+    string? FilterPanelImageMime = null,
+    BandwidthFilterSettingsDto? BandwidthFilter = null);
 
 public sealed record DisplaySettingsSetRequest(
     string Mode,
@@ -3278,7 +3317,8 @@ public sealed record DisplaySettingsSetRequest(
     string? GlobeCustomImageryJson = null,
     string? FilterPanelBgMode = null,
     string? FilterPanelBgColor = null,
-    int? FilterPanelBgBrightness = null);
+    int? FilterPanelBgBrightness = null,
+    BandwidthFilterSettingsDto? BandwidthFilter = null);
 
 // One detected wideband signal, as reported by the engine's deterministic
 // wideband signal detector. Frequencies are absolute Hz in the wideband ADC

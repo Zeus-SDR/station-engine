@@ -119,7 +119,8 @@ internal static class P2WidebandZoomPolicy
         int sampleRateHz,
         long targetCenterHz,
         double requestedSpanHz,
-        int guestDdcCount = 0)
+        int guestDdcCount = 0,
+        int ddcCapacity = Zeus.Protocol2.Protocol2Client.StandardRxDdcCapacity)
     {
         // The hidden stream must extend the already-contiguous user run, which
         // is exactly the run the protocol client composes
@@ -137,9 +138,9 @@ internal static class P2WidebandZoomPolicy
         int guests = Math.Clamp(
             guestDdcCount,
             0,
-            Zeus.Protocol2.Protocol2Client.GuestDdcCapacityBehind(firstFree, displayDdcWanted: true));
+            Zeus.Protocol2.Protocol2Client.GuestDdcCapacityBehind(firstFree, displayDdcWanted: true, ddcCapacity));
         int candidate = firstFree + guests;
-        if (candidate is >= 2 and < Zeus.Protocol2.Protocol2Client.MaxRxDdc)
+        if (candidate >= 2 && candidate < ddcCapacity)
         {
             return new P2WidebandDetailSource(
                 P2WidebandDetailSourceKind.HiddenDdc,

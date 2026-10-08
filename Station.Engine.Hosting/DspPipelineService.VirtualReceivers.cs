@@ -543,6 +543,7 @@ public partial class DspPipelineService
         long now = GuestClock.GetTimestamp();
         long hangTicks = (long)(ListenerSquelchHang.TotalSeconds * GuestClock.TimestampFrequency);
         double calOffsetDb = RadioCalibrations.RxMeterOffsetDb(_radio.EffectiveBoardKind, _radio.EffectiveOrionMkIIVariant);
+        double physicalAttenuationDb = PhysicalReceiveMeterAttenuationDb(ActualPrimaryReceiveAdcSource());
         for (int slot = 0; slot < _vrx.Length; slot++)
         {
             var vrx = _vrx[slot];
@@ -558,7 +559,7 @@ public partial class DspPipelineService
                 {
                     double raw = engine.GetRxaSignalDbm(chan);
                     // -400 = xmeter never ran (docs/lessons/wdsp-init-gotchas.md): no reading.
-                    if (double.IsFinite(raw) && raw > -399.0) dbm = raw + calOffsetDb;
+                    dbm = CalibrateListenerSignalDbm(raw, calOffsetDb, physicalAttenuationDb);
                 }
                 vrx.LastDbm = dbm;
                 _vrxPool.PublishMeter(slot, generation, dbm);

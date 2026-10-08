@@ -172,6 +172,7 @@ public static class StationEngineEndpoints
         // the route used to be mapped only by the product host, so the IMD
         // tool 404'd against a standalone engine (attach mode).
         endpoints.MapImdMeasure();
+        endpoints.MapTxSpectrum();
         endpoints.MapTdoaEndpoints();
         endpoints.MapTdoaContributionEndpoints();
         // Same field gap as ImdMeasure: the SPA's Windows Firewall control

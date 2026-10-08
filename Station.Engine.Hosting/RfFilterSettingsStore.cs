@@ -45,25 +45,52 @@ public sealed class RfFilterSettingsStore : IDisposable
         _log.LogInformation("RfFilterSettingsStore initialized at {Path}", dbPath);
     }
 
-    public RfFilterSettingsDto GetDto(HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled)
+    public RfFilterSettingsDto GetDto(HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled, bool protocolSupported = true, ReceiveRfSnapshot? hardware = null, bool rx6mLnaControlSupported = false)
     {
         var settings = GetSettings();
         string activeKey = ProfileKeyFor(board);
         var profile = settings.Profiles.First(p => p.Key == activeKey);
-        long rx1Hz = ClampHz(state.VfoHz);
-        long rx2Hz = ClampHz(state.Rx2Enabled ? state.Rx2().VfoHz : state.VfoHz);
-        long txHz = ClampHz(RadioFrequencyResolver.TxFrequencyHz(state));
+        long rx1Hz = ClampHz(hardware?.Rx1HardwareHz ?? (state.RadioLoHz > 0 ? state.RadioLoHz : state.VfoHz));
+        long rx2Hz = ClampHz(hardware?.Rx2HardwareHz ?? (state.Rx2Enabled ? state.Rx2().VfoHz : rx1Hz));
+        long txHz = ClampHz(hardware?.TxHardwareHz ?? RadioFrequencyResolver.TxFrequencyHz(state));
         bool bypassed = settings.RxBypassAll
             || (txActive && settings.RxBypassOnTx)
             || (txActive && psEnabled && settings.RxBypassOnPureSignal);
         string reason = BypassReason(settings, txActive, psEnabled);
 
-        var rx1 = ResolveActive(profile.RxFilters, rx1Hz, bypassed);
-        var rx2 = ResolveActive(profile.RxFilters, rx2Hz, bypassed);
-        var tx = ResolveActive(profile.TxFilters, txHz, bypassed: false);
+        var defaults = activeKey == ClassicProfileKey ? DefaultClassicProfile() : DefaultAnanProfile();
+        var effective = settings.CustomMatrixEnabled ? profile : defaults;
+        var rx1 = ResolveActive(effective.RxFilters, defaults.RxFilters, rx1Hz, bypassed);
+        var rx2 = ResolveActive(effective.RxFilters, defaults.RxFilters, rx2Hz, bypassed);
+        var tx = ResolveActive(effective.TxFilters, defaults.TxFilters, txHz, bypassed: false);
+        RfFilterBankActiveDto[]? banks = hardware?.Banks.Select(bank =>
+        {
+            string label = defaults.RxFilters.FirstOrDefault(r => r.Key == bank.FilterKey)?.Label ?? "Unknown relay selection";
+            return new RfFilterBankActiveDto(bank.PhysicalAdcSource, bank.HardwareCenterHz, bank.FilterKey,
+                label, bank.Reason, bank.Demands.Select(d => new RfFilterDemandDto(d.Role, d.ReceiverIndex, d.HardwareCenterHz)).ToArray());
+        }).ToArray();
+        if (banks is not null)
+        {
+            if (banks.FirstOrDefault(b => b.PhysicalAdcSource == 0) is { } b0)
+            {
+                rx1Hz = b0.HardwareCenterHz;
+                rx1 = new(b0.FilterKey, b0.FilterLabel, rx1Hz, rx1Hz);
+            }
+            if (banks.FirstOrDefault(b => b.PhysicalAdcSource == 1) is { } b1)
+            {
+                rx2Hz = b1.HardwareCenterHz;
+                rx2 = new(b1.FilterKey, b1.FilterLabel, rx2Hz, rx2Hz);
+            }
+            reason = banks.Any(b => b.Reason == "transmit-relay-policy")
+                ? "Most recently composed command uses the existing transmit relay policy."
+                : banks.Any(b => b.Reason == "feedback-relay-policy")
+                    ? "Most recently composed command uses the existing feedback relay policy."
+                    : "Most recently composed command bank selections; compatibility checks receive centers only.";
+        }
+        if (!protocolSupported) reason = "Editable RF filter matrix is available on Protocol 2 only.";
 
         return new RfFilterSettingsDto(
-            Supported: SupportsRfFilters(board),
+            Supported: protocolSupported && SupportsRfFilters(board),
             BoardFamily: BoardFamilyLabel(board),
             ActiveProfileKey: activeKey,
             CustomMatrixEnabled: settings.CustomMatrixEnabled,
@@ -84,8 +111,12 @@ public sealed class RfFilterSettingsStore : IDisposable
                 Rx2Label: rx2.Label,
                 TxKey: tx.Key,
                 TxLabel: tx.Label,
-                Reason: reason),
-            Warnings: Validate(settings.Profiles));
+                Reason: reason,
+                Banks: banks),
+            Warnings: Validate(settings.Profiles),
+            Rx6mLnaControlSupported: protocolSupported && rx6mLnaControlSupported,
+            Adc0Rx6mLnaDisabled: settings.Adc0Rx6mLnaDisabled,
+            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled);
     }
 
     public RfFilterRuntimeSettings GetRuntime(HpsdrBoardKind board)
@@ -101,7 +132,9 @@ public sealed class RfFilterSettingsStore : IDisposable
             RxBypassOnPureSignal: settings.RxBypassOnPureSignal,
             Anan7000RxFilters: anan.RxFilters,
             ClassicAlexRxFilters: classic.RxFilters,
-            TxFilters: active.TxFilters);
+            TxFilters: active.TxFilters,
+            Adc0Rx6mLnaDisabled: settings.Adc0Rx6mLnaDisabled,
+            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled);
     }
 
     public RfFilterSettingsDto Set(RfFilterSettingsSetRequest req, HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled)
@@ -143,6 +176,8 @@ public sealed class RfFilterSettingsStore : IDisposable
             RxBypassAll: req.RxBypassAll,
             RxBypassOnTx: req.RxBypassOnTx,
             RxBypassOnPureSignal: req.RxBypassOnPureSignal,
+            Adc0Rx6mLnaDisabled: req.Adc0Rx6mLnaDisabled,
+            Adc1Rx6mLnaDisabled: req.Adc1Rx6mLnaDisabled,
             Profiles: new[]
             {
                 MergeProfile(DefaultAnanProfile(), incoming.FirstOrDefault(p => p.Key == AnanProfileKey)),
@@ -209,12 +244,13 @@ public sealed class RfFilterSettingsStore : IDisposable
         }
     }
 
-    private static RfFilterRangeDto ResolveActive(IReadOnlyList<RfFilterRangeDto> rows, long hz, bool bypassed)
+    private static RfFilterRangeDto ResolveActive(IReadOnlyList<RfFilterRangeDto> rows,
+        IReadOnlyList<RfFilterRangeDto> defaults, long hz, bool bypassed)
     {
         if (bypassed)
             return new RfFilterRangeDto("bypass", "Bypass (forced)", hz, hz);
         var row = rows.FirstOrDefault(r => hz >= r.StartHz && hz <= r.EndHz)
-            ?? new RfFilterRangeDto("auto", "Auto fallback", hz, hz);
+            ?? defaults.First(r => hz >= r.StartHz && hz <= r.EndHz);
         return row.ForceBypass
             ? row with { Label = $"{row.Label} -> Bypass" }
             : row;
@@ -303,6 +339,8 @@ public sealed class RfFilterSettingsStore : IDisposable
         RxBypassAll = s.RxBypassAll,
         RxBypassOnTx = s.RxBypassOnTx,
         RxBypassOnPureSignal = s.RxBypassOnPureSignal,
+        Adc0Rx6mLnaDisabled = s.Adc0Rx6mLnaDisabled,
+        Adc1Rx6mLnaDisabled = s.Adc1Rx6mLnaDisabled,
         Profiles = s.Profiles.Select(ToProfileEntry).ToList(),
         UpdatedUtc = DateTime.UtcNow,
     };
@@ -329,6 +367,8 @@ public sealed class RfFilterSettingsStore : IDisposable
         RxBypassAll: e.RxBypassAll,
         RxBypassOnTx: e.RxBypassOnTx,
         RxBypassOnPureSignal: e.RxBypassOnPureSignal,
+        Adc0Rx6mLnaDisabled: e.Adc0Rx6mLnaDisabled,
+        Adc1Rx6mLnaDisabled: e.Adc1Rx6mLnaDisabled,
         Profiles: (e.Profiles ?? new()).Select(FromProfileEntry).ToArray());
 
     private static RfFilterProfileDto FromProfileEntry(RfFilterProfileEntry p) => new(
@@ -350,6 +390,8 @@ public sealed class RfFilterSettingsEntry
     public bool RxBypassAll { get; set; }
     public bool RxBypassOnTx { get; set; }
     public bool RxBypassOnPureSignal { get; set; }
+    public bool? Adc0Rx6mLnaDisabled { get; set; }
+    public bool? Adc1Rx6mLnaDisabled { get; set; }
     public List<RfFilterProfileEntry> Profiles { get; set; } = new();
     public DateTime UpdatedUtc { get; set; }
 }

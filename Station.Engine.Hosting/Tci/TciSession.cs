@@ -43,7 +43,6 @@
 // License for details.
 
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using Zeus.Contracts;
@@ -57,9 +56,9 @@ namespace Zeus.Server.Tci;
 ///
 /// Outbound architecture mirrors Thetis TCIServer: three priority queues
 /// (Urgent / Binary / Control) drained by a single send loop in priority
-/// order. Queues are unbounded — backpressure is provided implicitly by
-/// the underlying socket send window; on a write exception, the session
-/// is torn down.
+/// order. A frame/byte budget bounds retained data when a socket stalls.
+/// Old binary samples are evicted first; an overflowing control backlog
+/// disconnects the client instead of silently losing commands.
 /// </summary>
 public sealed class TciSession : IDisposable
 {
@@ -101,10 +100,19 @@ public sealed class TciSession : IDisposable
     private int _diglOffsetHz;
     private int _diguOffsetHz;
 
-    private readonly ConcurrentQueue<TciOutboundFrame> _urgentQueue = new();
-    private readonly ConcurrentQueue<TciOutboundFrame> _binaryQueue = new();
-    private readonly ConcurrentQueue<TciOutboundFrame> _controlQueue = new();
-    private readonly SemaphoreSlim _outboundSignal = new(0);
+    private const int MaxQueuedFrames = 256;
+    private const int MaxQueuedBytes = 4 * 1024 * 1024;
+    private readonly object _outboundLock = new();
+    private readonly Queue<TciOutboundFrame> _urgentQueue = new();
+    private readonly Queue<TciOutboundFrame> _binaryQueue = new();
+    private readonly Queue<TciOutboundFrame> _controlQueue = new();
+    // A notification, not one permit per frame: evicting queued samples must
+    // not accumulate stale permits and turn the sender into a busy loop.
+    private readonly SemaphoreSlim _outboundSignal = new(0, 1);
+    private int _queuedFrames;
+    private long _queuedBytes;
+    private bool _outboundClosed;
+    private int _disposed;
 
     // Track current drive level so we can echo it back on query
     private int _lastDrivePercent = 50;
@@ -306,19 +314,45 @@ public sealed class TciSession : IDisposable
 
     private void Enqueue(TciOutboundFrame frame, TciOutboundPriority priority)
     {
-        switch (priority)
+        bool overflow = false;
+        lock (_outboundLock)
         {
-            case TciOutboundPriority.Urgent:
-                _urgentQueue.Enqueue(frame);
-                break;
-            case TciOutboundPriority.Binary:
-                _binaryQueue.Enqueue(frame);
-                break;
-            default:
-                _controlQueue.Enqueue(frame);
-                break;
+            if (_outboundClosed) return;
+            // A single oversized binary frame cannot fit even in an empty
+            // queue. Drop it without evicting useful pending samples.
+            if (frame.ByteCount > MaxQueuedBytes && frame.IsBinary) return;
+            while ((_queuedFrames >= MaxQueuedFrames || _queuedBytes + frame.ByteCount > MaxQueuedBytes)
+                && _binaryQueue.TryDequeue(out var stale))
+            {
+                _queuedFrames--;
+                _queuedBytes -= stale.ByteCount;
+            }
+            if (_queuedFrames >= MaxQueuedFrames || _queuedBytes + frame.ByteCount > MaxQueuedBytes)
+            {
+                if (frame.IsBinary) return;
+                _outboundClosed = true;
+                ClearOutboundQueues();
+                overflow = true;
+            }
+            else
+            {
+                var queue = priority switch
+                {
+                    TciOutboundPriority.Urgent => _urgentQueue,
+                    TciOutboundPriority.Binary => _binaryQueue,
+                    _ => _controlQueue,
+                };
+                queue.Enqueue(frame);
+                _queuedFrames++;
+                _queuedBytes += frame.ByteCount;
+            }
+            if (_outboundSignal.CurrentCount == 0) _outboundSignal.Release();
         }
-        _outboundSignal.Release();
+        if (overflow)
+        {
+            _log.LogWarning("tci outbound control backlog exceeded budget; disconnecting client={Id}", _id);
+            _ws.Abort();
+        }
     }
 
     private async Task SendHandshakeAsync(CancellationToken ct)
@@ -354,7 +388,7 @@ public sealed class TciSession : IDisposable
             while (!ct.IsCancellationRequested && _ws.State == WebSocketState.Open)
             {
                 await _outboundSignal.WaitAsync(ct);
-                if (TryDequeueNext(out var frame))
+                while (!ct.IsCancellationRequested && TryDequeueNext(out var frame))
                 {
                     await SendFrameAsync(frame, ct);
                 }
@@ -373,11 +407,28 @@ public sealed class TciSession : IDisposable
 
     private bool TryDequeueNext(out TciOutboundFrame frame)
     {
-        if (_urgentQueue.TryDequeue(out frame)) return true;
-        if (_binaryQueue.TryDequeue(out frame)) return true;
-        if (_controlQueue.TryDequeue(out frame)) return true;
-        frame = default;
-        return false;
+        lock (_outboundLock)
+        {
+            if (_urgentQueue.TryDequeue(out frame)
+                || _binaryQueue.TryDequeue(out frame)
+                || _controlQueue.TryDequeue(out frame))
+            {
+                _queuedFrames--;
+                _queuedBytes -= frame.ByteCount;
+                return true;
+            }
+            frame = default;
+            return false;
+        }
+    }
+
+    private void ClearOutboundQueues()
+    {
+        _urgentQueue.Clear();
+        _binaryQueue.Clear();
+        _controlQueue.Clear();
+        _queuedFrames = 0;
+        _queuedBytes = 0;
     }
 
     private async Task SendFrameAsync(TciOutboundFrame frame, CancellationToken ct)
@@ -2223,8 +2274,15 @@ public sealed class TciSession : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _rateLimiter.Dispose();
-        _outboundSignal.Dispose();
+        lock (_outboundLock)
+        {
+            _outboundClosed = true;
+            ClearOutboundQueues();
+            _outboundSignal.Dispose();
+        }
+        _ws.Abort();
     }
 }
 
@@ -2241,6 +2299,8 @@ internal readonly struct TciOutboundFrame
     public readonly byte[]? Bytes;
 
     public bool IsBinary => Bytes is not null;
+    // Account for retained UTF-16 text, even though TCI sends ASCII bytes.
+    public long ByteCount => Bytes?.LongLength ?? (long)Text!.Length * sizeof(char);
 
     public TciOutboundFrame(string text)
     {

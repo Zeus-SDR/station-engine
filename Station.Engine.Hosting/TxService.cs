@@ -1241,6 +1241,92 @@ public sealed class TxService
     public bool TrySetMox(bool on, out string? error)
         => TrySetMox(on, MoxSource.UI, out error);
 
+    private int _instantCwIdRequestActive;
+
+    internal bool TrySendInstantCwId(CwIdService cwId, string? rawCallsign, string? remoteLeaseId, out string? error)
+    {
+        if (Interlocked.CompareExchange(ref _instantCwIdRequestActive, 1, 0) != 0)
+        {
+            error = "A CW ID is already being sent.";
+            return false;
+        }
+        try { return SendInstantCwIdCore(cwId, rawCallsign, remoteLeaseId, out error); }
+        finally { Volatile.Write(ref _instantCwIdRequestActive, 0); }
+    }
+
+    private bool SendInstantCwIdCore(CwIdService cwId, string? rawCallsign, string? remoteLeaseId, out string? error)
+    {
+        if (!CwIdService.TryNormalizeCallsign(rawCallsign, out var callsign))
+        {
+            error = "A valid callsign is required (letters, digits and /).";
+            return false;
+        }
+        lock (_transitionSync)
+        {
+            if (remoteLeaseId is not null && !ValidateRemoteLease(remoteLeaseId, out error)) return false;
+            lock (_sync)
+            {
+                if (_activeIntent is not null)
+                {
+                    error = "Stop the current transmission before sending an instant CW ID.";
+                    return false;
+                }
+            }
+            if (!IsVoiceTxMode(RadioFrequencyResolver.TxReceiver(_radio.Snapshot()).Mode) || _pipeline.IsFreeDvActive)
+            {
+                error = "Instant CW ID requires a voice mode with FreeDV off.";
+                return false;
+            }
+            if (cwId.IsSending)
+            {
+                error = "A CW ID is already being sent.";
+                return false;
+            }
+            if (!_pipeline.ReserveInstantCwId())
+            {
+                error = "The transmit audio path is unavailable.";
+                return false;
+            }
+            try
+            {
+                bool keyed = remoteLeaseId is null
+                    ? TrySetMox(true, MoxSource.UI, out error)
+                    : TrySetRemoteMox(true, remoteLeaseId, MoxSource.UI, out error);
+                if (!keyed) return false;
+                if (!IsMoxOn || MoxOwner != MoxSource.UI || IsReleaseTailAbortRequested())
+                {
+                    error = "The instant CW ID transmission was interrupted.";
+                    return false;
+                }
+                if (!IsVoiceTxMode(RadioFrequencyResolver.TxReceiver(_radio.Snapshot()).Mode) || _pipeline.IsFreeDvActive)
+                {
+                    error = "Instant CW ID requires a voice mode with FreeDV off.";
+                    return false;
+                }
+                if (!cwId.BeginInstant(callsign, _radio.EffectiveTxMoxPreKeyDelayMs, out error)) return false;
+                bool drained = _pipeline.DrainCwIdTail(IsReleaseTailAbortRequested);
+                bool interrupted = IsReleaseTailAbortRequested();
+                if (IsMoxOn)
+                {
+                    ConvergeToSafeIdle(faultLatched: false, stopTxMonitor: true);
+                    BroadcastMoxState(moxOn: false, tunOn: false);
+                }
+                if (!drained || interrupted || !cwId.InstantCompleted)
+                {
+                    error = "The CW ID could not be completed.";
+                    return false;
+                }
+                error = null;
+                return true;
+            }
+            finally
+            {
+                if (IsMoxOn) TryReleaseMoxImmediately(MoxSource.UI, out _);
+                _pipeline.ReleaseInstantCwId();
+            }
+        }
+    }
+
     /// <summary>
     /// Source-aware MOX setter. The <paramref name="source"/> tag determines
     /// whether the call is allowed when MOX is already held by another

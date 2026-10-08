@@ -156,6 +156,8 @@ public sealed class RadioStateEntry
     public int AdcProtectionMagnitudeSoftLimit { get; set; }
     public int AdcProtectionReleaseHoldMs { get; set; } = 2000;
     public int AttenDb { get; set; }
+    public int? Adc0AttenBaselineDb { get; set; }
+    public int? Adc1AttenBaselineDb { get; set; }
     public bool AutoAgcEnabled { get; set; }
     public bool RxLevelerEnabled { get; set; }
     public RxLevelerMode RxLevelerMode { get; set; } = RxLevelerMode.Auto;

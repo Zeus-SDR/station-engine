@@ -253,8 +253,8 @@ public static class StationProtocolEndpoints
         // Loopback seam that lets a product plugin engage the operator-facing TX
         // Monitor. The recorder uses it for over-air playback so a transmitted
         // recording is heard through the same processed on-air preview path as
-        // live mic. Clear meter-only so the monitor is AUDIBLE (matching the
-        // Audio Suite "Preview" toggle exactly), and report the state BEFORE the
+        // live mic. Clear meter-only only when starting a new audible monitor;
+        // preserve an already-enabled preview and report the state BEFORE the
         // change so the caller restores it when the transmission ends. RF-safe:
         // TX Monitor is a receive-side demod of the transmit IQ and never alters
         // what is transmitted.
@@ -268,6 +268,10 @@ public static class StationProtocolEndpoints
             if (request is null) return Results.BadRequest(new { error = "tx-monitor request is required" });
             var pipe = context.RequestServices.GetService<DspPipelineService>();
             bool previousEnabled = radio.Snapshot().TxMonitorEnabled;
+            // An existing preview belongs to its current operator/feature. Keep
+            // its audible or meter-only routing and do not claim ownership.
+            if (previousEnabled == request.Enabled)
+                return Results.Ok(new { previousEnabled, enabled = previousEnabled });
             pipe?.SetTxMonitorMeterOnly(false);
             var state = radio.SetTxMonitor(new TxMonitorSetRequest(request.Enabled));
             return Results.Ok(new { previousEnabled, enabled = state.TxMonitorEnabled });

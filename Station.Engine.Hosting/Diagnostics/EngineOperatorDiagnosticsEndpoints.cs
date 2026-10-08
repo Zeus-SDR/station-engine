@@ -27,7 +27,8 @@ public static class EngineOperatorDiagnosticsEndpoints
                 services.GetService<DspPipelineService>(),
                 services.GetService<DisplaySettingsStore>(),
                 services.GetService<AudioDeviceSettingsStore>(),
-                services.GetService<ExternalPttService>())));
+                services.GetService<ExternalPttService>(),
+                services.GetService<NativeHostAudioCoordinator>())));
         return endpoints;
     }
 }
@@ -48,7 +49,8 @@ internal sealed record EngineOperatorDiagnosticsSnapshot(
         DspPipelineService? pipeline,
         DisplaySettingsStore? display,
         AudioDeviceSettingsStore? audioDevices,
-        ExternalPttService? externalPtt)
+        ExternalPttService? externalPtt,
+        NativeHostAudioCoordinator? hostAudio = null)
     {
         var history = tx?.History.Snapshot() ?? [];
         if (radio is null)
@@ -116,6 +118,27 @@ internal sealed record EngineOperatorDiagnosticsSnapshot(
                 return Redaction.Scrub(
                     $"backend {devices.Backend}, input {DeviceOrDefault(devices.InputDeviceId)}, output {DeviceOrDefault(devices.OutputDeviceId)}");
             });
+        }
+        if (hostAudio is { } hostAudioCoordinator && hostAudioCoordinator.State is { } hostAudioState)
+        {
+            // Surface the ASIO side only when it is relevant: ASIO active, a
+            // driver saved or attempted, or an ASIO error on record. The
+            // attempted id wins over the persisted one because a failed apply
+            // rolls the store back to the previous route.
+            var asioDriverId = hostAudioState.AsioAttemptedDriverId ?? hostAudioState.Settings.AsioDriverId;
+            if (hostAudioState.Backend == AudioHostApi.Asio
+                || !string.IsNullOrWhiteSpace(asioDriverId)
+                || !string.IsNullOrWhiteSpace(hostAudioState.AsioError))
+            {
+                AddOptional("ASIO driver", () =>
+                {
+                    var name = hostAudioCoordinator.AsioDriverName(asioDriverId);
+                    var id = string.IsNullOrWhiteSpace(asioDriverId) ? "none selected" : asioDriverId;
+                    return Redaction.Scrub(name is null ? id : $"{name} ({id})");
+                });
+                if (hostAudioState.AsioError is { Length: > 0 } asioError)
+                    AddOptional("ASIO error", () => Redaction.Scrub(asioError));
+            }
         }
         if (externalPtt is not null)
         {

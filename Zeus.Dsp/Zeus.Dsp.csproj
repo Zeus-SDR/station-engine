@@ -16,6 +16,7 @@
     <ProjectReference Include="..\Zeus.Contracts\Zeus.Contracts.csproj" />
     <InternalsVisibleTo Include="Zeus.Dsp.Tests" />
     <InternalsVisibleTo Include="Zeus.Server.Hosting" />
+    <InternalsVisibleTo Include="dsp-fixture-evidence" />
   </ItemGroup>
 
   <ItemGroup>

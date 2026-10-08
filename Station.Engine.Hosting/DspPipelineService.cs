@@ -718,10 +718,16 @@ public partial class DspPipelineService : BackgroundService,
     }
 
 
+    private const double RxFallbackRmsFloor = 1e-10;
+
+    internal static bool RxScalarSignalAvailable(double nativeDbm, double fallbackRms) =>
+        (double.IsFinite(nativeDbm) && nativeDbm > -399.0)
+        || (double.IsFinite(fallbackRms) && fallbackRms > RxFallbackRmsFloor);
+
     internal static double AudioRmsToFallbackDbm(double rms)
     {
         if (!double.IsFinite(rms)) return double.NaN;
-        double dbfs = 20.0 * Math.Log10(Math.Max(rms, 1e-10));
+        double dbfs = 20.0 * Math.Log10(Math.Max(rms, RxFallbackRmsFloor));
         return dbfs - 50.0;
     }
 
@@ -1923,6 +1929,8 @@ public partial class DspPipelineService : BackgroundService,
     private long _diagRxMetersMs;
     private int _diagRxMetersChannelId;
     private double _diagRxDbm = double.NaN;
+    private bool _diagRxScalarSignalAvailable;
+    private bool _diagRxReceiveEligible;
     private RxMetersV2Frame _diagRxMeters;
     private const long RxMetersFreshMs = 2_500;
     private const long RxMetersAgingMs = 10_000;
@@ -2239,6 +2247,9 @@ public partial class DspPipelineService : BackgroundService,
     /// </summary>
     public virtual bool DrainCwIdTail(Func<bool>? shouldAbort = null, Action? onHold = null) =>
         ResolveTxIngest()?.DrainCwIdTail(shouldAbort, onHold) ?? false;
+
+    internal virtual bool ReserveInstantCwId() => ResolveTxIngest()?.ReserveInstantCwId() ?? false;
+    internal virtual void ReleaseInstantCwId() => ResolveTxIngest()?.ReleaseInstantCwId();
 
     /// <summary>
     /// Clocks any stale WDSP TXA output through silence and discards it before
@@ -2993,7 +3004,8 @@ public partial class DspPipelineService : BackgroundService,
             rate,
             WidebandViewportTargetCenterHz(state),
             zoomPlan.RequestedSpanHz,
-            guestDdcCount: _p2Client?.ActiveGuestDdcCount ?? 0);
+            guestDdcCount: _p2Client?.ActiveGuestDdcCount ?? 0,
+            ddcCapacity: _p2Client?.RxDdcCapacity ?? Zeus.Protocol2.Protocol2Client.StandardRxDdcCapacity);
     }
 
     // RX3+ (full multi-DDC): the contiguous enabled receivers beyond RX2 in
@@ -4115,7 +4127,8 @@ public partial class DspPipelineService : BackgroundService,
             effectiveNrMode = nrRuntime.EffectiveNrMode,
             rxDsp,
             rxMeters,
-            rxDynamicRange = BuildRxDynamicRangeDiagnostics(state, rxMeters, adcProtection),
+            rxDynamicRange = BuildRxDynamicRangeDiagnostics(state, rxMeters, adcProtection,
+                hardwarePreampSupported: _radio.EffectiveBoardKind == HpsdrBoardKind.Metis),
             squelch,
             filterGeometry = BuildFilterGeometryDiagnostics(
                 state,
@@ -4522,7 +4535,12 @@ public partial class DspPipelineService : BackgroundService,
         bool p2WidebandCapable = maxRate > 384_000;
         bool widebandActive = connected && activeRate > 384_000;
         int activeSoftwareReceivers = connected ? 1 : 0;
-        int manualReceiverCapacity = g2Class ? 10 : Math.Max(1, caps.RxAdcCount);
+        HpsdrBoardKind capacityBoard = connectedBoard != HpsdrBoardKind.Unknown ? connectedBoard : effectiveBoard;
+        int physicalDdcCapacity = protocol2Active ? Zeus.Protocol2.Protocol2Client.RxDdcCapacityFor(capacityBoard, variant) : 0;
+        int manualReceiverCapacity = protocol2Active
+            ? physicalDdcCapacity - Zeus.Protocol2.Protocol2Client.RxBaseDdc(capacityBoard)
+            : Math.Max(1, caps.RxAdcCount);
+        activeSoftwareReceivers = connected ? Math.Max(1, state.Receivers?.Count(r => r.Enabled && r.Index < state.MaxReceivers) ?? (state.Rx2Enabled ? 2 : 1)) : 0;
         int unexposedReceivers = Math.Max(0, manualReceiverCapacity - activeSoftwareReceivers);
         HpsdrBoardKind wireBoard = connectedBoard != HpsdrBoardKind.Unknown
             ? connectedBoard
@@ -4592,6 +4610,7 @@ public partial class DspPipelineService : BackgroundService,
             unusedNyquistHz = Math.Max(0, (maxRate - activeRate) / 2),
             activeSoftwareReceivers,
             manualReceiverCapacity,
+            physicalDdcCapacity,
             unexposedReceiverCount = unexposedReceivers,
             activeUserDdcIndex,
             activeSlots,
@@ -4740,6 +4759,8 @@ public partial class DspPipelineService : BackgroundService,
         long sampleMs;
         int channelId;
         double rxDbm;
+        bool scalarSignalAvailable;
+        bool receiveEligible;
         RxMetersV2Frame meters;
         lock (_rxMeterDiagLock)
         {
@@ -4747,12 +4768,18 @@ public partial class DspPipelineService : BackgroundService,
             sampleMs = _diagRxMetersMs;
             channelId = _diagRxMetersChannelId;
             rxDbm = _diagRxDbm;
+            scalarSignalAvailable = _diagRxScalarSignalAvailable;
+            receiveEligible = _diagRxReceiveEligible;
             meters = _diagRxMeters;
         }
 
         long? ageMs = valid && sampleMs > 0 ? Math.Max(0, nowMs - sampleMs) : null;
-        return BuildRxMetersDiagnostics(valid, ageMs, channelId, rxDbm, meters);
+        return BuildRxMetersDiagnostics(valid, ageMs, channelId, rxDbm, meters,
+            scalarSignalAvailable, receiveEligible && DiagnosticReceiveEligible);
     }
+
+    private bool DiagnosticReceiveEligible => !_keyed && !_radio.IsMox
+        && !_rxAudioSuppressedForTx && Volatile.Read(ref _rxPostTxMuteBlocksRemaining) <= 0;
 
     private AudioPathDiagnosticsDto SnapshotAudioDiagnostics()
     {
@@ -5122,16 +5149,23 @@ public partial class DspPipelineService : BackgroundService,
         long? ageMs,
         int channelId,
         double rxDbm,
-        RxMetersV2Frame meters)
+        RxMetersV2Frame meters,
+        bool scalarSignalAvailable = false,
+        bool receiveEligible = true)
     {
-        double? signalPk = valid ? RxStageLevelDb(meters.SignalPk) : null;
-        double? signalAv = valid ? RxStageLevelDb(meters.SignalAv) : null;
-        double? adcPk = valid ? RxStageLevelDb(meters.AdcPk) : null;
-        double? adcAv = valid ? RxStageLevelDb(meters.AdcAv) : null;
-        double? agcGain = valid && double.IsFinite(meters.AgcGain) ? Math.Round(meters.AgcGain, 1) : null;
-        double? agcEnvPk = valid ? RxStageLevelDb(meters.AgcEnvPk) : null;
-        double? agcEnvAv = valid ? RxStageLevelDb(meters.AgcEnvAv) : null;
-        double? rxDbmOut = valid && double.IsFinite(rxDbm) ? Math.Round(rxDbm, 1) : null;
+        bool usable = valid && receiveEligible;
+        double? signalPk = usable ? RxStageLevelDb(meters.SignalPk) : null;
+        double? signalAv = usable ? RxStageLevelDb(meters.SignalAv) : null;
+        double? adcPk = usable ? RxStageLevelDb(meters.AdcPk) : null;
+        double? adcAv = usable ? RxStageLevelDb(meters.AdcAv) : null;
+        // WDSP initializes gain to -400; GetRxStageMeters negates it.
+        double? agcGain = usable && double.IsFinite(meters.AgcGain) && meters.AgcGain != 400f
+            ? Math.Round(meters.AgcGain, 1) : null;
+        double? agcEnvPk = usable ? RxStageLevelDb(meters.AgcEnvPk) : null;
+        double? agcEnvAv = usable ? RxStageLevelDb(meters.AgcEnvAv) : null;
+        // A calibrated audio floor is finite but is not evidence of a signal.
+        double? rxDbmOut = usable && (scalarSignalAvailable || signalPk.HasValue || signalAv.HasValue)
+            && double.IsFinite(rxDbm) ? Math.Round(rxDbm, 1) : null;
         double? adcHeadroomDb = adcPk is { } pk ? Math.Round(Math.Max(0.0, -pk), 1) : null;
         bool fresh = valid && ageMs is <= RxMetersFreshMs;
         bool stale = !valid || ageMs is null || ageMs > RxMetersAgingMs;
@@ -5151,6 +5185,11 @@ public partial class DspPipelineService : BackgroundService,
             status = "stale";
             recommendation = "RXA stage meters are stale; verify the DSP tick path and active websocket/radio connection before tuning weak-signal or AGC settings.";
         }
+        else if (!receiveEligible)
+        {
+            status = "rx-muted";
+            recommendation = "RX stage readings are unavailable during transmit; wait for a receive meter frame before judging weak-signal gain.";
+        }
         else if (adcPk is > -3.0)
         {
             status = "adc-hot";
@@ -5166,7 +5205,7 @@ public partial class DspPipelineService : BackgroundService,
             status = "agc-normalizing";
             recommendation = "RX AGC is normalizing a strong signal while ADC headroom is clean; keep AGC-T and RF gain stable, and judge recovered audio with RX audio RMS/peak and scene SNR.";
         }
-        else if (agcGain is > 35.0 && (signalPk is null || signalPk < -90.0))
+        else if (signalUsable && agcGain is > 35.0 && (signalPk is null || signalPk < -90.0))
         {
             status = "weak-signal-boost";
             recommendation = "RX AGC is strongly boosting a weak signal; use Smart NR and narrow filtering carefully while watching ADC headroom and coherent SNR.";
@@ -5208,29 +5247,49 @@ public partial class DspPipelineService : BackgroundService,
     internal static RxDynamicRangeDiagnosticsDto BuildRxDynamicRangeDiagnostics(
         StateDto state,
         RxMetersDiagnosticsDto rxMeters,
-        AdcProtectionStatusDto adc)
+        AdcProtectionStatusDto adc,
+        bool hardwarePreampSupported = false,
+        DateTimeOffset? now = null)
     {
         const double targetMinDb = 6.0;
         const double targetMaxDb = 30.0;
         const double weakSignalHeadroomDb = 32.0;
         const double weakSignalFloorDbm = -92.0;
 
-        double? headroom = rxMeters.AdcHeadroomDb;
-        double? adcPk = rxMeters.AdcPkDbfs;
+        byte adcSource = adc.PhysicalAdcs is not null ? adc.PrimaryAdcSource : PrimaryReceiverAdcSource(state);
+        ushort? magnitude = adcSource switch
+        {
+            0 => adc.Adc0MaxMagnitude,
+            1 => adc.Adc1MaxMagnitude,
+            _ => null,
+        };
+        long? hardwareAgeMs = adc.LastTelemetryUtc is { } timestamp
+            ? (long)Math.Max(0, ((now ?? DateTimeOffset.UtcNow) - timestamp).TotalMilliseconds) : null;
+        bool hardwareFresh = hardwareAgeMs is <= RxMetersFreshMs && magnitude is > 0;
+        // Firmware magnitude is a broadband peak snapshot, not a sensitivity
+        // or signal-to-noise measurement. WDSP input meters remain separate.
+        double? adcPk = hardwareFresh
+            ? Math.Round(20.0 * Math.Log10(magnitude!.Value / 32767.0), 1) : null;
+        double? headroom = adcPk is { } pk ? Math.Round(Math.Max(0.0, -pk), 1) : null;
         double? agcGain = rxMeters.AgcGainDb;
         double? signalPk = rxMeters.SignalPkDbm;
-        bool fresh = rxMeters.Fresh && !rxMeters.Stale;
+        double? signalLevel = signalPk ?? rxMeters.SignalAvDbm ?? rxMeters.RxDbm;
+        bool dspFresh = rxMeters.Fresh && !rxMeters.Stale && rxMeters.SignalUsable;
+        bool fresh = hardwareFresh;
         bool missingMeters = string.Equals(rxMeters.Status, "missing", StringComparison.OrdinalIgnoreCase)
             || string.Equals(rxMeters.Status, "unavailable", StringComparison.OrdinalIgnoreCase);
-        bool overloadRisk = state.AdcOverloadWarning || adc.Warning || headroom is <= targetMinDb || adcPk is > -targetMinDb;
-        bool frontEndHot = fresh && agcGain is < -20.0 && headroom is <= 15.0;
-        bool weakSignalOpportunity = fresh
+        bool hardwareOverload = adcSource <= 1 && hardwareAgeMs is <= RxMetersFreshMs
+            && (adc.LastOverloadBits & (1 << adcSource)) != 0;
+        bool overloadWarning = state.AdcOverloadWarning || adc.Warning || hardwareOverload;
+        bool overloadRisk = overloadWarning || headroom is <= targetMinDb || adcPk is > -targetMinDb;
+        bool frontEndHot = fresh && dspFresh && agcGain is < -20.0 && headroom is <= 15.0;
+        bool weakSignalOpportunity = fresh && dspFresh
             && !overloadRisk
             && headroom is >= weakSignalHeadroomDb
-            && (agcGain is >= 30.0 || signalPk is null || signalPk <= weakSignalFloorDbm);
+            && (agcGain is >= 30.0 || signalLevel is <= weakSignalFloorDbm);
         bool frontEndUnderused = weakSignalOpportunity
-            && (!state.PreampOn || adc.EffectiveDb > 0);
-        bool headroomOptimal = fresh
+            && ((hardwarePreampSupported && !state.PreampOn) || adc.EffectiveDb > 0);
+        bool headroomOptimal = fresh && dspFresh
             && !overloadRisk
             && headroom is >= targetMinDb and <= targetMaxDb
             && agcGain is > -20.0 and < 35.0;
@@ -5238,20 +5297,23 @@ public partial class DspPipelineService : BackgroundService,
         var reasons = new List<string>();
         var actions = new List<RxDynamicRangeActionDto>();
 
+        if (!dspFresh)
+            reasons.Add("rx-signal-unavailable");
+
         if (!fresh)
         {
-            reasons.Add(missingMeters ? "rx-meters-missing" : "rx-meters-stale");
+            reasons.Add(missingMeters ? "rx-meters-missing" : "hardware-adc-unavailable-or-stale");
             actions.Add(new RxDynamicRangeActionDto(
                 "verify-rx-meter-feed",
-                "Verify RXA meters",
+                "Verify hardware ADC telemetry",
                 "required",
-                "Wait for fresh RXA stage-meter frames before using dynamic-range guidance."));
+                "Fresh broadband hardware ADC magnitude is required for RF gain guidance; DSP input meters cover only the selected receiver bandwidth."));
         }
-        else
+        if (fresh || overloadWarning)
         {
             if (overloadRisk)
             {
-                reasons.Add(state.AdcOverloadWarning || adc.Warning ? "adc-overload-warning" : "adc-headroom-low");
+                reasons.Add(overloadWarning ? "adc-overload-warning" : "adc-headroom-low");
                 actions.Add(new RxDynamicRangeActionDto(
                     "add-attenuation",
                     "Add 3-6 dB attenuation",
@@ -5259,7 +5321,7 @@ public partial class DspPipelineService : BackgroundService,
                     state.AutoAttEnabled
                         ? "Auto-ATT is enabled; confirm it is raising offset quickly enough, or add manual attenuation if the ADC remains hot."
                         : "Increase S-ATT or reduce external/front-end gain before applying more AGC or NR."));
-                if (state.PreampOn)
+                if (hardwarePreampSupported && state.PreampOn)
                 {
                     actions.Add(new RxDynamicRangeActionDto(
                         "disable-preamp",
@@ -5290,7 +5352,7 @@ public partial class DspPipelineService : BackgroundService,
                         "candidate",
                         "ADC headroom is large and the signal is weak; reduce S-ATT in small steps while watching overload bits."));
                 }
-                if (!state.PreampOn)
+                if (hardwarePreampSupported && !state.PreampOn)
                 {
                     actions.Add(new RxDynamicRangeActionDto(
                         "enable-preamp",
@@ -5329,17 +5391,23 @@ public partial class DspPipelineService : BackgroundService,
         string status;
         string tone;
         string recommendation;
-        if (!fresh)
+        if (!fresh && !overloadWarning)
         {
             status = missingMeters ? "missing" : "stale";
             tone = "verify";
-            recommendation = "RX dynamic-range advisor is waiting for fresh RXA stage meters before recommending RF-chain changes.";
+            recommendation = "RF gain guidance requires fresh broadband hardware ADC telemetry; selected-band DSP input levels cannot establish converter headroom.";
         }
         else if (overloadRisk)
         {
             status = "adc-headroom-limited";
             tone = "danger";
-            recommendation = "ADC headroom is limited; protect the converter first with attenuation/preamp changes before increasing AGC, NR, or audio gain.";
+            recommendation = "ADC headroom is limited; protect the converter first with attenuation or external gain changes before increasing AGC, NR, or audio gain.";
+        }
+        else if (!dspFresh)
+        {
+            status = rxMeters.Status == "rx-muted" ? "rx-muted" : "rx-meters-unusable";
+            tone = "verify";
+            recommendation = "Broadband hardware ADC telemetry is available, but weak-signal RF guidance requires usable receive meter evidence.";
         }
         else if (frontEndHot)
         {
@@ -5351,7 +5419,9 @@ public partial class DspPipelineService : BackgroundService,
         {
             status = "weak-signal-rf-chain-underused";
             tone = "ready";
-            recommendation = "The weak-signal path has spare ADC headroom; try less attenuation or preamp in small steps while watching overload telemetry.";
+            recommendation = hardwarePreampSupported
+                ? "The weak-signal path has spare ADC headroom; try less attenuation or preamp in small steps while watching overload telemetry."
+                : "The weak-signal path has spare ADC headroom; try less attenuation in small steps while watching overload telemetry.";
         }
         else if (weakSignalOpportunity)
         {
@@ -5377,9 +5447,9 @@ public partial class DspPipelineService : BackgroundService,
             Status: status,
             Tone: tone,
             Fresh: fresh,
-            Stale: rxMeters.Stale,
-            AgeMs: rxMeters.AgeMs,
-            Source: "rx-meters+radio-state+adc-protection",
+            Stale: !hardwareFresh,
+            AgeMs: hardwareAgeMs,
+            Source: "hardware-adc-magnitude+wdsp-rxa-meters",
             SampleRateHz: state.SampleRate,
             AttenDb: adc.AttenDb,
             AttOffsetDb: adc.OffsetDb,
@@ -5387,7 +5457,7 @@ public partial class DspPipelineService : BackgroundService,
             PreampOn: state.PreampOn,
             AutoAttEnabled: state.AutoAttEnabled,
             AdcProtectionEnabled: adc.Config.Enabled,
-            AdcOverloadWarning: state.AdcOverloadWarning || adc.Warning,
+            AdcOverloadWarning: overloadWarning,
             AdcOverloadLevel: adc.OverloadLevel,
             TargetHeadroomMinDb: targetMinDb,
             TargetHeadroomMaxDb: targetMaxDb,
@@ -5402,7 +5472,12 @@ public partial class DspPipelineService : BackgroundService,
             FrontEndUnderused: frontEndUnderused,
             Reasons: reasons.ToArray(),
             Actions: actions.ToArray(),
-            DiagnosticRecommendation: recommendation);
+            DiagnosticRecommendation: recommendation,
+            PhysicalAdcSource: adcSource,
+            HardwareAdcMagnitude: hardwareFresh ? magnitude : null,
+            HardwarePreampSupported: hardwarePreampSupported,
+            DspInputPkDbfs: rxMeters.AdcPkDbfs,
+            DspInputHeadroomDb: rxMeters.AdcHeadroomDb);
     }
 
     internal static RxListenabilityDiagnosticsDto BuildRxListenabilityDiagnostics(
@@ -6809,14 +6884,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             if (_p2Client is { } attenuatorClient)
             {
-                if (_appliedAttenuatorAdc != attenuatorAdc)
-                {
-                    if (_appliedAttenuatorAdc == 0)
-                        attenuatorClient.SetAttenuator(0);
-                    else if (_appliedAttenuatorAdc == 1)
-                        _radio.ApplyG2AdcOptionsToP2Client(attenuatorClient, _radio.ConnectedBoardKind);
-                }
-                SetP2Attenuator(attenuatorClient, attenuatorAdc, effectiveAttDb);
+                _radio.ApplyPhysicalAttenuatorsToP2Client(attenuatorClient);
             }
             _appliedEffectiveAttDb = effectiveAttDb;
             _appliedAttenuatorAdc = attenuatorAdc;
@@ -7919,14 +7987,7 @@ public partial class DspPipelineService : BackgroundService,
         }
         if (nowAttDb != initialAttDb || nowAttenuatorAdc != initialAttenuatorAdc)
         {
-            if (nowAttenuatorAdc != initialAttenuatorAdc)
-            {
-                if (initialAttenuatorAdc == 0)
-                    client.SetAttenuator(0);
-                else
-                    _radio.ApplyG2AdcOptionsToP2Client(client, boardKind);
-            }
-            SetP2Attenuator(client, nowAttenuatorAdc, nowAttDb);
+            _radio.ApplyPhysicalAttenuatorsToP2Client(client);
             _appliedEffectiveAttDb = nowAttDb;
             _appliedAttenuatorAdc = nowAttenuatorAdc;
         }
@@ -8164,6 +8225,10 @@ public partial class DspPipelineService : BackgroundService,
     {
         // Clear before publishing the new keyed state so the first tick of a
         // new transmission cannot observe a hold from the prior over.
+        Interlocked.Increment(ref _txSpectrumKeyGeneration);
+        _txSpectrum.Reset();
+        _txSpectrumPixels.Reset();
+        _txSpectrumPrimer.Reset();
         _lastTxPanValid = false;
         _lastTxWfValid = false;
         // Normal MOX-off drops the radio wire before SetMox(false) tears down
@@ -8176,6 +8241,10 @@ public partial class DspPipelineService : BackgroundService,
                 ref _rxPostTxDisplayFramesRemaining,
                 PostTxMuteBlocksForDelayMs(_radio.TxPostTxRxMuteDelayMs));
         _keyed = on;
+        // Do not reuse a pre-TX diagnostic sample after key-up. A new receive
+        // meter capture restores eligibility without changing meter broadcasts.
+        lock (_rxMeterDiagLock)
+            _diagRxReceiveEligible = false;
         // This cache also feeds Auto AGC. A keyed TX/feedback frame can be
         // younger than its 300 ms acceptance window after MOX falls, so make
         // the edge an ownership barrier: only a fresh, post-settle RX frame may
@@ -8624,7 +8693,9 @@ public partial class DspPipelineService : BackgroundService,
     {
         var channels = (CurrentEngine as WdspDspEngine)?.SnapshotRxChannels()
                        ?? (IReadOnlyList<WdspDspEngine.RxChannelHealth>)System.Array.Empty<WdspDspEngine.RxChannelHealth>();
-        long[] portRates = ActiveP2Client?.SnapshotRxPortPacketRates() ?? System.Array.Empty<long>();
+        var protocol2 = ActiveP2Client;
+        int ddcCapacity = protocol2?.RxDdcCapacity ?? Zeus.Protocol2.Protocol2Client.StandardRxDdcCapacity;
+        long[] portRates = protocol2?.SnapshotRxPortPacketRates().Take(ddcCapacity).ToArray() ?? System.Array.Empty<long>();
 
         var channelDtos = new object[channels.Count];
         for (int i = 0; i < channels.Count; i++)
@@ -8674,7 +8745,7 @@ public partial class DspPipelineService : BackgroundService,
         return new
         {
             schemaVersion = 1,
-            maxRxDdc = Zeus.Protocol2.Protocol2Client.MaxRxDdc,
+            maxRxDdc = ddcCapacity,
             activeChannels = channels.Count,
             rxPortPacketRates = portRates,
             primaryChannelId = Volatile.Read(ref _channelId),
@@ -9702,6 +9773,9 @@ public partial class DspPipelineService : BackgroundService,
         // the display gate to keep one timestamp call per tick.
         double nowMs = UnixTimeMillisecondsHighRes();
         long holdNowMs = Environment.TickCount64;
+        var txSpectrumContext = DigitalTxContext(engine, state, sampleRate);
+        bool captureTxSpectrum = _txSpectrum.TryBeginCapture(txSpectrumContext, holdNowMs,
+            out long txSpectrumGeneration);
         bool pan = false, wf = false;
         bool psFbPanUsed = false, psFbWfUsed = false;
         bool psFeedbackCorrecting = false;
@@ -9761,7 +9835,7 @@ public partial class DspPipelineService : BackgroundService,
                 }
                 if (!pan)
                 {
-                    pan = engine.TryGetTxDisplayPixels(DisplayPixout.Panadapter, panBuf);
+                    pan = TryGetDigitalTxMainPixels(engine, state, sampleRate, panBuf);
                     if (pan)
                     {
                         panSource = "tx";
@@ -9861,6 +9935,11 @@ public partial class DspPipelineService : BackgroundService,
                     if (wf) { wfSource = "ps-feedback"; psFbWfUsed = true; }
                 }
             }
+
+            if (captureTxSpectrum && txSpectrumContext is not null)
+                CaptureDigitalTxSpectrum(engine, txSpectrumContext,
+                    RequiresDedicatedTxSpectrumRead(captureTxSpectrum, pan, panSource) ? null : panBuf,
+                    holdNowMs, nowMs, txSpectrumGeneration);
 
             // TX display calibration offset (Thetis TXDisplayCalOffset). Pure
             // dB shift of the transmitted-signal trace/waterfall so the operator
@@ -10133,6 +10212,9 @@ public partial class DspPipelineService : BackgroundService,
             // fresh client doesn't pick up a stale gate counter.
             if (!displayStreamRequested) _psMonitorTickCount = 0;
         }
+
+        if (!hasDisplaySubscribers && captureTxSpectrum && txSpectrumContext is not null)
+            CaptureDigitalTxSpectrum(engine, txSpectrumContext, null, holdNowMs, nowMs, txSpectrumGeneration);
 
         if (displayOnly)
             return true;
@@ -10840,7 +10922,7 @@ public partial class DspPipelineService : BackgroundService,
                 _radio.EffectiveBoardKind,
                 _radio.EffectiveOrionMkIIVariant)
                 + transverterMeterCorrectionDb
-                + RxAttenuatorMeterOffsetDb(state);
+                + (_p2Client is not null ? PhysicalReceiveMeterAttenuationDb(ActualPrimaryReceiveAdcSource()) : RxAttenuatorMeterOffsetDb(state));
             double rxCalOffsetDb = AddOperatorSMeterOffset(
                 baseRxCalOffsetDb,
                 operatorSMeterOffsetDb);
@@ -10907,6 +10989,8 @@ public partial class DspPipelineService : BackgroundService,
                 _diagRxMetersMs = (long)nowMs;
                 _diagRxMetersChannelId = channel;
                 _diagRxDbm = dbm;
+                _diagRxScalarSignalAvailable = RxScalarSignalAvailable(rawDbm, rxAudioRmsForMeter);
+                _diagRxReceiveEligible = DiagnosticReceiveEligible && !suppressRxAudioForTx;
                 _diagRxMeters = v2;
             }
             _hub.Broadcast(v2);
@@ -10931,7 +11015,7 @@ public partial class DspPipelineService : BackgroundService,
                     _radio.EffectiveBoardKind,
                     _radio.EffectiveOrionMkIIVariant)
                     + _radio.TransverterMeterCorrectionDb(secVfoHz)
-                    + RxAttenuatorMeterOffsetDb(state, ReceiverAdcSource(state, ri));
+                    + PhysicalReceiveMeterAttenuationDb(ReceiverAdcSource(state, ri));
                 double secCalOffsetDb = AddOperatorSMeterOffset(
                     secBaseCalOffsetDb,
                     operatorSMeterOffsetDb);
@@ -11071,10 +11155,12 @@ public partial class DspPipelineService : BackgroundService,
         _radio.HandleRxMetersForAutoAgc(dbm, p3Floor, v2.AdcPk, v2.AgcGain, Environment.TickCount64);
         lock (_rxMeterDiagLock)
         {
-            _diagRxMetersValid = true;
+            _diagRxMetersValid = double.IsFinite(dbfsRaw);
             _diagRxMetersMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _diagRxMetersChannelId = channel;
             _diagRxDbm = dbm;
+            _diagRxScalarSignalAvailable = double.IsFinite(dbfsRaw);
+            _diagRxReceiveEligible = DiagnosticReceiveEligible;
             _diagRxMeters = v2;
         }
         _hub.Broadcast(v2);
@@ -11367,10 +11453,11 @@ public partial class DspPipelineService : BackgroundService,
         double operatorOffsetDb) =>
         existingCalibrationDb + operatorOffsetDb;
 
-    internal static double RxAttenuatorMeterOffsetDb(StateDto state, byte meteredAdcSource) =>
+    internal static double RxAttenuatorMeterOffsetDb(StateDto state, byte meteredAdcSource,
+        int independentAdc1AttenuationDb = 0) =>
         (meteredAdcSource == PrimaryReceiverAdcSource(state))
             ? RxAttenuatorMeterOffsetDb(state)
-            : 0.0;
+            : meteredAdcSource == 1 ? Math.Clamp(independentAdc1AttenuationDb, 0, 31) : 0.0;
 
     private static byte PrimaryReceiverAdcSource(StateDto state)
     {
@@ -11496,7 +11583,12 @@ internal sealed record RxDynamicRangeDiagnosticsDto(
     bool FrontEndUnderused,
     string[] Reasons,
     RxDynamicRangeActionDto[] Actions,
-    string DiagnosticRecommendation);
+    string DiagnosticRecommendation,
+    byte PhysicalAdcSource,
+    ushort? HardwareAdcMagnitude,
+    bool HardwarePreampSupported,
+    double? DspInputPkDbfs,
+    double? DspInputHeadroomDb);
 
 internal sealed record RxListenabilityDiagnosticsDto(
     int SchemaVersion,

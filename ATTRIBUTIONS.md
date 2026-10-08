@@ -542,6 +542,27 @@ under the MIT license. The package's license text is preserved at
 [`ZeusProduct/ThirdParty/BouncyCastle-LICENSE.md`](ZeusProduct/ThirdParty/BouncyCastle-LICENSE.md)
 and copied beside the product host on build and publish.
 
+### GroovyCodecs / GroovyMp3
+
+The separately built `ZeusProduct` host uses **GroovyMp3 0.1.3** (namespace
+`GroovyCodecs.Mp3`) to encode Recorder captures to MP3. GroovyMp3 is a managed
+port of LAME 3.98.4 via jump3r, Copyright the GroovyCodecs / jump3r / LAME
+authors, and is distributed under the GNU Lesser General Public License
+version 3 (LGPL-3.0). Zeus links it dynamically as a separate replaceable
+assembly. The package's license text, including the GPL-3.0 text LGPL-3.0
+incorporates by reference, is preserved at
+[`ZeusProduct/ThirdParty/GroovyCodecs-LICENSE.txt`](ZeusProduct/ThirdParty/GroovyCodecs-LICENSE.txt)
+and copied beside the product host on build and publish.
+
+### NLayer
+
+The separately built `ZeusProduct` host uses **NLayer 3.0.0** to decode MP3
+recordings for playback, waveforms, and edits. NLayer is Copyright (c) 2018
+Mark Heath, Andrew Ward and Contributors and is distributed under the MIT
+license. The package's license text is preserved at
+[`ZeusProduct/ThirdParty/NLayer-LICENSE.txt`](ZeusProduct/ThirdParty/NLayer-LICENSE.txt)
+and copied beside the product host on build and publish.
+
 ### Assets and imagery
 
 Images under `docs/pics/` are original screenshots of the Zeus user

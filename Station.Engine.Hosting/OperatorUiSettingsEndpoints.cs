@@ -62,7 +62,8 @@ public static class OperatorUiSettingsEndpoints
                     req.RxDisplayFftSize,
                     req.WaterfallLowColor,
                     req.WaterfallMidColor,
-                    req.WaterfallHighColor);
+                    req.WaterfallHighColor,
+                    req.BandwidthFilter);
             }
             catch (System.Text.Json.JsonException ex)
             {
