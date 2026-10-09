@@ -264,6 +264,14 @@ public sealed class DisplaySettingsStore : IDisposable
             InspectionRefreshHz = Math.Floor(Bound(value.InspectionRefreshHz ?? 2, 1, 8, 2) + 0.5),
             InspectionAverageMs = Math.Floor(Bound(value.InspectionAverageMs ?? 1000, 0, 5000, 1000) + 0.5),
             TxSpectrumAverageMs = Math.Floor(Bound(value.TxSpectrumAverageMs ?? 200, 0, 1000, 200) + 0.5),
+            RxViewSpanHz = Math.Floor(Bound(value.RxViewSpanHz ?? 12000, 1000, 48000, 12000) + 0.5),
+            TxViewSpanHz = Math.Floor(Bound(value.TxViewSpanHz ?? 12000, 1000, 48000, 12000) + 0.5),
+            CenterPassband = value.CenterPassband ?? false,
+            VisualizationMode = value.VisualizationMode is "spectrum" or "waveform" ? value.VisualizationMode : "spectrum",
+            WaveformTimebaseMs = value.WaveformTimebaseMs is 5 or 10 or 20 or 50 or 100 ? value.WaveformTimebaseMs : 50,
+            WaveformGain = Bound(value.WaveformGain ?? 1, 0.25, 16, 1),
+            WaveformAutoScale = value.WaveformAutoScale ?? true,
+            WaveformPhaseView = value.WaveformPhaseView ?? false,
         };
     }
 

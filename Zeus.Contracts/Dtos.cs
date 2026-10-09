@@ -3218,7 +3218,15 @@ public sealed record BandwidthFilterSettingsDto(
     double? EqHoverMagnification = 1.5,
     double? InspectionRefreshHz = 2,
     double? InspectionAverageMs = 1000,
-    double? TxSpectrumAverageMs = 200);
+    double? TxSpectrumAverageMs = 200,
+    double? RxViewSpanHz = 12000,
+    double? TxViewSpanHz = 12000,
+    bool? CenterPassband = false,
+    string? VisualizationMode = "spectrum",
+    double? WaveformTimebaseMs = 50,
+    double? WaveformGain = 1,
+    bool? WaveformAutoScale = true,
+    bool? WaveformPhaseView = false);
 
 public sealed record DisplaySettingsDto(
     string Mode,

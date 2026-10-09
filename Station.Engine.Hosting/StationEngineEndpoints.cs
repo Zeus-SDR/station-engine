@@ -173,6 +173,7 @@ public static class StationEngineEndpoints
         // tool 404'd against a standalone engine (attach mode).
         endpoints.MapImdMeasure();
         endpoints.MapTxSpectrum();
+        endpoints.MapWaveform();
         endpoints.MapTdoaEndpoints();
         endpoints.MapTdoaContributionEndpoints();
         // Same field gap as ImdMeasure: the SPA's Windows Firewall control

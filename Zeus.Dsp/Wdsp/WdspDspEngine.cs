@@ -5243,6 +5243,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 alcPk, alcAv, -alcGain,
                 outPk, outAv);
         }
+        var waveformTap = Environment.TickCount64 < Volatile.Read(ref _waveformDemandUntil)
+            ? Volatile.Read(ref _waveformTap) : null;
+        // Observe the exact completed digital output; observers cannot interrupt transmission.
+        try { waveformTap?.Invoke(_txaOutputRateHz, iqInterleaved[..(2 * outSize)]); } catch { }
         return outSize;
     }
 

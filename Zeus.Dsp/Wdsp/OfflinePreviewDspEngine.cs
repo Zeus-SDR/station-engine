@@ -9,8 +9,10 @@ namespace Zeus.Dsp.Wdsp;
 /// Disconnected-mode DSP engine: no radio RX/audio is published, but the TXA
 /// chain is a real WDSP path so Audio Suite Preview can run while off-air.
 /// </summary>
-public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost
+public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, ITxWaveformSource
 {
+    public void SetTxWaveformTap(TxWaveformHandler? handler, long demandUntilTickMs) =>
+        _tx.SetTxWaveformTap(handler, demandUntilTickMs);
     private readonly SyntheticDspEngine _control = new();
     private readonly WdspDspEngine _tx;
     private readonly object _channelLock = new();

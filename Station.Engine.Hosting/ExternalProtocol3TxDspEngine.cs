@@ -13,8 +13,12 @@ namespace Zeus.Server;
 /// provider that reports an impossible produced count before host scratch
 /// buffers can be indexed with it.
 /// </summary>
-internal sealed class ExternalProtocol3TxDspEngine : IDspEngine
+internal sealed class ExternalProtocol3TxDspEngine : IDspEngine, ITxWaveformSource
 {
+    public void SetTxWaveformTap(TxWaveformHandler? handler, long demandUntilTickMs)
+    {
+        if (_inner is ITxWaveformSource source) source.SetTxWaveformTap(handler, demandUntilTickMs);
+    }
     internal const int MaxTxBlockSamples = 1024;
     internal const int MaxTxOutputSamples = 2048;
 

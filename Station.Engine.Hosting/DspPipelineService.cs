@@ -10330,6 +10330,8 @@ public partial class DspPipelineService : BackgroundService,
                 audioBuf.AsSpan(0, audioSampleCount),
                 EffectiveAfGainDb(state.RxAfGainDb, state.Rx1AfGainDb));
         if (streamLocalRx && audioSampleCount > 0)
+            CaptureRxWaveform(engine, state, 0, audioBuf.AsSpan(0, audioSampleCount));
+        if (streamLocalRx && audioSampleCount > 0)
             ReceiverAudioAvailable?.Invoke(
                 0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, audioSampleCount));
         // Per-RX mute (Thetis chkMUT): RX1 stays the audio clock-master so the
@@ -10405,6 +10407,8 @@ public partial class DspPipelineService : BackgroundService,
                 }
                 _productPluginAudio?.PublishRxAudio(
                     ri, AudioOutputRateHz, sec.AudioBuf.AsSpan(0, n));
+                if (streamLocalRx)
+                    CaptureRxWaveform(engine, state, ri, sec.AudioBuf.AsSpan(0, n));
                 if (streamLocalRx)
                     ReceiverAudioAvailable?.Invoke(
                         ri, AudioOutputRateHz, new ReadOnlyMemory<float>(sec.AudioBuf, 0, n));
