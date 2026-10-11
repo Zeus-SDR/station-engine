@@ -53,7 +53,7 @@ public partial class Program
             Console.Error.WriteLine(
                 "usage: StationEngine --port <1..65535> [--bind <loopback|lan>] " +
                 "[--product-lan-https-port <1..65535>] [--lan-https-port <1..65535>] " +
-                "[--native-audio-output <true|false>]");
+                "[--native-audio-output <true|false>] [--receive-only <true|false>] [--supervise-pid <pid>]");
             diagnosticLogFileSink.Dispose();
             return 2;
         }
@@ -172,6 +172,7 @@ public partial class Program
             tciBindAddress = persistedTci.BindAddress;
             tciPort = persistedTci.Port;
         }
+        if (options.ReceiveOnly) tciEnabled = false;
         var tciListener = TciHostingExtensions.ResolveTciListener(
             tciEnabled,
             tciBindAddress,
@@ -222,6 +223,13 @@ public partial class Program
                 options.AutoReport = pendingCat.AutoReport;
             });
         }
+        if (options.ReceiveOnly)
+        {
+            builder.Services.PostConfigure<TciOptions>(value => value.Enabled = false);
+            builder.Services.PostConfigure<CatOptions>(value => value.Enabled = false);
+        }
+        if (options.SupervisePid is { } ownerPid)
+            builder.Services.AddSingleton<IHostedService>(services => new ReceiveOnlyOwnerMonitor(ownerPid, services.GetRequiredService<IHostApplicationLifetime>()));
         var httpContextAccessor = new HttpContextAccessor();
         builder.Services.AddSingleton<IHttpContextAccessor>(httpContextAccessor);
         builder.Services.AddCors(cors => cors.AddPolicy(
@@ -237,16 +245,17 @@ public partial class Program
             P2AutoConnectService.EndpointEnvironmentVariable);
         builder.Services.AddStationEngine(new StationEngineHostingOptions(
             NativeAudioOutputEnabled: options.NativeAudioOutputEnabled,
-            P2AutoConnectEndpoint: string.IsNullOrWhiteSpace(p2AutoConnectEndpoint)
+            P2AutoConnectEndpoint: options.ReceiveOnly || string.IsNullOrWhiteSpace(p2AutoConnectEndpoint)
                 ? null
                 : p2AutoConnectEndpoint,
-            LanHttpsUrls: lanHttpsUrls));
+            LanHttpsUrls: lanHttpsUrls,
+            ReceiveOnly: options.ReceiveOnly));
         // Windows only in effect. Grants this engine build its inbound firewall
         // rule once, without a prompt where it can, and never re-asks. Zeus Link
         // reinstalls the engine to a new version-scoped path on every update, so
         // the rule genuinely has to be re-pointed; see
         // docs/designs/windows-firewall-zero-prompt.md.
-        builder.Services.AddWindowsFirewallStartupGrant();
+        if (!options.ReceiveOnly) builder.Services.AddWindowsFirewallStartupGrant();
         builder.Services.AddZeusPlugins(
             prefsDbPathProvider: PrefsDbPath.EngineGet,
             options: new PluginManagerOptions
@@ -269,7 +278,9 @@ public partial class Program
         }
         app.UseCors(CorsPolicyName);
         app.UseStationAccessTokenAuthorization(
-            Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable));
+            Environment.GetEnvironmentVariable(StationAccessTokenEnvironmentVariable),
+            allRequests: options.ReceiveOnly);
+        if (options.ReceiveOnly) app.Use(ReceiveOnlyRuntime.RestrictRequests);
         app.Use(RejectRemotePluginMutations);
         app.UseWebSockets(new WebSocketOptions
         {
@@ -285,7 +296,7 @@ public partial class Program
                 options.LanHttpsPort),
             allowLanHttpsSameHost: options.LanHttpsPort is not null);
         var pluginManager = app.Services.GetRequiredService<PluginManager>();
-        pluginManager.StartAsync(default).GetAwaiter().GetResult();
+        if (!options.ReceiveOnly) pluginManager.StartAsync(default).GetAwaiter().GetResult();
         PluginEndpoints.MapAll(app, pluginManager);
         return app;
     }
@@ -325,6 +336,8 @@ public partial class Program
         int? productLanHttpsPort = null;
         StationEngineBindMode? bindMode = null;
         bool? nativeAudioOutputEnabled = null;
+        bool? receiveOnly = null;
+        int? supervisePid = null;
         for (var index = 0; index < args.Count; index++)
         {
             switch (args[index])
@@ -372,6 +385,16 @@ public partial class Program
                         _ => throw new ArgumentException("--bind requires loopback or lan"),
                     };
                     break;
+                case "--receive-only":
+                    if (receiveOnly is not null || ++index >= args.Count || !bool.TryParse(args[index], out var readOnly))
+                        throw new ArgumentException("--receive-only requires true or false, specified once");
+                    receiveOnly = readOnly;
+                    break;
+                case "--supervise-pid":
+                    if (supervisePid is not null || ++index >= args.Count || !int.TryParse(args[index], out var ownerPid) || ownerPid <= 0)
+                        throw new ArgumentException("--supervise-pid requires a positive process ID, specified once");
+                    supervisePid = ownerPid;
+                    break;
                 case "--native-audio-output":
                     if (nativeAudioOutputEnabled is not null)
                         throw new ArgumentException(
@@ -408,12 +431,19 @@ public partial class Program
             throw new ArgumentException(
                 "--lan-https-port must differ from --product-lan-https-port");
 
+        if (receiveOnly == true && (resolvedBindMode != StationEngineBindMode.Loopback || lanHttpsPort is not null || productLanHttpsPort is not null || nativeAudioOutputEnabled == true))
+            throw new ArgumentException("Receive-only engines require loopback binding and no auxiliary listeners or native audio output.");
+        if (supervisePid is not null && receiveOnly != true)
+            throw new ArgumentException("--supervise-pid requires --receive-only true");
+
         return new StationEngineCommandLineOptions(
             Port: resolvedPort,
             BindMode: resolvedBindMode,
             LanHttpsPort: lanHttpsPort,
             ProductLanHttpsPort: productLanHttpsPort,
-            NativeAudioOutputEnabled: nativeAudioOutputEnabled ?? false);
+            NativeAudioOutputEnabled: nativeAudioOutputEnabled ?? false,
+            ReceiveOnly: receiveOnly ?? false,
+            SupervisePid: supervisePid);
     }
 
     internal static bool ListenOnAllInterfaces(
@@ -433,17 +463,90 @@ public partial class Program
         StationEngineBindMode BindMode,
         int? LanHttpsPort,
         int? ProductLanHttpsPort,
-        bool NativeAudioOutputEnabled);
+        bool NativeAudioOutputEnabled,
+        bool ReceiveOnly = false,
+        int? SupervisePid = null);
 
-    private static void PrepareEnginePreferences()
+    internal static void PrepareEnginePreferences()
     {
         var enginePath = PrefsDbPath.EngineGet();
         if (!PrefsDbPath.EnsureUsable(enginePath))
             throw new InvalidOperationException(
                 $"Station engine preferences are corrupt and unavailable at '{enginePath}'.");
+
+        // Product stores (Kiwi, display, bundle) and the two migrations below
+        // open zeus-prefs.db. Probe it before any of them do. A file moved
+        // aside — page damage, or a wrong-shaped row the typed check below
+        // rejects — is recreated by the stores; startup continues on the
+        // original path. A corrupt file that cannot be moved cannot be opened,
+        // so this session uses a throwaway product file instead.
         var productPath = PrefsDbPath.Get();
+        if (!PrefsDbPath.EnsureUsable(productPath))
+            productPath = FallBackFromUnmovableProductPrefs(productPath, enginePath);
+        else if (PrefsCollectionShapeGuard.FindUnreadable(productPath) is { } unreadable)
+        {
+            // These three typed reads already run at every engine startup
+            // (KiwiSdrService.ExecuteAsync, DisplaySettingsApplyService.StartAsync,
+            // SpeTaurusWorker via ProductFeatureState). A throw there stops the
+            // host, so only a file that cannot start today is moved. FindUnreadable
+            // returns null when the read is clean, when the file is busy or
+            // access-denied, or when the open itself failed — those are not moved.
+            // The check opens a short-lived handle the way PrefsDbPath's probe does
+            // and disposes it before the move — never a SharedLiteDatabase lease,
+            // which would still be holding the file. No ILogger exists yet;
+            // stderr is the same channel PrefsDbPath.Warn uses.
+            Console.Error.WriteLine(
+                $"prefs.guard '{unreadable.Name}' could not be read " +
+                $"({unreadable.Error.GetType().Name}: {unreadable.Error.Message}). " +
+                "Moving the product preferences file aside.");
+            if (!PrefsDbPath.MoveCorruptAside(productPath, log: null))
+                productPath = FallBackFromUnmovableProductPrefs(productPath, enginePath);
+        }
+
         EnginePrefsDbMigration.RunIfNeeded(productPath, enginePath);
         AudioDevicePrefsMigration.RunIfNeeded(productPath, enginePath);
+    }
+
+    // EnsureUsable returned false: the product file is corrupt and could not
+    // be moved. Mirror the desktop host (record a fatal log, keep launching)
+    // without pointing ZEUS_PREFS_PATH at a temp directory. EngineGet follows
+    // ZEUS_PREFS_PATH unless ZEUS_ENGINE_PREFS_PATH is set, and LogbookPath,
+    // LogDir, CrashDir and VersionFloorPath all take their directory from
+    // ZEUS_PREFS_PATH. Pin the engine file that was already resolved, then
+    // put the throwaway product file in the directory those paths already
+    // use — DataDir when ZEUS_PREFS_PATH is unset, otherwise that override's
+    // directory — so the operator's station-engine.db, logbook and engine log
+    // stay where they are.
+    private static string FallBackFromUnmovableProductPrefs(string productPath, string enginePath)
+    {
+        var fatalLog = Path.Combine(
+            Path.GetDirectoryName(productPath) ?? ".",
+            "zeus-prefs-fatal.log");
+        try
+        {
+            File.AppendAllText(
+                fatalLog,
+                $"{DateTime.UtcNow:o} prefs DB corrupt and locked at {productPath}; " +
+                "close any other Zeus instance or delete the file. " +
+                "Running on temporary settings for this session.\n");
+        }
+        catch
+        {
+            // Best effort — never block launch on the log write.
+        }
+
+        Environment.SetEnvironmentVariable(PrefsDbPath.EnginePathEnvironmentVariable, enginePath);
+
+        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var anchor = string.IsNullOrEmpty(env)
+            ? PrefsDbPath.DataDir
+            : Path.GetDirectoryName(Path.GetFullPath(env)) ?? PrefsDbPath.DataDir;
+        Directory.CreateDirectory(anchor);
+        var fallback = Path.Combine(anchor, $"zeus-prefs-fallback-{Guid.NewGuid():N}.db");
+        Environment.SetEnvironmentVariable("ZEUS_PREFS_PATH", fallback);
+        Console.Error.WriteLine(
+            $"prefs.guard falling back to temporary prefs DB at {fallback}; settings will not persist this session.");
+        return fallback;
     }
 
     private static string StationFeaturePluginRoot()

@@ -347,6 +347,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         public RxEqualizerSettings? OperatorRxEq;
         public bool OperatorApf;
         public bool RxDigitalBypass;
+        public bool RxCwNoiseReductionBypass;
         // Zoom level (1..32). Changing it re-calls SetAnalyzer with shifted
         // fscLin/fscHin; the worker's Spectrum0 and the pixel drain's GetPixels
         // take this lock so they never interleave with an in-flight reconfig.
@@ -1528,6 +1529,22 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setRxDigitalBypass channel={Id} bypass={Bypass}", channelId, bypass);
     }
 
+    internal static NrConfig EffectiveCwNoiseReductionConfig(NrConfig cfg, bool bypass) =>
+        bypass ? cfg with { NrMode = NrMode.Off, AnfEnabled = false } : cfg;
+
+    public void SetRxCwNoiseReductionBypass(int channelId, bool bypass)
+    {
+        if (!_channels.TryGetValue(channelId, out var state)) return;
+        RunNativeLifecycleCriticalSection(() =>
+        {
+            if (state.Stopped || !_channels.TryGetValue(channelId, out var current) ||
+                !ReferenceEquals(state, current)) return;
+            if (state.RxCwNoiseReductionBypass == bypass) return;
+            state.RxCwNoiseReductionBypass = bypass;
+            if (state.OperatorNr is { } nr) ApplyNoiseReductionLocked(channelId, nr, state);
+        });
+    }
+
     // Re-push every gated RX stage after the channel enters or leaves the
     // digital bypass. Squelch is re-planned by the caller (SetMode already
     // re-asserts it on every mode change).
@@ -1685,7 +1702,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private void ApplyNoiseReductionLocked(int channelId, NrConfig operatorCfg, ChannelState state)
     {
         bool digitalBypassed = IsRxDigitalBypassed(state);
-        var cfg = EffectiveRxNrConfig(operatorCfg, digitalBypassed);
+        var cfg = EffectiveCwNoiseReductionConfig(
+            EffectiveRxNrConfig(operatorCfg, digitalBypassed), state.RxCwNoiseReductionBypass);
 
         // Mutually-exclusive NR button. When switching to a mode, re-apply its
         // Thetis defaults before toggling Run=1 — matches Thetis setup.cs order
@@ -1824,9 +1842,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         state.CurrentNbMode = cfg.NbMode;
 
         _log.LogInformation(
-            "wdsp.setNoiseReduction channel={Id} nr={Nr} anf={Anf} snb={Snb} notches={Notches} nb={Nb} thr={Thr:F2} digitalBypass={Digital}",
+            "wdsp.setNoiseReduction channel={Id} nr={Nr} anf={Anf} snb={Snb} notches={Notches} nb={Nb} thr={Thr:F2} digitalBypass={Digital} cwBypass={Cw}",
             channelId, cfg.NrMode, cfg.AnfEnabled, cfg.SnbEnabled, cfg.NbpNotchesEnabled,
-            cfg.NbMode, scaledThreshold, digitalBypassed);
+            cfg.NbMode, scaledThreshold, digitalBypassed, state.RxCwNoiseReductionBypass);
     }
 
 
@@ -2946,6 +2964,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     }
                 }
 
+                OpenBandwidthTxAnalyzer(id);
+
                 // DEXP sits on the mic block ahead of TXA (Thetis cmaster.c
                 // xdexp before fexchange0); its block size / rate are the TXA
                 // input profile latched above. Never throws.
@@ -2962,6 +2982,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             {
                 lock (_txDispLock)
                 {
+                    CloseBandwidthTxAnalyzer();
                     if (txAnalyzerOpened)
                     {
                         RunNativeLifecycleCriticalSection(() =>
@@ -5141,7 +5162,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // the WDSP analyzer's sideband convention (same fix as before — the
         // siphon hands back complex IQ in the same orientation as the post-
         // CFIR buffer did).
-        if (_txDispAlive)
+        if (_txDispAlive || Environment.TickCount64 < Volatile.Read(ref _bandwidthTxDemandUntil))
         {
             int sipSize = _txaDspSize;
             Span<float> sipBuf = stackalloc float[2 * sipSize];
@@ -5157,6 +5178,12 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // Re-check under the display lock to close the destroy/feed window.
                 if (_txDispAlive && _txaChannelId == txa)
                     NativeMethods.Spectrum0(1, txa, 0, 0, ref txSpectrumIq[0]);
+                if (_bandwidthTxAnalyzer >= 0 && _txaChannelId == txa
+                    && Environment.TickCount64 < Volatile.Read(ref _bandwidthTxDemandUntil))
+                {
+                    NativeMethods.Spectrum0(1, _bandwidthTxAnalyzer, 0, 0, ref txSpectrumIq[0]);
+                    _bandwidthTxSnapped = true;
+                }
             }
         }
 
@@ -5275,6 +5302,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     {
                         lock (_txDispLock)
                         {
+                            CloseBandwidthTxAnalyzer();
                             if (_txDispAlive)
                             {
                                 NativeMethods.DestroyAnalyzer(txa);
@@ -5372,6 +5400,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 AnalyzerWindow, AnalyzerKaiserPi, overlap, 0, 0.0, 0.0,
                 SnrAnalyzerPixelWidth, 1, 0, 0.0, 0.0, maxW);
             ConfigureSnrPowerOutput(disp, sampleRateHz);
+            NativeMethods.SetDisplayDetectorMode(disp, 0, 0);
+            NativeMethods.SetDisplayAverageMode(disp, 0, 0);
+            NativeMethods.SetDisplayNormOneHz(disp, 0, 0);
         });
     }
 

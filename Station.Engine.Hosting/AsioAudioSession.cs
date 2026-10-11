@@ -62,7 +62,8 @@ internal interface IAsioSessionFactory
     IAsioSession Open(
         AsioSessionConfig config,
         NativeAudioSink? sink,
-        NativeMicCapture? mic);
+        NativeMicCapture? mic,
+        ILogger? log = null);
 }
 
 internal sealed class AsioSessionFactory : IAsioSessionFactory
@@ -150,7 +151,8 @@ internal sealed class AsioSessionFactory : IAsioSessionFactory
     public IAsioSession Open(
         AsioSessionConfig config,
         NativeAudioSink? sink,
-        NativeMicCapture? mic)
+        NativeMicCapture? mic,
+        ILogger? log = null)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("ASIO is available only on Windows.");
@@ -161,7 +163,7 @@ internal sealed class AsioSessionFactory : IAsioSessionFactory
         if (config.EnableOutput && sink is null)
             throw new InvalidOperationException("ASIO playback was requested without a native output consumer.");
         AsioInterop.EnsureResolverRegistered();
-        return new AsioAudioSession(config, sink, mic);
+        return new AsioAudioSession(config, sink, mic, log);
     }
 
     internal static unsafe string ReadLastError(IntPtr session, string fallback)
@@ -207,16 +209,31 @@ internal static class AsioPumpScheduler
     internal static bool CanWritePlayback(Func<bool> isStopping) => !isStopping();
 }
 
+internal enum AsioPumpDecision
+{
+    Continue,
+    Recover,
+}
+
 internal sealed class AsioAudioSession : IAsioSession
 {
     internal const int RequiredSampleRate = 48_000;
     internal const int NativeStatusSize = 112;
+    /// <summary>
+    /// After a non-fatal <c>kAsioResyncRequest</c>, rebuild the driver if the
+    /// native callback counter has not advanced within this many milliseconds.
+    /// Issue #2852.
+    /// </summary>
+    internal const int ResyncStallDeadlineMs = 1000;
+    internal const int ResyncLogIntervalMs = 60_000;
     private const uint RingFrames = 65_536;
     private const int PumpFrames = 4_096;
+    private const long NoPendingMs = -1;
 
     private readonly AsioSessionConfig _config;
     private readonly NativeAudioSink? _sink;
     private readonly NativeMicCapture? _mic;
+    private readonly ILogger? _log;
     private readonly float[] _captureBuffer = new float[PumpFrames];
     private readonly float[] _playbackBuffer = new float[PumpFrames * 2];
     private readonly object _lifecycleSync = new();
@@ -233,13 +250,15 @@ internal sealed class AsioAudioSession : IAsioSession
     internal AsioAudioSession(
         AsioSessionConfig config,
         NativeAudioSink? sink,
-        NativeMicCapture? mic)
+        NativeMicCapture? mic,
+        ILogger? log = null)
     {
         if (Marshal.SizeOf<AsioNativeStatus>() != NativeStatusSize)
             throw new InvalidOperationException("The managed ASIO status ABI layout is invalid.");
         _config = config;
         _sink = sink;
         _mic = mic;
+        _log = log;
         _handle = AsioInterop.SessionCreate(
             config.DriverId,
             config.EnableInput ? config.InputChannel : -1,
@@ -354,8 +373,123 @@ internal sealed class AsioAudioSession : IAsioSession
         }
     }
 
+    /// <summary>
+    /// Classifies native pump wait events. Thetis cmASIO (<c>hostsample.cpp</c>
+    /// asioMessages) treats <c>kAsioResyncRequest</c> as informational ("the
+    /// driver encountered some non fatal data loss") and keeps running; only
+    /// <c>kAsioResetRequest</c> rebuilds the driver. Issue #2852: some vendor
+    /// drivers emit resyncs in bursts, and treating them as fatal silently
+    /// rebuilt the session.
+    /// Fatal signals keep today's precedence: any of wait-failed, Error,
+    /// Stopped, ResetRequested, or SampleRateChanged still recovers even when
+    /// a resync bit is also set.
+    /// </summary>
+    internal static AsioPumpDecision ClassifyPumpEvents(int waitResult, uint events, out bool resyncSeen)
+    {
+        resyncSeen = (events & (uint)AsioEvents.ResyncRequested) != 0;
+        if (waitResult < 0) return AsioPumpDecision.Recover;
+        if ((events & (uint)AsioEvents.Error) != 0) return AsioPumpDecision.Recover;
+        if ((events & (uint)AsioEvents.Stopped) != 0) return AsioPumpDecision.Recover;
+        if ((events & (uint)AsioEvents.ResetRequested) != 0) return AsioPumpDecision.Recover;
+        if ((events & (uint)AsioEvents.SampleRateChanged) != 0) return AsioPumpDecision.Recover;
+        return AsioPumpDecision.Continue;
+    }
+
+    /// <summary>
+    /// Safety net for a driver that raises <c>kAsioResyncRequest</c> and then
+    /// actually stops calling back. <paramref name="resyncNotedAtMs"/> &lt; 0
+    /// means no pending resync watch. Issue #2852.
+    /// </summary>
+    internal static bool IsResyncStalled(
+        long resyncNotedAtMs,
+        long nowMs,
+        ulong callbackCountAtResync,
+        ulong callbackCountNow,
+        int deadlineMs)
+    {
+        if (resyncNotedAtMs < 0) return false;
+        if (callbackCountNow != callbackCountAtResync) return false;
+        if (nowMs < resyncNotedAtMs) return false;
+        return nowMs - resyncNotedAtMs >= deadlineMs;
+    }
+
+    /// <summary>
+    /// First resync logs immediately; later logs at most once per
+    /// <paramref name="intervalMs"/>. <paramref name="lastLoggedAtMs"/> &lt; 0
+    /// means never logged.
+    /// </summary>
+    internal static bool ShouldLogResync(long lastLoggedAtMs, long nowMs, int intervalMs)
+    {
+        if (lastLoggedAtMs < 0) return true;
+        if (nowMs < lastLoggedAtMs) return true;
+        return nowMs - lastLoggedAtMs >= intervalMs;
+    }
+
+    internal static string FormatPumpRecoveryReason(int waitResult, uint events)
+    {
+        if (waitResult < 0) return "wait-failed";
+        if ((events & (uint)AsioEvents.Error) != 0) return "error";
+        if ((events & (uint)AsioEvents.Stopped) != 0) return "stopped";
+        if ((events & (uint)AsioEvents.ResetRequested) != 0) return "reset";
+        if ((events & (uint)AsioEvents.SampleRateChanged) != 0) return "sample-rate";
+        return "unknown";
+    }
+
+    internal readonly record struct ResyncWatchStep(
+        bool Recover,
+        long ResyncNotedAtMs,
+        ulong CallbackCountAtResync);
+
+    /// <summary>
+    /// One step of the resync stall watch. A pending watch that
+    /// <see cref="IsResyncStalled"/> reports keeps its state and recovers.
+    /// Otherwise a resync seen while a watch is pending and
+    /// <paramref name="callbackNow"/> still equals
+    /// <paramref name="callbackCountAtResync"/> leaves that watch unchanged,
+    /// so repeated resyncs from a frozen callback counter cannot push the
+    /// stall deadline forward. A resync with no pending watch, or one whose
+    /// callback counter advanced, arms or re-arms at <paramref name="nowMs"/>
+    /// and <paramref name="callbackNow"/>, because native <c>wait()</c>
+    /// consumes the event bit and a cleared resync is lost. A pending watch
+    /// whose callback counter advanced, with no new resync, clears.
+    /// Issue #2852.
+    /// </summary>
+    internal static ResyncWatchStep StepResyncWatch(
+        long resyncNotedAtMs,
+        ulong callbackCountAtResync,
+        bool resyncSeen,
+        long nowMs,
+        ulong callbackNow,
+        int deadlineMs)
+    {
+        if (IsResyncStalled(
+                resyncNotedAtMs,
+                nowMs,
+                callbackCountAtResync,
+                callbackNow,
+                deadlineMs))
+            return new ResyncWatchStep(true, resyncNotedAtMs, callbackCountAtResync);
+
+        if (resyncSeen)
+        {
+            if (resyncNotedAtMs >= 0 && callbackNow == callbackCountAtResync)
+                return new ResyncWatchStep(false, resyncNotedAtMs, callbackCountAtResync);
+
+            return new ResyncWatchStep(false, nowMs, callbackNow);
+        }
+
+        if (resyncNotedAtMs >= 0 && callbackNow != callbackCountAtResync)
+            return new ResyncWatchStep(false, NoPendingMs, callbackCountAtResync);
+
+        return new ResyncWatchStep(false, resyncNotedAtMs, callbackCountAtResync);
+    }
+
     private unsafe void PumpLoop()
     {
+        long resyncNotedAtMs = NoPendingMs;
+        ulong callbackCountAtResync = 0;
+        long lastResyncLogMs = NoPendingMs;
+        ulong resyncCount = 0;
         try
         {
             while (!_stopping)
@@ -363,18 +497,56 @@ internal sealed class AsioAudioSession : IAsioSession
                 uint events = 0;
                 int wait = AsioInterop.SessionWait(_handle, 50, &events);
                 if (_stopping) break;
-                if (wait < 0 || (events & ((uint)AsioEvents.Error | (uint)AsioEvents.Stopped)) != 0)
+
+                var decision = ClassifyPumpEvents(wait, events, out bool resyncSeen);
+                if (decision == AsioPumpDecision.Recover)
                 {
+                    _log?.LogWarning(
+                        "audio.asio driver recovery requested reason={Reason}",
+                        FormatPumpRecoveryReason(wait, events));
                     RecoveryRequested?.Invoke();
                     break;
                 }
-                if ((events & ((uint)AsioEvents.ResetRequested |
-                               (uint)AsioEvents.ResyncRequested |
-                               (uint)AsioEvents.SampleRateChanged)) != 0)
+
+                // Callback counter and one tick sample only when a resync arrived
+                // or a watch is already pending. Steady state adds no GetStatus
+                // P/Invoke. Issue #2852.
+                if (resyncSeen || resyncNotedAtMs >= 0)
                 {
-                    RecoveryRequested?.Invoke();
-                    break;
+                    long nowMs = Environment.TickCount64;
+                    if (resyncSeen)
+                    {
+                        resyncCount++;
+                        if (ShouldLogResync(lastResyncLogMs, nowMs, ResyncLogIntervalMs))
+                        {
+                            lastResyncLogMs = nowMs;
+                            _log?.LogInformation(
+                                "audio.asio driver resync (non-fatal) count={Count}",
+                                resyncCount);
+                        }
+                    }
+
+                    ulong callbackNow = ReadCallbackCount();
+                    var step = StepResyncWatch(
+                        resyncNotedAtMs,
+                        callbackCountAtResync,
+                        resyncSeen,
+                        nowMs,
+                        callbackNow,
+                        ResyncStallDeadlineMs);
+                    if (step.Recover)
+                    {
+                        _log?.LogWarning(
+                            "audio.asio driver recovery requested reason={Reason}",
+                            "resync-stall");
+                        RecoveryRequested?.Invoke();
+                        break;
+                    }
+
+                    resyncNotedAtMs = step.ResyncNotedAtMs;
+                    callbackCountAtResync = step.CallbackCountAtResync;
                 }
+
                 AsioPumpScheduler.ServiceIteration(
                     _config.EnableOutput,
                     FillPlaybackRing,
@@ -436,6 +608,13 @@ internal sealed class AsioAudioSession : IAsioSession
         }
     }
 
+    private ulong ReadCallbackCount()
+    {
+        var native = new AsioNativeStatus { StructSize = (uint)Marshal.SizeOf<AsioNativeStatus>() };
+        AsioInterop.GetStatus(_handle, ref native);
+        return native.CallbackCount;
+    }
+
     private AsioSessionRuntime ReadRuntime()
     {
         var inputs = ReadChannels(_handle, AsioInterop.InputChannelCount(_handle), AsioInterop.InputChannelName);
@@ -492,8 +671,9 @@ internal sealed class AsioAudioSession : IAsioSession
         if (stopError is not null) throw stopError;
     }
 
+    // Values match native/asio/zeus_asio.h zeus_asio_event.
     [Flags]
-    private enum AsioEvents : uint
+    internal enum AsioEvents : uint
     {
         ResetRequested = 4,
         ResyncRequested = 8,

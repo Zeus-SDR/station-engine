@@ -24,9 +24,11 @@ namespace Zeus.Server;
 /// </summary>
 public readonly record struct CwSymbol(bool KeyDown, int DurationMs);
 
+internal readonly record struct CwSampleSymbol(bool KeyDown, int DurationSamples);
+
 /// <summary>
 /// Pure ASCII-text → key-down/key-up timing stream. No side effects, no IO,
-/// no allocation past the returned iterator's local state — safe to call
+/// bounded iterator state and no per-symbol heap allocation — safe to call
 /// from any thread.
 ///
 /// Timing follows the PARIS-method standard: unit = 1200 / WPM ms.
@@ -44,7 +46,8 @@ public readonly record struct CwSymbol(bool KeyDown, int DurationMs);
 /// </summary>
 public static class MorseEncoder
 {
-    /// <summary>One PARIS dit-unit in ms at <paramref name="wpm"/> WPM.</summary>
+    /// <summary>Integer-millisecond PARIS unit for compatibility helpers.
+    /// IQ playback uses sample-domain timing to preserve fractional units.</summary>
     public static int DitMs(int wpm) => 1200 / wpm;
 
     // ASCII 32..95, seeded from Thetis morsedef.txt defaults. Entries with
@@ -127,6 +130,33 @@ public static class MorseEncoder
         if (wpm < 1) throw new ArgumentOutOfRangeException(nameof(wpm), wpm, "WPM must be ≥ 1");
 
         int unit = DitMs(wpm);
+        foreach (var symbol in EncodeUnits(text))
+            yield return new CwSymbol(symbol.KeyDown, unit * symbol.Units);
+    }
+
+    /// <summary>
+    /// Emit sample-domain timing with each cumulative boundary rounded to
+    /// the nearest sample. Carrying the remainder prevents WPM truncation
+    /// and drift over long messages; one Morse unit is exactly 6/(5*WPM) s.
+    /// </summary>
+    internal static IEnumerable<CwSampleSymbol> EncodeSamples(string text, int wpm, int rateHz)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        if (wpm < 1) throw new ArgumentOutOfRangeException(nameof(wpm));
+        if (rateHz < 1) throw new ArgumentOutOfRangeException(nameof(rateHz));
+        long denominator = 5L * wpm;
+        long remainder = denominator / 2;
+        foreach (var symbol in EncodeUnits(text))
+        {
+            long numerator = 6L * rateHz * symbol.Units + remainder;
+            int samples = checked((int)(numerator / denominator));
+            remainder = numerator % denominator;
+            yield return new CwSampleSymbol(symbol.KeyDown, samples);
+        }
+    }
+
+    private static IEnumerable<(bool KeyDown, int Units)> EncodeUnits(string text)
+    {
         bool atWordStart = true;  // suppresses the leading inter-character gap
 
         foreach (char raw in text)
@@ -139,7 +169,7 @@ public static class MorseEncoder
                 // otherwise precede the next char, so we mark atWordStart.
                 // Suppress at the very start of the buffer — no point
                 // emitting 7 units of silence before the first character.
-                if (!atWordStart) yield return new CwSymbol(false, unit * 7);
+                if (!atWordStart) yield return (false, 7);
                 atWordStart = true;
                 continue;
             }
@@ -148,13 +178,13 @@ public static class MorseEncoder
 
             // Inter-character gap. Skipped when this is the first
             // character of the buffer or of a fresh word (atWordStart).
-            if (!atWordStart) yield return new CwSymbol(false, unit * 3);
+            if (!atWordStart) yield return (false, 3);
             atWordStart = false;
 
             for (int i = 0; i < pattern.Length; i++)
             {
-                if (i > 0) yield return new CwSymbol(false, unit); // intra-element gap
-                yield return new CwSymbol(true, pattern[i] == '.' ? unit : unit * 3);
+                if (i > 0) yield return (false, 1); // intra-element gap
+                yield return (true, pattern[i] == '.' ? 1 : 3);
             }
         }
     }

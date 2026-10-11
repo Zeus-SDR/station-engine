@@ -229,6 +229,11 @@ public static class PublicListenStationEndpoints
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
+        endpoints.MapGet($"{RoutePrefix}/runtime", (HttpContext context) =>
+            IsTrustedServiceRequest(context)
+                ? Results.Ok(new { executablePath = Environment.ProcessPath, assemblyPath = System.Reflection.Assembly.GetEntryAssembly()?.Location })
+                : Results.StatusCode(StatusCodes.Status403Forbidden));
+
         endpoints.MapGet($"{RoutePrefix}/status", (HttpContext context, PublicListenFeedSocketHub hub) =>
             IsTrustedServiceRequest(context)
                 ? Results.Ok(hub.Status())
@@ -290,6 +295,11 @@ public static class PublicListenStationEndpoints
                 if (dto is null || !dto.TryToRequest(out var receiver))
                     return Results.BadRequest(new { error = "invalid receiver" });
                 receivers.Add(receiver);
+            }
+            if (context.RequestServices.GetService<StationReceiveOnlyPolicy>()?.Enabled == true)
+            {
+                for (int i = 0; i < receivers.Count; i++)
+                    receivers[i] = receivers[i] with { Settings = (receivers[i].Settings with { Hz = request[i].Hz }).Normalize(StationReceiveOnlyPolicy.MaximumFrequencyHz) };
             }
             hub.SetVrxReceivers(receivers);
             return Results.Ok(new { receivers = receivers.Count });

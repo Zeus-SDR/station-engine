@@ -22,11 +22,14 @@ namespace Zeus.Server;
 /// (only a <c>HasPassword</c> bool).</summary>
 public sealed class KiwiSettingsStore : IDisposable
 {
+    internal const string CollectionName = "kiwi_settings";
+
     private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<KiwiSettingsEntry> _entries;
     private readonly ILogger<KiwiSettingsStore> _log;
     private readonly object _sync = new();
+    private bool _loggedUnreadable;
 
     /// <summary>Raised after a successful <see cref="Set"/>.</summary>
     public event Action? Changed;
@@ -41,7 +44,7 @@ public sealed class KiwiSettingsStore : IDisposable
 
         _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
         _db = _dbLease.Database;
-        _entries = _db.GetCollection<KiwiSettingsEntry>("kiwi_settings");
+        _entries = _db.GetCollection<KiwiSettingsEntry>(CollectionName);
         _log.LogInformation("KiwiSettingsStore initialized at {Path}", dbPath);
     }
 
@@ -49,10 +52,29 @@ public sealed class KiwiSettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _entries.FindAll().FirstOrDefault();
-            return e is null
-                ? new KiwiSettings(false, null, null)
-                : new KiwiSettings(e.Enabled, e.Url, e.Password);
+            try
+            {
+                var e = _entries.FindAll().FirstOrDefault();
+                return e is null
+                    ? new KiwiSettings(false, null, null)
+                    : new KiwiSettings(e.Enabled, e.Url, e.Password);
+            }
+            catch (Exception ex)
+            {
+                // Wrong-shaped rows still open as raw documents, so the startup
+                // probe accepts the file, then this typed read throws. KiwiSdrService
+                // calls Get from its background loop and a throw stops the host.
+                // Log once and keep the slice disabled. Set refuses to write.
+                if (!_loggedUnreadable)
+                {
+                    _loggedUnreadable = true;
+                    _log.LogWarning(
+                        "kiwi.settings unreadable; using defaults. {ExceptionType}: {Message}",
+                        ex.GetType().Name,
+                        ex.Message);
+                }
+                return new KiwiSettings(false, null, null);
+            }
         }
     }
 
@@ -62,7 +84,8 @@ public sealed class KiwiSettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _entries.FindAll().FirstOrDefault() ?? new KiwiSettingsEntry { Id = 1 };
+            var e = PrefsSingleRow.ReadOrRefuse(_entries, CollectionName)
+                ?? new KiwiSettingsEntry { Id = 1 };
             if (enabled.HasValue) e.Enabled = enabled.Value;
             if (url is not null) e.Url = string.IsNullOrWhiteSpace(url) ? null : url.Trim();
             if (password is not null) e.Password = password.Length == 0 ? null : password;

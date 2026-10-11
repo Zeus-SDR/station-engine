@@ -213,18 +213,17 @@ public static class PrefsDbPath
             if (!File.Exists(dbPath))
                 return true; // fresh install / fresh DB — nothing to validate
 
-            const int attempts = 3;
-            const int backoffMs = 150;
-            for (int i = 0; i < attempts; i++)
+            for (int i = 0; i < PrefsDbTransient.Attempts; i++)
             {
                 var result = Probe(dbPath, log);
                 if (result is ProbeResult.Ok or ProbeResult.Transient)
                     return true; // valid, or busy → leave it alone
-                if (i < attempts - 1)
-                    System.Threading.Thread.Sleep(backoffMs);
+                if (i < PrefsDbTransient.Attempts - 1)
+                    System.Threading.Thread.Sleep(PrefsDbTransient.BackoffMs);
             }
 
-            Warn(log, $"prefs DB at '{dbPath}' is corrupt across {attempts} probes — moving it aside.");
+            Warn(log,
+                $"prefs DB at '{dbPath}' is corrupt across {PrefsDbTransient.Attempts} probes — moving it aside.");
             return MoveCorruptAside(dbPath, log);
         }
         catch (Exception ex)
@@ -251,14 +250,11 @@ public static class PrefsDbPath
                 _ = db.GetCollection(name).FindAll().FirstOrDefault();
             return ProbeResult.Ok;
         }
-        catch (IOException)
+        catch (Exception ex) when (PrefsDbTransient.IsTransientLock(ex))
         {
             // Raw OS file lock (another instance, antivirus) — never corruption.
-            return ProbeResult.Transient;
-        }
-        catch (Exception ex) when (ex.InnerException is IOException)
-        {
-            // Lock surfaced wrapped in a LiteException (or similar).
+            // A lock surfaced wrapped in a LiteException (or similar) is the same.
+            // EndOfStreamException stays transient: it is an IOException.
             return ProbeResult.Transient;
         }
         catch (Exception ex)
@@ -266,9 +262,13 @@ public static class PrefsDbPath
             // Any other failure to open/read the file is corruption: a bad
             // header, a torn/truncated data page, or garbage where a DB should
             // be. LiteDB raises several exception types here (LiteException,
-            // end-of-stream, format errors) — all mean "this file won't open".
-            // The caller retries before judging, so a torn read from a live
-            // writer mid-flush is never mistaken for a corrupt file.
+            // format errors) — all mean "this file won't open".
+            // UnauthorizedAccessException is not a lock (it is not an
+            // IOException). A permanently unwritable file, such as one with
+            // the Windows read-only attribute, is moved aside. The typed
+            // shape guard does not do that: it cannot judge, and it never
+            // moves a file. The caller retries before judging, so a torn read
+            // from a live writer mid-flush is never mistaken for a corrupt file.
             Warn(log, $"prefs DB probe failed: {ex.GetType().Name}: {ex.Message}", ex);
             return ProbeResult.Corrupt;
         }
@@ -291,10 +291,14 @@ public static class PrefsDbPath
             {
                 if (File.Exists(src)) File.Move(src, dst);
             }
+            // TX/PA calibration lives in the engine database. Product files
+            // (zeus-prefs.db and operator profiles) hold UI preferences only.
+            var lost = IsEngineDatabaseFileName(Path.GetFileName(dbPath))
+                ? "Prior settings (including TX/PA calibration) were lost"
+                : "Prior UI/product preferences were reset";
             Warn(log,
                 $"prefs DB moved aside to '{bak}'; a fresh one will be created. " +
-                "Prior settings (including TX/PA calibration) were lost — the moved " +
-                "file is preserved for developer diagnosis only and cannot be auto-restored.");
+                $"{lost} — the moved file is preserved for developer diagnosis only and cannot be auto-restored.");
             return true;
         }
         catch (Exception ex)

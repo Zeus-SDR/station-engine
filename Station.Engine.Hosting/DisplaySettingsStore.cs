@@ -26,6 +26,8 @@ namespace Zeus.Server;
 // pointed at the Zeus instance.
 public sealed class DisplaySettingsStore : IDisposable
 {
+    internal const string CollectionName = "display_settings";
+
     public const string DefaultFilterPanelBgColor = "#262A33";
     public const int DefaultFilterPanelBgBrightness = 50;
     public const int MaxCombinedImageBytes = 12 * 1024 * 1024;
@@ -114,6 +116,7 @@ public sealed class DisplaySettingsStore : IDisposable
     private readonly double _defaultDisplayMaxFrameRateHz;
     private readonly bool _lowPowerDisplay;
     private readonly object _sync = new();
+    private bool _loggedUnreadable;
 
     public DisplaySettingsStore(
         ILogger<DisplaySettingsStore> log,
@@ -133,7 +136,7 @@ public sealed class DisplaySettingsStore : IDisposable
 
         _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
         _db = _dbLease.Database;
-        _docs = _db.GetCollection<DisplaySettingsEntry>("display_settings");
+        _docs = _db.GetCollection<DisplaySettingsEntry>(CollectionName);
 
         _log.LogInformation("DisplaySettingsStore initialized at {Path}", dbPath);
     }
@@ -142,7 +145,27 @@ public sealed class DisplaySettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault();
+            DisplaySettingsEntry? e;
+            try
+            {
+                e = _docs.FindAll().FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                // DisplaySettingsApplyService.StartAsync reads this during host
+                // start. A wrong-shaped row must not stop the engine; the
+                // operator gets the same defaults as an empty store.
+                if (!_loggedUnreadable)
+                {
+                    _loggedUnreadable = true;
+                    _log.LogWarning(
+                        "{Collection} unreadable; using defaults. {ExceptionType}: {Message}",
+                        CollectionName,
+                        ex.GetType().Name,
+                        ex.Message);
+                }
+                e = null;
+            }
             if (e is null)
             {
                 return new DisplaySettingsDto(
@@ -240,7 +263,9 @@ public sealed class DisplaySettingsStore : IDisposable
                 FilterPanelImageMime: string.IsNullOrEmpty(e.FilterPanelImageMime)
                     ? null
                     : e.FilterPanelImageMime,
-                BandwidthFilter: e.BandwidthFilter is null ? null : NormalizeBandwidthFilter(e.BandwidthFilter));
+                BandwidthFilter: e.BandwidthFilter is null ? null : NormalizeBandwidthFilter(e.BandwidthFilter),
+                CwTuningSpanHz: IsValidCwSpan(e.CwTuningSpanHz) ? e.CwTuningSpanHz : null,
+                CwSidebandByBand: NormalizeCwSidebands(e.CwSidebandByBand));
         }
     }
 
@@ -272,6 +297,8 @@ public sealed class DisplaySettingsStore : IDisposable
             WaveformGain = Bound(value.WaveformGain ?? 1, 0.25, 16, 1),
             WaveformAutoScale = value.WaveformAutoScale ?? true,
             WaveformPhaseView = value.WaveformPhaseView ?? false,
+            WaveformRecordingSeconds = value.WaveformRecordingSeconds is 2 or 5 or 10 or 20 ? value.WaveformRecordingSeconds : 5,
+            HighResolutionSpectrum = value.HighResolutionSpectrum ?? true,
         };
     }
 
@@ -286,7 +313,21 @@ public sealed class DisplaySettingsStore : IDisposable
     // Null dB range values are treated as "not provided" — the existing
     // stored value is kept unchanged. This lets callers updating only
     // mode/fit/color leave the operator's dB scale untouched.
-    public void SaveMode(string mode, string fit, string rxTraceColor,
+    private static bool IsValidCwSpan(int? value) => value == 500 ||
+        (value is >= 1000 and <= 10000 && value % 1000 == 0);
+
+    private static Dictionary<string, string>? NormalizeCwSidebands(IReadOnlyDictionary<string, string>? values)
+    {
+        if (values is null) return null;
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in values.Take(128))
+            if (!string.IsNullOrWhiteSpace(pair.Key) && pair.Key.Length <= 80 &&
+                pair.Key.All(c => !char.IsControl(c)) && pair.Value is "CWU" or "CWL")
+                result[pair.Key] = pair.Value;
+        return result;
+    }
+
+    public void SaveMode(string? mode = null, string? fit = null, string? rxTraceColor = null,
         double? dbMin = null, double? dbMax = null,
         double? txDbMin = null, double? txDbMax = null,
         double? wfDbMin = null, double? wfDbMax = null,
@@ -313,15 +354,27 @@ public sealed class DisplaySettingsStore : IDisposable
         string? waterfallLowColor = null,
         string? waterfallMidColor = null,
         string? waterfallHighColor = null,
-        BandwidthFilterSettingsDto? bandwidthFilter = null)
+        BandwidthFilterSettingsDto? bandwidthFilter = null,
+        int? cwTuningSpanHz = null,
+        IReadOnlyDictionary<string, string>? cwSidebandByBand = null)
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault() ?? new DisplaySettingsEntry();
-            e.Mode = NormalizeMode(mode);
-            e.Fit = NormalizeFit(fit);
-            e.RxTraceColor = NormalizeHexColor(rxTraceColor);
+            var e = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName) ?? new DisplaySettingsEntry();
+            if (mode is not null) e.Mode = NormalizeMode(mode);
+            if (fit is not null) e.Fit = NormalizeFit(fit);
+            if (rxTraceColor is not null) e.RxTraceColor = NormalizeHexColor(rxTraceColor);
             if (bandwidthFilter is not null) e.BandwidthFilter = NormalizeBandwidthFilter(bandwidthFilter);
+            if (IsValidCwSpan(cwTuningSpanHz)) e.CwTuningSpanHz = cwTuningSpanHz;
+            if (cwSidebandByBand is not null)
+            {
+                // Requests are per-band patches; another window may have saved
+                // a different band since this client's last hydration.
+                var merged = NormalizeCwSidebands(e.CwSidebandByBand) ?? new Dictionary<string, string>();
+                foreach (var pair in NormalizeCwSidebands(cwSidebandByBand) ?? new Dictionary<string, string>())
+                    merged[pair.Key] = pair.Value;
+                e.CwSidebandByBand = merged;
+            }
             // Accept a (min, max) pair only when it's a non-degenerate window.
             // The old code wrote whatever the client sent, so a dB drag that
             // hit the abs-limit on both endpoints persisted min == max == -200
@@ -410,7 +463,7 @@ public sealed class DisplaySettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault() ?? new DisplaySettingsEntry();
+            var e = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName) ?? new DisplaySettingsEntry();
             EnsureCombinedImageBudget(bytes.Length, e.FilterPanelImageBytes?.Length ?? 0);
             e.ImageBytes = bytes;
             e.ImageMime = string.IsNullOrEmpty(mime) ? "application/octet-stream" : mime;
@@ -424,7 +477,7 @@ public sealed class DisplaySettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault();
+            var e = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName);
             if (e is null) return;
             e.ImageBytes = null;
             e.ImageMime = null;
@@ -451,7 +504,7 @@ public sealed class DisplaySettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault() ?? new DisplaySettingsEntry();
+            var e = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName) ?? new DisplaySettingsEntry();
             EnsureCombinedImageBudget(bytes.Length, e.ImageBytes?.Length ?? 0);
             e.FilterPanelImageBytes = bytes;
             e.FilterPanelImageMime = string.IsNullOrEmpty(mime) ? "application/octet-stream" : mime;
@@ -465,7 +518,7 @@ public sealed class DisplaySettingsStore : IDisposable
     {
         lock (_sync)
         {
-            var e = _docs.FindAll().FirstOrDefault();
+            var e = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName);
             if (e is null) return;
             e.FilterPanelImageBytes = null;
             e.FilterPanelImageMime = null;
@@ -597,6 +650,8 @@ public sealed class DisplaySettingsEntry
     // RX display analyzer FFT size. Null = never chosen: the engine keeps its
     // profile/config size (16384 stock / 8192 low-power).
     public int? RxDisplayFftSize { get; set; }
+    public int? CwTuningSpanHz { get; set; }
+    public Dictionary<string, string>? CwSidebandByBand { get; set; }
     public int? TxDisplayWindow { get; set; }
     public double? TxDisplayAvgTauMs { get; set; }
     // Protocol-2 ADC snapshot display mode. False on legacy rows because bool

@@ -32,6 +32,7 @@ public sealed class ProductBundleSettingsStore : IDisposable
     private readonly ILiteCollection<ProductBundleSettingsEntry> _docs;
     private readonly ILogger<ProductBundleSettingsStore> _log;
     private readonly object _sync = new();
+    private bool _loggedUnreadable;
 
     public event Action? Changed;
 
@@ -58,7 +59,28 @@ public sealed class ProductBundleSettingsStore : IDisposable
     public ProductBundleSettingsEntry? Get()
     {
         lock (_sync)
-            return _docs.FindAll().FirstOrDefault();
+        {
+            try
+            {
+                return _docs.FindAll().FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                // SpeTaurusWorker reads this through ProductFeatureState at
+                // startup. A throw there stops the host. Missing document is
+                // the fresh-install answer, so a wrong-shaped row stays inactive.
+                if (!_loggedUnreadable)
+                {
+                    _loggedUnreadable = true;
+                    _log.LogWarning(
+                        "{Collection} unreadable; treating as unset. {ExceptionType}: {Message}",
+                        CollectionName,
+                        ex.GetType().Name,
+                        ex.Message);
+                }
+                return null;
+            }
+        }
     }
 
     public ProductBundleSettingsEntry Save(string json)
@@ -71,7 +93,8 @@ public sealed class ProductBundleSettingsStore : IDisposable
         ProductBundleSettingsEntry entry;
         lock (_sync)
         {
-            entry = _docs.FindAll().FirstOrDefault() ?? new ProductBundleSettingsEntry();
+            entry = PrefsSingleRow.ReadOrRefuse(_docs, CollectionName)
+                ?? new ProductBundleSettingsEntry();
             entry.Json = json;
             entry.UpdatedUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             if (entry.Id == 0) _docs.Insert(entry);

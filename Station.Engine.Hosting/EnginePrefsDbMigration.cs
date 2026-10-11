@@ -66,6 +66,7 @@ internal static class EnginePrefsDbMigration
             "audio_device_settings",
             "audio_frontend",
             "band_memory",
+            "band_memory_metadata",
             "band_plan_overrides",
             "band_plan_prefs",
             "band_stack",

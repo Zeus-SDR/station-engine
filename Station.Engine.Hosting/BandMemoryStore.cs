@@ -138,6 +138,37 @@ public sealed class BandMemoryStore : IDisposable
         return e?.ZoomLevel;
     }
 
+    public bool? GetSquelchEnabled(string band) =>
+        _entries.FindOne(x => x.Band == band)?.SquelchEnabled;
+
+    public bool HasSquelchMemory() =>
+        _entries.FindOne(x => x.SquelchEnabled != null) is not null
+        || _db.GetCollection<BsonDocument>("band_memory_metadata")
+            .FindById("squelch_migrated") is not null;
+
+    // Retiring a legacy choice outside every known band cannot create a band
+    // row. Keep a marker so a subsequent restart does not migrate it again.
+    public void MarkSquelchMigrated()
+    {
+        lock (_mutationSync)
+            _db.GetCollection<BsonDocument>("band_memory_metadata").Upsert(
+                new BsonDocument { ["_id"] = "squelch_migrated" });
+    }
+
+    // Like zoom-only entries, squelch-only rows keep Hz=0 and stay invisible
+    // to frequency/mode recall. Other band settings survive this update.
+    public void SetSquelchEnabled(string band, bool enabled)
+    {
+        lock (_mutationSync)
+        {
+            var entry = _entries.FindOne(x => x.Band == band)
+                ?? new BandMemoryEntry { Band = band };
+            entry.SquelchEnabled = enabled;
+            entry.UpdatedUtc = DateTime.UtcNow;
+            _entries.Upsert(entry);
+        }
+    }
+
     public IReadOnlyList<BandWaterfallSettingsDto> GetAllWaterfallSettings()
     {
         return _entries
@@ -380,6 +411,9 @@ public sealed class BandMemoryEntry
     // field as null and RadioService.RestoreBandZoom leaves the current
     // slider alone until the operator explicitly zooms while on that band.
     public int? ZoomLevel { get; set; }
+    // Only the on/off choice is per band; thresholds remain station-wide.
+    // Null distinguishes legacy rows from an explicit remembered off choice.
+    public bool? SquelchEnabled { get; set; }
     // Per-band RX1 signed bandpass edges (#179). Null on rows persisted before
     // #179 shipped; RadioService.RestoreBandFilter leaves the current filter
     // alone in that case.

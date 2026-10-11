@@ -129,6 +129,9 @@ public sealed partial class RadioService : IDisposable
     // the physical front panel, the VFO knob, or a typed frequency (KB2UKA
     // 2026-06-25). Writes stay frontend/front-panel driven; this is read-only.
     private readonly BandMemoryStore? _bandMemoryStore;
+    private string? _squelchBandKey;
+    private long? _legacySquelchStartupHz;
+    private bool _legacySquelchStartupEnabled;
     // Global (per-radio, NOT per-band) TX-audio source selection. Pushed via
     // PushAudioFrontEnd on store edit + connect (external-audio-jacks re-port).
     private readonly AudioSettingsStore? _audioStore;
@@ -290,6 +293,10 @@ public sealed partial class RadioService : IDisposable
         public long TxVfoHz;
         public int ZoomLevel = 1; // independent DDC display zoom for this slice
         public NrMode NrMode = NrMode.Off; // per-RX NR mode (NR tunables stay shared)
+        public AgcConfig Agc = new();
+        public double AgcTopDb = 90.0;
+        public bool AutoAgcEnabled;
+        public double AgcOffsetDb;
     }
     private readonly ExtraReceiver[] _extraReceivers = CreateExtraReceivers();
     // Current Zeus ordinary Protocol-1 ingest decodes one DDC stream and fans it
@@ -565,8 +572,11 @@ public sealed partial class RadioService : IDisposable
     private readonly IExternalReceiverSource _externalReceiverSource;
     private readonly int? _defaultConnectSampleRateHz;
 
-    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null, TransverterSettingsStore? transverterSettingsStore = null, LayoutStore? layoutStore = null, IBandPlanService? bandPlan = null)
+    public bool ReceiveOnly { get; }
+
+    public RadioService(ILoggerFactory loggerFactory, DspSettingsStore dspSettingsStore, PaSettingsStore paStore, FilterPresetStore? filterPresetStore = null, Zeus.Protocol1.ITxIqSource? txIqSource = null, PreferredRadioStore? preferredRadioStore = null, PsSettingsStore? psStore = null, RadioStateStore? radioStateStore = null, CwSettingsStore? cwSettingsStore = null, IInitialTxAudioConfigSource? initialTxAudioConfigSource = null, AntennaSettingsStore? antennaStore = null, AudioSettingsStore? audioStore = null, Nr3ModelStore? nr3ModelStore = null, Hl2GpioSettingsStore? hl2GpioStore = null, BandMemoryStore? bandMemoryStore = null, IExternalReceiverSource? externalReceiverSource = null, Zeus.Protocol1.IRxAudioSource? rxAudioSource = null, RfFilterSettingsStore? rfFilterStore = null, IConfiguration? configuration = null, IRadioDiscovery? p1Discovery = null, TransverterSettingsStore? transverterSettingsStore = null, LayoutStore? layoutStore = null, IBandPlanService? bandPlan = null, StationReceiveOnlyPolicy? receiveOnlyPolicy = null)
     {
+        ReceiveOnly = receiveOnlyPolicy?.Enabled ?? false;
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<RadioService>();
         _dspSettingsStore = dspSettingsStore;
@@ -996,6 +1006,7 @@ public sealed partial class RadioService : IDisposable
                 TxFilterHighHz = persistedFm.TxHighCutHz,
             };
         }
+        InitializeBandSquelch();
         // Seed the ARS latch with the hydrated dial so startup never rewrites a
         // persisted manual shift; only a real tune / mode change re-evaluates.
         _arsLastKey = ArsKeyLocked(_state);
@@ -1058,9 +1069,18 @@ public sealed partial class RadioService : IDisposable
                     FilterLowHz: hydFilterLowB, FilterHighHz: hydFilterHighB,
                     FilterPresetName: hydPresetB, AfGainDb: hydAfGainB,
                     SampleRateHz: _state.SampleRate, Muted: _state.Rx2Muted,
-                    NrMode: hydNrModeB),
+                    NrMode: hydNrModeB,
+                    Agc: LoadReceiverAgc(1), AgcTopDb: LoadReceiverAgcTop(1),
+                    AutoAgcEnabled: _dspSettingsStore.GetReceiverAutoAgc(ReceiverAgcProfile(1)) ?? _state.AutoAgcEnabled),
             },
         };
+
+        for (int i = 2; i < _extraReceivers.Length; i++)
+        {
+            _extraReceivers[i].Agc = LoadReceiverAgc(i);
+            _extraReceivers[i].AgcTopDb = LoadReceiverAgcTop(i);
+            _extraReceivers[i].AutoAgcEnabled = _dspSettingsStore.GetReceiverAutoAgc(ReceiverAgcProfile(i)) ?? _state.AutoAgcEnabled;
+        }
 
         // Persist the fold immediately. A crash before the next natural flush
         // would otherwise re-run it on the following start; the fold is applied
@@ -1614,6 +1634,8 @@ public sealed partial class RadioService : IDisposable
         string? firmware = attempt.Firmware;
         if (!TryParseEndpoint(endpoint, out var ipEndpoint))
             throw new ArgumentException($"Invalid endpoint '{endpoint}'.", nameof(endpoint));
+        if (ReceiveOnly && !System.Net.IPAddress.IsLoopback(ipEndpoint.Address))
+            throw new ArgumentException("Receive-only engines require a loopback receiver endpoint.", nameof(endpoint));
 
         // This is the Protocol 1 connect path (it constructs a Protocol1Client).
         // P1's 2-bit rate field caps at 384 kHz; 768/1536 kHz are Protocol 2 only,
@@ -1836,6 +1858,25 @@ public sealed partial class RadioService : IDisposable
         return DisconnectClientAsync(expectedClient: null, ct);
     }
 
+    public async Task<StateDto?> DisconnectIfEndpointAsync(string expectedEndpoint, CancellationToken ct = default)
+    {
+        if (!TryParseEndpoint(expectedEndpoint, out var expected))
+            throw new ArgumentException("Invalid expected receiver endpoint.", nameof(expectedEndpoint));
+        await RadioLifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                if (_activeClient is null || _p2Active || _p3Active
+                    || !TryParseEndpoint(_state.Endpoint ?? string.Empty, out var current)
+                    || !expected.Equals(current)) return null;
+            }
+            BeginOperatorConnectionAction();
+            return await DisconnectClientCoreAsync(expectedClient: null, ct).ConfigureAwait(false);
+        }
+        finally { RadioLifecycleGate.Release(); }
+    }
+
     private async Task<StateDto> DisconnectClientAsync(
         Protocol1Client? expectedClient,
         CancellationToken ct)
@@ -1964,6 +2005,7 @@ public sealed partial class RadioService : IDisposable
     /// </summary>
     internal long ToHardwareFrequencyHz(long rfHz)
     {
+        if (ReceiveOnly) return Math.Clamp(rfHz, 0L, StationReceiveOnlyPolicy.MaximumFrequencyHz);
         if (Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
             return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
         var settings = ActiveTransverterSettings();
@@ -2001,6 +2043,7 @@ public sealed partial class RadioService : IDisposable
     internal bool IsExternalFrequencyAvailable(long hz, bool allowZero = false)
     {
         if (hz < (allowZero ? 0 : 1)) return false;
+        if (ReceiveOnly) return hz <= StationReceiveOnlyPolicy.MaximumFrequencyHz;
         var settings = ActiveTransverterSettings();
         if (settings.Enabled
             && TransverterFrequencyConverter.TryResolveBandByRfHz(hz, settings, out _))
@@ -2010,6 +2053,7 @@ public sealed partial class RadioService : IDisposable
 
     internal long ClampTuningFrequency(long hz)
     {
+        if (ReceiveOnly) return Math.Clamp(hz, 0L, StationReceiveOnlyPolicy.MaximumFrequencyHz);
         var settings = ActiveTransverterSettings();
         if (!settings.Enabled || hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz)
             return Math.Clamp(hz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
@@ -2032,7 +2076,7 @@ public sealed partial class RadioService : IDisposable
         }
         PushPrimaryRadioFrequency(current.RadioLoHz);
         RecomputePaAndPush();
-        StateChanged?.Invoke(current);
+        Mutate(s => s);
     }
 
     private void OnActiveTransverterSelectionChanged(string radioKey, bool enabled)
@@ -2051,7 +2095,7 @@ public sealed partial class RadioService : IDisposable
         }
         PushPrimaryRadioFrequency(current.RadioLoHz);
         RecomputePaAndPush();
-        StateChanged?.Invoke(current);
+        Mutate(s => s);
     }
 
     private void RevalidateTransverterChange(StateDto state)
@@ -2307,8 +2351,11 @@ public sealed partial class RadioService : IDisposable
         double? afGainDb = null,
         string? filterPresetName = null,
         int? zoomLevel = null,
-        NrMode? nrMode = null)
+        NrMode? nrMode = null,
+        AgcConfig? agc = null, double? agcTopDb = null, bool? autoAgcEnabled = null)
     {
+        if (agc is not null || agcTopDb is not null || autoAgcEnabled is not null)
+            SetReceiverAgc(index, agc, agcTopDb, autoAgcEnabled);
         // RX1 (0) and RX2 (1) live on the flat StateDto fields, but the uniform
         // numeric model means /api/receivers/{index} must drive every receiver.
         // Route each supplied field to its canonical RX1/RX2 setter so all their
@@ -4797,9 +4844,12 @@ public sealed partial class RadioService : IDisposable
             AgcTopMinDb,
             AgcTopMaxDb);
 
-    private double AutoAgcRawTopFromNoiseFloor(double noiseFloorDbm)
+    private double AutoAgcRawTopFromNoiseFloor(double noiseFloorDbm) =>
+        AutoAgcRawTopFromNoiseFloor(noiseFloorDbm, _state);
+
+    private double AutoAgcRawTopFromNoiseFloor(double noiseFloorDbm, StateDto state)
     {
-        var agc = _state.Agc ?? new AgcConfig(AgcMode.Med);
+        var agc = state.Agc ?? new AgcConfig(AgcMode.Med);
         double calOffsetDb = agc.Mode == AgcMode.Fixed ? 0.0 : AgcThreshCalOffsetDb;
         // 1) Desired AGC threshold (Thetis: floor + userOffset − cal), clamped.
         double thresh = Math.Clamp(
@@ -4807,8 +4857,8 @@ public sealed partial class RadioService : IDisposable
             AgcThreshMinDbm, AgcThreshMaxDbm);
         // 2) WDSP bandwidth/FFT term: 10·log10((fhigh−flow)·size/rate) (wcpAGC.c:482).
         //    fhigh−flow is the RX passband width WDSP runs (our _state filter edges).
-        double bwHz = Math.Max(1.0, Math.Abs(_state.FilterHighHz - _state.FilterLowHz));
-        double rate = Math.Max(1.0, _state.SampleRate);
+        double bwHz = Math.Max(1.0, Math.Abs(state.FilterHighHz - state.FilterLowHz));
+        double rate = Math.Max(1.0, state.SampleRate);
         double noiseOffset = 10.0 * Math.Log10(bwHz * _autoAgcAnalyzerFftSize / rate);
         // 3) top = 20·log10(max_gain) = 20·log10(out_target) − 20·log10(var_gain)
         //    − (thresh + noiseOffset). WDSP sets var_gain=10^(slope/200),
@@ -4943,6 +4993,7 @@ public sealed partial class RadioService : IDisposable
 
     private void SetMoxCore(bool on, long nowMs)
     {
+        if (on && ReceiveOnly) throw new InvalidOperationException(StationReceiveOnlyPolicy.TransmitDenied);
         // Per-digital-mode Drive lands before the first keyed block.
         if (on) SettleDigitalModeDriveBeforeKey();
         // The hardware NCO can sit off the dial for RX (CTUN freeze, or an
@@ -5533,6 +5584,7 @@ public sealed partial class RadioService : IDisposable
     // just-applied keying state (Thetis PreviousPWR swap, `console.cs:30094`).
     internal void NotifyTunActive(bool on)
     {
+        if (on && ReceiveOnly) throw new InvalidOperationException(StationReceiveOnlyPolicy.TransmitDenied);
         bool tuneFell;
         lock (_sync)
         {
@@ -6533,9 +6585,43 @@ public sealed partial class RadioService : IDisposable
                 SquelchConfig.MinFixedSensitivity,
                 SquelchConfig.MaxFixedSensitivity),
         };
-        Mutate(s => s with { Squelch = clamped });
-        _dspSettingsStore.SetSquelch(clamped);
+        Mutate(s => s with { Squelch = clamped }, out _, accepted =>
+        {
+            _dspSettingsStore.SetSquelch(accepted.Squelch!);
+            if (_squelchBandKey is { } band)
+                _bandMemoryStore?.SetSquelchEnabled(band, accepted.Squelch!.Enabled);
+            else
+                _bandMemoryStore?.MarkSquelchMigrated();
+            // An explicit setting outside a resolved band ends legacy carry.
+            _legacySquelchStartupHz = null;
+        }, recallBandSquelch: false);
         return Snapshot();
+    }
+
+    private void InitializeBandSquelch()
+    {
+        if (_bandMemoryStore is null) return;
+        _squelchBandKey = RuntimeBandKey(_state.VfoHz);
+        var config = _state.Squelch ?? new SquelchConfig();
+        bool legacy = !_bandMemoryStore.HasSquelchMemory();
+        if (_squelchBandKey is { } band)
+        {
+            bool enabled = _bandMemoryStore.GetSquelchEnabled(band)
+                ?? (legacy && config.Enabled);
+            _state = _state with { Squelch = config with { Enabled = enabled } };
+            _bandMemoryStore.SetSquelchEnabled(band, enabled);
+        }
+        else if (legacy)
+        {
+            // A saved transverter dial can lack a profile before connection.
+            // Migrate only if that same startup dial later resolves a band.
+            _legacySquelchStartupHz = _state.VfoHz;
+            _legacySquelchStartupEnabled = config.Enabled;
+        }
+        else
+        {
+            _state = _state with { Squelch = config with { Enabled = false } };
+        }
     }
 
     // TX leveling — ALC (max-gain/decay), Leveler (on/off/decay), Compressor
@@ -7266,7 +7352,8 @@ public sealed partial class RadioService : IDisposable
     // result aborts without dirtying or broadcasting the unchanged state.
     // Unconditional Mutate delegates here so the Receivers/MaxReceivers/
     // ConnectedProtocol projection lives in exactly one place.
-    private void Mutate(Func<StateDto, StateDto?> fn, out bool applied)
+    private void Mutate(Func<StateDto, StateDto?> fn, out bool applied,
+        Action<StateDto>? persistAccepted = null, bool recallBandSquelch = true)
     {
         StateDto? next;
         bool arsChanged = false;
@@ -7279,6 +7366,25 @@ public sealed partial class RadioService : IDisposable
                 {
                     applied = false;
                     return;
+                }
+                // Band identity can change at the same dial frequency when a
+                // radio connects or its layout/profile selection changes.
+                string? squelchBand = _bandMemoryStore is null
+                    ? null : RuntimeBandKey(next.VfoHz);
+                bool? seedSquelch = null;
+                if (_bandMemoryStore is not null && (squelchBand != _squelchBandKey
+                    || (_legacySquelchStartupHz is { } startupHz && startupHz != next.VfoHz)))
+                {
+                    bool? stored = squelchBand is null
+                        ? null : _bandMemoryStore.GetSquelchEnabled(squelchBand);
+                    bool enabled = recallBandSquelch
+                        ? stored ?? (_legacySquelchStartupHz == next.VfoHz && _legacySquelchStartupEnabled)
+                        : next.Squelch?.Enabled ?? false;
+                    next = next with
+                    {
+                        Squelch = (next.Squelch ?? new SquelchConfig()) with { Enabled = enabled },
+                    };
+                    if (squelchBand is not null && stored is null) seedSquelch = enabled;
                 }
                 // Project the canonical per-receiver array from the flat RX1/RX2
                 // fields on every mutation so StateChanged subscribers and the
@@ -7299,6 +7405,17 @@ public sealed partial class RadioService : IDisposable
                 TransmitSafetyStateChanging?.Invoke(_state, next);
                 _state = next;
                 _currentMode = (int)next.Mode;
+                _squelchBandKey = squelchBand;
+                if (_legacySquelchStartupHz is { } pendingHz && pendingHz != next.VfoHz
+                    && squelchBand is null)
+                    _bandMemoryStore?.MarkSquelchMigrated();
+                if (squelchBand is not null || _legacySquelchStartupHz != next.VfoHz)
+                    _legacySquelchStartupHz = null;
+                if (seedSquelch is { } enabledForBand)
+                    _bandMemoryStore!.SetSquelchEnabled(squelchBand!, enabledForBand);
+                // Persist before publishing so even a subscriber's immediate
+                // leave-and-return sees the just-accepted per-band choice.
+                persistAccepted?.Invoke(next);
             }
         }
         catch (TransmitSafetyRejectedException ex)
@@ -7354,7 +7471,8 @@ public sealed partial class RadioService : IDisposable
         // Read-only mirror of the legacy global zoom — RX1 is still SET only via
         // StateDto.ZoomLevel / SetZoom, never through this projection.
         ZoomLevel: s.ZoomLevel,
-        NrMode: Rx1NrMode(s));
+        NrMode: Rx1NrMode(s), Agc: s.Agc, AgcTopDb: s.AgcTopDb,
+        AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb);
 
     private static StateDto WithReceiverAdcSource(StateDto s, int index, byte adcSource)
     {
@@ -7449,7 +7567,8 @@ public sealed partial class RadioService : IDisposable
                 AfGainDb: s.Rx1AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
                 TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel,
-                NrMode: Rx1NrMode(s)),
+                NrMode: Rx1NrMode(s), Agc: s.Agc, AgcTopDb: s.AgcTopDb,
+                AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
             // in the array itself (the flat VFO-B fields are gone). Carry the
             // existing tuning forward and overlay the flat RX2 control fields
@@ -7482,7 +7601,8 @@ public sealed partial class RadioService : IDisposable
                 FilterPresetName: e.FilterPresetName,
                 AfGainDb: e.AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: e.Muted, SplitEnabled: e.SplitEnabled,
-                TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel, NrMode: e.NrMode));
+                TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel, NrMode: e.NrMode,
+                Agc: e.Agc, AgcTopDb: e.AgcTopDb, AutoAgcEnabled: e.AutoAgcEnabled, AgcOffsetDb: e.AgcOffsetDb));
         }
         // Non-hardware KiwiSDR slice (reserved index KiwiReceiverIndex). Appended
         // out of the contiguous DDC run — it is a remote receiver, not a DDC, so

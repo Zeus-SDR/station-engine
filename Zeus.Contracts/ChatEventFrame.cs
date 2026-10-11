@@ -75,6 +75,9 @@ public static class ChatEventFrame
     public static byte[] Friends(ChatFriendsDto friends) =>
         Encode(new FriendsEnvelope(friends));
 
+    public static byte[] SignalReport(ChatSignalReportDto report) =>
+        Encode(new SignalReportEnvelope(report));
+
     /// <summary>Encodes an ephemeral PTT signalling envelope into a 0x35 frame.</summary>
     public static byte[] Ptt(ChatPttSignal ptt) =>
         Encode(new PttEnvelope(ptt));
@@ -166,6 +169,11 @@ public static class ChatEventFrame
     public sealed record FriendsEnvelope(ChatFriendsDto Friends)
     {
         public string Kind => "friends";
+    }
+
+    public sealed record SignalReportEnvelope(ChatSignalReportDto Report)
+    {
+        public string Kind => "signal-report";
     }
 
     public sealed record PttEnvelope(ChatPttSignal Ptt)

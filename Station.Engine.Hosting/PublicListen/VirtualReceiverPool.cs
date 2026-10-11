@@ -64,6 +64,7 @@ public static class VrxEngineEndReasons
 /// </summary>
 public interface IVirtualReceiverPool
 {
+    long MaximumFrequencyHz => GuestReceiverSettings.MaxHz;
     /// <summary>Slot numbers run 0..MaxSlots-1 (stream id 0xC0 + slot).</summary>
     int MaxSlots { get; }
 
@@ -132,6 +133,7 @@ public sealed class VirtualReceiverPool : IVirtualReceiverPool
 
     private readonly object _gate = new();
     private readonly TimeProvider _time;
+    private readonly long _maximumFrequencyHz;
     private Action<Action> _dispatch;
     private readonly Dictionary<int, VrxRequest> _receivers = [];
     private readonly Meter[] _meters = new Meter[MaxVrxSlots];
@@ -140,14 +142,17 @@ public sealed class VirtualReceiverPool : IVirtualReceiverPool
     private int _capacity;
     private VrxSpan _span;
 
-    public VirtualReceiverPool(Action<Action>? dispatch = null, TimeProvider? time = null)
+    public VirtualReceiverPool(Action<Action>? dispatch = null, TimeProvider? time = null, long maximumFrequencyHz = GuestReceiverSettings.MaxHz)
     {
         _dispatch = dispatch ?? (work => ThreadPool.QueueUserWorkItem(static w => ((Action)w!)(), work));
         _time = time ?? TimeProvider.System;
+        _maximumFrequencyHz = maximumFrequencyHz;
         for (int i = 0; i < _meters.Length; i++) _meters[i] = new Meter();
     }
 
     public int MaxSlots => MaxVrxSlots;
+
+    public long MaximumFrequencyHz => _maximumFrequencyHz;
 
     public IReadOnlyList<GuestNrMode> NrModes
     {
@@ -218,7 +223,7 @@ public sealed class VirtualReceiverPool : IVirtualReceiverPool
         {
             if (receiver.Slot is < 0 or >= MaxVrxSlots || receiver.Settings is null) continue;
             if (next.ContainsKey(receiver.Slot)) continue;
-            next[receiver.Slot] = receiver with { Settings = receiver.Settings.Normalize() };
+            next[receiver.Slot] = receiver with { Settings = receiver.Settings.Normalize(_maximumFrequencyHz) };
         }
 
         lock (_gate)

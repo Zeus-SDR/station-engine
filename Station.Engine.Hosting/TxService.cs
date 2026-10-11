@@ -93,17 +93,17 @@ public sealed class TxService
     private MoxSource? _tunOwner;
     private MoxSource? _pendingTunOwner;
     private bool _paCalibrationLeaseActive;
-    // TX pre-key (MOX/TUNE) delay window deadline, in Stopwatch ticks (issue #630).
-    // 0 = no active window. Armed on a UI voice-MOX or UI TUNE rising edge when
-    // RadioService.TxMoxPreKeyDelayMs > 0; the IQ producers substitute silence
+    // TX pre-key (MOX/TUNE/TwoTone) delay window deadline, in Stopwatch ticks (issue #630).
+    // 0 = no active window. Armed on operator voice-MOX, TUNE, or TwoTone key-down when
+    // RadioService.EffectiveTxMoxPreKeyDelayMs > 0; the IQ producers substitute silence
     // for modulated IQ until the deadline so an external amp's T/R relay settles
     // before RF appears. The window is cleared on every MOX-off, TUN-off,
-    // two-tone, and trip so a stale deadline can never bleed into a later
+    // TwoTone-off, and trip so a stale deadline can never bleed into a later
     // transmission. Written under _sync, read lock-free via Interlocked elsewhere.
     private long _preKeyOpenAtTicks;
 
     /// <summary>Stopwatch-tick deadline until which modulated TX IQ should be
-    /// muted (silence substituted) after a UI MOX/TUNE key-down. 0 = no mute.
+    /// muted (silence substituted) after an operator MOX/TUNE/TwoTone key-down. 0 = no mute.
     /// Read by <see cref="TxAudioIngest"/> and <see cref="TxTuneDriver"/> on
     /// their producer threads.</summary>
     public long PreKeyOpenAtTicks => Interlocked.Read(ref _preKeyOpenAtTicks);
@@ -592,6 +592,11 @@ public sealed class TxService
         out string? error,
         bool paCalibrationLeaseOwner = false)
     {
+        if (_radio.ReceiveOnly)
+        {
+            error = StationReceiveOnlyPolicy.TransmitDenied;
+            return false;
+        }
         TransmitIntent? active;
         lock (_sync)
         {
@@ -878,6 +883,8 @@ public sealed class TxService
         {
             _activeIntent = intent;
             _transitionRevision = revision;
+            // Arm the IQ mute before publishing any latch read by a producer.
+            Interlocked.Exchange(ref _preKeyOpenAtTicks, armPreKey ? long.MaxValue : 0);
             _moxOn = intent is TransmitIntent.Mox or TransmitIntent.TwoTone;
             _tunOn = intent == TransmitIntent.Tun;
             _moxStartedAt = _moxOn ? DateTime.UtcNow : null;
@@ -885,7 +892,6 @@ public sealed class TxService
             _moxOwner = _moxOn ? source : null;
             _tunOwner = _tunOn ? source : null;
             IsTwoToneOn = intent == TransmitIntent.TwoTone;
-            Interlocked.Exchange(ref _preKeyOpenAtTicks, armPreKey ? long.MaxValue : 0);
             _keyedAtTicks = _stopwatchTicks();
             changed = CaptureTxActiveChangeUnderLock();
         }
@@ -1781,6 +1787,8 @@ public sealed class TxService
                 }
             }
 
+            int preKeyMs = _radio.EffectiveTxMoxPreKeyDelayMs;
+            long preKeyDelayTicks = preKeyMs > 0 ? DelayMsToStopwatchTicks(preKeyMs) : 0;
             long revision = NextTransitionRevision();
             _safety.AdmitExplicitRequest();
             _radio.SetHardwareCwSafetyBlocked(true);
@@ -1800,7 +1808,8 @@ public sealed class TxService
                 _radio.SetMox(true);
                 _pipeline.CommitTxEgress(revision);
                 _pipeline.SetPsMox(true);
-                CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, revision, armPreKey: false);
+                CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, revision, preKeyDelayTicks > 0);
+                RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
                 _log.LogInformation(
                     "tx.twoTone on=true f1={F1} f2={F2} mag={Mag} revision={Revision}",
                     req.Freq1, req.Freq2, req.Mag, revision);

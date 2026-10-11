@@ -53,7 +53,7 @@ public partial class DspPipelineService
                 _waveformTapEngine = engine;
                 _waveformTapHandler = (rate, samples) => CaptureTxWaveform(engine, rate, samples);
             }
-            source.SetTxWaveformTap(context is not null ? _waveformTapHandler : null, now + WaveformSnapshotCache.LeaseMs);
+            source.SetTxWaveformTap(context is not null ? _waveformTapHandler : null, Math.Max(now + WaveformSnapshotCache.LeaseMs, Volatile.Read(ref _txCaptureTapUntil)));
         }
         var cache = tx ? _txWaveform : _rxWaveforms[receiver];
         return cache.Request(context, now, context?.Receiver ?? receiver, tx, windowMs,
@@ -62,11 +62,12 @@ public partial class DspPipelineService
 
     private void CaptureTxWaveform(IDspEngine engine, int rate, ReadOnlySpan<float> samples)
     {
-        if (!ReferenceEquals(engine, Volatile.Read(ref _engine))) return;
+        long now = Environment.TickCount64;
+        if (!_txWaveform.IsDemanded(now) || !ReferenceEquals(engine, Volatile.Read(ref _engine))) return;
         var requested = Volatile.Read(ref _requestedTxWaveform);
         if (requested is null || !requested.Tx) return;
         var current = WaveformSourceContext(Volatile.Read(ref _engine), _radio.Snapshot(), requested.Receiver, true);
-        _txWaveform.Append(current, rate, 2, samples, Environment.TickCount64,
+        _txWaveform.Append(current, rate, 2, samples, now,
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
@@ -88,6 +89,28 @@ public static class WaveformEndpoints
         endpoints.MapGet("/api/display/waveform", (DspPipelineService pipeline,
             int? receiver, bool? tx, double? windowMs) =>
             Results.Ok(pipeline.GetWaveformSnapshot(receiver ?? 0, tx ?? false, windowMs ?? 50)));
+        endpoints.MapPost("/api/display/waveform/capture", (DspPipelineService pipeline,
+            int? receiver, bool? tx, int? durationMs) =>
+        {
+            int rx = receiver ?? 0, duration = durationMs ?? 3000;
+            if (rx is < 0 or > 7 || duration is not (1000 or 3000 or 5000 or 10000))
+                return Results.BadRequest(new { error = "Invalid receiver or duration" });
+            var capture = pipeline.StartWaveformCapture(rx, tx ?? false, duration, out var error);
+            return capture is null ? Results.Conflict(new { error })
+                : Results.Json(capture, statusCode: StatusCodes.Status202Accepted);
+        });
+        endpoints.MapGet("/api/display/waveform/capture/{id}", (DspPipelineService pipeline, string id) =>
+            pipeline.GetWaveformCapture(id) is { } capture ? Results.Ok(capture) : Results.NotFound());
+        endpoints.MapGet("/api/display/waveform/capture/{id}/samples", (DspPipelineService pipeline, string id) =>
+        {
+            var capture = pipeline.GetWaveformCapture(id);
+            if (capture is null) return Results.NotFound();
+            if (capture.Status != "complete") return Results.Conflict(new { error = "Capture is not complete" });
+            var bytes = pipeline.GetWaveformCaptureSamples(id);
+            return bytes is null ? Results.NotFound() : Results.Bytes(bytes, "application/octet-stream");
+        });
+        endpoints.MapDelete("/api/display/waveform/capture/{id}", (DspPipelineService pipeline, string id) =>
+            pipeline.CancelWaveformCapture(id) ? Results.NoContent() : Results.NotFound());
         return endpoints;
     }
 }

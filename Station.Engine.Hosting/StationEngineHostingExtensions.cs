@@ -11,7 +11,8 @@ public sealed record StationEngineHostingOptions(
     bool NativeAudioOutputEnabled = false,
     string? P2AutoConnectEndpoint = null,
     IReadOnlyList<string>? LanHttpsUrls = null,
-    string? GodsEyeDatabasePath = null);
+    string? GodsEyeDatabasePath = null,
+    bool ReceiveOnly = false);
 
 /// <summary>Registers the complete standalone station-engine runtime.</summary>
 public static class StationEngineHostingExtensions
@@ -28,6 +29,7 @@ public static class StationEngineHostingExtensions
         ArgumentNullException.ThrowIfNull(services);
         options ??= new StationEngineHostingOptions();
 
+        services.AddSingleton(new StationReceiveOnlyPolicy(options.ReceiveOnly));
         services.AddHttpClient();
 
         // LAN Browser proxy: StationEngine is the API origin reached by local

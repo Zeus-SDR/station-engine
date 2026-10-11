@@ -418,6 +418,11 @@ public interface IDspEngine : IDisposable
     /// </summary>
     void SetRxDigitalBypass(int channelId, bool bypass) { }
 
+    /// <summary>Temporarily bypass NR and automatic notch filtering on a CW
+    /// decoder's receive channel. Retain the latest operator settings for
+    /// restoration; leave blankers, manual notches and other RX stages alone.</summary>
+    void SetRxCwNoiseReductionBypass(int channelId, bool bypass) { }
+
     /// <summary>Temporarily bypass speech-only TX processing for a linear
     /// product-plugin injection source. The engine must restore the operator's
     /// configured stages when the source releases its lease.</summary>

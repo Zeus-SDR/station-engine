@@ -453,7 +453,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 var opened = _asioFactory.Open(
                     config,
                     config.EnableOutput ? _sink : null,
-                    config.EnableInput ? _mic : null);
+                    config.EnableInput ? _mic : null,
+                    _log);
                 try
                 {
                     // Subscribe before Start: a driver may synchronously report a
@@ -565,6 +566,10 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                         StopAsio();
                         StartAsio(settings);
                         Volatile.Write(ref _asioError, null);
+                        _log.LogInformation(
+                            "audio.asio driver recovered driver={DriverName} id={DriverId}",
+                            AsioDriverName(settings.AsioDriverId) ?? "unknown",
+                            settings.AsioDriverId);
                     }
                     catch (Exception ex)
                     {

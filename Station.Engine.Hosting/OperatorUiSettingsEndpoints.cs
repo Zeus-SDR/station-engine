@@ -34,8 +34,9 @@ public static class OperatorUiSettingsEndpoints
 
         endpoints.MapPut("/api/display-settings", (DisplaySettingsSetRequest req, DisplaySettingsStore store, DspPipelineService dsp) =>
         {
-            if (string.IsNullOrWhiteSpace(req.Mode) || string.IsNullOrWhiteSpace(req.Fit))
-                return Results.BadRequest(new { error = "mode and fit required" });
+            if (req.Mode is not null && string.IsNullOrWhiteSpace(req.Mode) ||
+                req.Fit is not null && string.IsNullOrWhiteSpace(req.Fit))
+                return Results.BadRequest(new { error = "mode and fit must not be blank when provided" });
             try
             {
                 store.SaveMode(req.Mode, req.Fit, req.RxTraceColor,
@@ -63,7 +64,9 @@ public static class OperatorUiSettingsEndpoints
                     req.WaterfallLowColor,
                     req.WaterfallMidColor,
                     req.WaterfallHighColor,
-                    req.BandwidthFilter);
+                    req.BandwidthFilter,
+                    req.CwTuningSpanHz,
+                    req.CwSidebandByBand);
             }
             catch (System.Text.Json.JsonException ex)
             {

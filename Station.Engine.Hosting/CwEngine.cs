@@ -682,7 +682,7 @@ public sealed class CwEngine : BackgroundService
 
         try
         {
-            foreach (var symbol in MorseEncoder.Encode(job.Text, job.Wpm))
+            foreach (var symbol in MorseEncoder.EncodeSamples(job.Text, job.Wpm, pump.RateHz))
             {
                 ct.ThrowIfCancellationRequested();
                 // The fence is the envelope, not MOX. Every key-down checks
@@ -712,7 +712,7 @@ public sealed class CwEngine : BackgroundService
                     _sidetone?.Up();
                 }
 
-                int totalSamples = (int)((long)symbol.DurationMs * pump.RateHz / 1000);
+                int totalSamples = symbol.DurationSamples;
                 int rampSamples = Math.Min(pump.RampSamples, totalSamples / 2);
 
                 int written = 0;
@@ -1110,9 +1110,9 @@ public sealed class CwEngine : BackgroundService
         double phase = 0.0;
         double phaseStep = 2.0 * Math.PI * basebandHz / rateHz;
         var buf = new System.Collections.Generic.List<float>();
-        foreach (var sym in MorseEncoder.Encode(text, wpm))
+        foreach (var sym in MorseEncoder.EncodeSamples(text, wpm, rateHz))
         {
-            int total = (int)((long)sym.DurationMs * rateHz / 1000);
+            int total = sym.DurationSamples;
             int ramp = Math.Min((int)((long)RampMs * rateHz / 1000), total / 2);
             for (int i = 0; i < total; i++)
             {

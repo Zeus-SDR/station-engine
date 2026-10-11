@@ -174,6 +174,7 @@ public static class StationEngineEndpoints
         endpoints.MapImdMeasure();
         endpoints.MapTxSpectrum();
         endpoints.MapWaveform();
+        endpoints.MapBandwidthSpectrum();
         endpoints.MapTdoaEndpoints();
         endpoints.MapTdoaContributionEndpoints();
         // Same field gap as ImdMeasure: the SPA's Windows Firewall control

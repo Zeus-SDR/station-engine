@@ -48,6 +48,7 @@ public sealed class CwDecoderService : IHostedService, IDisposable
     private StreamingHub.CwDecodeAim _aim = StreamingHub.CwDecodeAim.FollowPitch;
     private int _disposed;
     private long _droppedSamples;
+    private long _appliedDrops;
     private long _lastLoggedDroppedSamples;
     private long _nextDropLogTimestamp;
     private long _nextWorkerFaultLogTimestamp;
@@ -458,11 +459,10 @@ public sealed class CwDecoderService : IHostedService, IDisposable
                     aim.Sequence,
                     _decodedHandler);
 
-                int read = _ring.Read(_drain);
+                int read = ProcessPrimaryAudio(out bool discontinuity);
                 long timestamp = Stopwatch.GetTimestamp();
                 LogDropsIfDue(timestamp);
-                if (read > 0)
-                    _decoder.Process(_drain.AsSpan(0, read), _decodedHandler);
+                if (discontinuity) { _confidenceSum = 0; _confidenceCount = 0; _status.Reset(); }
 
                 // Copy stays on the 10 Hz cadence. An empty status frame is a
                 // separate clock: once when the decoder wakes, again when the
@@ -526,8 +526,13 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     private void OnDecoded(MorseDecodedSymbol symbol)
     {
+        // Process and Retune both drain through this callback. Defer loss
+        // recovery to their consumer boundary, never publish a lost block.
+        long before = _appliedDrops;
+        if (Interlocked.Read(ref _droppedSamples) != before) return;
         if (_batch.Length + symbol.Text.Length > CwDecodedTextFrame.MaxTextBytes)
             TryBroadcast(force: true);
+        if (_appliedDrops != before || Interlocked.Read(ref _droppedSamples) != before) return;
         _batch.Append(symbol.Text);
         _confidenceSum += symbol.Confidence;
         _confidenceCount++;
@@ -535,6 +540,11 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     private bool TryBroadcast(bool force = false)
     {
+        if (RecoverAudioLoss(_ring, _decoder, _batch, ref _droppedSamples, ref _appliedDrops))
+        {
+            _confidenceSum = 0; _confidenceCount = 0; _status.Reset();
+            return false;
+        }
         // Empty copy is a status frame, not a text frame. The 10 Hz cadence
         // still gates characters only.
         if (_batch.Length == 0) return false;
@@ -661,6 +671,47 @@ public sealed class CwDecoderService : IHostedService, IDisposable
         _decoder.Reset();
     }
 
+    internal int ProcessPrimaryAudio(out bool discontinuity, Action<MorseDecodedSymbol>? decodedForTest = null) =>
+        ProcessAvailableAudio(_ring, _drain, _decoder, decodedForTest ?? _decodedHandler,
+            _batch, ref _droppedSamples, ref _appliedDrops, out discontinuity);
+
+    internal static int ProcessAvailableAudio(FloatSpscRing ring, float[] drain, CwDecoderCore decoder,
+        Action<MorseDecodedSymbol> decoded, StringBuilder batch, ref long dropped, ref long appliedDrops,
+        out bool discontinuity, Action? afterReadForTest = null)
+    {
+        discontinuity = RecoverAudioLoss(ring, decoder, batch, ref dropped, ref appliedDrops);
+        if (discontinuity) return 0;
+        int read = ring.Read(drain);
+        afterReadForTest?.Invoke();
+        discontinuity = RecoverAudioLoss(ring, decoder, batch, ref dropped, ref appliedDrops);
+        if (discontinuity) return 0;
+        long beforeDecode = appliedDrops;
+        if (read > 0) decoder.Process(drain.AsSpan(0, read), decoded);
+        // A full-batch callback can reconcile a drop while Process is still
+        // on the stack. Its remaining input and callbacks are ambiguous even
+        // when that callback has already acknowledged the current counter.
+        discontinuity = RecoverAudioLoss(ring, decoder, batch, ref dropped, ref appliedDrops,
+            force: appliedDrops != beforeDecode);
+        if (discontinuity) return 0;
+        return read;
+    }
+
+    // Consumer thread only. Missing real time makes both pending Morse
+    // and queued copy ambiguous. Keep the operator's target/lock, but start
+    // a fresh clock and envelope. Record the pre-clear snapshot: a newer
+    // concurrent drop must be detected on the next check, never absorbed.
+    private static bool RecoverAudioLoss(FloatSpscRing ring, CwDecoderCore decoder, StringBuilder batch,
+        ref long dropped, ref long appliedDrops, bool force = false)
+    {
+        long observed = Interlocked.Read(ref dropped);
+        if (observed == appliedDrops && !force) return false;
+        ring.Clear();
+        decoder.Reset();
+        batch.Clear();
+        appliedDrops = observed;
+        return true;
+    }
+
     internal int BufferedSampleCount => _ring.Count;
     internal long DroppedSampleCount => Interlocked.Read(ref _droppedSamples);
 
@@ -751,9 +802,9 @@ public sealed class CwDecoderService : IHostedService, IDisposable
                 aim.Sequence,
                 symbol => OnLaneDecoded(lane, symbol));
 
-            int read = lane.Ring.Read(lane.Drain);
-            if (read > 0)
-                lane.Decoder.Process(lane.Drain.AsSpan(0, read), symbol => OnLaneDecoded(lane, symbol));
+            ProcessAvailableAudio(lane.Ring, lane.Drain, lane.Decoder, symbol => OnLaneDecoded(lane, symbol),
+                lane.Batch, ref lane.Dropped, ref lane.AppliedDrops, out bool discontinuity);
+            if (discontinuity) { lane.ConfidenceSum = 0; lane.ConfidenceCount = 0; lane.Status.Reset(); }
 
             bool sentText = TryBroadcastLane(lane, force: false);
             int pitch = PitchHzForDecodedTone(lane.Decoder.TrackedToneHz);
@@ -791,8 +842,11 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     private void OnLaneDecoded(ExtraLane lane, MorseDecodedSymbol symbol)
     {
+        long before = lane.AppliedDrops;
+        if (Interlocked.Read(ref lane.Dropped) != before) return;
         if (lane.Batch.Length + symbol.Text.Length > CwDecodedTextFrame.MaxTextBytes)
             TryBroadcastLane(lane, force: true);
+        if (lane.AppliedDrops != before || Interlocked.Read(ref lane.Dropped) != before) return;
         lane.Batch.Append(symbol.Text);
         lane.ConfidenceSum += symbol.Confidence;
         lane.ConfidenceCount++;
@@ -800,6 +854,11 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     private bool TryBroadcastLane(ExtraLane lane, bool force)
     {
+        if (RecoverAudioLoss(lane.Ring, lane.Decoder, lane.Batch, ref lane.Dropped, ref lane.AppliedDrops))
+        {
+            lane.ConfidenceSum = 0; lane.ConfidenceCount = 0; lane.Status.Reset();
+            return false;
+        }
         if (lane.Batch.Length == 0) return false;
         long now = Stopwatch.GetTimestamp();
         if (force) lane.Cadence.ConsumeForced(now);
@@ -859,6 +918,7 @@ public sealed class CwDecoderService : IHostedService, IDisposable
         public float[] Drain { get; } = new float[DrainSamples];
         public StreamingHub.CwDecodeAim Aim = StreamingHub.CwDecodeAim.FollowPitch;
         public long Dropped;
+        public long AppliedDrops;
         public int AppliedCenter;
         public int AppliedLocked = -1;
         public long AppliedSequence = -1;

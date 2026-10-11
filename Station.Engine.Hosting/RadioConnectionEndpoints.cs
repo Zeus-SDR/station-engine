@@ -434,6 +434,28 @@ public static class RadioConnectionEndpoints
             IP2AutoConnectControl p2AutoConnect,
             HttpContext ctx) =>
         {
+            if (ctx.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpRequestBodyDetectionFeature>()?.CanHaveBody == true
+                || ctx.Request.ContentLength is > 0)
+            {
+                System.Text.Json.JsonElement request;
+                try { request = await ctx.Request.ReadFromJsonAsync<System.Text.Json.JsonElement>(ctx.RequestAborted); }
+                catch (System.Text.Json.JsonException) { return Results.BadRequest(new { error = "invalid disconnect request" }); }
+                if (request.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    return Results.BadRequest(new { error = "invalid disconnect request" });
+                if (request.TryGetProperty("expectedEndpoint", out var expected))
+                {
+                    if (expected.ValueKind != System.Text.Json.JsonValueKind.String || string.IsNullOrWhiteSpace(expected.GetString()))
+                        return Results.BadRequest(new { error = "expectedEndpoint is required" });
+                    try
+                    {
+                        var disconnected = await radio.DisconnectIfEndpointAsync(expected.GetString()!, ctx.RequestAborted);
+                        return disconnected is null
+                            ? Results.Conflict(new { error = "The connected receiver changed; it was left connected." })
+                            : Results.Ok(disconnected);
+                    }
+                    catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+                }
+            }
             log.LogInformation("api.disconnect");
             p2AutoConnect.DisableForManualDisconnect();
             if (radio.IsProtocol3Active)

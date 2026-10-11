@@ -377,6 +377,17 @@ internal sealed class MorseTimingEstimator
     private static bool Tight(int count, double min, double max) =>
         count >= 2 && min > 0 && max <= min * SpaceClusterSpread;
 
+    // Complete mark/short-gap evidence has jointly resolved clock and edge bias.
+    // Apply the fitted unit without training the ordinary mark-only estimator.
+    internal void SeedJoint(double dit)
+    {
+        _markCount = _markCursor = _spaceCount = _spaceCursor = 0;
+        _sinceMarkEstimate = _sinceSpaceEstimate = 0;
+        _twoClusters = true;
+        _fastAcquisition = false;
+        ApplyDit(dit, 3 * dit, true);
+        IsLocked = true;
+    }
     private void ApplyDit(double dit, double dahCenter, bool splitFromCenters)
     {
         _ditMs = Math.Clamp(dit, MinDitMs, MaxDitMs);

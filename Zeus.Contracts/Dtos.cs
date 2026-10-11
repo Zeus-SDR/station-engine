@@ -1510,7 +1510,11 @@ public sealed record ReceiverDto(
     // ReceiverSetRequest.NrMode. Every other NrConfig field (NR tunables, NB, ANF,
     // SNB, NBP) stays shared across receivers. Defaulted Off so pre-per-RX-NR
     // wire frames deserialize unchanged.
-    NrMode NrMode = NrMode.Off);
+    NrMode NrMode = NrMode.Off,
+    AgcConfig? Agc = null,
+    double AgcTopDb = 90.0,
+    bool AutoAgcEnabled = false,
+    double AgcOffsetDb = 0.0);
 
 public sealed record StateDto(
     ConnectionStatus Status,
@@ -2109,7 +2113,10 @@ public sealed record ReceiverSetRequest(
     // Per-receiver noise-reduction mode. Index 0 updates StateDto.Nr.NrMode (the
     // same value POST /api/rx/nr sets); RX2+ select their own mode. The rest of
     // the NR/NB/ANF/SNB configuration stays shared.
-    NrMode? NrMode = null);
+    NrMode? NrMode = null,
+    AgcConfig? Agc = null,
+    double? AgcTopDb = null,
+    bool? AutoAgcEnabled = null);
 
 /// <summary>Body of <c>POST /api/kiwi</c> — configure the KiwiSDR slice
 /// receiver. Every field is optional; only supplied fields change.
@@ -3226,7 +3233,9 @@ public sealed record BandwidthFilterSettingsDto(
     double? WaveformTimebaseMs = 50,
     double? WaveformGain = 1,
     bool? WaveformAutoScale = true,
-    bool? WaveformPhaseView = false);
+    bool? WaveformPhaseView = false,
+    double? WaveformRecordingSeconds = 5,
+    bool? HighResolutionSpectrum = true);
 
 public sealed record DisplaySettingsDto(
     string Mode,
@@ -3286,12 +3295,14 @@ public sealed record DisplaySettingsDto(
     int FilterPanelBgBrightness = 50,
     bool HasFilterPanelImage = false,
     string? FilterPanelImageMime = null,
-    BandwidthFilterSettingsDto? BandwidthFilter = null);
+    BandwidthFilterSettingsDto? BandwidthFilter = null,
+    int? CwTuningSpanHz = null,
+    IReadOnlyDictionary<string, string>? CwSidebandByBand = null);
 
 public sealed record DisplaySettingsSetRequest(
-    string Mode,
-    string Fit,
-    string RxTraceColor,
+    string? Mode = null,
+    string? Fit = null,
+    string? RxTraceColor = null,
     double? DbMin = null,
     double? DbMax = null,
     double? TxDbMin = null,
@@ -3326,7 +3337,9 @@ public sealed record DisplaySettingsSetRequest(
     string? FilterPanelBgMode = null,
     string? FilterPanelBgColor = null,
     int? FilterPanelBgBrightness = null,
-    BandwidthFilterSettingsDto? BandwidthFilter = null);
+    BandwidthFilterSettingsDto? BandwidthFilter = null,
+    int? CwTuningSpanHz = null,
+    IReadOnlyDictionary<string, string>? CwSidebandByBand = null);
 
 // One detected wideband signal, as reported by the engine's deterministic
 // wideband signal detector. Frequencies are absolute Hz in the wideband ADC

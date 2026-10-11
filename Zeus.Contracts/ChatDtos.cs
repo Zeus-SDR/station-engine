@@ -148,7 +148,8 @@ public sealed record ChatOperator(
     string? Status,
     long Since,
     bool Admin = false,
-    bool DevTester = false);
+    bool DevTester = false,
+    bool SignalReportEligible = false);
 
 /// <summary>
 /// Snapshot of the local chat node's state, surfaced via
@@ -191,6 +192,16 @@ public sealed record ChatFriendsDto(
     IReadOnlyList<string> Accepted,
     IReadOnlyList<string> Incoming,
     IReadOnlyList<string> Outgoing);
+
+/// <summary>
+/// Calibrated RX1 passband peak observed while a mutually accepted friend
+/// advertises RF transmit on the same frequency and mode. This is a receiver
+/// measurement, not proof that every signal in its passband is from that friend.
+/// MeasuredAt is the last valid sample in the reported burst, in epoch milliseconds.
+/// </summary>
+public sealed record ChatSignalReportDto(
+    string From, string To, long FreqHz, string Mode, double PeakDbm, long MeasuredAt,
+    double? PeakSnrDb = null);
 
 /// <summary>
 /// One ephemeral friend-to-friend PTT signalling event. <paramref name="Type"/>

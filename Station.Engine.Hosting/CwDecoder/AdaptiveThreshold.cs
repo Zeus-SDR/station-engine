@@ -62,6 +62,9 @@ internal sealed class AdaptiveThreshold
     // Fraction of the noise-to-mark span. 0.15 puts attack at 0.65 of the
     // span and release at 0.35, symmetric about the linear midpoint.
     private const double Hysteresis = 0.15;
+    // Below a previous mark this far above noise, one isolated crossing
+    // must not erase an element gap while fast keying is being acquired.
+    private const double RecoverySpikeMarkRatio = 8;
     // While keyed, follow the smoothed mark in a handful of blocks so a
     // fade moves the gate. A block under FadePull of the local mark is the
     // fade itself and is tracked faster. While quiet, creep back so a
@@ -110,6 +113,8 @@ internal sealed class AdaptiveThreshold
     private bool _reacquire;
     private bool _wasKeyed;
     private bool _fadeLatch;
+    private bool _recoveryFromGap;
+    private int _recoveryAttackBlocks;
     private double _fadeLatchLevel;
     private int _fadeLatchBlocks;
     private double _prevLevel;
@@ -133,8 +138,9 @@ internal sealed class AdaptiveThreshold
 
     internal double NoiseFloor => Percentile(25);
 
-    public bool Update(double level)
+    public bool Update(double level, bool rejectRecoverySpikes = false)
     {
+        if (!TonePresent) _recoveryAttackBlocks = 0;
         if (level <= DigitalZeroPower || !double.IsFinite(level))
         {
             TonePresent = false;
@@ -273,29 +279,34 @@ internal sealed class AdaptiveThreshold
                     TonePresent = true;
                     _fadeLatch = false;
                 }
-                else if (level >= noiseGate && !_fadeLatch)
+                else if (level >= noiseGate && !_fadeLatch && (!rejectRecoverySpikes || _signalLevel < RecoverySpikeMarkRatio * noise))
                 {
-                    // The gap already happened. A fade under the last peak
-                    // still opens at the noise ratio.
+                    // Near the noise floor there is little amplitude margin.
+                    // Preserve immediate recovery for a weak or slower fist.
                     TonePresent = true;
                 }
-                else if (level >= noiseGate && _fadeLatch && SameLevel(level, _fadeLatchLevel))
+                else if (level >= noiseGate && _fadeLatch
+                         && (SameLevel(level, _fadeLatchLevel) || (rejectRecoverySpikes && _recoveryFromGap)))
                 {
                     _fadeLatchBlocks++;
                     if (_fadeLatchBlocks >= FadeDwellBlocks)
                     {
-                        // Two blocks at one level: a dwell, not the next
-                        // sample of a ramp. The tracker below skips this
+                        // A falling ramp must dwell. A fresh fast attack needs
+                        // two crossings, allowing its amplitude to rise. The
+                        // tracker below skips this
                         // block because the previous one was unkeyed, so
                         // the local mark has to move here or the old
                         // release drops the key again.
                         TonePresent = true;
                         _fadeLatch = false;
                         _signalLevel += FadeTrack * (level - _signalLevel);
+                        if (rejectRecoverySpikes && _recoveryFromGap) _recoveryAttackBlocks = 1;
                     }
                 }
-                else if (level >= noiseGate && _fadeLatch)
+                else if (level >= noiseGate)
                 {
+                    _recoveryFromGap = !_fadeLatch;
+                    _fadeLatch = true;
                     _fadeLatchLevel = level;
                     _fadeLatchBlocks = 1;
                 }
@@ -328,6 +339,7 @@ internal sealed class AdaptiveThreshold
                         // Under the old release, over the noise gate. A ramp
                         // keeps falling and never confirms; a fade dwells.
                         _fadeLatch = true;
+                        _recoveryFromGap = false;
                         _fadeLatchLevel = level;
                         _fadeLatchBlocks = 1;
                     }
@@ -379,6 +391,8 @@ internal sealed class AdaptiveThreshold
         _count = 0;
         _cursor = 0;
         _signalLevel = 0;
+        _recoveryFromGap = false;
+        _recoveryAttackBlocks = 0;
         _snrDb = 0;
         HasMeasurement = false;
         _digitalZeroBlocks = 0;
@@ -402,16 +416,17 @@ internal sealed class AdaptiveThreshold
     /// <summary>
     /// Blocks a mark runs long because the attack sits on the noise gate
     /// and the release sits on the local mark. Zero when those crossings
-    /// are the same distance from the two edges, and zero on a hard
-    /// digital-zero key-up (there is no ramp to correct).
+    /// are the same distance from the two edges. Negative values compensate
+    /// the extra confirmation block of a fast recovery attack. A hard
+    /// digital-zero key-up adds no release ramp to correct.
     /// </summary>
     internal double ExcessMarkBlocks(int smootherLength)
     {
         if (_quietFloorLatched || smootherLength < 2 || _signalLevel <= 0)
-            return 0;
+            return -_recoveryAttackBlocks;
         double noise = Math.Max(_lastNoise, MinimumNoiseFloor);
         double span = _signalLevel - noise;
-        if (span <= noise) return 0;
+        if (span <= noise) return -_recoveryAttackBlocks;
         double midpointAttack = noise + ((0.5 + Hysteresis) * span);
         double effectiveAttack = Math.Min(midpointAttack, noise * _bootstrapRatio);
         double release = noise + ((0.5 - Hysteresis) * span);
@@ -419,7 +434,7 @@ internal sealed class AdaptiveThreshold
         double fallFrac = Math.Clamp((release - noise) / span, 0, 1);
         int rise = CrossingIndex(smootherLength, riseFrac);
         int fall = HoldIndex(smootherLength, fallFrac);
-        return Math.Max(0, fall - rise);
+        return Math.Max(0, fall - rise) - _recoveryAttackBlocks;
     }
 
     private static bool SameLevel(double level, double reference)

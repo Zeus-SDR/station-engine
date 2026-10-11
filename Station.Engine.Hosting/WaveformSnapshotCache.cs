@@ -4,10 +4,10 @@ namespace Zeus.Server;
 public sealed record WaveformSnapshot(bool Available, string Source, string Kind,
     int ReceiverIndex, int SampleRateHz, int Channels, long Seq, long Generation,
     double CaptureTimeUnixMs, long AgeMs, float[] Samples, double DurationMs,
-    double WindowMs, string AmplitudeReference, string Mode, double CarrierHz, string SignalStage);
+    double WindowMs, string AmplitudeReference, string Mode, double CarrierHz, string SignalStage, long EndSampleIndex = 0);
 
 /// <summary>Bounded contiguous samples; request readers never consume the producer.</summary>
-public sealed class WaveformSnapshotCache
+public sealed partial class WaveformSnapshotCache
 {
     public const int MaxFrames = 16384;
     public const long LeaseMs = 1500;
@@ -16,7 +16,7 @@ public sealed class WaveformSnapshotCache
     private readonly float[] _ring = new float[MaxFrames * 2];
     private object? _context;
     private int _count, _write, _rate, _channels;
-    private long _generation, _seq, _until, _capture;
+    private long _generation, _seq, _until, _capture, _endSampleIndex;
     private double _captureUnix;
     private int _missed;
 
@@ -25,7 +25,7 @@ public sealed class WaveformSnapshotCache
     private void SetContext(object? context)
     {
         if (Equals(context, _context)) return;
-        _context = context; _count = _write = _rate = _channels = 0; _generation++;
+        _context = context; _count = _write = _rate = _channels = 0; _endSampleIndex = 0; _generation++;
     }
 
     public void Append(object? context, int rate, int channels, ReadOnlySpan<float> samples,
@@ -34,6 +34,8 @@ public sealed class WaveformSnapshotCache
         if (!Monitor.TryEnter(_sync)) { Interlocked.Exchange(ref _missed, 1); return; }
         try
         {
+            _session?.Append(context, rate, channels, samples, nowMs, Volatile.Read(ref _missed) != 0);
+            if (_session?.Expired(nowMs) == true) _session = null;
             SetContext(context);
             if (context is null || nowMs >= _until || rate is < 8000 or > 768000 || channels is < 1 or > 2
                 || !double.IsFinite(unixMs)
@@ -41,9 +43,9 @@ public sealed class WaveformSnapshotCache
             double blockMs = samples.Length * 1000.0 / (rate * channels);
             if (_rate != rate || _channels != channels || Interlocked.Exchange(ref _missed, 0) != 0
                 || (_count > 0 && (nowMs < _capture || nowMs - _capture > Math.Max(60, blockMs * 2 + 20))))
-            { _count = _write = 0; _generation++; }
+            { _count = _write = 0; _endSampleIndex = 0; _generation++; }
             for (int i = 0; i < samples.Length; i++)
-                if (!float.IsFinite(samples[i])) { _count = _write = 0; _generation++; return; }
+                if (!float.IsFinite(samples[i])) { _count = _write = 0; _endSampleIndex = 0; _generation++; return; }
             _rate = rate; _channels = channels;
             int capacity = MaxFrames * channels;
             int start = Math.Max(0, samples.Length - capacity);
@@ -53,6 +55,9 @@ public sealed class WaveformSnapshotCache
             tail[first..].CopyTo(_ring);
             _write = (_write + tail.Length) % capacity;
             _count = Math.Min(capacity, _count + tail.Length);
+            // Exclusive frame cursor counts the entire producer block, including any ring-capacity trim.
+            // Paired with Generation, it identifies overlap without relying on callback wall-clock timing.
+            _endSampleIndex += samples.Length / channels;
             _capture = nowMs; _captureUnix = unixMs; _seq++;
         }
         finally { Monitor.Exit(_sync); }
@@ -64,8 +69,8 @@ public sealed class WaveformSnapshotCache
         lock (_sync)
         {
             SetContext(context);
-            if (nowMs >= _until && _count > 0) { _count = _write = 0; _generation++; }
-            _until = nowMs + LeaseMs;
+            if (nowMs >= _until && _count > 0) { _count = _write = 0; _endSampleIndex = 0; _generation++; }
+            _until = Math.Max(_until, nowMs + LeaseMs);
             windowMs = double.IsFinite(windowMs) ? Math.Clamp(windowMs, 5, 100) : 50;
             bool valid = context is not null && _count > 0 && nowMs >= _capture && nowMs - _capture <= MaxAgeMs;
             float[] result = [];
@@ -84,7 +89,7 @@ public sealed class WaveformSnapshotCache
             return new(valid, tx ? "digital-tx" : "rx-demodulated", tx ? "complex" : "real",
                 receiver, valid ? _rate : 0, tx ? 2 : 1, _seq, _generation,
                 valid ? _captureUnix : 0, valid ? nowMs - _capture : 0, result,
-                duration, duration, "relative", mode, carrier, tx ? "tx-output" : "rx-post-demod");
+                duration, duration, "relative", mode, carrier, tx ? "tx-output" : "rx-post-demod", valid ? _endSampleIndex : 0);
         }
     }
 }

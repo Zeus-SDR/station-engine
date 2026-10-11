@@ -15,7 +15,8 @@ public static class StationAccessTokenAuthorization
 {
     public static IApplicationBuilder UseStationAccessTokenAuthorization(
         this IApplicationBuilder app,
-        string? stationAccessToken)
+        string? stationAccessToken,
+        bool allRequests = false)
     {
         ArgumentNullException.ThrowIfNull(app);
         if (stationAccessToken is null)
@@ -25,7 +26,7 @@ public static class StationAccessTokenAuthorization
             // it fails closed when no launcher token was provisioned.
             return app.Use(async (context, next) =>
             {
-                if (IsContributionPath(context.Request.Path)
+                if (allRequests || IsContributionPath(context.Request.Path)
                     || IsPublicListenFeedRequest(context.Request))
                 {
                     context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -44,7 +45,7 @@ public static class StationAccessTokenAuthorization
         var expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(stationAccessToken));
         return app.Use(async (context, next) =>
         {
-            if (RequiresAuthorization(context.Request)
+            if ((allRequests || RequiresAuthorization(context.Request))
                 && !HasExpectedBearerToken(context.Request, expectedHash))
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;

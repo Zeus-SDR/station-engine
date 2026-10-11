@@ -63,6 +63,8 @@ public sealed class CwSidetoneSource
     // already complete" — the idle fast path returns immediately without
     // generating tone on the never-keyed-yet case.
     private int _envelopePos = RampSamples;
+    private double _envelopeLevel;
+    private double _edgeStartLevel;
 
     // --- Cross-thread state ---
 
@@ -127,6 +129,10 @@ public sealed class CwSidetoneSource
         bool wantKeyed = _keyed;
         if (wantKeyed != _renderedKeyed)
         {
+            // An edge can arrive before the preceding ramp completes.
+            // Continue from its last rendered level instead of jumping to
+            // full amplitude on release or zero on a renewed attack.
+            _edgeStartLevel = _envelopeLevel;
             _renderedKeyed = wantKeyed;
             _envelopePos = 0;
         }
@@ -146,20 +152,12 @@ public sealed class CwSidetoneSource
 
         for (int i = 0; i < dst.Length; i++)
         {
-            double env;
-            if (wantKeyed)
-            {
-                env = _envelopePos < RampSamples
-                    ? 0.5 * (1.0 - Math.Cos(Math.PI * _envelopePos / RampSamples))
-                    : 1.0;
-            }
-            else
-            {
-                // Release: 1 → 0 raised-cosine, then silent.
-                env = _envelopePos < RampSamples
-                    ? 0.5 * (1.0 + Math.Cos(Math.PI * _envelopePos / RampSamples))
-                    : 0.0;
-            }
+            double target = wantKeyed ? 1.0 : 0.0;
+            double progress = _envelopePos < RampSamples
+                ? 0.5 * (1.0 - Math.Cos(Math.PI * _envelopePos / RampSamples))
+                : 1.0;
+            double env = _edgeStartLevel + (target - _edgeStartLevel) * progress;
+            _envelopeLevel = env;
             if (env > 0.0)
             {
                 dst[i] += (float)(gain * env * Math.Sin(_phase));

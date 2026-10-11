@@ -882,6 +882,8 @@ public partial class DspPipelineService : BackgroundService,
     private readonly float[] _monitorInject = new float[MonitorInjectCapacity];
     private long _monInjW;
     private long _monInjR;
+    private bool _monInjStartPending;
+    private bool _monInjStarted;
 
     // Output samples per Tick at the 30 Hz cadence (~1600 @ 48 kHz). When RX
     // produces no audio this tick (RX1 muted / no band audio) but a local clip
@@ -924,12 +926,46 @@ public partial class DspPipelineService : BackgroundService,
     {
         long w = Volatile.Read(ref _monInjW);
         long r = _monInjR;
+        r = MixMonitorInject(_monitorInject, r, w, dest, ref _monInjStartPending, ref _monInjStarted);
+        Volatile.Write(ref _monInjR, r);
+    }
+
+    internal static void ResetMonitorInjectStartup(long backlog, ref bool startPending, ref bool started)
+    {
+        if (backlog > 0) return;
+        startPending = false;
+        started = false;
+    }
+
+    internal static long MixMonitorInject(
+        ReadOnlySpan<float> ring, long r, long w, Span<float> dest,
+        ref bool startPending, ref bool started)
+    {
         long avail = w - r;
-        if (avail <= 0) return;
+        if (avail <= 0)
+        {
+            startPending = false;
+            started = false;
+            return r;
+        }
+        // Recorder blocks arrive every 20 ms, while output drains at 30 Hz.
+        // Starting with the first 960 samples would leave silence after them
+        // in a 1600-sample output frame. Retain that first block for one tick
+        // so the next producer block supplies the startup reserve instead.
+        if (!started && !startPending)
+        {
+            startPending = true;
+            return r;
+        }
         int n = (int)Math.Min(avail, dest.Length);
+        // A short clip still flushes on the second tick. Put its leading
+        // silence before the first sample rather than inside the recording.
+        int offset = started ? 0 : dest.Length - n;
+        started = true;
+        startPending = false;
         for (int i = 0; i < n; i++)
-            dest[i] += _monitorInject[(int)((r + i) & MonitorInjectMask)];
-        Volatile.Write(ref _monInjR, r + n);
+            dest[offset + i] += ring[(int)((r + i) & (ring.Length - 1))];
+        return r + n;
     }
 
     // _engineLock serialises CONCURRENT WRITERS to _engine / _channelId /
@@ -975,6 +1011,7 @@ public partial class DspPipelineService : BackgroundService,
     {
         public SecondaryRx(int width)
         {
+            AutoAgcBins = new float[width];
             PanBuf = new float[width];
             WfBuf = new float[width];
         }
@@ -1013,6 +1050,17 @@ public partial class DspPipelineService : BackgroundService,
         public double AppliedAgcTopDb = double.NaN;
         public NrConfig? AppliedNr;
         public AgcConfig? AppliedAgc;
+        public readonly AutoAgcNoiseFloorTracker AutoAgcTracker = new(feedFps: 5.0);
+        public readonly float[] AutoAgcBins;
+        public long AutoAgcPanMs = long.MinValue;
+        public int AutoAgcFeedSource;
+        public bool AutoAgcPreamp;
+        public int AutoAgcAtten = int.MinValue;
+        public byte AutoAgcAdc;
+        public int AutoAgcRate;
+        public long AutoAgcVfoHz = long.MinValue;
+        public bool AutoAgcWasEnabled;
+        public readonly object AutoAgcLock = new();
         public SquelchConfig? AppliedSquelch;
         public BandpassWindow? AppliedBandpassWindow;
         public FilterPhaseMode? AppliedFilterPhase;
@@ -1035,6 +1083,13 @@ public partial class DspPipelineService : BackgroundService,
             AppliedAfGainDb = double.NaN;
             AppliedNr = null;
             AppliedAgc = null;
+            lock (AutoAgcLock)
+            {
+                AutoAgcTracker.Reset();
+                AutoAgcWasEnabled = false;
+                AutoAgcPanMs = long.MinValue;
+                AutoAgcFeedSource = 0;
+            }
             AppliedSquelch = null;
             AppliedBandpassWindow = null;
             AppliedFilterPhase = null;
@@ -1048,7 +1103,7 @@ public partial class DspPipelineService : BackgroundService,
     // One secondary-receiver audio block read during a Tick, paired with its
     // sample count. Used to feed the N-receiver "Both" mixer without per-tick
     // allocation (the scratch span below is reused every tick).
-    internal readonly record struct RxAudioSlice(float[] Buffer, int Count);
+    internal readonly record struct RxAudioSlice(float[] Buffer, int Count, int FadeInSamplesRemaining = 0);
     // Reused each tick to collect the enabled secondary RX audio blocks for the
     // mixer. Sized for every secondary slot (1..N-1) PLUS the Kiwi slice, which
     // is mixed in on the same bus; only the populated prefix is passed to
@@ -1694,7 +1749,7 @@ public partial class DspPipelineService : BackgroundService,
     // Raised-cosine fade-in applied to the first audio blocks of a freshly
     // opened secondary receiver (RX2..RXn). A newly opened WDSP RX channel
     // starts with an unconverged AGC and can emit a large first block; summed
-    // unramped into the additive RX mix bus (MixRxAudioN) that lands as an
+    // unramped into the RX mix bus (MixRxAudioN) that lands as an
     // audible click/distortion the instant RX2 is toggled on. Mirrors RX1's
     // post-TX raised-cosine resume so every receiver enters the mix smoothly.
     internal const int SecondaryRxOpenFadeInSamples = RxPostTxFadeInSamples;
@@ -2009,6 +2064,9 @@ public partial class DspPipelineService : BackgroundService,
         TxMonitorSettingsStore? txMonitorSettingsStore = null)
     {
         _radio = radio;
+        _vrxPool = new(maximumFrequencyHz: radio.ReceiveOnly
+            ? StationReceiveOnlyPolicy.MaximumFrequencyHz
+            : Zeus.Server.PublicListen.GuestReceiverSettings.MaxHz);
         _txMonitorSettingsStore = txMonitorSettingsStore;
         _txMonitorVolumeDb = txMonitorSettingsStore?.VolumeDb
             ?? TxMonitorSettingsStore.DefaultVolumeDb;
@@ -2112,6 +2170,8 @@ public partial class DspPipelineService : BackgroundService,
         for (int i = 1; i < MaxReceivers; i++)
             _secondaryRx[i] = new SecondaryRx(_panadapterWidth);
 
+        _hub.CwDecodeRequestChanged += OnCwNoiseReductionDemandChanged;
+
         _nr3ModelStore = nr3ModelStore;
         if (_nr3ModelStore is not null)
         {
@@ -2152,6 +2212,8 @@ public partial class DspPipelineService : BackgroundService,
 
     public override void Dispose()
     {
+        _hub.CwDecodeRequestChanged -= OnCwNoiseReductionDemandChanged;
+        ClearCwNoiseReductionBypass();
         if (_sMeterCalibrationStore is not null)
             _sMeterCalibrationStore.Changed -= OnSMeterCalibrationChanged;
         base.Dispose();
@@ -3781,15 +3843,17 @@ public partial class DspPipelineService : BackgroundService,
         int toFade = Math.Min(samples.Length, remainingSamples);
         int startRemaining = remainingSamples;
         for (int i = 0; i < toFade; i++)
-        {
-            int samplesLeftAfterThis = startRemaining - i - 1;
-            int completed = Math.Clamp(totalSamples - samplesLeftAfterThis, 0, totalSamples);
-            double phase = completed / (double)totalSamples;
-            float gain = (float)(0.5 - 0.5 * Math.Cos(Math.PI * phase));
-            samples[i] *= gain;
-        }
+            samples[i] *= RxFadeInGain(startRemaining, totalSamples, i);
 
         return remainingSamples - toFade;
+    }
+
+    private static float RxFadeInGain(int remainingSamples, int totalSamples, int sampleIndex)
+    {
+        if (remainingSamples <= sampleIndex || totalSamples <= 0) return 1f;
+        int completed = Math.Clamp(totalSamples - remainingSamples + sampleIndex + 1, 0, totalSamples);
+        double phase = completed / (double)totalSamples;
+        return (float)(0.5 - 0.5 * Math.Cos(Math.PI * phase));
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -4099,7 +4163,8 @@ public partial class DspPipelineService : BackgroundService,
             nrRuntime,
             _appliedNr,
             _appliedAgc,
-            _appliedSquelch);
+            _appliedSquelch,
+            cwNoiseReductionBypassed: CwNoiseReductionBypassForReceiver(state, 0));
         var rxMeters = SnapshotRxMetersDiagnostics();
         var adcProtection = _radio.GetAdcProtectionStatus();
         var squelch = SnapshotAdaptiveSquelchDiagnostics(squelchConfig);
@@ -5750,7 +5815,7 @@ public partial class DspPipelineService : BackgroundService,
         };
     }
 
-    private static DspNrRuntimeSnapshot BuildNrRuntime(
+    private DspNrRuntimeSnapshot BuildNrRuntime(
         IDspEngine? engine,
         StateDto state)
     {
@@ -5762,7 +5827,7 @@ public partial class DspPipelineService : BackgroundService,
         bool nr3ModelActive = !string.IsNullOrWhiteSpace(state.Nr3ModelName);
         var nr = NormalizeNrConfig(state.Nr ?? new NrConfig());
         string requestedNrMode = nr.NrMode.ToString();
-        string effectiveNrMode = wdspActive
+        string effectiveNrMode = wdspActive && !CwNoiseReductionBypassForReceiver(state, 0)
             ? nr.NrMode switch
             {
                 NrMode.Rnnr when !wdspNr3RnnrAvailable || !nr3ModelActive => NrMode.Off.ToString(),
@@ -5827,9 +5892,13 @@ public partial class DspPipelineService : BackgroundService,
         DspNrRuntimeSnapshot nrRuntime,
         NrConfig? appliedNr = null,
         AgcConfig? appliedAgc = null,
-        SquelchConfig? appliedSquelch = null)
+        SquelchConfig? appliedSquelch = null,
+        bool cwNoiseReductionBypassed = false)
     {
-        var nr = NormalizeNrConfig(state.Nr ?? new NrConfig());
+        var requested = NormalizeNrConfig(state.Nr ?? new NrConfig());
+        var nr = cwNoiseReductionBypassed
+            ? requested with { NrMode = NrMode.Off, AnfEnabled = false }
+            : requested;
         var agc = EffectiveAgcConfig(
             state.Agc ?? new AgcConfig(AgcMode.Med),
             EffectiveAgcGainDb(state));
@@ -5837,13 +5906,13 @@ public partial class DspPipelineService : BackgroundService,
         int notchCount = notches?.Count ?? 0;
         int activeNotchCount = notches?.Count(static n => n.Active) ?? 0;
         bool effectiveNbpRun = nr.NbpNotchesEnabled || activeNotchCount > 0;
-        bool requestedNr = nr.NrMode != NrMode.Off;
+        bool requestedNr = requested.NrMode != NrMode.Off;
         bool effectiveNr = !string.Equals(nrRuntime.EffectiveNrMode, NrMode.Off.ToString(), StringComparison.OrdinalIgnoreCase);
-        bool nrCapabilityLimited = requestedNr && !effectiveNr;
+        bool nrCapabilityLimited = requestedNr && !effectiveNr && !cwNoiseReductionBypassed;
         bool weakSignalAssist = effectiveNr || nr.AnfEnabled || nr.SnbEnabled;
         bool impulseControl = nr.NbMode != NbMode.Off;
         bool notchControl = effectiveNbpRun || activeNotchCount > 0;
-        bool appliedNrMatches = appliedNr is null || nr.Equals(appliedNr);
+        bool appliedNrMatches = appliedNr is null || requested.Equals(appliedNr);
         bool appliedAgcMatches = appliedAgc is null || agc.Equals(appliedAgc);
         bool appliedSquelchMatches = appliedSquelch is null || squelch.Equals(appliedSquelch);
         double effectiveAgcTopDb = Math.Round(EffectiveAgcGainDb(state), 1);
@@ -5861,6 +5930,7 @@ public partial class DspPipelineService : BackgroundService,
 
         var reasons = new List<string>();
         reasons.Add(nrRuntime.WdspActive ? "wdsp-active" : "wdsp-inactive");
+        if (cwNoiseReductionBypassed) reasons.Add("cw-decode-noise-bypass");
         reasons.Add(effectiveNr ? "nr-effective" : requestedNr ? "nr-requested-not-effective" : "nr-off");
         if (nrCapabilityLimited) reasons.Add("nr-capability-limited");
         if (nr.AnfEnabled) reasons.Add("anf-enabled");
@@ -5881,6 +5951,11 @@ public partial class DspPipelineService : BackgroundService,
         {
             status = "dsp-engine-unavailable";
             recommendation = "WDSP RX processing is not active; connect or restart the DSP engine before judging NR, notch, blanker, or AGC fidelity.";
+        }
+        else if (cwNoiseReductionBypassed)
+        {
+            status = "cw-decode-noise-bypass";
+            recommendation = "NR and automatic notch are temporarily bypassed for CW decoding; the receiver's saved settings resume when decoding ends.";
         }
         else if (nrCapabilityLimited)
         {
@@ -6031,8 +6106,7 @@ public partial class DspPipelineService : BackgroundService,
         // refactor that drops the outer lock.
         lock (_engineLock)
         {
-            Volatile.Write(ref _engine, engine);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(engine, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, SyntheticSampleRateHz);
         }
@@ -6101,8 +6175,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, wdsp);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(wdsp, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, rate);
         }
@@ -6178,8 +6251,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, disconnectedEngine);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(disconnectedEngine, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, SyntheticSampleRateHz);
         }
@@ -6532,20 +6604,7 @@ public partial class DspPipelineService : BackgroundService,
             _appliedAgcCeilingDb = StepTowardCappedDb(
                 _appliedAgcCeilingDb, effectiveAgcTarget, AgcTopSlewMaxDbPerTick);
             engine.SetAgcTop(channel, _appliedAgcCeilingDb);
-            if (rx2Channel >= 0)
-            {
-                engine.SetAgcTop(rx2Channel, _appliedAgcCeilingDb);
-                _secondaryRx[1].AppliedAgcTopDb = _appliedAgcCeilingDb;
-            }
-            for (int ri = 2; ri < MaxReceivers; ri++)
-            {
-                int sec = Volatile.Read(ref _secondaryRx[ri].ChannelId);
-                if (sec >= 0)
-                {
-                    engine.SetAgcTop(sec, _appliedAgcCeilingDb);
-                    _secondaryRx[ri].AppliedAgcTopDb = _appliedAgcCeilingDb;
-                }
-            }
+
         }
         // (Removed: the manual AGC "knee" push. WDSP's threshold and AGC-T are
         // the SAME register (max_gain) — driving both independently clobbered
@@ -6595,6 +6654,7 @@ public partial class DspPipelineService : BackgroundService,
             engine.SetTxLevelerMaxGain(levelerMax);
             _appliedTxLevelerMaxGainDb = levelerMax;
         }
+        engine.SetRxCwNoiseReductionBypass(channel, CwNoiseReductionBypassForReceiver(s, 0));
         var nr = NormalizeNrConfig(s.Nr ?? new NrConfig());
         if (!nr.Equals(_appliedNr))
         {
@@ -7244,6 +7304,7 @@ public partial class DspPipelineService : BackgroundService,
         var txPhaseRotator = effectiveTxAudio.TxPhaseRotator;
         var cfc = effectiveTxAudio.Cfc;
         engine.SetRxDigitalBypass(channelId, s.Mode == RxMode.FreeDv);
+        engine.SetRxCwNoiseReductionBypass(channelId, CwNoiseReductionBypassForReceiver(s, 0));
         engine.SetMode(channelId, openEngineMode);
         // Sync TXA modulator with RX mode at engine-open time so the first
         // key-down lands with the correct sideband (no-op on Synthetic / pre-
@@ -7602,7 +7663,12 @@ public partial class DspPipelineService : BackgroundService,
 
     private void ApplyStateToSecondaryRxChannel(IDspEngine engine, int rxIndex, int channelId, StateDto s)
     {
+        engine.SetRxCwNoiseReductionBypass(channelId, CwNoiseReductionBypassForReceiver(s, rxIndex));
         var rx = _secondaryRx[rxIndex];
+        var agcState = RadioService.ReceiverAgcState(s, rxIndex);
+        double agcTarget = EffectiveAgcGainDb(agcState);
+        double agcNext = double.IsNaN(rx.AppliedAgcTopDb) ? agcTarget
+            : StepTowardCappedDb(rx.AppliedAgcTopDb, agcTarget, AgcTopSlewMaxDbPerTick);
         var nr = SecondaryRxNrConfig(s, rxIndex);
         var squelch = s.Squelch ?? new SquelchConfig();
         var (mode, vfoHz, filterLow, filterHigh, afGainDb) = SecondaryRxParams(s, rxIndex);
@@ -7610,10 +7676,10 @@ public partial class DspPipelineService : BackgroundService,
         // that is not FreeDV keeps the operator AGC from this same method.
         bool secFreeDv = mode == RxMode.FreeDv;
         var agc = secFreeDv
-            ? new AgcConfig(AgcMode.Fixed, FixedGainDb: RadioService.AgcBaseline(s))
+            ? new AgcConfig(AgcMode.Fixed, FixedGainDb: RadioService.AgcBaseline(agcState))
             : EffectiveAgcConfig(
-                s.Agc ?? new AgcConfig(AgcMode.Med),
-                _appliedAgcCeilingDb);
+                agcState.Agc ?? new AgcConfig(AgcMode.Med),
+                agcNext);
         // FreeDV on a secondary RX follows the same band-convention sideband as the
         // primary (LSB < 10 MHz, USB ≥). The helper also repairs legacy
         // symmetric DIGU/DIGL state before it reaches the secondary engine.
@@ -7653,15 +7719,10 @@ public partial class DspPipelineService : BackgroundService,
             engine.SetCtunShift(channelId, shiftHz);
             rx.AppliedCtunShiftHz = shiftHz;
         }
-        // AGC-T fanout uses the per-tick slewed ceiling computed in the
-        // main OnRadioStateChanged block, not the raw target — so RX2..N
-        // see the same rate-capped dB as RX1 (no extra fan-out wiring
-        // needed at the slew-advance site). The applied-value latch still
-        // guarantees a freshly-opened channel receives the current value.
-        if (rx.AppliedAgcTopDb != _appliedAgcCeilingDb)
+        if (rx.AppliedAgcTopDb != agcNext)
         {
-            engine.SetAgcTop(channelId, _appliedAgcCeilingDb);
-            rx.AppliedAgcTopDb = _appliedAgcCeilingDb;
+            engine.SetAgcTop(channelId, agcNext);
+            rx.AppliedAgcTopDb = agcNext;
         }
         // Per-secondary AF-gain slew: each receiver has its own slider
         // (Receivers[i].AfGainDb) so the rate-cap state is per-SecondaryRx.
@@ -7706,6 +7767,22 @@ public partial class DspPipelineService : BackgroundService,
         {
             engine.SetZoom(channelId, zoom);
             rx.AppliedZoom = zoom;
+        }
+    }
+
+    private void AdvanceSecondaryAgc(IDspEngine engine)
+    {
+        lock (_engineLock)
+        {
+            if (!ReferenceEquals(engine, _engine)) return;
+            var state = _radio.Snapshot();
+            for (int index = 1; index < MaxReceivers; index++)
+            {
+                var rx = _secondaryRx[index];
+                if (rx.ChannelId < 0 || !SecondaryReceiverEnabled(index, state)) continue;
+                if (rx.AppliedAgcTopDb != EffectiveAgcGainDb(RadioService.ReceiverAgcState(state, index)))
+                    ApplyStateToSecondaryRxChannel(engine, index, rx.ChannelId, state);
+            }
         }
     }
 
@@ -7949,8 +8026,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, newEngine);
-            Volatile.Write(ref _channelId, newChannelId);
+            PublishPrimaryEngineLocked(newEngine, newChannelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, rateHz);
         }
@@ -8351,6 +8427,7 @@ public partial class DspPipelineService : BackgroundService,
             Volatile.Write(ref _rx1Reopening, 1);
             RerateRxChannelForP2Locked(p2, engine, rateHz);
         }
+        ReconcileCwNoiseReductionAfterRerate(engine);
     }
 
     private void RerateRxChannelForP2Locked(Zeus.Protocol2.Protocol2Client p2, IDspEngine engine, int rateHz)
@@ -8536,8 +8613,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, next);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(next, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, rateHz);
         }
@@ -8582,8 +8658,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, disconnectedEngine);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(disconnectedEngine, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, SyntheticSampleRateHz);
         }
@@ -8653,8 +8728,7 @@ public partial class DspPipelineService : BackgroundService,
         {
             old = _engine;
             oldChannel = _channelId;
-            Volatile.Write(ref _engine, disconnectedEngine);
-            Volatile.Write(ref _channelId, channelId);
+            PublishPrimaryEngineLocked(disconnectedEngine, channelId);
             ResetSecondaryRxChannels();
             Volatile.Write(ref _sampleRateHz, SyntheticSampleRateHz);
         }
@@ -9540,12 +9614,12 @@ public partial class DspPipelineService : BackgroundService,
         try { engine.Dispose(); } catch { /* best-effort; never mask the initiating failure */ }
     }
 
-    // N-receiver additive mix. Averaging silently reduced every receiver by
-    // 6.02 dB with two streams (9.54 dB with three), which made strong signals
-    // sound weak merely because another RX was enabled. Sum configured streams
-    // at unity, as a real mixer does; the existing final-bus soft limiter owns
-    // coincident-peak headroom. A stalled, muted, or shorter stream never
-    // dilutes the receivers that remain present.
+    // Normalize the receive mix by the receivers contributing to each sample.
+    // Adding receivers must not multiply the output level at the same AF setting.
+    // Muted, stalled, and exhausted shorter streams are excluded so a remaining
+    // receiver still plays at full amplitude. A fresh secondary contributes its
+    // known open-fade weight to the divisor so RX1 does not jump down while RX2
+    // fades in. Waveform zero crossings still count normally.
     //
     // <paramref name="rx1Muted"/>: RX1's samples are dropped from the sum (the
     // caller has already zeroed them), but rx1Count still
@@ -9575,20 +9649,21 @@ public partial class DspPipelineService : BackgroundService,
         for (int i = 0; i < count; i++)
         {
             float sum = 0f;
-            bool contributed = false;
+            float contributorWeight = 0f;
             if (rx1Contributes && i < rx1Count)
             {
                 sum = rx1[i];
-                contributed = true;
+                contributorWeight += 1f;
             }
             foreach (var s in slices)
             {
                 int sc = Math.Clamp(s.Count, 0, s.Buffer.Length);
                 if (sc <= 0 || i >= sc) continue;
                 sum += s.Buffer[i];
-                contributed = true;
+                contributorWeight += RxFadeInGain(s.FadeInSamplesRemaining, SecondaryRxOpenFadeInSamples, i);
             }
-            rx1[i] = contributed ? sum : 0f;
+            // Keep a lone secondary's fade intact instead of dividing it away.
+            rx1[i] = sum / Math.Max(1f, contributorWeight);
         }
         return count;
     }
@@ -9675,6 +9750,7 @@ public partial class DspPipelineService : BackgroundService,
 
         var state = _radio.Snapshot();
         ReconcileExternalPureSignalStatusForTick(engine, state);
+        CaptureBandwidthSpectra(engine, state);
         // Synthetic engine stays open while disconnected so SetMode/SetFilter
         // etc. have somewhere to land, but its sweep+static placeholder used
         // to render a misleading "fake spectrum" before any radio existed.
@@ -9685,6 +9761,8 @@ public partial class DspPipelineService : BackgroundService,
         // when the user clicked Connect. The synthetic engine never produces
         // real-radio data, so suppressing it unconditionally is correct.
         if (engine is SyntheticDspEngine) return true;
+
+        if (!displayOnly) AdvanceSecondaryAgc(engine);
 
         // Display subscribers can appear/disappear, and WB can be toggled,
         // without producing a RadioService state mutation. Reconcile the WDSP
@@ -10153,6 +10231,18 @@ public partial class DspPipelineService : BackgroundService,
                     bool secWf = displayPlan.IncludeWaterfall &&
                         engine.TryGetDisplayPixels(secChan, DisplayPixout.Waterfall, rx.WfBuf);
                     if (secPan) { Array.Reverse(rx.PanBuf); SanitizeDisplayBuffer(rx.PanBuf); rx.PanCnt++; }
+                    if (secPan)
+                    {
+                        lock (rx.AutoAgcLock)
+                        {
+                            if (RadioService.ReceiverAgcState(state, ri).AutoAgcEnabled && !_keyed
+                                && Volatile.Read(ref _rxPostTxMuteBlocksRemaining) == 0 && !_rxAudioSuppressedForTx)
+                            {
+                                Array.Copy(rx.PanBuf, rx.AutoAgcBins, rx.PanBuf.Length);
+                                rx.AutoAgcPanMs = Environment.TickCount64;
+                            }
+                        }
+                    }
                     if (secWf) { Array.Reverse(rx.WfBuf); SanitizeDisplayBuffer(rx.WfBuf); rx.WfCnt++; }
 
                     var secFlags = DisplayBodyFlags.None;
@@ -10218,6 +10308,11 @@ public partial class DspPipelineService : BackgroundService,
 
         if (displayOnly)
             return true;
+
+        // Silent/muted receive paths skip the monitor mixer while its ring is
+        // empty. Observe idle here as well so the next clip gets its own
+        // startup reserve on those paths.
+        ResetMonitorInjectStartup(MonitorBacklog, ref _monInjStartPending, ref _monInjStarted);
 
         // Audio broadcast — when TX monitor is on, replace RX audio with the
         // monitor channel's demodulated TX audio so the operator hears the
@@ -10378,6 +10473,7 @@ public partial class DspPipelineService : BackgroundService,
             // (audioSampleCount==0) read nothing this tick.
             int want = Math.Min(audioSampleCount, sec.AudioBuf.Length);
             int n = want > 0 ? engine.ReadAudio(secChan, sec.AudioBuf.AsSpan(0, want)) : 0;
+            int fadeRemaining = Volatile.Read(ref sec.FadeInSamplesRemaining);
             if (n > 0)
             {
                 // Data tap: raw WDSP output, ahead of the open fade below. Like
@@ -10393,10 +10489,9 @@ public partial class DspPipelineService : BackgroundService,
                         sec.AudioBuf.AsSpan(0, n),
                         EffectiveAfGainDb(state.RxAfGainDb, SecondaryRxParams(state, ri).afGainDb));
                 // Ramp the first blocks of a freshly opened channel so RX2-on
-                // enters the additive mix (below) smoothly instead of dumping an
+                // enters the normalized mix (below) smoothly instead of dumping an
                 // unconverged full-scale block. Applied before the plugin tap and
                 // the mix so every consumer sees the same faded audio.
-                int fadeRemaining = Volatile.Read(ref sec.FadeInSamplesRemaining);
                 if (fadeRemaining > 0)
                 {
                     int fadeNext = ApplyRxPostTxFadeIn(
@@ -10415,13 +10510,13 @@ public partial class DspPipelineService : BackgroundService,
             }
             // A muted secondary is still drained above (so its ring can't back up)
             // but excluded from the mix entirely — it must neither add signal nor
-            // affect the additive MixRxAudioN bus. With DUP on, every unmuted
+            // affect the MixRxAudioN divisor. With DUP on, every unmuted
             // secondary remains audible while keyed/draining; with DUP off,
             // every secondary drops out during suppression, same as RX1 above.
             if (IsReceiverMuted(state, ri)
                 || (suppressRxAudioForTx && !allowLocalRxDuringSuppression))
                 continue;
-            _mixSlices[mixSliceCount++] = new RxAudioSlice(sec.AudioBuf, n);
+            _mixSlices[mixSliceCount++] = new RxAudioSlice(sec.AudioBuf, n, fadeRemaining);
         }
 
         // Kiwi slice: an INDEPENDENT remote receiver that shares the final
@@ -11025,6 +11120,47 @@ public partial class DspPipelineService : BackgroundService,
                     operatorSMeterOffsetDb);
                 var secRx = engine.GetRxStageMeters(secChan);
                 var secV2 = BuildRxMetersV2(secRx, secCalOffsetDb) with { RxId = (byte)ri };
+                var secondary = _secondaryRx[ri];
+                var secondaryAgc = RadioService.ReceiverAgcState(state, ri);
+                double secondaryFloor = double.NaN;
+                long agcNow = Environment.TickCount64;
+                lock (secondary.AutoAgcLock)
+                {
+                    if (!secondaryAgc.AutoAgcEnabled || engine is not WdspDspEngine || _keyed || Volatile.Read(ref _rxPostTxMuteBlocksRemaining) > 0 || _rxAudioSuppressedForTx)
+                    {
+                        secondary.AutoAgcTracker.Reset();
+                        secondary.AutoAgcWasEnabled = false;
+                        secondary.AutoAgcPanMs = long.MinValue;
+                    }
+                    else
+                    {
+                        if (!secondary.AutoAgcWasEnabled || (secondary.AutoAgcVfoHz != long.MinValue && Math.Abs(secVfoHz - secondary.AutoAgcVfoHz) > AutoAgcFastAttackVfoDeltaHz)
+                            || secondary.AutoAgcPreamp != state.PreampOn || secondary.AutoAgcAtten != state.AttenDb
+                            || secondary.AutoAgcAdc != ReceiverAdcSource(state, ri) || secondary.AutoAgcRate != state.SampleRate)
+                            secondary.AutoAgcTracker.FastAttack(agcNow);
+                        secondary.AutoAgcWasEnabled = true;
+                        secondary.AutoAgcVfoHz = secVfoHz;
+                        secondary.AutoAgcPreamp = state.PreampOn;
+                        secondary.AutoAgcAtten = state.AttenDb;
+                        secondary.AutoAgcAdc = ReceiverAdcSource(state, ri);
+                        secondary.AutoAgcRate = state.SampleRate;
+                        long spectrumAge = secondary.AutoAgcPanMs == long.MinValue ? long.MaxValue : agcNow - secondary.AutoAgcPanMs;
+                        bool fromSpectrum = spectrumAge <= 300;
+                        int source = fromSpectrum ? 1 : spectrumAge <= AutoAgcSpectrumStaleMs ? 0
+                            : double.IsFinite(secV2.SignalAv) && secV2.SignalAv > -250.0 ? 2 : 0;
+                        if (source != 0 && secondary.AutoAgcFeedSource != 0 && secondary.AutoAgcFeedSource != source)
+                        {
+                            secondary.AutoAgcTracker.Reset();
+                            secondary.AutoAgcTracker.FastAttack(agcNow);
+                        }
+                        if (source != 0) secondary.AutoAgcFeedSource = source;
+                        if (fromSpectrum) secondary.AutoAgcTracker.AddBins(secondary.AutoAgcBins, agcNow);
+                        else if (source == 2) secondary.AutoAgcTracker.AddScalar(secV2.SignalAv, agcNow);
+                        if (secondary.AutoAgcTracker.IsGood)
+                            secondaryFloor = secondary.AutoAgcTracker.FloorDbm + (secondary.AutoAgcFeedSource == 1 ? secCalOffsetDb : 0.0);
+                    }
+                }
+                _radio.HandleReceiverAutoAgc(ri, secondaryFloor, agcNow);
                 _hub.Broadcast(secV2);
                 RxMetersV2Updated?.Invoke(secChan, secV2);
             }

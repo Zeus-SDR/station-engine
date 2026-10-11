@@ -27,7 +27,7 @@ public static class ReceiverControlEndpoints
             RadioService radio,
             IExternalReceiverControlPort external) =>
         {
-            if (index < 0 || index > WireContract.KiwiReceiverIndex)
+            if (index < 0 || (index >= WireContract.MaxReceivers && index != WireContract.KiwiReceiverIndex))
                 return Results.BadRequest(new
                 {
                     error = $"receiver index out of range (0..{WireContract.KiwiReceiverIndex})",
@@ -52,6 +52,11 @@ public static class ReceiverControlEndpoints
                 return Results.Ok(radio.Snapshot());
             }
 
+            if (req.Agc is { } agc && (!Enum.IsDefined(agc.Mode) || (agc.FixedGainDb is double fixedGain && !double.IsFinite(fixedGain))))
+                return Results.BadRequest(new { error = "invalid AGC configuration" });
+            if (req.AgcTopDb is double top && !double.IsFinite(top))
+                return Results.BadRequest(new { error = "AGC gain must be finite" });
+
             log.LogInformation(
                 "api.receivers index={Index} enabled={Enabled} vfoHz={VfoHz} adc={Adc} mode={Mode}",
                 index,
@@ -70,7 +75,8 @@ public static class ReceiverControlEndpoints
                 afGainDb: req.AfGainDb,
                 filterPresetName: req.FilterPresetName,
                 zoomLevel: req.ZoomLevel,
-                nrMode: req.NrMode));
+                nrMode: req.NrMode,
+                agc: req.Agc, agcTopDb: req.AgcTopDb, autoAgcEnabled: req.AutoAgcEnabled));
         });
 
         endpoints.MapPost("/api/receivers/{index:int}/mute", (
@@ -79,7 +85,7 @@ public static class ReceiverControlEndpoints
             RadioService radio,
             IExternalReceiverControlPort external) =>
         {
-            if (index < 0 || index > WireContract.KiwiReceiverIndex)
+            if (index < 0 || (index >= WireContract.MaxReceivers && index != WireContract.KiwiReceiverIndex))
                 return Results.BadRequest(new
                 {
                     error = $"receiver index out of range (0..{WireContract.KiwiReceiverIndex})",
@@ -113,7 +119,7 @@ public static class ReceiverControlEndpoints
             DspPipelineService pipeline,
             IExternalReceiverControlPort external) =>
         {
-            if (index < 0 || index > WireContract.KiwiReceiverIndex)
+            if (index < 0 || (index >= WireContract.MaxReceivers && index != WireContract.KiwiReceiverIndex))
                 return Results.BadRequest(new
                 {
                     error = $"receiver index out of range (0..{WireContract.KiwiReceiverIndex})",

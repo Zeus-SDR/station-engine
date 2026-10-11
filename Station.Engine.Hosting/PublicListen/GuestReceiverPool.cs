@@ -123,7 +123,7 @@ public sealed record GuestReceiverSettings(
     /// the passband into ±10 kHz with a minimum width, and sideband-signed
     /// (a positive passband sent for LSB/CWL is mirrored, and vice versa).
     /// </summary>
-    public GuestReceiverSettings Normalize()
+    public GuestReceiverSettings Normalize(long maximumFrequencyHz = MaxHz)
     {
         var mode = IsAllowedMode(Mode) ? Mode : RxMode.USB;
         int low = Math.Clamp(FilterLowHz, -MaxFilterEdgeHz, MaxFilterEdgeHz);
@@ -136,7 +136,7 @@ public sealed record GuestReceiverSettings(
         if (high - low < MinFilterWidthHz) (low, high) = DefaultFilter(mode);
         return this with
         {
-            Hz = Math.Clamp(Hz, MinHz, MaxHz),
+            Hz = Math.Clamp(Hz, MinHz, maximumFrequencyHz),
             Mode = mode,
             FilterLowHz = low,
             FilterHighHz = high,

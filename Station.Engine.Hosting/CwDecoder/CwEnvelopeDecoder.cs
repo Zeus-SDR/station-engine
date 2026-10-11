@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA) and contributors.
 namespace Zeus.Server;
-
 /// <summary>One envelope's independent threshold, clock and Morse state.</summary>
 internal sealed class CwEnvelopeDecoder
 {
     private readonly bool _narrow;
+    private bool _retainedEnvelope;
+    private bool _haveNonZeroInput;
+    private double _digitalZeroMs;
+    private const double DigitalZeroReacquireMs = 2000;
     private readonly EnvelopeSmoother _smoother = new();
     private readonly AdaptiveThreshold _threshold = new();
     private readonly MatchedToneThreshold _matched = new();
@@ -47,43 +50,98 @@ internal sealed class CwEnvelopeDecoder
     private const int MinOpeningReplayBlocks = 128;
     private int _openingCount;
     private int _openingCursor;
-
-    public CwEnvelopeDecoder(bool narrow)
+    private readonly bool _jointCandidate;
+    public CwEnvelopeDecoder(bool narrow, bool jointCandidate = false)
     {
         _narrow = narrow;
-        _fsm = new MorseFsm(_timing);
+        _jointCandidate = jointCandidate;
+        _fsm = new MorseFsm(_timing, jointCandidate);
     }
 
     public double Wpm => _timing.Wpm;
-    public double SnrDb => _narrow ? (_fading ? _fadeThreshold.SnrDb : _matched.SnrDb) : _threshold.SnrDb;
+    public double SnrDb => _narrow ? (_fading && !_jointCandidate ? _fadeThreshold.SnrDb : _matched.SnrDb) : _threshold.SnrDb;
+    internal double OpeningQuietNoise => _matched.OpeningQuietNoise;
+    internal double MarkRail => _matched.MarkRail;
+    internal double NoiseFloor => _narrow ? _matched.NoiseFloor : _threshold.NoiseFloor;
     public double MeanSnrDb => _snrCount == 0 ? 0 : _snrSum / _snrCount;
     public double QuietMs => _quietMs;
     public double DitMs => _timing.DitMs;
     public int ToneBlocks => _snrCount;
+    internal int FitnessMarks => _fsm.Fitness.Marks;
+
+    internal double TimingFit(double quantum, out bool mixed) => JointTimingFit(quantum, out mixed);
+    internal bool ClockLocked => _timing.IsLocked;
+    internal double JointSkew => _fsm.JointSkew;
+    internal bool SingleMarkCluster => _fsm.Fitness.SingleMarkCluster;
+
+    internal bool SupportedFastClock(double quantum) => _fsm.Fitness.TryJoint(quantum, 32, out double dit, out _, out _, MorseTimingEstimator.MinDitMs) && dit < 50;
+    internal bool StrongShortMark => _fsm.Fitness.StrongShortMark;
+    internal bool MayBeSlow => _fsm.Fitness.MayBeSlow;
+    internal bool HasOpenLongMark => _fsm.CurrentMarkMs >= 120 && _fsm.CurrentMarkQuality >= .93 && _fsm.CurrentSnr >= 15;
+
+    private double JointTimingFit(double quantum, out bool mixed)
+    {
+        if (double.IsFinite(_fsm.JointFit))
+        {
+            mixed = true;
+            return _fsm.JointFit;
+        }
+
+        return _fsm.Fitness.Fit(DitMs, quantum, out mixed);
+    }
 
     public void Process(double amplitude, double blockMs, Action<MorseDecodedSymbol> output, double signalQuality = 1, double detectorDelayMs = 0)
     {
         _signalQuality = signalQuality;
         _detectorDelayMs = detectorDelayMs;
+        if (amplitude > 1e-10)
+        {
+            _haveNonZeroInput = true;
+            _digitalZeroMs = 0;
+        }
+        else if (_haveNonZeroInput)
+        {
+            _digitalZeroMs = Math.Min(DigitalZeroReacquireMs, _digitalZeroMs + blockMs);
+            // The amplitude threshold also rebases after two seconds of
+            // digital silence. Its opening marks need the established full
+            // acquisition window before their lengths can seed a cold pair.
+            if (_digitalZeroMs >= DigitalZeroReacquireMs)
+                _fsm.SuppressColdPairSeed();
+        }
+
         // A receiver noise-floor step can resemble a continuous key-down to
         // an old amplitude threshold. Rebase only after repeated incoherent
         // in-passband samples; a louder coherent station is kept immediately.
         if (!_narrow && signalQuality < 0.85 && amplitude > 4 * _threshold.NoiseFloor)
         {
-            if (++_raisedNoiseBlocks >= 12) BeginNextSender();
+            if (++_raisedNoiseBlocks >= 12)
+                BeginNextSender();
         }
-        else if (signalQuality > 0.95 || amplitude < 2 * _threshold.NoiseFloor) _raisedNoiseBlocks = 0;
+        else if (signalQuality > 0.95 || amplitude < 2 * _threshold.NoiseFloor)
+            _raisedNoiseBlocks = 0;
         bool keyed;
         if (_narrow)
         {
-            bool matched = _matched.Update(amplitude);
+            bool matched = _matched.Update(amplitude, signalQuality, _fsm.HasCoherentSupport);
             if (_matched.JustAcquired && !_open)
             {
                 ReplayOpening(blockMs, output);
                 _signalQuality = signalQuality;
                 matched = _matched.Classify(amplitude);
             }
-            else if (!_matched.Acquired && !_open) KeepOpeningBlock(amplitude, signalQuality);
+            else if ((!_matched.Acquired || _jointCandidate) && !_open)
+            {
+                if (_jointCandidate && matched && _openingCount >= MinOpeningReplayBlocks)
+                {
+                    ReplayOpening(blockMs, output);
+                    _signalQuality = signalQuality;
+                    matched = _matched.Classify(amplitude);
+                }
+
+                if (!_open)
+                    KeepOpeningBlock(amplitude, signalQuality);
+            }
+
             bool adaptive = _fadeThreshold.Update(amplitude);
             // Use the adaptive envelope to observe fresh fading evidence;
             // it can see a coherent mark below the old stable mark rail.
@@ -102,26 +160,31 @@ internal sealed class CwEnvelopeDecoder
                 // A peak needs a plateau beyond both integration ramps.
                 // Otherwise fast dits and dahs have different peak heights
                 // even without fading. Coherence also excludes noise fragments.
-                if (_markBlocks * blockMs >= 2 * (2 * detectorDelayMs + blockMs)
-                    && _markBlocks >= 4 && coherence >= 0.85 && _fsm.HasCoherentSupport
-                    && (_markBlocks * blockMs >= 0.7 * _timing.DitMs || coherence >= 0.95))
+                if (_markBlocks * blockMs >= 2 * (2 * detectorDelayMs + blockMs) && _markBlocks >= 4 && coherence >= 0.85 && _fsm.HasCoherentSupport && (_markBlocks * blockMs >= 0.7 * _timing.DitMs || coherence >= 0.95))
                 {
                     if (_previousPeak > 0 && (_markPeak > 2 * _previousPeak || _markPeak < 0.5 * _previousPeak))
                         _fading = true;
                     _previousPeak = _markPeak;
                 }
+
                 _markPeak = 0;
                 _markQuality = 0;
                 _markBlocks = 0;
             }
-            keyed = _fading ? adaptive : matched;
+
+            keyed = _fading && !_jointCandidate ? adaptive : matched;
         }
         else
         {
             _smoother.SetDit(_timing.FastAcquisition ? MorseTimingEstimator.MinDitMs : _timing.DitMs, blockMs);
-            keyed = _threshold.Update(amplitude <= 1e-10 ? 0 : _smoother.Push(amplitude));
-            if (amplitude <= 1e-10) _smoother.Clear();
+            // A retained envelope belongs to the preceding sender. Its attack
+            // calibration must retain the established recovery behavior.
+            bool rejectSpikes = !_retainedEnvelope && !_timing.Reacquiring && (_timing.FastAcquisition || _timing.DitMs < 33);
+            keyed = _threshold.Update(amplitude <= 1e-10 ? 0 : _smoother.Push(amplitude), rejectRecoverySpikes: rejectSpikes);
+            if (amplitude <= 1e-10)
+                _smoother.Clear();
         }
+
         Advance(keyed, signalQuality, blockMs, output);
     }
 
@@ -137,6 +200,7 @@ internal sealed class CwEnvelopeDecoder
                 _snrSum += SnrDb;
                 _snrCount++;
             }
+
             _openRun++;
             _openingQuality += blockQuality;
         }
@@ -146,15 +210,19 @@ internal sealed class CwEnvelopeDecoder
             _openRun = 0;
             _openingQuality = 0;
         }
+
         if (!_open)
         {
-            if (_openRun < 4) return;
+            if (_openRun < 4)
+                return;
             _open = true;
             _signalQuality = _openingQuality / _openRun;
             Feed(false, blockMs, output);
-            for (int i = 0; i < _openRun; i++) Feed(true, blockMs, output);
+            for (int i = 0; i < _openRun; i++)
+                Feed(true, blockMs, output);
             return;
         }
+
         Feed(keyed, blockMs, output);
     }
 
@@ -163,7 +231,8 @@ internal sealed class CwEnvelopeDecoder
         _openingAmplitude[_openingCursor] = amplitude;
         _openingSignalQuality[_openingCursor] = signalQuality;
         _openingCursor = (_openingCursor + 1) % OpeningCapacity;
-        if (_openingCount < OpeningCapacity) _openingCount++;
+        if (_openingCount < OpeningCapacity)
+            _openingCount++;
     }
 
     /// <summary>
@@ -174,9 +243,10 @@ internal sealed class CwEnvelopeDecoder
     /// </summary>
     private void ReplayOpening(double blockMs, Action<MorseDecodedSymbol> output)
     {
+        if (_jointCandidate && _openingCount < MinOpeningReplayBlocks)
+            return;
         int oldest = (_openingCursor - _openingCount + OpeningCapacity) % OpeningCapacity;
-        if (_openingCount < MinOpeningReplayBlocks
-            || !TryFindOpeningMark(oldest, out int first, out double markLevel))
+        if (_openingCount < MinOpeningReplayBlocks || !TryFindOpeningMark(oldest, out int first, out double markLevel))
         {
             // No real pause before this sender, or rails that separated on
             // noise alone. Re-reading either would turn quiet into letters;
@@ -196,16 +266,17 @@ internal sealed class CwEnvelopeDecoder
             _signalQuality = _openingSignalQuality[index];
             Advance(_matched.Classify(_openingAmplitude[index]), _signalQuality, blockMs, output);
         }
+
         ClearOpening();
     }
 
     /// <summary>
-    /// First real opening element: <see cref="OpeningMarkBlocks"/> consecutive
+    /// First real opening element: <see cref = "OpeningMarkBlocks"/> consecutive
     /// blocks well clear of the noise floor whose tone phase holds.
     /// Band-limited noise can cross an amplitude threshold for a block or
     /// two, but it does not keep the tone's phase for that long.
-    /// <paramref name="first"/> is the run's first block, counted from the
-    /// oldest buffered block; <paramref name="markLevel"/> is its mean amplitude.
+    /// <paramref name = "first"/> is the run's first block, counted from the
+    /// oldest buffered block; <paramref name = "markLevel"/> is its mean amplitude.
     /// </summary>
     private bool TryFindOpeningMark(int oldest, out int first, out double markLevel)
     {
@@ -257,14 +328,14 @@ internal sealed class CwEnvelopeDecoder
         if (tone)
         {
             int integratedBlocks = (int)Math.Round(2 * _detectorDelayMs / blockMs + 1);
-            double skew = _narrow
-                ? (_fading ? _fadeThreshold.ExcessMarkBlocks(integratedBlocks) : 0)
-                : _threshold.ExcessMarkBlocks(_smoother.Length);
-            _fsm.NoteMarkSkew(skew * blockMs);
+            double skew = _narrow ? (_fading ? _fadeThreshold.ExcessMarkBlocks(integratedBlocks) : 0) : _threshold.ExcessMarkBlocks(_smoother.Length);
+            _fsm.NoteMarkSkew(_jointCandidate ? _fsm.JointSkew : skew * blockMs);
         }
+
         _fsm.NoteSignalQuality(_signalQuality, afterGlitch: !_narrow);
         _fsm.Process(tone, blockMs);
-        while (_fsm.TryTake(out var symbol)) output(symbol);
+        while (_fsm.TryTake(out var symbol))
+            output(symbol);
     }
 
     public void BeginNextSender(bool keepEnvelope = false)
@@ -272,6 +343,7 @@ internal sealed class CwEnvelopeDecoder
         _timing.BeginReacquisition(allowFaster: true);
         if (keepEnvelope)
         {
+            _retainedEnvelope = true;
             // A matched floor belongs to one sender. Re-measure it during
             // the quiet interval rather than retaining a frozen low rail.
             _matched.Reset();
@@ -284,12 +356,14 @@ internal sealed class CwEnvelopeDecoder
                 _openingQuality = 0;
                 ClearOpening();
             }
+
             ClearFade();
             _fsm.Reset();
             _snrSum = 0;
             _snrCount = 0;
         }
-        else ClearEnvelope();
+        else
+            ClearEnvelope();
     }
 
     public void Reset()
@@ -300,6 +374,9 @@ internal sealed class CwEnvelopeDecoder
 
     private void ClearEnvelope()
     {
+        _retainedEnvelope = false;
+        _haveNonZeroInput = false;
+        _digitalZeroMs = 0;
         _smoother.Reset();
         _threshold.Reset();
         _matched.Reset();

@@ -2,35 +2,70 @@
 //
 // Zeus — OpenHPSDR Protocol-1 / Protocol-2 client.
 // Copyright (C) 2026 Douglas J. Cerrato (KB2UKA), Christian Suarez (N9WAR), and contributors.
-
 namespace Zeus.Server;
-
 internal readonly record struct MorseDecodedSymbol(string Text, float Confidence);
-
 /// <summary>Converts thresholded key timing into International Morse text.</summary>
 internal sealed class MorseFsm
 {
     public const string UnknownPlaceholder = "?";
-
     // AR, BT, and KN share their wire patterns with +, =, and (. Those
     // conventional glyphs preserve round-trippable punctuation while also
     // rendering the corresponding prosigns. SK is unambiguous and is named.
-    private static readonly IReadOnlyDictionary<string, string> Table =
-        new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            [".-"]="A", ["-..."]="B", ["-.-."]="C", ["-.."]="D", ["."]="E",
-            ["..-."]="F", ["--."]="G", ["...."]="H", [".."]="I", [".---"]="J",
-            ["-.-"]="K", [".-.."]="L", ["--"]="M", ["-."]="N", ["---"]="O",
-            [".--."]="P", ["--.-"]="Q", [".-."]="R", ["..."]="S", ["-"]="T",
-            ["..-"]="U", ["...-"]="V", [".--"]="W", ["-..-"]="X", ["-.--"]="Y", ["--.."]="Z",
-            ["-----"]="0", [".----"]="1", ["..---"]="2", ["...--"]="3", ["....-"]="4",
-            ["....."]="5", ["-...."]="6", ["--..."]="7", ["---.."]="8", ["----."]="9",
-            [".-.-.-"]=".", ["--..--"]=",", ["..--.."]="?", ["-..-."]="/", [".--.-."]="@",
-            ["-...-"]="=", [".-.-."]="+", ["..--.-"]="_", [".----."]="'", ["-.--.-"]=")",
-            ["-.--."]="(", ["-.-.--"]="!", ["---..."]=":", ["-.-.-."]=";", [".-..-."]="\"",
-            ["...-.-"]="<SK>"
-        };
-
+    private static readonly IReadOnlyDictionary<string, string> Table = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        [".-"] = "A",
+        ["-..."] = "B",
+        ["-.-."] = "C",
+        ["-.."] = "D",
+        ["."] = "E",
+        ["..-."] = "F",
+        ["--."] = "G",
+        ["...."] = "H",
+        [".."] = "I",
+        [".---"] = "J",
+        ["-.-"] = "K",
+        [".-.."] = "L",
+        ["--"] = "M",
+        ["-."] = "N",
+        ["---"] = "O",
+        [".--."] = "P",
+        ["--.-"] = "Q",
+        [".-."] = "R",
+        ["..."] = "S",
+        ["-"] = "T",
+        ["..-"] = "U",
+        ["...-"] = "V",
+        [".--"] = "W",
+        ["-..-"] = "X",
+        ["-.--"] = "Y",
+        ["--.."] = "Z",
+        ["-----"] = "0",
+        [".----"] = "1",
+        ["..---"] = "2",
+        ["...--"] = "3",
+        ["....-"] = "4",
+        ["....."] = "5",
+        ["-...."] = "6",
+        ["--..."] = "7",
+        ["---.."] = "8",
+        ["----."] = "9",
+        [".-.-.-"] = ".",
+        ["--..--"] = ",",
+        ["..--.."] = "?",
+        ["-..-."] = "/",
+        [".--.-."] = "@",
+        ["-...-"] = "=",
+        [".-.-."] = "+",
+        ["..--.-"] = "_",
+        [".----."] = "'",
+        ["-.--.-"] = ")",
+        ["-.--."] = "(",
+        ["-.-.--"] = "!",
+        ["---..."] = ":",
+        ["-.-.-."] = ";",
+        [".-..-."] = "\"",
+        ["...-.-"] = "<SK>"
+    };
     // Runs held until the dit estimate locks, then replayed. A cold 20 WPM
     // estimate mis-reads a 12 WPM dit as a dah and misses a 30 WPM letter
     // gap; the opening characters are still in this buffer when it locks.
@@ -59,9 +94,10 @@ internal sealed class MorseFsm
     // space at 20 WPM is 60 ms. Four dits at 5 WPM (960 ms) held the carrier
     // open through a normal word space, so the next transmission never printed.
     private const double FragmentGapMs = 50;
-
     private double _signalQuality = 1;
     private double _qualitySum;
+    private double _markSnrSum;
+    private int _markSnrCount;
     private int _qualityCount;
     private int _supportedMarks;
     private double _supportSum;
@@ -70,6 +106,12 @@ internal sealed class MorseFsm
     private bool _strongSupport;
     private bool _qualityAfterGlitch;
     internal bool HasCoherentSupport => _strongSupport;
+    internal double CurrentSnr => _markSnrCount > 0 ? _markSnrSum / _markSnrCount : _snrDb;
+    internal double CurrentMarkMs => _tone ? _durationMs : 0;
+    internal double CurrentMarkQuality => _qualityCount > 0 ? _qualitySum / _qualityCount : 0;
+
+    internal readonly CwTimingFitness Fitness = new();
+    private bool _fitnessMark;
     public void NoteSignalQuality(double quality, bool afterGlitch = false)
     {
         _signalQuality = quality;
@@ -87,6 +129,7 @@ internal sealed class MorseFsm
     private int _pendingCount;
     private bool _initialized;
     private bool _live;
+    private bool _coldPairSuppressed;
     private bool _seenMark;
     private bool _filterReady;
     private bool _cleanTone;
@@ -110,18 +153,21 @@ internal sealed class MorseFsm
     private bool _carrierEcho;
     private bool _holdingSlow;
     private int _slowMarks;
-
     private readonly record struct Run(bool Tone, double Ms);
+    private readonly bool _jointCandidate;
+    internal double JointSkew { get; private set; }
+    internal double JointFit { get; private set; } = double.PositiveInfinity;
 
-    public MorseFsm(MorseTimingEstimator timing) => _timing = timing;
+    public MorseFsm(MorseTimingEstimator timing, bool jointCandidate = false)
+    {
+        _timing = timing;
+        _jointCandidate = jointCandidate;
+    }
 
     internal static IReadOnlyDictionary<string, string> CharacterTable => Table;
 
-    internal static string DecodePattern(string pattern) =>
-        Table.TryGetValue(pattern, out string? text) ? text : UnknownPlaceholder;
-
+    internal static string DecodePattern(string pattern) => Table.TryGetValue(pattern, out string? text) ? text : UnknownPlaceholder;
     public void NoteSnr(double snrDb) => _snrDb = snrDb;
-
     /// <summary>
     /// Group delay of the envelope average, in milliseconds. Equal delay on
     /// both edges leaves the mark length alone; a resize between the edges
@@ -129,7 +175,8 @@ internal sealed class MorseFsm
     /// </summary>
     public void NoteEdgeDelay(double delayMs)
     {
-        if (!double.IsFinite(delayMs) || delayMs < 0) delayMs = 0;
+        if (!double.IsFinite(delayMs) || delayMs < 0)
+            delayMs = 0;
         _pendingEdgeDelayMs = delayMs;
     }
 
@@ -140,7 +187,10 @@ internal sealed class MorseFsm
     /// </summary>
     public void NoteMarkSkew(double skewMs)
     {
-        if (!double.IsFinite(skewMs) || skewMs < 0) skewMs = 0;
+        // Positive skew removes envelope hold; negative skew restores a
+        // confirmed recovery attack that started one block before key-down.
+        if (!double.IsFinite(skewMs))
+            skewMs = 0;
         _markSkewMs = skewMs;
     }
 
@@ -150,24 +200,40 @@ internal sealed class MorseFsm
         if (!rawTone && !_cleanTone && !_tone)
         {
             _qualitySum = 0;
+            _markSnrSum = 0;
+            _markSnrCount = 0;
             _qualityCount = 0;
         }
+
         if (rawTone && !_qualityAfterGlitch && double.IsFinite(_signalQuality))
         {
             _qualitySum += _signalQuality;
+            if (double.IsFinite(_snrDb))
+            {
+                _markSnrSum += _snrDb;
+                _markSnrCount++;
+            }
+
             _qualityCount++;
         }
+
         // Estimator was trained before any audio (tests, or a later session
         // that reset only the tone state). Decode live; there is nothing to replay.
         if (!_live && _runCount == 0 && !_seenMark && _timing.IsLocked)
             _live = true;
-
         bool tone = FilterGlitch(rawTone);
         if (tone && _qualityAfterGlitch && double.IsFinite(_signalQuality))
         {
             _qualitySum += _signalQuality;
+            if (double.IsFinite(_snrDb))
+            {
+                _markSnrSum += _snrDb;
+                _markSnrCount++;
+            }
+
             _qualityCount++;
         }
+
         if (!_initialized)
         {
             _initialized = true;
@@ -183,8 +249,10 @@ internal sealed class MorseFsm
             {
                 if (_carrierEcho && _durationMs >= FragmentGapMs)
                     _carrierEcho = false;
-                if (!_live) MaybeForceLock();
-                if (_live) TryEmitGap();
+                if (!_live)
+                    MaybeForceLock();
+                if (_live)
+                    TryEmitGap();
                 if (!_qualityWordGap && _durationMs >= _timing.WordGapThresholdMs + 2 * _quantumMs)
                 {
                     _qualityWordGap = true;
@@ -200,11 +268,13 @@ internal sealed class MorseFsm
                         ClearPartial();
                         _timing.BeginReacquisition(allowFaster: true);
                     }
+
                     _strongSupport = false;
                     _supportedMarks = 0;
                     _supportSum = 0;
                 }
             }
+
             return;
         }
 
@@ -213,7 +283,7 @@ internal sealed class MorseFsm
             _fallDelayMs = _pendingEdgeDelayMs;
             CloseMark();
             _tone = false;
-            _durationMs = blockDurationMs;
+            _durationMs = blockDurationMs + JointSkew;
             _letterEmitted = false;
             _wordEmitted = false;
             return;
@@ -222,7 +292,8 @@ internal sealed class MorseFsm
         _qualityWordGap = false;
         CloseSpace();
         _riseDelayMs = _pendingEdgeDelayMs;
-        if (_live) FlushHeld();
+        if (_live)
+            FlushHeld();
         _tone = true;
         _durationMs = blockDurationMs;
         _letterEmitted = false;
@@ -249,21 +320,23 @@ internal sealed class MorseFsm
     /// operator has moved to another station, so no later gap will end it.
     /// Marks still buffered before the dit locked are replayed on the
     /// current estimate, then the open character is decoded. A lone
-    /// character <see cref="HoldsAlone"/> would hold ends its word here and is
+    /// character <see cref = "HoldsAlone"/> would hold ends its word here and is
     /// dropped, as a word gap would drop it. Returns false once nothing is left.
     /// </summary>
     internal bool TryFlush(out MorseDecodedSymbol symbol)
     {
-        if (_holdingSlow) AbandonSlowCandidate();
+        if (_holdingSlow)
+            AbandonSlowCandidate();
         if (!_live && _bufferedMarks > 0)
         {
-            if (_bufferedMarks < 3) SeedBufferedPair();
+            if (_bufferedMarks < 3)
+                SeedBufferedPair();
             Replay();
         }
 
         if (_patternLength > 0)
         {
-            string text = DecodePattern(new string(_pattern, 0, _patternLength));
+            string text = DecodePattern(new string (_pattern, 0, _patternLength));
             float confidence = ConfidenceFor(text);
             ClearPartial();
             _letterEmitted = true;
@@ -278,9 +351,17 @@ internal sealed class MorseFsm
         return TryTake(out symbol);
     }
 
+    internal void SuppressColdPairSeed() => _coldPairSuppressed = true;
     public void Reset()
     {
+        Fitness.Reset();
+        _fitnessMark = false;
+        JointSkew = 0;
+        JointFit = double.PositiveInfinity;
+        _coldPairSuppressed = false;
         _qualitySum = 0;
+        _markSnrSum = 0;
+        _markSnrCount = 0;
         _qualityCount = 0;
         _signalQuality = 1;
         _supportedMarks = 0;
@@ -357,7 +438,8 @@ internal sealed class MorseFsm
         if (_timing.FastAcquisition && _quantumMs > 0)
         {
             double threeBlocks = 3.0 * _quantumMs;
-            if (limit > threeBlocks) limit = threeBlocks;
+            if (limit > threeBlocks)
+                limit = threeBlocks;
         }
 
         return limit;
@@ -367,7 +449,10 @@ internal sealed class MorseFsm
     {
         double adjusted = AdjustedMark(_durationMs);
         double quality = _qualityCount == 0 ? 0 : _qualitySum / _qualityCount;
+        _fitnessMark = Fitness.NoteMark(adjusted + JointSkew, quality, CurrentSnr);
         _qualitySum = 0;
+        _markSnrSum = 0;
+        _markSnrCount = 0;
         _qualityCount = 0;
         // Random band-limited bursts can have a Morse-shaped envelope. They
         // do not sustain the tone's phase. Reject them before clock training;
@@ -381,12 +466,27 @@ internal sealed class MorseFsm
             _held = null;
             return;
         }
+
         _supportedMarks++;
         _supportSum += quality;
-        if (quality >= 0.995 || (quality >= 0.93 && _snrDb >= 15)
-            || (_supportedMarks >= 3 && _supportSum / _supportedMarks >= 0.85))
+        if (quality >= 0.995 || (quality >= 0.93 && _snrDb >= 15) || (_supportedMarks >= 3 && _supportSum / _supportedMarks >= 0.85))
             _strongSupport = true;
-        if (_strongSupport) _readyCount = _pendingCount;
+        if (_strongSupport)
+            _readyCount = _pendingCount;
+        if (_jointCandidate && !_timing.IsLocked)
+        {
+            if (adjusted >= MorseTimingEstimator.MaxPreLockMarkMs || _runCount >= RunCapacity - 2)
+            {
+                _fitnessMark = false;
+                return;
+            }
+
+            _seenMark = true;
+            PushRun(true, adjusted);
+            _bufferedMarks++;
+            return;
+        }
+
         if (!_timing.IsLocked)
         {
             if (adjusted >= _timing.CarrierMs || IsCarrierFragment(adjusted))
@@ -411,7 +511,8 @@ internal sealed class MorseFsm
                 PushRun(true, adjusted);
                 _timing.ObserveElement(adjusted);
                 _bufferedMarks++;
-                if (_bufferedMarks == 2 && _timing.Reacquiring) SeedBufferedPair();
+                if (_bufferedMarks == 2 && (_timing.Reacquiring || (_timing.FastAcquisition && !_coldPairSuppressed)))
+                    SeedBufferedPair(mixedOnly: !_timing.Reacquiring);
                 if (_timing.IsLocked)
                     Replay();
                 return;
@@ -444,6 +545,37 @@ internal sealed class MorseFsm
 
     private void CloseSpace()
     {
+        if (_fitnessMark)
+            Fitness.NoteGap(_durationMs - JointSkew);
+        if (_jointCandidate && !_timing.IsLocked)
+        {
+            if (_seenMark && _runCount < RunCapacity - 2)
+                PushRun(false, _durationMs);
+            if (_strongSupport && Fitness.TryJoint(_quantumMs, 32, out double dit, out double skew, out double fit))
+            {
+                JointSkew = skew;
+                JointFit = fit;
+                _timing.SeedJoint(dit);
+                for (int i = 0; i < _runCount; i++)
+                {
+                    Run run = _runs[i];
+                    _runs[i] = new Run(run.Tone, Math.Max(_quantumMs, run.Ms + (run.Tone ? -skew : skew)));
+                }
+
+                Replay();
+            }
+
+            return;
+        }
+
+        if (_jointCandidate && _timing.IsLocked && Fitness.TryJoint(_quantumMs, 32, out double nextDit, out double nextSkew, out double nextFit) && nextDit >= .8 * _timing.DitMs && nextDit <= 1.25 * _timing.DitMs && nextFit < JointFit)
+        {
+            _durationMs += nextSkew - JointSkew;
+            JointSkew = nextSkew;
+            JointFit = nextFit;
+            _timing.SeedJoint(nextDit);
+        }
+
         if (_holdingSlow)
         {
             // A dropout inside a carrier is not the key-up of a slower fist.
@@ -481,6 +613,8 @@ internal sealed class MorseFsm
 
     private void MaybeForceLock()
     {
+        if (_jointCandidate && !_timing.IsLocked)
+            return;
         // A short send (a single K, then the tail) may never collect six
         // marks. Replay once the open space is a word gap so the tail still
         // flushes the letters that were buffered. Two marks have no 2-means
@@ -547,14 +681,15 @@ internal sealed class MorseFsm
 
     private void AbandonSlowCandidate()
     {
-        if (!_holdingSlow) return;
+        if (!_holdingSlow)
+            return;
         _holdingSlow = false;
         _runCount = 0;
         _bufferedMarks = 0;
         _slowMarks = 0;
     }
 
-    private void SeedBufferedPair()
+    private void SeedBufferedPair(bool mixedOnly = false)
     {
         double first = 0;
         double second = 0;
@@ -566,8 +701,10 @@ internal sealed class MorseFsm
             Run run = _runs[i];
             if (run.Tone)
             {
-                if (marks == 0) first = run.Ms;
-                else if (marks == 1) second = run.Ms;
+                if (marks == 0)
+                    first = run.Ms;
+                else if (marks == 1)
+                    second = run.Ms;
                 marks++;
             }
             else if (marks == 1 && !haveGap)
@@ -577,7 +714,11 @@ internal sealed class MorseFsm
             }
         }
 
-        if (marks == 2 && haveGap)
+        // Equal marks and gaps cannot distinguish dah-only letters from dits.
+        // Seed early only from a plausible mixed pair; ordinary replay and
+        // the established reacquisition path retain their equal-pair handling.
+        double ratio = Math.Max(first, second) / Math.Max(Math.Min(first, second), 1e-9);
+        if (marks == 2 && haveGap && (!mixedOnly || (ratio >= 1.45 && ratio <= 4.5)))
             _timing.SeedFromGapRatio(first, gap, second);
     }
 
@@ -590,7 +731,6 @@ internal sealed class MorseFsm
         ClearPartial();
         _held = null;
         _charsInWord = 0;
-
         for (int i = 0; i < count; i++)
         {
             Run run = _runs[i];
@@ -643,15 +783,13 @@ internal sealed class MorseFsm
         _fitCount++;
         if (_patternLength < _pattern.Length)
             _pattern[_patternLength++] = dah ? '-' : '.';
-        if (observe)
+        if (observe && !_jointCandidate)
             _timing.ObserveElement(durationMs);
     }
 
     private void TryEmitGap()
     {
-        if (!_letterEmitted
-            && _patternLength > 0
-            && _durationMs + _quantumMs >= _timing.LetterGapThresholdMs)
+        if (!_letterEmitted && _patternLength > 0 && _durationMs + _quantumMs >= _timing.LetterGapThresholdMs)
         {
             string pattern = new(_pattern, 0, _patternLength);
             string text = DecodePattern(pattern);
@@ -665,12 +803,11 @@ internal sealed class MorseFsm
                 Enqueue(text, confidence);
                 _charsInWord++;
             }
+
             return;
         }
 
-        if (_letterEmitted
-            && !_wordEmitted
-            && _durationMs + _quantumMs >= _timing.WordGapThresholdMs)
+        if (_letterEmitted && !_wordEmitted && _durationMs + _quantumMs >= _timing.WordGapThresholdMs)
         {
             _wordEmitted = true;
             if (_held is not null)
@@ -691,7 +828,8 @@ internal sealed class MorseFsm
 
     private void FlushHeld()
     {
-        if (_held is null) return;
+        if (_held is null)
+            return;
         Enqueue(_held.Value.Text, _held.Value.Confidence);
         _held = null;
         _charsInWord++;
@@ -702,18 +840,21 @@ internal sealed class MorseFsm
     private float ConfidenceFor(string text)
     {
         double fit = _fitCount == 0 ? 0 : _fitSum / _fitCount;
-        if (text == UnknownPlaceholder) fit *= 0.25;
+        if (text == UnknownPlaceholder)
+            fit *= 0.25;
         double snrFit = Math.Clamp((_snrDb - 6.0) / 12.0, 0.0, 1.0);
         return (float)Math.Clamp(fit * (0.5 + 0.5 * snrFit), 0.0, 1.0);
     }
 
     private void Enqueue(string text, float confidence)
     {
-        if (_pendingCount >= _pending.Length) return;
+        if (_pendingCount >= _pending.Length)
+            return;
         int index = (_pendingHead + _pendingCount) % _pending.Length;
         _pending[index] = new MorseDecodedSymbol(text, confidence);
         _pendingCount++;
-        if (_strongSupport) _readyCount = _pendingCount;
+        if (_strongSupport)
+            _readyCount = _pendingCount;
     }
 
     private void PushRun(bool tone, double durationMs)
@@ -730,9 +871,7 @@ internal sealed class MorseFsm
         // same delay on both edges cancels. Only a window resize between
         // the edges still moves the length. A noise-gate attack on a loud
         // mark holds the key past that symmetric delay; the skew removes it.
-        double corrected = _riseDelayMs > 0 || _fallDelayMs > 0
-            ? rawMs + _riseDelayMs - _fallDelayMs
-            : rawMs - _quantumMs;
+        double corrected = _riseDelayMs > 0 || _fallDelayMs > 0 ? rawMs + _riseDelayMs - _fallDelayMs : rawMs - _quantumMs;
         corrected -= _markSkewMs;
         return Math.Max(_quantumMs, corrected);
     }
@@ -750,21 +889,18 @@ internal sealed class MorseFsm
     // mark after that pause is the next transmission.
     private bool IsCarrierFragment(double adjustedMs)
     {
-        if (_timing.IsLocked) return false;
-        if (_carrierEcho) return true;
+        if (_timing.IsLocked)
+            return false;
+        if (_carrierEcho)
+            return true;
         return adjustedMs > MorseTimingEstimator.MaxPreLockMarkMs;
     }
 
-    private static bool IsFragile(string text) =>
-        text is "E" or "T" or "I";
-
+    private static bool IsFragile(string text) => text is "E" or "T" or "I";
     /// <summary>
     /// The first character of a word that prints only if another character
     /// joins it: a lone E, T, or I on a weak tone, or any character on a weak
-    /// tone decoded with less than <see cref="LoneConfidenceFloor"/> confidence.
+    /// tone decoded with less than <see cref = "LoneConfidenceFloor"/> confidence.
     /// </summary>
-    private bool HoldsAlone(string text, float confidence) =>
-        _charsInWord == 0
-        && ((IsFragile(text) && _snrDb < FragileSnrDb)
-            || (confidence < LoneConfidenceFloor && _snrDb < LoneConfidenceSnrDb));
+    private bool HoldsAlone(string text, float confidence) => _charsInWord == 0 && ((IsFragile(text) && _snrDb < FragileSnrDb) || (confidence < LoneConfidenceFloor && _snrDb < LoneConfidenceSnrDb));
 }

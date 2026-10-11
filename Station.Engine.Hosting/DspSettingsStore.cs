@@ -254,6 +254,22 @@ public sealed class DspSettingsStore : IDisposable
         }
     }
 
+    public bool? GetReceiverAutoAgc(string profileId) =>
+        _entries.FindOne(x => x.ProfileId == profileId)?.ReceiverAutoAgcEnabled;
+
+    public void SetReceiverAutoAgc(bool enabled, string profileId)
+    {
+        var entry = _entries.FindOne(x => x.ProfileId == profileId);
+        if (entry is null)
+        {
+            SetAgc(new AgcConfig(), profileId);
+            entry = _entries.FindOne(x => x.ProfileId == profileId)!;
+        }
+        entry.ReceiverAutoAgcEnabled = enabled;
+        entry.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(entry);
+    }
+
     private static void ApplyAgcToEntry(DspSettingsEntry e, AgcConfig c)
     {
         e.AgcMode = c.Mode;
@@ -994,6 +1010,7 @@ public sealed class DspSettingsEntry
     // AGC top (max gain) in dB. Null on legacy rows (pre-AGC-persist) so
     // RadioService can fall back to the baseline default for first-run.
     public double? AgcTopDb { get; set; }
+    public bool ReceiverAutoAgcEnabled { get; set; }
     // AGC threshold ("knee") in operator/displayed dBm (#741). Null = never set
     // → WDSP's per-mode default threshold stays in effect.
     public double? AgcThresholdDbm { get; set; }
