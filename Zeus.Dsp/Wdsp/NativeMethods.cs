@@ -1201,6 +1201,10 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXAEQRun(int channel, int run);
 
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static unsafe partial void SetTXAEQProfile(int channel, int nfreqs, double* frequencies, double* gains);
+
     // TUN carrier generator (wdsp.h:586-589) injected post-DSP. Zeus uses
     // mode 0 with a zero-Hz tone outside CW and a sideband-signed CW pitch
     // that cancels the CW transmit NCO offset.

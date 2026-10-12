@@ -213,20 +213,38 @@ public static class TxControlEndpoints
             return Results.Ok(saved);
         });
 
-        // Mic-gain: N dB in [-40, +10], scales WDSP TXA panel-gain-1 the same
+        // Mic-gain: N dB in [-96, +70], scales WDSP TXA panel-gain-1 the same
         // way Thetis does (console.cs:28805 setAudioMicGain → Audio.MicPreamp =
         // 10^(db/20) → cmaster.CMSetTXAPanelGain1). The negative range is the
         // important half: browser getUserMedia mics typically peak around
         // -10..-15 dBFS, which over-drives WDSP TXA + ALC and prints as
         // splatter on the air; without an attenuator the operator has nowhere
-        // to back off. Range matches Thetis's MicGainMin/Max defaults
-        // (console.cs:19151 = -40, :19163 = +10). RadioService persists the dB
+        // to back off. Range matches Thetis's full configurable mic-gain
+        // range, including imported profiles outside the default window.
+        // RadioService persists the dB
         // value via RadioStateStore; the dB → linear (10^(db/20)) conversion
         // happens at the engine seam in DspPipelineService.
         endpoints.MapPost("/api/mic-gain", (MicGainSetRequest req, RadioService r) =>
         {
             var snap = r.SetTxMicGain(req.Db);
             return Results.Ok(new { micGainDb = snap.MicGainDb });
+        });
+        endpoints.MapGet("/api/tx/legacy-eq", (RadioService radio) =>
+            Results.Ok(radio.Snapshot().LegacyTxEq ?? LegacyTxEqConfig.Default));
+        endpoints.MapPost("/api/tx/legacy-eq", (LegacyTxEqConfig config, RadioService radio) =>
+        {
+            try { return Results.Ok(radio.SetLegacyTxEq(config)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+        endpoints.MapGet("/api/tx/fm-audio", (RadioService radio) =>
+        {
+            var fm = radio.Snapshot().Fm ?? FmConfig.Default;
+            return Results.Ok(new FmTxAudioConfig(fm.MicGainDb, fm.TxLowCutHz, fm.TxHighCutHz));
+        });
+        endpoints.MapPost("/api/tx/fm-audio", (FmTxAudioConfig config, RadioService radio) =>
+        {
+            try { return Results.Ok(radio.SetFmTxAudio(config)); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
         // Legacy symmetric AM carrier level (0..125 %, clamped), used by AM/SAM

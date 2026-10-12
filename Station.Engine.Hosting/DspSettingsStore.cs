@@ -931,6 +931,25 @@ public sealed class DspSettingsStore : IDisposable
         return clean;
     }
 
+    public LegacyTxEqConfig? GetLegacyTxEq(string profileId = "default")
+    {
+        var json = _entries.FindOne(entry => entry.ProfileId == profileId)?.LegacyTxEqJson;
+        if (json is null) return null;
+        try { return System.Text.Json.JsonSerializer.Deserialize<LegacyTxEqConfig>(json)?.Validated(); }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or ArgumentException) { return null; }
+    }
+
+    public void SetLegacyTxEq(LegacyTxEqConfig config, string profileId = "default")
+    {
+        var clean = config.Validated();
+        var entry = _entries.FindOne(candidate => candidate.ProfileId == profileId);
+        var exists = entry is not null;
+        entry ??= new DspSettingsEntry { ProfileId = profileId };
+        entry.LegacyTxEqJson = System.Text.Json.JsonSerializer.Serialize(clean);
+        entry.UpdatedUtc = DateTime.UtcNow;
+        if (exists) _entries.Update(entry); else _entries.Insert(entry);
+    }
+
     public void Dispose() => _dbLease.Dispose();
 
 }
@@ -1088,5 +1107,6 @@ public sealed class DspSettingsEntry
     // Null on legacy rows = AmCarrierLevel.DefaultPercent.
     public int? AmCarrierLevelPercent { get; set; }
     public string? FmConfigJson { get; set; }
+    public string? LegacyTxEqJson { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

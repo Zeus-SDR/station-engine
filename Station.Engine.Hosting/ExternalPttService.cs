@@ -133,10 +133,16 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     // dit/dah while the internal keyer runs — so the host monitor sidetone
     // tracks the gateware's shaped key-down. Owned by the P2 RX thread only.
     private bool _p2PrevSidetone;
-    // Orion 2.2b10 added the shaped keyout signal above. Older Orion-MkII DLE
-    // gateware exposes only the raw dot/dash inputs, so those builds need the
-    // paddle level as their best available host-monitor sidetone source.
+    // Orion 2.2.10 added the shaped keyout signal above. Older Orion-MkII DLE
+    // gateware exposes only the raw dot/dash inputs. Straight mode on those
+    // builds still uses the raw paddle as the host-monitor source; Iambic A/B
+    // runs a host-side port of the FPGA keyer (issue #2977) so a held paddle
+    // is not a continuous tone (#2463) and is not silent either.
     private bool _p2UseLegacyPaddleSidetone;
+    // True while this P2 connection is feeding the host iambic emulator.
+    // Owned by the P2 RX thread; used to ReleasePaddles once on the
+    // transition off that path (mode change, non-CW, disconnect).
+    private bool _p2PaddleEmulatorActive;
     // Single-shot timer used to debounce falling edges. Created lazily and
     // re-armed via Change(); the underlying System.Threading.Timer is thread
     // safe so cancellation from the RX thread and fire-and-handle on the
@@ -365,13 +371,16 @@ public sealed class ExternalPttService : IHostedService, IDisposable
         return BoardCapabilitiesTable.For(_radio.ConnectedBoardKind).HasOnboardCodec;
     }
 
-    // Toggle the host CW monitor tone off a shaped key-down edge, gated to CW
-    // modes so an SSB mic-PTT press never injects a 600 Hz tone. Shared by the
-    // P1 CwKeyDownChanged (C0[2]) path and the P2 hi-priority sidetone bit.
+    // Toggle the host CW monitor tone off a shaped key-down edge. Key-down is
+    // gated to CW modes so an SSB mic-PTT press never injects a 600 Hz tone.
+    // Key-up is not: leaving CW while the monitor is keyed (CW→USB with the
+    // hardware key still down, or a falling edge that arrives after the mode
+    // change) must still release the host tone. Shared by the P1
+    // CwKeyDownChanged (C0[2]) path and the P2 hi-priority sidetone bit.
     private void DriveSidetone(bool down)
     {
         if (_sidetone is null) return;
-        if (!IsCwMode(_radio.CurrentMode)) return;
+        if (down && !IsCwMode(_radio.CurrentMode)) return;
         if (down) _sidetone.Down();
         else _sidetone.Up();
     }
@@ -394,6 +403,7 @@ public sealed class ExternalPttService : IHostedService, IDisposable
             _p2PrevPtt = false;
             _p2PrevSidetone = false;
             _p2UseLegacyPaddleSidetone = legacyPaddleSidetone;
+            _p2PaddleEmulatorActive = false;
         }
         client.TelemetryReceived += OnP2Telemetry;
     }
@@ -409,13 +419,17 @@ public sealed class ExternalPttService : IHostedService, IDisposable
             _p2PrevPtt = false;
             _p2PrevSidetone = false;
             _p2UseLegacyPaddleSidetone = false;
+            _p2PaddleEmulatorActive = false;
             ++_moxOpSeq;
             _moxWorkPending = false;
         }
         if (client is not null) client.TelemetryReceived -= OnP2Telemetry;
         // Release any monitor tone left keyed by an in-flight element so a
-        // disconnect mid-dah can't wedge the sidetone on.
+        // disconnect mid-dah can't wedge the sidetone on. The emulator is
+        // Reset on the next render so a mid-element disconnect decays
+        // through the raised-cosine envelope instead of cutting.
         _sidetone?.Up();
+        _sidetone?.ReleasePaddles(reset: true);
         _hangTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         ClearHardwareLevel();
     }
@@ -426,21 +440,60 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     private void OnP2Telemetry(Zeus.Protocol2.P2TelemetryReading reading)
     {
         // Modern P2 gateware reports its shaped key-down envelope in byte 0
-        // bit 7. Pre-2.2b10 Orion DLE builds lack that signal, so the
-        // connection-scoped compatibility path substitutes dot/dash input in
-        // straight-key mode only. A raw paddle level is not the FPGA-shaped
-        // iambic envelope; using it for Iambic A/B produces a delayed,
-        // continuous host tone that falsely sounds like straight-key RF.
+        // bit 7 (FPGA keyer `keyout`, added to Orion P2 in 2.2.10). Pre-2.2.10
+        // Orion-MkII DLE builds lack that bit, so the connection-scoped
+        // compatibility path has two arms:
+        //
+        //   • Straight — the raw paddle (byte 0 bits 1/2) is the key-down
+        //     envelope. Same as #2463.
+        //   • Iambic A/B — a host-side port of iambic.v keys the monitor from
+        //     those same raw pins, so a held paddle is a stream of dits/dahs
+        //     (issue #2977) instead of silence (#2977 without the emulator)
+        //     or a continuous tone (#2463's raw-level regression).
+        //
         // Drive either source before the PttIn edge gate below, which would
         // otherwise swallow every element while the PTT level remains held.
-        bool sidetone = _p2UseLegacyPaddleSidetone
-            && _radio.CurrentCwKeyerMode == CwKeyerMode.Straight
-            ? reading.DotIn || reading.DashIn
-            : reading.SidetoneActive;
-        if (sidetone != _p2PrevSidetone)
+        var keyerMode = _radio.CurrentCwKeyerMode;
+        if (_p2UseLegacyPaddleSidetone
+            && keyerMode is CwKeyerMode.IambicA or CwKeyerMode.IambicB)
         {
-            _p2PrevSidetone = sidetone;
-            DriveSidetone(sidetone);
+            // Switching Straight → Iambic mid-key must not strand a Down()
+            // from the raw-paddle path.
+            if (_p2PrevSidetone)
+            {
+                _p2PrevSidetone = false;
+                DriveSidetone(false);
+            }
+            if (IsCwMode(_radio.CurrentMode) && _sidetone is not null)
+            {
+                _sidetone.SetPaddles(
+                    reading.DotIn,
+                    reading.DashIn,
+                    _radio.CurrentHostIambicKeyerConfig);
+                _p2PaddleEmulatorActive = true;
+            }
+            else if (_p2PaddleEmulatorActive)
+            {
+                _sidetone?.ReleasePaddles(reset: true);
+                _p2PaddleEmulatorActive = false;
+            }
+        }
+        else
+        {
+            if (_p2PaddleEmulatorActive)
+            {
+                _sidetone?.ReleasePaddles(reset: true);
+                _p2PaddleEmulatorActive = false;
+            }
+            bool sidetone = _p2UseLegacyPaddleSidetone
+                && keyerMode == CwKeyerMode.Straight
+                ? reading.DotIn || reading.DashIn
+                : reading.SidetoneActive;
+            if (sidetone != _p2PrevSidetone)
+            {
+                _p2PrevSidetone = sidetone;
+                DriveSidetone(sidetone);
+            }
         }
 
         bool ptt = reading.PttIn;

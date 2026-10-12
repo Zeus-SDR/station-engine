@@ -5,6 +5,8 @@ namespace Zeus.Dsp.Wdsp;
 internal interface IWdspTxControlNative
 {
     void SetTXAPanelGain1(int channel, double gain);
+    void SetTXAEQRun(int channel, int run) { }
+    void SetTXAEQProfile(int channel, int nfreqs, double[] frequencies, double[] gains) { }
     void SetTXAMode(int channel, int mode);
     void SetTXAAMCarrierLevel(int channel, double carrierLevel);
     void SetTXAAMBroadcast(int channel, int run, double posLimit, double negLimit, int preemph, int invert);
@@ -46,6 +48,13 @@ internal interface IWdspTxControlNative
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
 {
+    public void SetTXAEQRun(int channel, int run) => NativeMethods.SetTXAEQRun(channel, run);
+    public unsafe void SetTXAEQProfile(int channel, int nfreqs, double[] frequencies, double[] gains)
+    {
+        fixed (double* f = frequencies)
+        fixed (double* g = gains)
+            NativeMethods.SetTXAEQProfile(channel, nfreqs, f, g);
+    }
     public void SetTXAPanelGain1(int channel, double gain) =>
         NativeMethods.SetTXAPanelGain1(channel, gain);
 

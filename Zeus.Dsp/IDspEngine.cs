@@ -488,6 +488,7 @@ public interface IDspEngine : IDisposable
     /// <paramref name="linearGain"/> is already linear. No-op on Synthetic
     /// and when TXA is not open.</summary>
     void SetTxPanelGain(double linearGain);
+    void SetLegacyTxEq(LegacyTxEqConfig config) { }
 
     /// <summary>Set the TXA Leveler maximum-gain ceiling in dB. Calls
     /// <c>SetTXALevelerTop</c> (wcpAGC.c:648), which WDSP converts internally

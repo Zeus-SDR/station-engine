@@ -16,7 +16,11 @@ public sealed record InitialTxAudioConfig(
     int TxFilterLowHz,
     int TxFilterHighHz,
     // Null (legacy profile) keeps the persisted DEXP.
-    DexpConfig? Dexp = null);
+    DexpConfig? Dexp = null,
+    LegacyTxEqConfig? LegacyTxEq = null,
+    FmTxAudioConfig? FmTxAudio = null,
+    BandpassWindow? TxFilterWindow = null,
+    FilterPhaseMode? TxFilterPhase = null);
 
 /// <summary>Supplies an optional product-selected initial TX-audio configuration.</summary>
 public interface IInitialTxAudioConfigSource

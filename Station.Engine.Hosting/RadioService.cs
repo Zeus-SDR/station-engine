@@ -727,7 +727,7 @@ public sealed partial class RadioService : IDisposable
             persistedTxPhaseRotator = NormalizeTxPhaseRotator(
                 initialTxAudioConfig.TxPhaseRotator ?? persistedTxPhaseRotator);
             persistedDexp = initialTxAudioConfig.Dexp?.Clamped() ?? persistedDexp;
-            overlayMicGain = Math.Clamp(initialTxAudioConfig.MicGainDb, -40, 10);
+            overlayMicGain = Math.Clamp(initialTxAudioConfig.MicGainDb, -96, 70);
             overlayLevelerMaxGain = Math.Clamp(initialTxAudioConfig.LevelerMaxGainDb, 0.0, 20.0);
             // Re-sign the operator-typed positive magnitudes for the startup
             // mode so the TX bandpass comes up correctly.
@@ -907,15 +907,15 @@ public sealed partial class RadioService : IDisposable
             TxFilterLowHz: overlayTxFilterLow ?? hydTxLow,
             TxFilterHighHz: overlayTxFilterHigh ?? hydTxHigh,
             RxFilterWindow: persistedRxFilterWindow,
-            TxFilterWindow: persistedTxFilterWindow,
+            TxFilterWindow: initialTxAudioConfig?.TxFilterWindow ?? persistedTxFilterWindow,
             RxFilterPhase: persistedRxFilterPhase,
-            TxFilterPhase: persistedTxFilterPhase,
+            TxFilterPhase: initialTxAudioConfig?.TxFilterPhase ?? persistedTxFilterPhase,
             RxAfGainDb: SanitizeAfGainDb(rsSnap?.RxAfGainDb),
             Rx1AfGainDb: SanitizeAfGainDb(rsSnap?.Rx1AfGainDb),
             // 0 dB unity matches the engine's TXA fresh-open default; legacy
             // rows missing the field hydrate to that same default. A last-loaded
             // TX Audio Profile overlays its mic gain ahead of the snapshot.
-            MicGainDb: overlayMicGain ?? Math.Clamp(rsSnap?.MicGainDb ?? 0, -40, 10),
+            MicGainDb: overlayMicGain ?? Math.Clamp(rsSnap?.MicGainDb ?? 0, -96, 70),
             // 8.0 dB matches WdspDspEngine.DefaultLevelerMaxGainDb. Clamp range
             // widened to 0..20 for Thetis parity (radio.cs leveler top 0..20).
             LevelerMaxGainDb: overlayLevelerMaxGain ?? Math.Clamp(rsSnap?.LevelerMaxGainDb ?? 8.0, 0.0, 20.0),
@@ -993,7 +993,12 @@ public sealed partial class RadioService : IDisposable
             AmBroadcast = persistedAmBroadcast,
             AmCarrierLevelPercent = persistedAmCarrierLevel,
             TxLowCutHz = _ssbTxFilter.LoAbs,
-            Fm = persistedFm,
+            Fm = initialTxAudioConfig?.FmTxAudio is { } initialFmAudio
+                ? persistedFm with { MicGainDb = initialFmAudio.MicGainDb, TxLowCutHz = initialFmAudio.TxLowCutHz, TxHighCutHz = initialFmAudio.TxHighCutHz }
+                : persistedFm,
+            LegacyTxEq = initialTxAudioConfig is not null
+                ? initialTxAudioConfig.LegacyTxEq?.Validated() ?? LegacyTxEqConfig.Default
+                : _dspSettingsStore.GetLegacyTxEq() ?? LegacyTxEqConfig.Default,
         };
         if (_state.Mode == RxMode.FM)
         {
@@ -1002,8 +1007,8 @@ public sealed partial class RadioService : IDisposable
             {
                 FilterLowHz = -fmHalf,
                 FilterHighHz = fmHalf,
-                TxFilterLowHz = -persistedFm.TxHighCutHz,
-                TxFilterHighHz = persistedFm.TxHighCutHz,
+                TxFilterLowHz = -_state.Fm!.TxHighCutHz,
+                TxFilterHighHz = _state.Fm!.TxHighCutHz,
             };
         }
         InitializeBandSquelch();
@@ -1392,6 +1397,16 @@ public sealed partial class RadioService : IDisposable
     /// lock. Intended for Protocol-2 telemetry edge handling.</summary>
     internal CwKeyerMode CurrentCwKeyerMode =>
         (CwKeyerMode)Volatile.Read(ref _cwKeyerMode);
+
+    /// <summary>Live host-iambic-emulator knobs, built from the same
+    /// fields <see cref="PushCwToP2"/> sends to the radio. Lock-free so
+    /// the Protocol-2 RX thread can sample them on every telemetry
+    /// packet.</summary>
+    internal HostIambicKeyerConfig CurrentHostIambicKeyerConfig => new(
+        Volatile.Read(ref _cwKeyerWpm),
+        (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
+        Volatile.Read(ref _cwWeight),
+        Volatile.Read(ref _cwPaddleReverse) != 0);
 
     /// <summary>Current operator preamp toggle. PreampOn isn't on the
     /// StateDto wire format, so DspPipelineService reads it directly when
@@ -6406,13 +6421,31 @@ public sealed partial class RadioService : IDisposable
         return Snapshot();
     }
 
-    // TX mic gain in dB. Server-clamped to [-40, +10] to match the endpoint
-    // contract and Thetis's MicGainMin/Max defaults. The dB → linear (10^(db/20))
+    // TX mic gain in dB. Server-clamped to [-96, +70] to match the full
+    // Thetis configurable mic-gain range. The dB → linear (10^(db/20))
     // conversion happens at the engine seam in DspPipelineService so the wire
     // and persisted form is the operator-friendly integer.
+    public StateDto SetLegacyTxEq(LegacyTxEqConfig config)
+    {
+        var clean = config.Validated();
+        _dspSettingsStore.SetLegacyTxEq(clean);
+        Mutate(state => state with { LegacyTxEq = clean });
+        return Snapshot();
+    }
+
+    public StateDto SetFmTxAudio(FmTxAudioConfig config)
+    {
+        var clean = config.Validated();
+        var current = Snapshot().Fm ?? FmConfig.Default;
+        return SetFmConfig(current with
+        {
+            MicGainDb = clean.MicGainDb, TxLowCutHz = clean.TxLowCutHz, TxHighCutHz = clean.TxHighCutHz,
+        });
+    }
+
     public StateDto SetTxMicGain(int db)
     {
-        int clamped = Math.Clamp(db, -40, 10);
+        int clamped = Math.Clamp(db, -96, 70);
         Mutate(s => s with { MicGainDb = clamped });
         return Snapshot();
     }

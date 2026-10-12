@@ -14,18 +14,25 @@ namespace Zeus.Server.Cat;
 
 /// <summary>
 /// Pure parse/format helpers for the Kenwood TS-2000 CAT protocol (the subset
-/// Thetis emulates and that WSJT-X / N1MM+ / fldigi / Hamlib require). All
+/// Thetis emulates and that WSJT-X / N1MM+ / fldigi / Hamlib require) plus the
+/// Thetis/PowerSDR "ZZ" extended dialect that N1MM+ (radio "Flex5000") and
+/// DXLab Commander (rig type "Thetis") speak to Thetis's TCP CAT server. All
 /// I/O lives in <see cref="CatSession"/>; everything here is a side-effect-free
 /// transform so it can be unit-tested in isolation. ASCII only.
 ///
 /// Framing: commands are a 2-letter prefix + optional fixed-width args, each
 /// terminated by ';'. They may arrive batched ("FA;MD;") or split across TCP
-/// segments — <see cref="ExtractCommands"/> handles both.
+/// segments — <see cref="ExtractCommands"/> handles both. ZZ commands are a
+/// 4-letter id ("ZZ" + 2-letter extension) + args on the same framing; Thetis
+/// answers them as "ZZ" + ext + the get-parameter the client sent + answer +
+/// ";" (CATParser.cs reply assembly), so e.g. ZZSM0; → ZZSM0nnn;.
 ///
 /// The <see cref="BuildIfBody"/> field layout is taken byte-for-byte from
 /// Thetis <c>CATCommands.IF()</c> (the authoritative reference): freq(11) +
 /// step(4) + RIT/XIT-value(6) + RIT(1) + XIT(1) + membank(3) + TX/RX(1) +
 /// mode(1) + FR/FT(1) + scan(1) + split(1) + balance(4) = 35 bytes.
+/// <see cref="BuildZzIfBody"/> is Thetis <c>CATCommands.ZZIF()</c>: the same
+/// layout with a 2-digit mode field = 36 bytes.
 /// </summary>
 public static class CatProtocol
 {
@@ -64,6 +71,16 @@ public static class CatProtocol
 
     /// <summary>The argument portion after the 2-letter id ("" for a bare query).</summary>
     public static string Args(string token) => token.Length > 2 ? token[2..] : "";
+
+    /// <summary>The 4-letter Thetis/PowerSDR extended ("ZZ") command id
+    /// (upper-cased), or "" if the token is shorter than 4 characters (Thetis
+    /// treats those as malformed and answers "?;").</summary>
+    public static string ZzCommandId(string token) =>
+        token.Length >= 4 ? token[..4].ToUpperInvariant() : "";
+
+    /// <summary>The argument portion after the 4-letter ZZ id ("" for a bare
+    /// query) — the Thetis "suffix" that get replies echo back.</summary>
+    public static string ZzArgs(string token) => token.Length > 4 ? token[4..] : "";
 
     /// <summary>Format a frequency in Hz as the 11-digit Kenwood field. Values
     /// wider than 11 digits keep the least-significant 11 (matches Thetis).</summary>
@@ -113,6 +130,46 @@ public static class CatProtocol
         _ => null,
     };
 
+    /// <summary>Zeus mode → 2-digit Thetis ZZ mode code (ZZMD/ZZME/ZZIF), per
+    /// Thetis <c>CATCommands.Mode2String</c>: 00 LSB, 01 USB, 02 DSB, 03 CWL,
+    /// 04 CWU, 05 FM, 06 AM, 07 DIGU, 08 SPEC, 09 DIGL, 10 SAM, 11 DRM. Zeus has
+    /// no SPEC or DRM, so nothing maps to 08/11; FreeDv reports 01 (USB) because
+    /// that is its WDSP carrier mode.</summary>
+    public static string ZzModeDigit(RxMode mode) => mode switch
+    {
+        RxMode.LSB => "00",
+        RxMode.USB => "01",
+        RxMode.DSB => "02",
+        RxMode.CWL => "03",
+        RxMode.CWU => "04",
+        RxMode.FM => "05",
+        RxMode.AM => "06",
+        RxMode.DIGU => "07",
+        RxMode.DIGL => "09",
+        RxMode.SAM => "10",
+        RxMode.FreeDv => "01", // runs as USB at the WDSP layer
+        _ => "01",
+    };
+
+    /// <summary>2-digit Thetis ZZ mode code → Zeus mode, per Thetis
+    /// <c>CATCommands.String2Mode</c>. Null for codes with no Zeus equivalent
+    /// (08 SPEC, 11 DRM) and for invalid input; the caller decides whether null
+    /// is a silent no-op (in-range 08/11) or a "?;" (anything else).</summary>
+    public static RxMode? ParseZzMode(string field) => field switch
+    {
+        "00" => RxMode.LSB,
+        "01" => RxMode.USB,
+        "02" => RxMode.DSB,
+        "03" => RxMode.CWL,
+        "04" => RxMode.CWU,
+        "05" => RxMode.FM,
+        "06" => RxMode.AM,
+        "07" => RxMode.DIGU,
+        "09" => RxMode.DIGL,
+        "10" => RxMode.SAM,
+        _ => null,
+    };
+
     /// <summary>
     /// Map a receive level in dBm to the Kenwood SM meter range (0000–0030).
     /// Approximate, monotonic, Tier-1 (digital-mode/logging clients don't gate
@@ -130,6 +187,22 @@ public static class CatProtocol
         SMeter(dbm).ToString(System.Globalization.CultureInfo.InvariantCulture).PadLeft(4, '0');
 
     /// <summary>
+    /// Map a receive level in dBm to the Thetis ZZSM meter range (000–260):
+    /// clamp to [−140, −10] dBm, then ((int)dbm + 140) × 2 — exactly
+    /// Thetis <c>CATCommands.ZZSM</c> (the (int) cast truncates toward zero on
+    /// purpose, same as Thetis).
+    /// </summary>
+    public static int ZzSMeter(double dbm)
+    {
+        double clamped = Math.Clamp(dbm, -140.0, -10.0);
+        return ((int)clamped + 140) * 2;
+    }
+
+    /// <summary>3-digit zero-padded ZZSM value, e.g. 134 → "134".</summary>
+    public static string ZzSMeterField(double dbm) =>
+        ZzSMeter(dbm).ToString(System.Globalization.CultureInfo.InvariantCulture).PadLeft(3, '0');
+
+    /// <summary>
     /// Build the 35-byte IF response body (NOT including the "IF" prefix or the
     /// ';' terminator). Field widths are exact per Thetis CATCommands.IF().
     /// RIT/XIT are Tier-2; for Tier-1 pass ritOn=xitOn=false (→ "+00000").
@@ -137,12 +210,36 @@ public static class CatProtocol
     public static string BuildIfBody(
         long freqHz, RxMode mode, bool mox, bool split,
         int ritXitHz = 0, bool ritOn = false, bool xitOn = false)
+        => BuildIfBodyCore(freqHz, ModeDigit(mode), mox, split, ritXitHz, ritOn, xitOn);
+
+    /// <summary>
+    /// Build the 36-byte ZZIF response body (NOT including the "ZZIF" prefix or
+    /// the ';' terminator). Field widths are exact per Thetis
+    /// <c>CATCommands.ZZIF()</c>: identical to <see cref="BuildIfBody"/> except
+    /// the mode field is the 2-digit <see cref="ZzModeDigit"/> code instead of
+    /// the single Kenwood digit. RIT/XIT are unimplemented; pass
+    /// ritOn=xitOn=false (→ "+00000").
+    /// </summary>
+    public static string BuildZzIfBody(
+        long freqHz, RxMode mode, bool mox, bool split,
+        int ritXitHz = 0, bool ritOn = false, bool xitOn = false)
+        => BuildIfBodyCore(freqHz, ZzModeDigit(mode), mox, split, ritXitHz, ritOn, xitOn);
+
+    /// <summary>
+    /// The shared IF/ZZIF body layout: Thetis CATCommands.IF() and ZZIF() are
+    /// the same field-for-field except the mode width, so both public builders
+    /// land here with their already-formatted mode field (1-digit Kenwood for
+    /// IF, 2-digit Thetis ZZ code for ZZIF).
+    /// </summary>
+    private static string BuildIfBodyCore(
+        long freqHz, string modeField, bool mox, bool split,
+        int ritXitHz, bool ritOn, bool xitOn)
     {
         int it = ritOn ? ritXitHz : (xitOn ? ritXitHz : 0);
         string incr = (it < 0 ? "-" : "+")
             + Math.Min(Math.Abs(it), 99999).ToString(System.Globalization.CultureInfo.InvariantCulture).PadLeft(5, '0');
 
-        var sb = new StringBuilder(35);
+        var sb = new StringBuilder(34 + modeField.Length);
         sb.Append(FormatFreq(freqHz)); // P1 freq            11
         sb.Append("0000");             // P2 step size        4 (Zeus exposes no tune-step)
         sb.Append(incr);               // P3 RIT/XIT value    6 (sign + 5)
@@ -150,11 +247,11 @@ public static class CatProtocol
         sb.Append(xitOn ? '1' : '0');  // P5 XIT status       1
         sb.Append("000");              // P6 memory bank      3 (dummy)
         sb.Append(mox ? '1' : '0');    // P7 TX/RX status     1
-        sb.Append(ModeDigit(mode));    // P8 mode             1
+        sb.Append(modeField);          // P8 mode             1 (IF) / 2 (ZZIF)
         sb.Append('0');                // P9 FR/FT            1 (dummy)
         sb.Append('0');                // P10 scan            1 (dummy)
         sb.Append(split ? '1' : '0');  // P11 split           1
         sb.Append("0000");             // P12 balance         4 (dummy)
-        return sb.ToString();          // total              35
+        return sb.ToString();          // total              35 (IF) / 36 (ZZIF)
     }
 }

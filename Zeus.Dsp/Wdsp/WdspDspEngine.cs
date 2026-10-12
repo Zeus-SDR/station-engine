@@ -487,6 +487,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private int _txCessbBandwidthHz = 3000;
     // 0 unknown, 1 available, -1 missing (older bundled/system libwdsp).
     private int _cessbBandwidthExportState;
+    private LegacyTxEqConfig _legacyTxEq = LegacyTxEqConfig.Default;
     // Operator's Leveler on/off, last applied via SetTxLeveling. The TUN and
     // two-tone paths force the Leveler St=0 while keyed and restore it on
     // un-key; they read this so the restore lands on the operator's setting
@@ -2845,7 +2846,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 ApplyTxPhaseRotatorLocked(id, new TxPhaseRotatorConfig());
                 // ApplyTxLevelingLocked above also asserted the default-off
                 // CESSB state after configuring the compressor.
-                NativeMethods.SetTXAEQRun(id, 0);
+                ApplyLegacyTxEqLocked(id, _legacyTxEq);
                 NativeMethods.SetTXAAMSQRun(id, 0);
                 // FM modulator state. WDSP create_fmmod (TXA.c:350) seeds CTCSS
                 // run=1 @ 100 Hz, so without an explicit SetTXACTCSSRun every FM
@@ -3285,6 +3286,32 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public int TxBlockSamples => _txaInSize;
     public int TxOutputSamples => _txaOutSize;
 
+    public void SetLegacyTxEq(LegacyTxEqConfig config)
+    {
+        var validated = config.Validated();
+        if (_disposed != 0) return;
+        lock (_txaLock)
+        {
+            _legacyTxEq = validated;
+            if (_txaChannelId is int txa) ApplyLegacyTxEqLocked(txa, validated);
+        }
+    }
+
+    private void ApplyLegacyTxEqLocked(int txa, LegacyTxEqConfig config)
+    {
+        var frequencies = new double[11];
+        var gains = new double[11];
+        config.FrequenciesHz.CopyTo(frequencies, 1);
+        config.GainsDb.CopyTo(gains, 1);
+        gains[0] = config.PreampDb;
+        _txControlNative.SetTXAEQProfile(txa, 10, frequencies, gains);
+        ApplyLegacyTxEqRunLocked(txa);
+    }
+
+    private void ApplyLegacyTxEqRunLocked(int txa) =>
+        _txControlNative.SetTXAEQRun(txa, EffectiveTxRun(_legacyTxEq.Enabled) != 0
+            && _txCurrentMode is not (RxaMode.CWL or RxaMode.CWU) && !_txLevelerForcedOff ? 1 : 0);
+
     public void SetTxPanelGain(double linearGain)
     {
         if (_disposed != 0) return;
@@ -3452,7 +3479,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // app sends. FreeDV is deliberately NOT gated here (only the mode is
     // checked, not _txDigitalBypass): its spec profile relies on the Leveler
     // for linear OFDM makeup gain (DspPipelineService.FreeDvTxLevelingProfile).
-    private void ApplyTxLevelerRunLocked(int txa) =>
+    private void ApplyTxLevelerRunLocked(int txa)
+    {
         _txControlNative.SetTXALevelerSt(
             txa,
             _txLevelerEnabled
@@ -3463,6 +3491,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             && !IsDigitalTxMode(_txCurrentMode)
                 ? 1
                 : 0);
+        ApplyLegacyTxEqRunLocked(txa);
+    }
 
     // Caller holds _txaLock. Set shape before Run so enabling from OFF never
     // exposes a partial phase-rotator profile to a live TXA block.
@@ -3474,6 +3504,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _txControlNative.SetTXAPHROTNstages(txa, cfg.Stages);
         _txControlNative.SetTXAPHROTAutoMode(txa, cfg.AutoMode ? 1 : 0);
         _txControlNative.SetTXAPHROTRun(txa, EffectiveTxRun(cfg.Enabled));
+        ApplyLegacyTxEqRunLocked(txa);
     }
 
     private static double PeakToDb(double peak) =>
@@ -3583,6 +3614,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // its current Thetis-matching behavior.
                 _txLevelerForcedOff = true;
                 _txControlNative.SetTXALevelerSt(txa, 0);
+                ApplyLegacyTxEqRunLocked(txa);
                 _log.LogInformation("wdsp.setTxTune on=true mode=singletone freq={Freq:F0} mag={Mag:F5} leveler=off", toneFreq, toneMag);
             }
             else
@@ -4386,6 +4418,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 // discrete tones.
                 _txLevelerForcedOff = true;
                 _txControlNative.SetTXALevelerSt(txa, 0);
+                ApplyLegacyTxEqRunLocked(txa);
                 _log.LogInformation(
                     "wdsp.setTwoTone on=true f1={F1} f2={F2} signedF1={SF1} signedF2={SF2} mag={Mag:F3} mode={Mode}",
                     freq1, freq2, signedF1, signedF2, mag, _txCurrentMode);

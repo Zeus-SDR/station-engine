@@ -1586,7 +1586,11 @@ public partial class DspPipelineService : BackgroundService,
     // TX phase rotator latch (Thetis DSP->CFC->PhaseRot parity). Default-OFF
     // matches the TXA-open baseline; every operator/Auto Tune edit is pushed
     // live and replayed on reconnect.
+    private static bool LegacyTxEqEqual(LegacyTxEqConfig a, LegacyTxEqConfig? b) =>
+        b is not null && a.Enabled == b.Enabled && a.PreampDb == b.PreampDb
+        && a.FrequenciesHz.SequenceEqual(b.FrequenciesHz) && a.GainsDb.SequenceEqual(b.GainsDb);
     private TxPhaseRotatorConfig _appliedTxPhaseRotator = new();
+    private LegacyTxEqConfig? _appliedLegacyTxEq;
     // RX/TX bandpass "rectangularity" latches — issue #871. Seeded to
     // BandpassWindow.Normal (= byte 1), which resolves to the WDSP open-time tap
     // count, so a connect landing on the default matches what
@@ -6637,6 +6641,12 @@ public partial class DspPipelineService : BackgroundService,
         // TX mic gain: dB → linear (10^(db/20)) at the engine seam. Conversion
         // matches the historical /api/mic-gain inline (Math.Pow(10.0, db/20.0));
         // moved here so the operator-friendly dB is what gets stored and broadcast.
+        var legacyTxEq = s.LegacyTxEq ?? LegacyTxEqConfig.Default;
+        if (!LegacyTxEqEqual(legacyTxEq, _appliedLegacyTxEq))
+        {
+            engine.SetLegacyTxEq(legacyTxEq);
+            _appliedLegacyTxEq = legacyTxEq;
+        }
         int effectiveMicGainDb = effectiveTxAudio.MicGainDb;
         double micLinear = Math.Pow(10.0, effectiveMicGainDb / 20.0);
         if (micLinear != _appliedTxMicGainLinear)
@@ -7378,6 +7388,9 @@ public partial class DspPipelineService : BackgroundService,
         // Auto Tune-locked setting survives reconnect. Reverse is part of the
         // same config but remains operator-controlled.
         engine.SetTxPhaseRotator(channelId, txPhaseRotator);
+        var legacyEqInitial = s.LegacyTxEq ?? LegacyTxEqConfig.Default;
+        engine.SetLegacyTxEq(legacyEqInitial);
+        _appliedLegacyTxEq = legacyEqInitial;
         engine.SetCfcConfig(cfc);
         var dexp = s.Dexp ?? DexpConfig.Default;
         engine.SetDexpConfig(dexp);

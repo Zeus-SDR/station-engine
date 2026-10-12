@@ -1598,8 +1598,8 @@ public sealed record StateDto(
     double Rx1AfGainDb = 0.0,
     // TX mic gain in dB. WDSP applies via SetTXAPanelGain1(10^(db/20)); the
     // server stores the operator-friendly dB and converts at the engine seam.
-    // Range matches the /api/mic-gain endpoint clamp ([-40, +10]) which in
-    // turn matches Thetis's MicGainMin/Max defaults (console.cs:19151/19163).
+    // Range matches the /api/mic-gain endpoint clamp ([-96, +70]), the full
+    // configurable Thetis mic-gain range.
     // Persisted server-side via RadioStateStore so a fresh frontend connect
     // (or a desktop relaunch that wiped localStorage) lands on the last
     // operator value instead of the engine's 0 dB seed. Wire name omits the
@@ -1984,7 +1984,8 @@ public sealed record StateDto(
     // ---- FM (Thetis FM panel + Setup → DSP → FM) ----
     // Appended so older positional StateDto construction sites stay valid.
     // Null (older producer) resolves to FmConfig.Default.
-    FmConfig? Fm = null);
+    FmConfig? Fm = null,
+    LegacyTxEqConfig? LegacyTxEq = null);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both
@@ -3575,6 +3576,37 @@ public sealed record TwoToneSetRequest(
 /// </summary>
 public sealed record CfcBand(double FreqHz, double CompLevelDb, double PostGainDb);
 
+/// <summary>Thetis legacy WDSP TX equalizer control values. Frequencies and
+/// gains contain ten entries; the zero-Hz first control point is valid.</summary>
+public sealed record LegacyTxEqConfig(bool Enabled, double PreampDb, double[] FrequenciesHz, double[] GainsDb)
+{
+    public static LegacyTxEqConfig Default => new(false, 0,
+        [32, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000], new double[10]);
+
+    public LegacyTxEqConfig Validated()
+    {
+        if (!double.IsFinite(PreampDb) || PreampDb is < -24 or > 24
+            || FrequenciesHz is not { Length: 10 } || GainsDb is not { Length: 10 }
+            || FrequenciesHz.Any(value => !double.IsFinite(value) || value < 0 || value > 20000)
+            || GainsDb.Any(value => !double.IsFinite(value) || value < -24 || value > 24)
+            || FrequenciesHz.Zip(FrequenciesHz.Skip(1)).Any(pair => pair.First >= pair.Second))
+            throw new ArgumentException("Legacy TX EQ requires ten increasing frequencies in 0..20000 Hz and finite gains in -24..24 dB.");
+        return this with { FrequenciesHz = FrequenciesHz.ToArray(), GainsDb = GainsDb.ToArray() };
+    }
+}
+
+/// <summary>Only FM transmit audio, independent of receive, tones and repeater settings.</summary>
+public sealed record FmTxAudioConfig(int? MicGainDb, int TxLowCutHz, int TxHighCutHz)
+{
+    public FmTxAudioConfig Validated()
+    {
+        if (MicGainDb is < -96 or > 70 || TxLowCutHz < FmConfig.MinAudioCutHz
+            || TxHighCutHz > FmConfig.MaxAudioCutHz || TxLowCutHz >= TxHighCutHz)
+            throw new ArgumentException("Unsupported FM TX microphone gain or audio filter bounds.");
+        return this;
+    }
+}
+
 /// <summary>Operator-tunable CFC configuration. <c>Bands</c> length is
 /// fixed at 10 to match pihpsdr's classic-mode default and keep the panel
 /// layout stable. Engine validates length at the seam.</summary>
@@ -3762,7 +3794,7 @@ public sealed record TxAudioProfileDto(
     string Id,                       // slug, lowercased; PK; seeds: studio-ssb / essb-wide / dx-punch
     string Name,                     // operator display name (captured by the Save dialog)
     // ---- mic / leveler scalars (reuse RadioService Set* clamps) ----
-    int MicGainDb,                   // [-40,10]
+    int MicGainDb,                   // [-96,70]
     double LevelerMaxGainDb,         // [0,20]
     // ---- whole-config reuse ----
     TxLevelingConfig TxLeveling,     // leveler on/decay, ALC max-gain/decay, CPDR on/gain
@@ -3804,7 +3836,11 @@ public sealed record TxAudioProfileDto(
     // ("SSB" -> 35). Tracked while the profile is live in that family and
     // restored on entering the family with it. A missing family leaves the
     // live drive untouched.
-    Dictionary<string, int>? DriveByFamily = null);
+    Dictionary<string, int>? DriveByFamily = null,
+    LegacyTxEqConfig? LegacyTxEq = null,
+    FmTxAudioConfig? FmTxAudio = null,
+    BandpassWindow? TxFilterWindow = null,
+    FilterPhaseMode? TxFilterPhase = null);
 
 public sealed record TxAudioProfilesResponse(IReadOnlyList<TxAudioProfileDto> Profiles);
 
