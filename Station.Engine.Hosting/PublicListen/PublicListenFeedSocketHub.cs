@@ -365,7 +365,7 @@ public sealed class PublicListenFeedSocketHub
         }
     }
 
-    private async Task SendLoopAsync(
+    internal async Task SendLoopAsync(
         WebSocket socket,
         ChannelReader<byte[]> frames,
         ChannelReader<string> control,
@@ -374,6 +374,9 @@ public sealed class PublicListenFeedSocketHub
     {
         string? lastStatus = null;
         var nextTick = DateTimeOffset.MinValue;
+        Task<bool>? frameReady = null;
+        Task<bool>? controlReady = null;
+        Task? tickReady = null;
         while (!ct.IsCancellationRequested && socket.State == WebSocketState.Open)
         {
             var now = DateTimeOffset.UtcNow;
@@ -391,6 +394,7 @@ public sealed class PublicListenFeedSocketHub
                     if (SignalJson() is { } signal) await SendTextAsync(socket, signal, ct).ConfigureAwait(false);
                     if (VrxSignalJson() is { } vrxSignal) await SendTextAsync(socket, vrxSignal, ct).ConfigureAwait(false);
                     nextTick = now + StatusTick;
+                    tickReady = null;
                 }
             }
 
@@ -405,12 +409,23 @@ public sealed class PublicListenFeedSocketHub
 
             var wait = nextTick - DateTimeOffset.UtcNow;
             if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
-            var frameReady = frames.WaitToReadAsync(ct).AsTask();
-            var controlReady = control.WaitToReadAsync(ct).AsTask();
-            var completed = await Task.WhenAny(frameReady, controlReady, Task.Delay(wait, ct)).ConfigureAwait(false);
+            // Keep the losing waits: Task.WhenAny does not cancel them, and
+            // replacing them per frame accumulates readers on the quiet channel.
+            frameReady ??= frames.WaitToReadAsync(ct).AsTask();
+            controlReady ??= control.WaitToReadAsync(ct).AsTask();
+            tickReady ??= Task.Delay(wait, ct);
+            var completed = await Task.WhenAny(frameReady, controlReady, tickReady).ConfigureAwait(false);
             // A completed channel (false) means the session is being torn down.
-            if (completed == frameReady && !await frameReady.ConfigureAwait(false)) return;
-            if (completed == controlReady && !await controlReady.ConfigureAwait(false)) return;
+            if (completed == frameReady)
+            {
+                if (!await frameReady.ConfigureAwait(false)) return;
+                frameReady = null;
+            }
+            if (completed == controlReady)
+            {
+                if (!await controlReady.ConfigureAwait(false)) return;
+                controlReady = null;
+            }
         }
     }
 
