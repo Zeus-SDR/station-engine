@@ -212,6 +212,7 @@ public static class StationEngineEndpoints
         endpoints.MapSpectralZoomEndpoint();
         endpoints.MapWorkspaceZoomEndpoint();
         endpoints.MapOperatorUiSettingsEndpoints();
+        endpoints.MapDisplayIntelligenceSettingsEndpoints();
         endpoints.MapOperatorSettingsEndpoints();
         // The attached SPA sends the same waterfall render-state beacon as the
         // full host. Without the shared route Zeus Link logs a 404 after every

@@ -167,6 +167,7 @@ public static class StationEngineHostingExtensions
         // and a standalone engine on the same machine, with no migration.
         services.AddSingleton<ThemeSettingsStore>();
         services.AddSingleton<DisplaySettingsStore>();
+        services.AddSingleton<DisplayIntelligenceSettingsStore>();
         services.AddSingleton<OperatorSettingsStore>();
         services.AddSingleton<ToolbarSettingsStore>();
         services.AddSingleton<NrUiPrefsStore>();
