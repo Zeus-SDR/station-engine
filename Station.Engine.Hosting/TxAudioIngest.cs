@@ -210,12 +210,24 @@ public sealed class TxAudioIngest : IDisposable
     // All-zero mic block substituted for gated idle blocks so the monitor
     // stream stays gapless while the preview gate is closed. Never written.
     private static readonly float[] SilentMicBlock = new float[MicBlockSamples];
+    // The gate fades between live mic and silence over 5 ms instead of
+    // switching in one sample. A hard switch steps the waveform (any mic DC
+    // offset or hiss jumps to exact zero), and the CFC/leveler chain makes that
+    // step an audible click in the off-air MON preview each time the gate
+    // closes after a pause or reopens on speech (#3029). Same length as the
+    // playback worklet's fade.
+    internal const int MonitorPreviewRampSamples = 5 * MicSamplesPerMs;
+    private const float MonitorPreviewRampStep = 1f / MonitorPreviewRampSamples;
 
     private long _totalMicSamples;
     private long _totalTxBlocks;
     // Hang countdown in samples so sub-block (ASIO-cadence) input times the
     // same 1.5 s as 20 ms blocks.
     private int _monitorPreviewHangSamples;
+    // Preview gate gain at the end of the last gated block: 1 open, 0 closed,
+    // between the two only while a ramp spans sub-block (ASIO) chunks. Starts
+    // closed, matching the zero hang: idle input is silent from the first block.
+    private float _monitorPreviewGain;
 
     internal bool IsFreeDvTailDraining => Volatile.Read(ref _tailDraining) != 0;
     private long _droppedFrames;
@@ -1874,11 +1886,18 @@ public sealed class TxAudioIngest : IDisposable
         // keep the monitor stream gapless and the TXA/VST state warm, and the
         // leveler cannot raise a tone out of exact zeros, so the gate's original
         // purpose is preserved.
+        //
+        // The gate ramps rather than switches (see MonitorPreviewRampSamples):
+        // a block that opens or closes it is faded in the accumulator copy
+        // below. Fully open blocks pass bit-identical; fully closed are zeros.
+        float previewGainStart = 1f;
+        float previewGainEnd = 1f;
         if (monitorOn && !moxNow
-            && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable
-            && ShouldSuppressIdleMonitorPreviewBlock(samples))
+            && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable)
         {
-            samples = SilentMicBlock.AsSpan(0, samples.Length);
+            (previewGainStart, previewGainEnd) = AdvanceIdleMonitorPreviewGate(samples);
+            if (previewGainStart == 0f && previewGainEnd == 0f)
+                samples = SilentMicBlock.AsSpan(0, samples.Length);
         }
 
         lock (_sync)
@@ -1938,8 +1957,15 @@ public sealed class TxAudioIngest : IDisposable
                 return;
             }
             var incoming = _accumulator.AsSpan(_accumulatorFill, need);
-            for (int i = 0; i < need; i++)
-                incoming[i] = DspPipelineService.SanitizeAudioSample(samples[i]);
+            if (previewGainStart == previewGainEnd)
+            {
+                for (int i = 0; i < need; i++)
+                    incoming[i] = DspPipelineService.SanitizeAudioSample(samples[i]);
+            }
+            else
+            {
+                ApplyMonitorPreviewRamp(samples, incoming, previewGainStart, previewGainEnd);
+            }
 
             // Product audio is paced by the native 20 ms microphone cadence,
             // not WDSP's protocol-dependent 512/256-sample drain geometry.
@@ -2172,6 +2198,42 @@ public sealed class TxAudioIngest : IDisposable
 
     private static bool IsBufferedCurrent(MicBlockValidity? validity) =>
         validity is not { } guarded || guarded.IsBufferedCurrent;
+
+    // Decide the preview gate for this block and advance its gain ramp toward
+    // open (1) or closed (0). Returns the gain entering and leaving the block;
+    // equal values mean no ramp inside it.
+    private (float Start, float End) AdvanceIdleMonitorPreviewGate(ReadOnlySpan<float> samples)
+    {
+        bool suppress = ShouldSuppressIdleMonitorPreviewBlock(samples);
+        lock (_sync)
+        {
+            float start = _monitorPreviewGain;
+            float travel = samples.Length * MonitorPreviewRampStep;
+            float end = suppress
+                ? Math.Max(0f, start - travel)
+                : Math.Min(1f, start + travel);
+            _monitorPreviewGain = end;
+            return (start, end);
+        }
+    }
+
+    // Copy a block into the accumulator while moving its gain linearly from
+    // start to end at one ramp step per sample, then holding end.
+    internal static void ApplyMonitorPreviewRamp(
+        ReadOnlySpan<float> source,
+        Span<float> destination,
+        float start,
+        float end)
+    {
+        float gain = start;
+        for (int i = 0; i < source.Length; i++)
+        {
+            gain = end > start
+                ? Math.Min(end, gain + MonitorPreviewRampStep)
+                : Math.Max(end, gain - MonitorPreviewRampStep);
+            destination[i] = DspPipelineService.SanitizeAudioSample(source[i]) * gain;
+        }
+    }
 
     private bool ShouldSuppressIdleMonitorPreviewBlock(ReadOnlySpan<float> samples)
     {

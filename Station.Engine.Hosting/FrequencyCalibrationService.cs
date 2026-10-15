@@ -138,6 +138,14 @@ public sealed class FrequencyCalibrationService
 
         try
         {
+            // With an external 10 MHz reference in use the radio applies that
+            // reference's factor, so a WWV measurement here would be composed
+            // onto the wrong factor. Thetis disables Start for the same reason
+            // (setup.cs chkUsing10MHzRef_CheckedChanged).
+            if (_radio.GetExternal10MHzReference().Enabled)
+                return CalibrationResult.ExternalReferenceInUse;
+            long startCorrectionGeneration = _radio.FrequencyCorrectionGeneration;
+
             var startSnap = _radio.Snapshot();
             if (startSnap.Status != ConnectionStatus.Connected)
                 return CalibrationResult.NotConnected;
@@ -425,12 +433,25 @@ public sealed class FrequencyCalibrationService
                     return CalibrationResult.OffsetOutOfRange(
                         deviationHz, (float)medianPeakDb, referenceFrequencyHz, maxDeviationHz);
 
+                // Another client may have turned the external reference on,
+                // or changed the correction, while the frames were measured
+                // (even if it was changed back); some frames then belong to a
+                // different factor.
+                if (_radio.GetExternal10MHzReference().Enabled)
+                    return CalibrationResult.ExternalReferenceInUse;
+
                 // Compose with the factor already in force — the measurement
                 // on a calibrated radio is the RESIDUAL error, not the total.
                 double currentFactor = _radio.GetFrequencyCorrectionFactor();
                 double factor = FrequencyCalibrationPlan.ComposeFactor(
                     currentFactor, deviationHz, commandedLoHz);
-                double applied = _radio.SetFrequencyCorrectionFactor(factor);
+                // Applied only if the generation still matches, atomically
+                // with any other correction write, so nothing can slip in
+                // between this check and the write.
+                double? maybeApplied = _radio.TrySetFrequencyCorrectionFactor(
+                    factor, startCorrectionGeneration);
+                if (maybeApplied is not double applied)
+                    return CalibrationResult.CorrectionChanged;
 
                 _log.LogInformation(
                     "freqcal.success ref={Ref}Hz measured={Meas:F2}Hz deviation={Dev:F2}Hz spread={Spread:F2}Hz frames={N}/{Total} peakDb={Db:F1} hzPerPx={Hpp:F2} priorFactor={Prior:F9} factor={Factor:F9} applied={Applied:F9}",
@@ -545,6 +566,14 @@ public sealed record CalibrationResult(
     public static readonly CalibrationResult Transmitting = new(
         CalibrationOutcome.Busy, null, null, null,
         "The radio is transmitting. Unkey, then run calibration.");
+
+    public static readonly CalibrationResult ExternalReferenceInUse = new(
+        CalibrationOutcome.Busy, null, null, null,
+        "An external 10 MHz reference is in use. Turn it off to calibrate the radio's own clock.");
+
+    public static readonly CalibrationResult CorrectionChanged = new(
+        CalibrationOutcome.Busy, null, null, null,
+        "The frequency correction changed while calibrating. Run calibration again.");
 
     public static readonly CalibrationResult NotConnected = new(
         CalibrationOutcome.NotConnected, null, null, null,

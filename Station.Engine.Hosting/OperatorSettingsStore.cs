@@ -41,6 +41,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["background-image-area"] = "display_aux_settings",
             ["spectrum-display"] = "display_aux_settings",
             ["spectrum-splits"] = "display_aux_settings",
+            ["vfo-popouts"] = "display_aux_settings",
             ["vox"] = "vox_settings",
         };
 

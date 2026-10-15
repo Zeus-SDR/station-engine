@@ -5050,6 +5050,32 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     private DateTime _lastTxMeterLogUtc;
 
+    // Blocks drained per TX block. One is normal; more cover a DSP thread that
+    // ran ahead. After an idle gap (no analyzer reading) only the newest blocks
+    // are kept, so the display resumes current rather than replaying backlog.
+    private const int TxSiphonMaxBlocks = 4;
+    // A libwdsp built before the contiguous reader lacks the export: the first
+    // EntryPointNotFoundException latches this and the display keeps the
+    // previous newest-block read rather than losing the TX trace.
+    private volatile bool _txSiphonBlocksUnavailable;
+
+    /// <summary>TX ingest thread only. Copies the siphon blocks written since the
+    /// previous call into <paramref name="sip"/> and returns how many.</summary>
+    private int ReadTxSiphonBlocks(int txa, Span<float> sip, int blockSize)
+    {
+        if (!_txSiphonBlocksUnavailable)
+        {
+            try { return NativeMethods.TXAGetaSipBlocksF1(txa, ref sip[0], blockSize, TxSiphonMaxBlocks); }
+            catch (EntryPointNotFoundException)
+            {
+                _txSiphonBlocksUnavailable = true;
+                _log.LogWarning("wdsp.txSiphon contiguous reader unavailable; TX spectrum uses the newest-block read");
+            }
+        }
+        NativeMethods.TXAGetaSipF1(txa, ref sip[0], blockSize);
+        return 1;
+    }
+
     public int ProcessTxBlock(ReadOnlySpan<float> micMono, Span<float> iqInterleaved)
     {
         if (_disposed != 0) return 0;
@@ -5182,7 +5208,6 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             FeedIq(monId, monIqDouble);
         }
 
-        // Feed the TX analyzer with the post-CFIR IQ so TryGetTxDisplayPixels
         // Feed the TX analyzer from the WDSP TXA SIPHON (xsiphon position in
         // xtxa, BEFORE iqc/cfir/rsmpout — see siphon.c, TXA.c:586) so the
         // panadapter trace shows the operator's pre-distortion voice spectrum.
@@ -5195,27 +5220,38 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         // the WDSP analyzer's sideband convention (same fix as before — the
         // siphon hands back complex IQ in the same orientation as the post-
         // CFIR buffer did).
+        //
+        // xtxa runs on WDSP's own thread, and fexchange2 can return before it
+        // has processed the block just submitted. Reading "the newest block"
+        // here therefore repeated or skipped blocks, and the analyzer drew the
+        // splices as a broadband floor outside the TX filter (rippled at
+        // dsp_rate / dsp_size). TXAGetaSipBlocksF1 hands over each written
+        // block exactly once instead.
         if (_txDispAlive || Environment.TickCount64 < Volatile.Read(ref _bandwidthTxDemandUntil))
         {
             int sipSize = _txaDspSize;
-            Span<float> sipBuf = stackalloc float[2 * sipSize];
-            NativeMethods.TXAGetaSipF1(txa, ref sipBuf[0], sipSize);
+            Span<float> sipBuf = stackalloc float[2 * sipSize * TxSiphonMaxBlocks];
+            int blocks = ReadTxSiphonBlocks(txa, sipBuf, sipSize);
             Span<double> txSpectrumIq = stackalloc double[2 * sipSize];
-            for (int i = 0; i < sipSize; i++)
+            for (int block = 0; block < blocks; block++)
             {
-                txSpectrumIq[2 * i] = sipBuf[2 * i];
-                txSpectrumIq[2 * i + 1] = -sipBuf[2 * i + 1];
-            }
-            lock (_txDispLock)
-            {
-                // Re-check under the display lock to close the destroy/feed window.
-                if (_txDispAlive && _txaChannelId == txa)
-                    NativeMethods.Spectrum0(1, txa, 0, 0, ref txSpectrumIq[0]);
-                if (_bandwidthTxAnalyzer >= 0 && _txaChannelId == txa
-                    && Environment.TickCount64 < Volatile.Read(ref _bandwidthTxDemandUntil))
+                var sip = sipBuf.Slice(2 * sipSize * block, 2 * sipSize);
+                for (int i = 0; i < sipSize; i++)
                 {
-                    NativeMethods.Spectrum0(1, _bandwidthTxAnalyzer, 0, 0, ref txSpectrumIq[0]);
-                    _bandwidthTxSnapped = true;
+                    txSpectrumIq[2 * i] = sip[2 * i];
+                    txSpectrumIq[2 * i + 1] = -sip[2 * i + 1];
+                }
+                lock (_txDispLock)
+                {
+                    // Re-check under the display lock to close the destroy/feed window.
+                    if (_txDispAlive && _txaChannelId == txa)
+                        NativeMethods.Spectrum0(1, txa, 0, 0, ref txSpectrumIq[0]);
+                    if (_bandwidthTxAnalyzer >= 0 && _txaChannelId == txa
+                        && Environment.TickCount64 < Volatile.Read(ref _bandwidthTxDemandUntil))
+                    {
+                        NativeMethods.Spectrum0(1, _bandwidthTxAnalyzer, 0, 0, ref txSpectrumIq[0]);
+                        _bandwidthTxSnapped = true;
+                    }
                 }
             }
         }

@@ -76,6 +76,7 @@ SIPHON create_siphon (int run, int position, int mode, int disp, int insize,
   a->n_alloc_disps = 0;
   a->alloc_run  = (int*) malloc0 (dMAX_DISPLAYS * sizeof(int));
   a->alloc_disp = (int*) malloc0 (dMAX_DISPLAYS * sizeof(int));
+  sip_cursor_reset (&a->cursor);
   return a;
 }
 
@@ -92,10 +93,15 @@ void destroy_siphon (SIPHON a) {
 }
 
 void flush_siphon (SIPHON a) {
+  // Zeus: under the update lock, so a TXAGetaSipBlocksF1 reader on another
+  // thread never sees the ring and its cursor half reset.
+  EnterCriticalSection (&a->update);
   memset (a->sipbuff, 0, a->sipsize * sizeof (complex));
   memset (a->sipout, 0, a->sipsize * sizeof (complex));
   memset (a->specout, 0, a->fftsize * sizeof (complex));
   a->idx = 0;
+  sip_cursor_reset (&a->cursor);
+  LeaveCriticalSection (&a->update);
 }
 
 void xsiphon (SIPHON a, int pos) {
@@ -122,6 +128,10 @@ void xsiphon (SIPHON a, int pos) {
         if ((a->idx += a->insize) >= a->sipsize) { a->idx -= a->sipsize; }
       }
 
+      // Zeus: count every write for the TXAGetaSipBlocksF1 cursor. The
+      // insize >= sipsize branch above does not move idx, so cursor reads
+      // assume insize < sipsize (TXA: dsp_size 512 or less, sipsize 16384).
+      a->cursor.written += a->insize;
       break;
 
     case 1:
@@ -273,6 +283,23 @@ void TXAGetaSipF1 (int channel, float* out, int size) {
     out[2 * i + 0] = (float)a->sipout[2 * i + 0];
     out[2 * i + 1] = (float)a->sipout[2 * i + 1];
   }
+}
+
+// Zeus extension. TXAGetaSipF1 returns the newest samples whenever it is
+// called, so a caller on the fexchange thread repeats or skips blocks that the
+// DSP thread is still writing. This returns each block once, in order.
+PORT
+int TXAGetaSipBlocksF1 (int channel, float* out, int block_size, int max_blocks) {
+  SIPHON a = txa[channel].sip1.p;
+  int blocks = 0;
+  EnterCriticalSection (&a->update);
+  // xsiphon's insize >= sipsize branch does not move idx, so the cursor
+  // cannot locate samples there; return nothing rather than stale data.
+  if (a->insize < a->sipsize)
+    blocks = sip_cursor_read_blocks (&a->cursor, a->sipbuff, a->sipsize, a->idx,
+                                   out, block_size, max_blocks);
+  LeaveCriticalSection (&a->update);
+  return blocks;
 }
 
 PORT

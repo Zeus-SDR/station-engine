@@ -928,6 +928,7 @@ extern void TXASetSipMode (int channel, int mode);
 extern void TXASetSipDisplay (int channel, int disp);
 extern void TXAGetaSipF (int channel, float* out, int size);
 extern void TXAGetaSipF1 (int channel, float* out, int size);
+extern int TXAGetaSipBlocksF1 (int channel, float* out, int block_size, int max_blocks);
 extern void TXASetSipSpecmode (int channel, int mode);
 extern void TXAGetSpecF1 (int channel, float* out);
 extern void TXASetSipAllocDisps (int channel, int n_alloc_disps, int* alloc_run, int* alloc_disp);

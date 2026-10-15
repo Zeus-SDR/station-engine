@@ -67,8 +67,11 @@ public sealed class TxSpectrumSnapshotCache
         }
     }
 
+    /// <param name="offsetDb">TX display calibration (Thetis TXDisplayCalOffset), so these
+    /// bins sit on the same dB scale as the main TX panadapter's pixels.</param>
     public void Publish(object context, ReadOnlySpan<float> nativeBins, long nowMs,
-        double captureTimeUnixMs, double centerHz, float hzPerBin, long generation, double? carrierHz = null, string mode = "")
+        double captureTimeUnixMs, double centerHz, float hzPerBin, long generation, double? carrierHz = null, string mode = "",
+        double offsetDb = 0.0)
     {
         bool valid = !(nativeBins.Length < 2 || nativeBins.Length > 65536 || !float.IsFinite(hzPerBin)
             || hzPerBin <= 0 || !double.IsFinite(captureTimeUnixMs));
@@ -80,6 +83,8 @@ public sealed class TxSpectrumSnapshotCache
             if (generation != _generation || !Equals(context, _context) || nowMs >= _demandUntil) return;
             if (!valid) { _snapshot = null; return; }
             float[] bins = nativeBins.ToArray();
+            if (offsetDb != 0.0)
+                for (int i = 0; i < bins.Length; i++) bins[i] = (float)(bins[i] + offsetDb);
             Array.Reverse(bins);
             _capturedAt = nowMs;
             _snapshot = new(true, "digital-tx", _generation, ++_sequence,

@@ -269,6 +269,14 @@ public partial class Program
         builder.Services.AddSingleton<IInstalledFeatureState, ProductFeatureState>();
 
         var app = builder.Build();
+        // Every engine build unpacks into a new .NET extraction directory; drop
+        // the ones earlier builds left behind once this one is up.
+        var bundleLog = app.Services.GetRequiredService<ILoggerFactory>()
+            .CreateLogger("Zeus.BundleExtractionJanitor");
+        BundleExtractionJanitor.StartWhenReady(
+            app.Lifetime.ApplicationStarted,
+            "StationEngine",
+            message => bundleLog.LogInformation("{Message}", message));
         if (options.BindMode == StationEngineBindMode.Lan && options.LanHttpsPort is null)
         {
             app.Logger.LogInformation(

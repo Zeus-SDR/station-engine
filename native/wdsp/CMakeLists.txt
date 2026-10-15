@@ -55,7 +55,7 @@ set(WDSP_SOURCES
     icfir.c iir.c impulse_cache.c iobuffs.c iqc.c linux_port.c lmath.c main.c
     matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c nob.c nobII.c nurbs.c nurbs_fit.c
     nurbs_spline.c osctrl.c patchpanel.c phrot.c resample.c reshb.c rmatch.c
-    RXA.c sender.c shift.c siphon.c slew.c snb.c snoop.c ssql.c syncbuffs.c
+    RXA.c sender.c shift.c sip_cursor.c siphon.c slew.c snb.c snoop.c ssql.c syncbuffs.c
     TXA.c utilities.c varsamp.c version.c wbfm.c wcpAGC.c wisdom.c zetaHat.c
 )
 
@@ -444,6 +444,20 @@ if(WDSP_BUILD_FM_TESTS OR WDSP_BUILD_OSCTRL_TESTS)
         target_link_libraries(wdsp_fm_tests PRIVATE m)
     endif()
     add_test(NAME wdsp_fm_tests COMMAND wdsp_fm_tests)
+
+    # Zeus contiguous siphon reader (sip_cursor.c): every block once, in
+    # order, across ring wrap, backlog, flush and partial blocks. WDSP-free.
+    add_executable(wdsp_sip_cursor_tests
+        sip_cursor.c
+        tests/sip_cursor_tests.c
+    )
+    target_include_directories(wdsp_sip_cursor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MSVC)
+        target_compile_options(wdsp_sip_cursor_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(wdsp_sip_cursor_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME wdsp_sip_cursor_tests COMMAND wdsp_sip_cursor_tests)
 endif()
 
 if(WDSP_BUILD_FFTW_TESTS)

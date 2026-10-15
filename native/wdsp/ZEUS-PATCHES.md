@@ -64,6 +64,13 @@ wholesale: Zeus's prior version is **2.00**, and its later fixes are required.
   (`SetRXAFMToneSquelch`, `GetRXAFMToneStatus`) and `SetRXAFMDeemphRun`. The
   detector state lives outside `calc_fmd`/`decalc_fmd`. Managed callers probe
   these exports; they are optional in `WdspRuntimeCompatibilityTests`.
+- `sip_cursor.{c,h}`, `siphon.{c,h}`, `tests/sip_cursor_tests.c`: Zeus
+  contiguous siphon reader. `xsiphon` mode 0 counts written samples,
+  `flush_siphon` resets the cursor under the siphon's update lock, and
+  `TXAGetaSipBlocksF1` returns each block written since the previous call
+  exactly once. The managed TX spectrum feed uses it because `TXAGetaSipF1`
+  ("the newest N samples"), called from the fexchange thread, repeated or
+  skipped blocks and drew a false floor outside the TX filter.
 - `wdsp.h`: retain Zeus's public compatibility declarations, update `GetPSDisp`
   to the new native signature, and add NNR/model and CFIR-curve declarations.
   Zeus does not call `GetPSDisp` from managed code.

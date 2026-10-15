@@ -1812,7 +1812,7 @@ public sealed partial class RadioService : IDisposable
             // run (factor = 1.0).
             if (_preferredRadioStore is not null)
             {
-                client.SetFrequencyCorrectionFactor(_preferredRadioStore.GetFrequencyCorrectionFactor());
+                client.SetFrequencyCorrectionFactor(_preferredRadioStore.GetEffectiveFrequencyCorrectionFactor());
             }
 
             ThrowIfSuperseded(attempt);
@@ -6059,6 +6059,55 @@ public sealed partial class RadioService : IDisposable
         _preferredRadioStore?.GetFrequencyCorrectionFactor() ?? 1.0;
 
     /// <summary>
+    /// The factor the radio clients apply: the external 10 MHz reference
+    /// factor while that reference is declared in use, otherwise the
+    /// crystal factor from <see cref="GetFrequencyCorrectionFactor"/>.
+    /// </summary>
+    public double GetEffectiveFrequencyCorrectionFactor() =>
+        _preferredRadioStore?.GetEffectiveFrequencyCorrectionFactor() ?? 1.0;
+
+    private long _frequencyCorrectionGeneration;
+
+    /// <summary>
+    /// Bumped every time a correction factor is pushed to the radio, crystal
+    /// or external reference. Auto-calibration compares it across its
+    /// measurement so a change that was made and undone mid-run (A to B to A)
+    /// is still caught, which comparing the factor itself would miss.
+    /// </summary>
+    public long FrequencyCorrectionGeneration => Interlocked.Read(ref _frequencyCorrectionGeneration);
+
+    /// <summary>External 10 MHz reference settings; off and 1.0 without a store.</summary>
+    public External10MHzReferenceSettings GetExternal10MHzReference() =>
+        _preferredRadioStore?.GetExternal10MHzReference() ?? External10MHzReferenceSettings.Default;
+
+    /// <summary>
+    /// Declares whether an external 10 MHz reference drives the radio clock
+    /// and sets the correction factor used while it does (Thetis "Using ext
+    /// 10MHz ref"). The radio disciplines its clock in hardware; this only
+    /// changes which factor the host applies. Same ±100 ppm clamp, fixed
+    /// channel guard and live push as <see cref="SetFrequencyCorrectionFactor"/>.
+    /// A null argument keeps that field's stored value; the read and the
+    /// write happen under one lock so two partial updates cannot undo each
+    /// other.
+    /// </summary>
+    public External10MHzReferenceSettings SetExternal10MHzReference(bool? enabled, double? correctionFactor)
+    {
+        lock (_productPluginFrequencyConfigSync)
+        {
+            ThrowIfFixedChannelHoldsFrequency();
+            var current = GetExternal10MHzReference();
+            var applied = new External10MHzReferenceSettings(
+                enabled ?? current.Enabled,
+                ClampFrequencyCorrectionFactor(correctionFactor ?? current.CorrectionFactor));
+            _preferredRadioStore?.SetExternal10MHzReference(applied);
+            PushEffectiveFrequencyCorrectionFactor(
+                _preferredRadioStore?.GetEffectiveFrequencyCorrectionFactor()
+                ?? (applied.Enabled ? applied.CorrectionFactor : 1.0));
+            return applied;
+        }
+    }
+
+    /// <summary>
     /// Persists the frequency-correction factor, pushes it to the live P1
     /// client (if any), raises <see cref="FrequencyCorrectionFactorChanged"/>
     /// for the P2 listener, and re-pushes the current dial VFO so the new
@@ -6073,24 +6122,62 @@ public sealed partial class RadioService : IDisposable
         // admission, and refuse before touching storage or either protocol.
         lock (_productPluginFrequencyConfigSync)
         {
-            if (Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
-                throw new TransmitSafetyRejectedException(
-                    "Frequency calibration cannot change during a fixed-channel audio transmission.");
+            ThrowIfFixedChannelHoldsFrequency();
             return SetFrequencyCorrectionFactorCore(factor);
         }
     }
 
+    /// <summary>
+    /// Auto-calibration's apply: sets the crystal factor only if no correction
+    /// was pushed since <paramref name="expectedGeneration"/>, checked and
+    /// applied under the same lock as every other correction write. Returns
+    /// null, changing nothing, when one was.
+    /// </summary>
+    public double? TrySetFrequencyCorrectionFactor(double factor, long expectedGeneration)
+    {
+        lock (_productPluginFrequencyConfigSync)
+        {
+            ThrowIfFixedChannelHoldsFrequency();
+            if (FrequencyCorrectionGeneration != expectedGeneration) return null;
+            return SetFrequencyCorrectionFactorCore(factor);
+        }
+    }
+
+    // Caller holds _productPluginFrequencyConfigSync. Clock calibration moves
+    // the NCO, so it must not change under a fixed-channel transmission.
+    private void ThrowIfFixedChannelHoldsFrequency()
+    {
+        if (Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
+            throw new TransmitSafetyRejectedException(
+                "Frequency calibration cannot change during a fixed-channel audio transmission.");
+    }
+
     private double SetFrequencyCorrectionFactorCore(double factor)
     {
-        if (double.IsNaN(factor) || double.IsInfinity(factor))
-            throw new ArgumentException("factor must be a finite real number", nameof(factor));
-        double clamped = Math.Clamp(factor, 0.9999, 1.0001);
+        double clamped = ClampFrequencyCorrectionFactor(factor);
 
         // Write-through to persistent storage first so a crash between the
         // store write and the live-client push can't lose the calibration.
         _preferredRadioStore?.SetFrequencyCorrectionFactor(clamped);
-        _activeClient?.SetFrequencyCorrectionFactor(clamped);
-        FrequencyCorrectionFactorChanged?.Invoke(clamped);
+        PushEffectiveFrequencyCorrectionFactor(
+            _preferredRadioStore?.GetEffectiveFrequencyCorrectionFactor() ?? clamped);
+        return clamped;
+    }
+
+    private static double ClampFrequencyCorrectionFactor(double factor)
+    {
+        if (double.IsNaN(factor) || double.IsInfinity(factor))
+            throw new ArgumentException("factor must be a finite real number", nameof(factor));
+        return Math.Clamp(factor, 0.9999, 1.0001);
+    }
+
+    // Pushes the factor now in force (crystal or external reference) to the
+    // live clients and re-pushes the LO so it reaches the wire.
+    private void PushEffectiveFrequencyCorrectionFactor(double effective)
+    {
+        Interlocked.Increment(ref _frequencyCorrectionGeneration);
+        _activeClient?.SetFrequencyCorrectionFactor(effective);
+        FrequencyCorrectionFactorChanged?.Invoke(effective);
 
         // Re-push the current hardware LO so the new factor lands on the wire.
         // Re-pushing the LO rather than re-tuning the dial matters in two
@@ -6104,8 +6191,6 @@ public sealed partial class RadioService : IDisposable
         var pushSnap = Snapshot();
         if (pushSnap.RadioLoHz > 0) SetRadioLoUnchecked(pushSnap.RadioLoHz);
         else SetVfo(pushSnap.VfoHz, fromExternal: true);
-
-        return clamped;
     }
 
     // Compute the current drive byte + OC masks + PA enable from _drivePct,

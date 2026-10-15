@@ -417,25 +417,70 @@ public sealed class PreferredRadioStore : IDisposable
     /// same single-row preferences entry as the other per-radio prefs.
     /// Setting to 1.0 is identical to "unset" (factory default).
     /// </summary>
-    public void SetFrequencyCorrectionFactor(double factor)
+    public void SetFrequencyCorrectionFactor(double factor) =>
+        Upsert(e => e.FrequencyCorrectionFactor = factor);
+
+    /// <summary>
+    /// External 10 MHz reference settings, modelled on Thetis
+    /// Setup → General → Calibration "Using ext 10MHz ref"
+    /// (<c>chkUsing10MHzRef</c> / <c>udHPSDRFreqCorrectFactor10MHz</c>). The
+    /// radio's clock is disciplined by the reference in hardware; the host
+    /// only swaps which correction factor it applies. Defaults: off, 1.0.
+    /// </summary>
+    public External10MHzReferenceSettings GetExternal10MHzReference()
+    {
+        lock (_sync)
+        {
+            var e = _entries.FindAll().FirstOrDefault();
+            if (e is null) return External10MHzReferenceSettings.Default;
+            // 0.0 is how LiteDB hydrates rows that pre-date this field.
+            double factor = e.External10MHzCorrectionFactor == 0.0
+                ? 1.0
+                : e.External10MHzCorrectionFactor;
+            return new External10MHzReferenceSettings(e.UsingExternal10MHzReference, factor);
+        }
+    }
+
+    /// <summary>Persists both external 10 MHz reference fields in one write.</summary>
+    public void SetExternal10MHzReference(External10MHzReferenceSettings settings) =>
+        Upsert(e =>
+        {
+            e.UsingExternal10MHzReference = settings.Enabled;
+            e.External10MHzCorrectionFactor = settings.CorrectionFactor;
+        });
+
+    /// <summary>
+    /// The factor the radio clients actually apply: the external-reference
+    /// factor while the operator says an external 10 MHz reference is in
+    /// use, otherwise the crystal calibration factor. Mirrors Thetis
+    /// <c>udHPSDRFreqCorrectFactor_ValueChanged</c>.
+    /// </summary>
+    public double GetEffectiveFrequencyCorrectionFactor()
+    {
+        var external = GetExternal10MHzReference();
+        return external.Enabled ? external.CorrectionFactor : GetFrequencyCorrectionFactor();
+    }
+
+    private void Upsert(Action<PreferredRadioEntry> apply)
     {
         lock (_sync)
         {
             var existing = _entries.FindAll().FirstOrDefault();
             if (existing is null)
             {
-                _entries.Insert(new PreferredRadioEntry
+                var created = new PreferredRadioEntry
                 {
                     Board = HpsdrBoardKind.Unknown,
                     OverrideDetection = false,
                     OrionMkIIVariantChosen = false,
-                    FrequencyCorrectionFactor = factor,
                     UpdatedUtc = DateTime.UtcNow,
-                });
+                };
+                apply(created);
+                _entries.Insert(created);
             }
             else
             {
-                existing.FrequencyCorrectionFactor = factor;
+                apply(existing);
                 existing.UpdatedUtc = DateTime.UtcNow;
                 _entries.Update(existing);
             }
@@ -483,5 +528,21 @@ public sealed class PreferredRadioEntry
     /// accessor treats 0.0 as "unset" and returns 1.0 to keep tuning
     /// behaviour bit-identical for upgrading operators.</summary>
     public double FrequencyCorrectionFactor { get; set; }
+    /// <summary>Operator-declared external 10 MHz reference in use
+    /// (Thetis "Using ext 10MHz ref"). LiteDB hydrates older rows as
+    /// <c>false</c>, the shipping default.</summary>
+    public bool UsingExternal10MHzReference { get; set; }
+    /// <summary>Correction factor applied instead of
+    /// <see cref="FrequencyCorrectionFactor"/> while
+    /// <see cref="UsingExternal10MHzReference"/> is on. 0.0 (older rows)
+    /// reads as 1.0, the Thetis default for a disciplined reference.</summary>
+    public double External10MHzCorrectionFactor { get; set; }
     public DateTime UpdatedUtc { get; set; }
+}
+
+/// <summary>External 10 MHz reference settings (see
+/// <see cref="PreferredRadioStore.GetExternal10MHzReference"/>).</summary>
+public sealed record External10MHzReferenceSettings(bool Enabled, double CorrectionFactor)
+{
+    public static readonly External10MHzReferenceSettings Default = new(false, 1.0);
 }

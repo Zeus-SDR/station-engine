@@ -18,17 +18,7 @@ public static class RadioCalibrationEndpoints
         // state, tune WWV 10 MHz, find peak, apply factor, restore).
         // POST /reset clears the factor back to 1.0.
         endpoints.MapGet("/api/radio/frequency-calibration", (RadioService radio) =>
-        {
-            double factor = radio.GetFrequencyCorrectionFactor();
-            double ppm = (factor - 1.0) * 1e6;
-            double offsetAt10MHz = ppm * 10.0; // Hz offset at 10 MHz
-            return Results.Ok(new
-            {
-                factor,
-                ppm,
-                offsetHzAt10MHz = offsetAt10MHz,
-            });
-        });
+            Results.Ok(FrequencyCalibrationSnapshot(radio)));
 
         // referenceHz picks the reference station (issue #47 follow-up): WWV
         // radiates a continuous carrier on 10 and 15 MHz, and operators who
@@ -55,11 +45,12 @@ public static class RadioCalibrationEndpoints
             return Results.Ok(result);
         });
 
-        endpoints.MapPost("/api/radio/frequency-calibration/reset", (FrequencyCalibrationService cal) =>
+        endpoints.MapPost("/api/radio/frequency-calibration/reset", (
+            FrequencyCalibrationService cal, RadioService radio) =>
         {
             log.LogInformation("api.freqcal.reset");
             cal.Reset();
-            return Results.Ok(new { factor = 1.0, ppm = 0.0, offsetHzAt10MHz = 0.0 });
+            return Results.Ok(FrequencyCalibrationSnapshot(radio));
         });
 
         // Manual ppm entry (issue #47). Netherlands / Europe / anywhere WWV
@@ -75,16 +66,31 @@ public static class RadioCalibrationEndpoints
             if (double.IsNaN(req.Ppm) || double.IsInfinity(req.Ppm))
                 return Results.BadRequest(new { error = "ppm must be a finite real number" });
 
-            double factor = 1.0 + req.Ppm * 1e-6;
-            double applied = radio.SetFrequencyCorrectionFactor(factor);
-            double appliedPpm = (applied - 1.0) * 1e6;
-            log.LogInformation("api.freqcal.set requested={Req} applied={AppliedPpm}", req.Ppm, appliedPpm);
-            return Results.Ok(new
-            {
-                factor = applied,
-                ppm = appliedPpm,
-                offsetHzAt10MHz = appliedPpm * 10.0,
-            });
+            double applied = radio.SetFrequencyCorrectionFactor(FactorFromPpm(req.Ppm));
+            log.LogInformation("api.freqcal.set requested={Req} applied={AppliedPpm}", req.Ppm, PpmFromFactor(applied));
+            return Results.Ok(FrequencyCalibrationSnapshot(radio));
+        });
+
+        // External 10 MHz reference (Thetis Setup > General > Calibration
+        // "Using ext 10MHz ref"). The radio locks to the reference in
+        // hardware; this picks which correction factor the host applies.
+        // Either field may be omitted to keep its current value.
+        endpoints.MapPost("/api/radio/frequency-calibration/external-reference", (
+            External10MHzReferenceRequest req, RadioService radio) =>
+        {
+            if (req is null || (req.Enabled is null && req.Ppm is null))
+                return Results.BadRequest(new { error = "enabled or ppm required" });
+            // The JSON binder accepts the named literals "NaN" and
+            // "Infinity", so this check is what turns them into a 400.
+            if (req.Ppm is double ppm && !double.IsFinite(ppm))
+                return Results.BadRequest(new { error = "ppm must be a finite real number" });
+
+            var applied = radio.SetExternal10MHzReference(
+                req.Enabled,
+                req.Ppm is double requested ? FactorFromPpm(requested) : null);
+            log.LogInformation("api.freqcal.ext10mhz enabled={Enabled} ppm={Ppm}",
+                applied.Enabled, PpmFromFactor(applied.CorrectionFactor));
+            return Results.Ok(FrequencyCalibrationSnapshot(radio));
         });
 
         endpoints.MapGet("/api/radio/smeter-calibration", (
@@ -134,6 +140,30 @@ public static class RadioCalibrationEndpoints
         return endpoints;
     }
 
+    private static double FactorFromPpm(double ppm) => 1.0 + ppm * 1e-6;
+
+    private static double PpmFromFactor(double factor) => (factor - 1.0) * 1e6;
+
+    // ppm = (factor - 1) * 1e6; offsetHzAt10MHz is the same error in Hz at
+    // 10 MHz. The top-level fields stay the crystal calibration so existing
+    // clients read what they always read.
+    private static FrequencyCalibrationDto FrequencyCalibrationSnapshot(RadioService radio)
+    {
+        double factor = radio.GetFrequencyCorrectionFactor();
+        double ppm = PpmFromFactor(factor);
+        var external = radio.GetExternal10MHzReference();
+        double externalPpm = PpmFromFactor(external.CorrectionFactor);
+        return new FrequencyCalibrationDto(
+            factor,
+            ppm,
+            ppm * 10.0,
+            new External10MHzReferenceDto(
+                external.Enabled,
+                external.CorrectionFactor,
+                externalPpm,
+                externalPpm * 10.0));
+    }
+
     private static SMeterCalibrationDto SMeterCalibrationSnapshot(
         RadioService radio,
         SMeterCalibrationStore store)
@@ -162,6 +192,20 @@ public static class RadioCalibrationEndpoints
 }
 
 internal sealed record FrequencyCalibrationSetRequest(double Ppm);
+
+internal sealed record External10MHzReferenceRequest(bool? Enabled, double? Ppm);
+
+internal sealed record FrequencyCalibrationDto(
+    double Factor,
+    double Ppm,
+    double OffsetHzAt10MHz,
+    External10MHzReferenceDto ExternalReference);
+
+internal sealed record External10MHzReferenceDto(
+    bool Enabled,
+    double Factor,
+    double Ppm,
+    double OffsetHzAt10MHz);
 
 internal sealed record SMeterCalibrationDto(
     double OffsetDb,

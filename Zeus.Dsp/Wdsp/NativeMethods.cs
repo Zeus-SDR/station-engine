@@ -395,6 +395,15 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void TXAGetaSipF1(int channel, ref float pout, int size);
 
+    // Zeus extension (native/wdsp/sip_cursor.c): the same siphon tap, but each
+    // block of blockSize complex samples written since the previous call is
+    // returned exactly once, oldest first, up to maxBlocks. Returns the block
+    // count. TXAGetaSipF1 called from the fexchange thread repeats or skips
+    // blocks the DSP thread is still writing.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int TXAGetaSipBlocksF1(int channel, ref float pout, int blockSize, int maxBlocks);
+
     // Averaging trio. Mode 3 = log-recursive (EMA in dB space) — the Thetis
     // default. Backmult is the per-frame retention factor (0 = no smoothing,
     // 1 = frozen). NumAverage matters for modes 2/4; we're on mode 3 so it

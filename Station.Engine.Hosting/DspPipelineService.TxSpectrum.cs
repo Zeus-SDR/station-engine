@@ -81,9 +81,19 @@ public partial class DspPipelineService
         var support = DigitalTxSupport(context.Width, context.Rate, context.Zoom, txRate, context.CenterHz, hzPerBin);
         // WDSP pads the unsupported aperture with its minimum value. Exclude those
         // manufactured pixels, retaining the original frequency step and odd-width offset.
-        _txSpectrum.Publish(context, pixels.AsSpan(support.Start, support.Width), nowMs, captureTimeUnixMs,
+        PublishDigitalTxPixels(context, pixels.AsSpan(support.Start, support.Width), nowMs, captureTimeUnixMs,
             support.CenterHz, hzPerBin, generation, context.CenterHz, context.Mode.ToString());
     }
+
+    /// <summary>Publishes digital TX pixels with the same TX display calibration the
+    /// main panadapter's TX pixels get (applied after this capture), so the TX filter
+    /// view can share the panadapter's dB window.</summary>
+    internal void PublishDigitalTxPixels(object context, ReadOnlySpan<float> pixels, long nowMs,
+        double captureTimeUnixMs, double centerHz, float hzPerBin, long generation, double carrierHz, string mode) =>
+        _txSpectrum.Publish(context, pixels, nowMs, captureTimeUnixMs, centerHz, hzPerBin, generation,
+            carrierHz, mode, Volatile.Read(ref _txDisplayCalOffsetDb));
+
+    internal TxSpectrumSnapshotCache TxSpectrumCache => _txSpectrum;
     internal static (int Start, int Width, double CenterHz) DigitalTxSupport(
         int width, int rxRate, int zoom, int txRate, double centerHz, float hzPerBin)
     {
