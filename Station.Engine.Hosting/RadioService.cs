@@ -982,6 +982,9 @@ public sealed partial class RadioService : IDisposable
             RitHz: Math.Clamp(rsSnap?.RitHz ?? 0L, -RitXitMaxHz, RitXitMaxHz),
             XitEnabled: rsSnap?.XitEnabled ?? false,
             XitHz: Math.Clamp(rsSnap?.XitHz ?? 0L, -RitXitMaxHz, RitXitMaxHz),
+            // Display-source preference only (issue #3060); PsEnabled above
+            // still starts false regardless of this value.
+            PsMonitorEnabled: rsSnap?.PsMonitorEnabled ?? false,
             SplitEnabled: false,
             SplitTxHz: 0);
         _currentMode = (int)_state.Mode;
@@ -7107,8 +7110,10 @@ public sealed partial class RadioService : IDisposable
     /// armed, AND PS has converged, DspPipelineService.Tick reads pixels
     /// from the PS-feedback analyzer instead of the post-CFIR TX analyzer
     /// so the operator sees the actual on-air RF rather than the
-    /// predistorted baseband. Operator viewing preference — NOT persisted
-    /// across sessions.
+    /// predistorted baseband. Operator viewing preference, persisted with the
+    /// RadioStateStore snapshot (issue #3060) so it survives a restart. It is
+    /// deliberately kept out of PersistPsState / PsSettingsStore: it never
+    /// arms PS and never reaches the wire.
     /// </summary>
     public StateDto SetPsMonitor(PsMonitorSetRequest req)
     {
@@ -7835,6 +7840,7 @@ public sealed partial class RadioService : IDisposable
                 RitHz = snap.RitHz,
                 XitEnabled = snap.XitEnabled,
                 XitHz = snap.XitHz,
+                PsMonitorEnabled = snap.PsMonitorEnabled,
                 Notches = notches.Select(n => new RadioStateNotchEntry
                 {
                     CenterHz = n.CenterHz,

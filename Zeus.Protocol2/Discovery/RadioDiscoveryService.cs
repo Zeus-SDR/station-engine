@@ -60,13 +60,26 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
     internal static readonly TimeSpan SendGap = TimeSpan.FromMilliseconds(50);
 
     private readonly ILogger<RadioDiscoveryService> _log;
+    // 1 while consecutive discoveries keep finding nothing and the empty
+    // result has already been reported; any radio found re-arms the warning.
+    private int _emptyReported;
 
     public RadioDiscoveryService(ILogger<RadioDiscoveryService> log)
     {
         _log = log;
     }
 
+    // Test seam: replaces the socket run so tests can check that every
+    // discovery is reported without real network I/O. Null in production.
+    internal Func<TimeSpan, CancellationToken, Task<DiscoveryRun>>? DiscoveryRunForTest { get; set; }
+
     public async Task<IReadOnlyList<DiscoveredRadio>> DiscoverAsync(TimeSpan timeout, CancellationToken ct = default)
+    {
+        var run = await (DiscoveryRunForTest ?? RunDiscoveryAsync)(timeout, ct).ConfigureAwait(false);
+        return ReportOutcome(run.Stats, run.Radios);
+    }
+
+    private async Task<DiscoveryRun> RunDiscoveryAsync(TimeSpan timeout, CancellationToken ct)
     {
         var socketPlans = GetSocketPlans();
 
@@ -78,12 +91,12 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
 
         var sockets = CreateDiscoverySockets(socketPlans);
         if (sockets.Count == 0)
-            return [];
+            return new DiscoveryRun(new DiscoveryRunStats(socketPlans.Count, 0, 0, 0, 0), []);
 
         try
         {
             var packet = BuildDiscoveryPacket();
-            await SendProbesAsync(sockets, packet, ct).ConfigureAwait(false);
+            var sendFailures = await SendProbesAsync(sockets, packet, ct).ConfigureAwait(false);
 
             var byMac = new Dictionary<PhysicalAddress, DiscoveredRadio>();
             var receiveTasks = sockets
@@ -92,7 +105,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
             var replies = await Task.WhenAll(receiveTasks).ConfigureAwait(false);
             foreach (var batch in replies)
             {
-                foreach (var radio in batch)
+                foreach (var radio in batch.Radios)
                 {
                     byMac[radio.Mac] = radio;
                 }
@@ -100,7 +113,13 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
 
             ct.ThrowIfCancellationRequested();
 
-            return byMac.Values.OrderBy(IpSortKey).ToList();
+            var stats = new DiscoveryRunStats(
+                socketPlans.Count,
+                sockets.Count,
+                sendFailures,
+                replies.Sum(r => r.Datagrams),
+                replies.Sum(r => r.Invalid));
+            return new DiscoveryRun(stats, byMac.Values.OrderBy(IpSortKey).ToList());
         }
         finally
         {
@@ -218,11 +237,44 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
         return null;
     }
 
-    private async Task SendProbesAsync(
+    /// <summary>
+    /// Reports a discovery that found no radio once per empty streak, at
+    /// Warning so it survives in "Report a problem" logs, which keep only the
+    /// newest Information lines. The counts separate the failure layers:
+    /// nothing bound or every send failed (host networking or OS permission),
+    /// no datagram back (the reply never arrived, e.g. a host firewall or a
+    /// network that drops broadcast), or replies that did not parse.
+    /// </summary>
+    internal IReadOnlyList<DiscoveredRadio> ReportOutcome(
+        DiscoveryRunStats stats,
+        IReadOnlyList<DiscoveredRadio> radios)
+    {
+        if (radios.Count > 0)
+        {
+            Volatile.Write(ref _emptyReported, 0);
+            return radios;
+        }
+
+        if (Interlocked.Exchange(ref _emptyReported, 1) == 0)
+        {
+            _log.LogWarning(
+                "p2.discovery.none no Protocol 2 radio answered: socketPlans={SocketPlans} socketsBound={Bound} sendFailures={SendFailures} datagrams={Datagrams} invalidReplies={Invalid}",
+                stats.SocketPlans,
+                stats.SocketsBound,
+                stats.SendFailures,
+                stats.Datagrams,
+                stats.InvalidReplies);
+        }
+
+        return radios;
+    }
+
+    private async Task<int> SendProbesAsync(
         IReadOnlyList<DiscoverySocket> sockets,
         ReadOnlyMemory<byte> packet,
         CancellationToken ct)
     {
+        var failures = 0;
         for (var attempt = 0; attempt < SendAttempts; attempt++)
         {
             foreach (var socket in sockets)
@@ -234,6 +286,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                 }
                 catch (SocketException ex)
                 {
+                    failures++;
                     _log.LogDebug(
                         ex,
                         "p2.discovery.send.skip local={Local} broadcast={Broadcast}",
@@ -250,18 +303,22 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                 }
                 catch (OperationCanceledException)
                 {
-                    return;
+                    return failures;
                 }
             }
         }
+
+        return failures;
     }
 
-    private async Task<IReadOnlyList<DiscoveredRadio>> ReceiveRepliesAsync(
+    private async Task<SocketReplies> ReceiveRepliesAsync(
         DiscoverySocket socket,
         TimeSpan timeout,
         CancellationToken ct)
     {
         var radios = new List<DiscoveredRadio>();
+        var datagrams = 0;
+        var invalid = 0;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
         var receiveBuffer = new byte[ReceiveBufferSize];
@@ -294,11 +351,13 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                 break;
             }
 
+            datagrams++;
             var fromIp = ((IPEndPoint)res.RemoteEndPoint).Address;
             var slice = new ReadOnlySpan<byte>(receiveBuffer, 0, res.ReceivedBytes);
 
             if (!ReplyParser.TryParse(slice, fromIp, out var radio))
             {
+                invalid++;
                 _log.LogDebug(
                     "p2.discovery.reply.invalid from={Ip} len={Len}",
                     fromIp,
@@ -317,7 +376,7 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
                 radio.Details.ProtocolSupported);
         }
 
-        return radios;
+        return new SocketReplies(radios, datagrams, invalid);
     }
 
     private IReadOnlyList<DiscoverySocketPlan> GetSocketPlans()
@@ -463,5 +522,21 @@ public sealed class RadioDiscoveryService : IRadioDiscovery
 
     internal readonly record struct DiscoverySocketPlan(IPAddress BindAddress, IPAddress TargetAddress);
 
+    internal readonly record struct DiscoveryRunStats(
+        int SocketPlans,
+        int SocketsBound,
+        int SendFailures,
+        int Datagrams,
+        int InvalidReplies);
+
+    internal sealed record DiscoveryRun(
+        DiscoveryRunStats Stats,
+        IReadOnlyList<DiscoveredRadio> Radios);
+
     private sealed record DiscoverySocket(Socket Socket, DiscoverySocketPlan Plan);
+
+    private sealed record SocketReplies(
+        IReadOnlyList<DiscoveredRadio> Radios,
+        int Datagrams,
+        int Invalid);
 }

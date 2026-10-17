@@ -388,6 +388,7 @@ public sealed class TxAudioIngest : IDisposable
         while (pairs > 0)
         {
             int chunk = Math.Min(pairs, maxPairs);
+            Interlocked.Add(ref _preKeyOnsetZeroSamples, chunk);
             _ring.Write(new ReadOnlySpan<float>(_muteIq, 0, 2 * chunk));
             _forwardP2?.Invoke(new ReadOnlyMemory<float>(_muteIq, 0, 2 * chunk));
             pairs -= chunk;
@@ -547,6 +548,27 @@ public sealed class TxAudioIngest : IDisposable
     private float _peakMicAccum;
     private float _peakIqAccum;
     private int _peakBlocksAccum;
+    internal bool AudioDiagnosticsActive => _isMoxOn() || (_engineProvider()?.IsTxMonitorOn ?? false);
+    private long _diagnosticLastInputTicks;
+    private long _diagnosticLastWindowTicks;
+    private readonly Zeus.Protocol2.TxIqSilenceRuns _diagnosticIqRuns = new();
+    private long _diagnosticIqEpoch;
+    private bool? _diagnosticIqMox;
+    private MicBlockSource? _diagnosticIqSource;
+    private long _diagnosticPreKeyMutedSamples, _diagnosticIqNonFinite;
+    private long _hostSuppressedBrowserSamples, _hostSuppressedTciSamples, _hostSuppressedWavSamples;
+    private long _preKeyOnsetZeroSamples;
+
+    internal (long Browser, long Tci, long Wav, long PreKeyZeros) TakeHostDecisionDiagnostics() =>
+        (Interlocked.Exchange(ref _hostSuppressedBrowserSamples, 0),
+         Interlocked.Exchange(ref _hostSuppressedTciSamples, 0),
+         Interlocked.Exchange(ref _hostSuppressedWavSamples, 0),
+         Interlocked.Exchange(ref _preKeyOnsetZeroSamples, 0));
+    private double _diagnosticInputGapMs, _diagnosticProductMs, _diagnosticDspMs, _diagnosticLockMs;
+    private double _diagnosticInputSquares;
+    private long _diagnosticInputSamples, _diagnosticInputClipped, _diagnosticInputSilent, _diagnosticInputNonFinite;
+    private int _diagnosticDspEmpty, _diagnosticStaleAfterProcessing, _diagnosticPreviewMuted;
+
 
     private readonly CwIdService? _cwId;
 
@@ -1306,7 +1328,11 @@ public sealed class TxAudioIngest : IDisposable
     {
         // Every key-down starts the latency governor from scratch, even when
         // the prime itself is skipped (FreeDV, TUN).
-        lock (_sync) _latencyGovernor.Reset();
+        lock (_sync)
+        {
+            _latencyGovernor.Reset();
+            EndIqDiagnostics(_engineProvider()?.IsTxMonitorOn ?? false);
+        }
         if (_audioModem.Active) return false;
         if (_txOwnedByTuneDriver()) return false;
 
@@ -1318,12 +1344,18 @@ public sealed class TxAudioIngest : IDisposable
             return false;
 
         if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
-        lock (_sync) { _accumulatorFill = 0; }
+        lock (_sync)
+        {
+            _accumulatorFill = 0;
+        }
         int blocks = 0;
         float iqPeak = 0f;
         long startTs = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
+            // Product's two-block response runway survives idle. Start this
+            // voice epoch before WDSP priming so old wet speech cannot reappear.
+            _productAudio.BeginVoiceTxEpoch();
             Array.Clear(_tailMic, 0, blockSize);
             for (int b = 0; b < KeyDownPrimeBlocks; b++)
             {
@@ -1487,9 +1519,7 @@ public sealed class TxAudioIngest : IDisposable
     internal void OnMicPcmBytesFromMic(ReadOnlyMemory<byte> f32lePayload)
     {
         long now = Environment.TickCount64;
-        if (ShouldSuppressForAuthoritativeSource(now)) return;
-        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
-        if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
+        if (ShouldSuppressHostSource(now, f32lePayload.Length / sizeof(float))) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.Host);
     }
 
@@ -1499,9 +1529,7 @@ public sealed class TxAudioIngest : IDisposable
     {
         _hostFanoutFill = 0; // never splice a partial ASIO block into the fan-out
         long now = Environment.TickCount64;
-        if (ShouldSuppressForAuthoritativeSource(now)) return;
-        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
-        if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
+        if (ShouldSuppressHostSource(now, f32lePayload.Length / sizeof(float))) return;
         OnMicPcmBytes(f32lePayload, MicBlockSource.Host, validity);
     }
 
@@ -1537,9 +1565,7 @@ public sealed class TxAudioIngest : IDisposable
             if (!IsCurrent(validity)) return;
         }
         long now = Environment.TickCount64;
-        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
-        if (ShouldSuppressForAuthoritativeSource(now)
-            || (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs))
+        if (ShouldSuppressHostSource(now, samples.Length))
         {
             _hostFanoutFill = 0;
             return;
@@ -1611,6 +1637,26 @@ public sealed class TxAudioIngest : IDisposable
             if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs) return;
         }
         OnMicPcmBytes(f32lePayload, MicBlockSource.VirtualCable, validity);
+    }
+
+    private bool ShouldSuppressHostSource(long now, int samples)
+    {
+        if (ShouldSuppressForAuthoritativeSource(now))
+        {
+            long lastTci = Volatile.Read(ref _lastTciTickMs);
+            if (lastTci != 0 && now - lastTci < TciHysteresisMs)
+                Interlocked.Add(ref _hostSuppressedTciSamples, samples);
+            else
+                Interlocked.Add(ref _hostSuppressedWavSamples, samples);
+            return true;
+        }
+        long lastBrowserMic = Volatile.Read(ref _lastBrowserMicTickMs);
+        if (lastBrowserMic != 0 && now - lastBrowserMic < TciHysteresisMs)
+        {
+            Interlocked.Add(ref _hostSuppressedBrowserSamples, samples);
+            return true;
+        }
+        return false;
     }
 
     private bool ShouldSuppressForAuthoritativeSource(long now)
@@ -1809,6 +1855,8 @@ public sealed class TxAudioIngest : IDisposable
             {
                 if (_accumulatorFill > 0) _accumulatorFill = 0;
                 _latencyGovernor.Reset();
+                _diagnosticLastInputTicks = 0;
+                EndIqDiagnostics(monitorOn);
                 SetRecordingBypassLocked(null, false);
                 if (_fmBurst.IsActive || _fmBurstBypassApplied) CancelFmToneBurstLocked(engine);
                 if (_lastSeenMox)
@@ -1865,6 +1913,8 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _accumulatorFill = 0;
                 _latencyGovernor.Reset();
+                _diagnosticLastInputTicks = 0;
+                EndIqDiagnostics(monitorOn);
                 SetRecordingBypassLocked(null, false);
             }
             return;
@@ -1900,8 +1950,27 @@ public sealed class TxAudioIngest : IDisposable
                 samples = SilentMicBlock.AsSpan(0, samples.Length);
         }
 
+        long diagnosticLockStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         lock (_sync)
         {
+            if (_diagnosticIqMox != moxNow || _diagnosticIqSource != source)
+            {
+                if (_diagnosticIqRuns.HasSamples && _diagnosticIqSource is { } previousSource)
+                    LogIqContent(previousSource, _diagnosticIqMox ?? false, monitorOn, "end");
+                _diagnosticIqEpoch++;
+                _diagnosticIqMox = moxNow;
+                _diagnosticIqSource = source;
+                _diagnosticIqRuns.Observe(_diagnosticIqEpoch,
+                    (int)Math.Round(TxRateHz * (double)iqOut / blockSize), 0, false, false);
+            }
+            long diagnosticNow = System.Diagnostics.Stopwatch.GetTimestamp();
+            _diagnosticLockMs = Math.Max(_diagnosticLockMs,
+                System.Diagnostics.Stopwatch.GetElapsedTime(diagnosticLockStarted, diagnosticNow).TotalMilliseconds);
+            if (_diagnosticLastInputTicks != 0)
+                _diagnosticInputGapMs = Math.Max(_diagnosticInputGapMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(_diagnosticLastInputTicks, diagnosticNow).TotalMilliseconds);
+            _diagnosticLastInputTicks = diagnosticNow;
+            if (previewGainStart == 0 && previewGainEnd == 0) _diagnosticPreviewMuted++;
             // FreeDV end-of-over tail is clocking the final frame out on the
             // un-key thread; yield TX exclusively (no second feeder on the WDSP
             // TXA / radio IQ ring). Authoritative check under _sync — the drain
@@ -1987,10 +2056,14 @@ public sealed class TxAudioIngest : IDisposable
                 && (source != MicBlockSource.ProductPlugin
                     || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
             {
+                long productStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 _productAudio.ProcessTx(incoming);
+                _diagnosticProductMs = Math.Max(_diagnosticProductMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(productStarted).TotalMilliseconds);
             }
             if (!(bypassOnset ? IsBufferedCurrent(validity) : IsCurrent(validity)))
             {
+                _diagnosticStaleAfterProcessing++;
                 _accumulatorFill = 0;
                 return;
             }
@@ -2058,6 +2131,7 @@ public sealed class TxAudioIngest : IDisposable
                     cwId.MixTxBlock(new Span<float>(_scratchMic, 0, blockSize), canSend: !preKeyMuted);
                 }
                 int produced;
+                long dspStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 bool recording = source == MicBlockSource.Wav;
                 try
                 {
@@ -2070,6 +2144,9 @@ public sealed class TxAudioIngest : IDisposable
                     if (recording) SetRecordingBypassLocked(null, false);
                     throw;
                 }
+                _diagnosticDspMs = Math.Max(_diagnosticDspMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(dspStarted).TotalMilliseconds);
+                if (produced <= 0) _diagnosticDspEmpty++;
                 // Burst finished on this block: speech processing resumes.
                 if (_fmBurstBypassApplied && !_fmBurst.IsActive)
                     CancelFmToneBurstLocked(engine);
@@ -2081,8 +2158,32 @@ public sealed class TxAudioIngest : IDisposable
                     _accumulatorFill = 0;
                     return;
                 }
+                float micPeak = 0f;
+                for (int s = 0; s < blockSize; s++)
+                {
+                    float a = _scratchMic[s];
+                    if (a < 0) a = -a;
+                    if (a > micPeak) micPeak = a;
+                    if (!float.IsFinite(a)) { _diagnosticInputNonFinite++; continue; }
+                    _diagnosticInputSquares += (double)a * a;
+                    _diagnosticInputSamples++;
+                    if (a >= 0.999f) _diagnosticInputClipped++;
+                }
+                if (micPeak < 0.0001f) _diagnosticInputSilent++;
                 if (produced > 0)
                 {
+                    bool validIq = true;
+                    float iqPeak = 0f;
+                    for (int s = 0; s < 2 * produced; s++)
+                    {
+                        float a = _scratchIq[s];
+                        if (!float.IsFinite(a)) { _diagnosticIqNonFinite++; validIq = false; continue; }
+                        if (a < 0) a = -a;
+                        if (a > iqPeak) iqPeak = a;
+                    }
+                    _diagnosticIqRuns.Observe(_diagnosticIqEpoch,
+                        (int)Math.Round(TxRateHz * (double)iqOut / blockSize), produced,
+                        validIq && iqPeak == 0, validIq && iqPeak <= 0.001f);
                     var iqSpan = new ReadOnlySpan<float>(_scratchIq, 0, 2 * produced);
                     // Only push the modulated IQ to the radio while MOX is
                     // asserted. When the chain is running for monitor-only
@@ -2114,6 +2215,7 @@ public sealed class TxAudioIngest : IDisposable
                             && !wavRecent;
 
                         // P1 path — EP2 packer in Protocol1Client drains the ring.
+                        if (mute) _diagnosticPreKeyMutedSamples += produced;
                         _ring.Write(mute
                             ? new ReadOnlySpan<float>(_muteIq, 0, 2 * produced)
                             : iqSpan);
@@ -2130,20 +2232,6 @@ public sealed class TxAudioIngest : IDisposable
                     onConsumed?.Invoke(blockSize);
 
                     // Accumulate peaks for the 1 Hz diagnostic log.
-                    float micPeak = 0f;
-                    for (int s = 0; s < blockSize; s++)
-                    {
-                        float a = _scratchMic[s];
-                        if (a < 0) a = -a;
-                        if (a > micPeak) micPeak = a;
-                    }
-                    float iqPeak = 0f;
-                    for (int s = 0; s < 2 * produced; s++)
-                    {
-                        float a = _scratchIq[s];
-                        if (a < 0) a = -a;
-                        if (a > iqPeak) iqPeak = a;
-                    }
                     if (micPeak > _peakMicAccum) _peakMicAccum = micPeak;
                     if (iqPeak > _peakIqAccum) _peakIqAccum = iqPeak;
                     _peakBlocksAccum++;
@@ -2185,12 +2273,56 @@ public sealed class TxAudioIngest : IDisposable
                 }
                 // Shift remainder down — typically ~64 leftover samples (960 %
                 // 1024 carry). Array.Copy handles overlapping source/dest.
+                long windowNow = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (_diagnosticLastWindowTicks == 0 || System.Diagnostics.Stopwatch.GetElapsedTime(_diagnosticLastWindowTicks, windowNow).TotalSeconds >= 1)
+                {
+                    _log.LogInformation(
+                        "tx.audio.window source={Source} mox={Mox} monitor={Monitor} suiteActive={Suite} blockSamples={BlockSamples} expectedIqOutputSamples={IqSamples} inputGapMsMax={GapMs:F2} lockWaitMsMax={LockMs:F2} productMsMax={ProductMs:F2} wdspMsMax={DspMs:F2} wdspEmptyBlocks={Empty} staleAfterProduct={Stale} previewMutedFrames={Muted} dspInputRms={Rms:F4} dspInputClippedSamples={Clipped} dspInputSilentBlocks={Silent} dspInputNonFinite={NonFinite}",
+                        source, moxNow, monitorOn, _productAudio.Active, blockSize, iqOut,
+                        _diagnosticInputGapMs, _diagnosticLockMs, _diagnosticProductMs, _diagnosticDspMs,
+                        _diagnosticDspEmpty, _diagnosticStaleAfterProcessing, _diagnosticPreviewMuted,
+                        Math.Sqrt(_diagnosticInputSquares / Math.Max(1, _diagnosticInputSamples)),
+                        _diagnosticInputClipped, _diagnosticInputSilent, _diagnosticInputNonFinite);
+                    LogIqContent(source, moxNow, monitorOn, "window");
+                    _diagnosticInputGapMs = _diagnosticLockMs = _diagnosticProductMs = _diagnosticDspMs = 0;
+                    _diagnosticInputSquares = 0;
+                    _diagnosticInputSamples = _diagnosticInputClipped = _diagnosticInputSilent = _diagnosticInputNonFinite = 0;
+                    _diagnosticDspEmpty = _diagnosticStaleAfterProcessing = _diagnosticPreviewMuted = 0;
+                    _diagnosticLastWindowTicks = windowNow;
+                }
                 int remainder = _accumulatorFill - blockSize;
                 if (remainder > 0)
                     Array.Copy(_accumulator, blockSize, _accumulator, 0, remainder);
                 _accumulatorFill = remainder;
             }
         }
+    }
+
+    private void EndIqDiagnostics(bool monitorOn)
+    {
+        if (_diagnosticIqMox is null) return;
+        if (_diagnosticIqRuns.HasSamples && _diagnosticIqSource is { } previousSource)
+            LogIqContent(previousSource, _diagnosticIqMox.Value, monitorOn, "end");
+        _diagnosticIqMox = null;
+        _diagnosticIqEpoch++;
+        _diagnosticIqRuns.Observe(_diagnosticIqEpoch, TxRateHz, 0, false, false);
+    }
+
+    private void LogIqContent(MicBlockSource source, bool moxNow, bool monitorOn, string phase)
+    {
+        var content = _diagnosticIqRuns.TakeWindow();
+        try
+        {
+            _log.LogInformation(
+            "tx.iq.content phase={Phase} source={Source} mox={Mox} monitor={Monitor} epoch={Epoch} samples={Samples} zeroSamples={Zeros} quietSamples={Quiet} sampleTimeMs={TimeMs:F2} currentZeroMs={ZeroMs:F2} maxZeroMs={ZeroMaxMs:F2} currentQuietMs={QuietMs:F2} maxQuietMs={QuietMaxMs:F2} initialQuietMs={InitialMs:F2} quietResumptionsGe50ms={Resumed} preKeyMutedSamples={Muted} nonFiniteComponents={Invalid} quietThreshold=0.001",
+            phase, source, moxNow, monitorOn, content.Epoch, content.Samples, content.ZeroSamples,
+            content.QuietSamples, content.SampleTimeMs, content.CurrentZeroMs,
+            content.MaxZeroMs, content.CurrentQuietMs, content.MaxQuietMs,
+            content.InitialQuietMs, content.QuietResumptionsOver50Ms,
+                _diagnosticPreKeyMutedSamples, _diagnosticIqNonFinite);
+        }
+        catch { /* Diagnostics must not interrupt audio processing. */ }
+        _diagnosticPreKeyMutedSamples = _diagnosticIqNonFinite = 0;
     }
 
     private static bool IsCurrent(MicBlockValidity? validity) =>

@@ -15,7 +15,8 @@ namespace Zeus.Server;
 // Persists the subset of RadioService state that no dedicated store covers:
 // active mode/VFO, RX/TX filter bounds, master volume, TX mic gain, TX
 // Leveler max gain, display zoom, auto-ATT/AGC toggles, PRE, user-baseline
-// attenuator, manual notches, and the per-mode-family filter memory slots.
+// attenuator, manual notches, the per-mode-family filter memory slots, and the
+// PureSignal panel's "Monitor PA output" display-source preference.
 //
 // Not persisted here — handled elsewhere or intentionally ephemeral:
 //   AgcTopDb, Nr, Cfc       → DspSettingsStore
@@ -23,7 +24,8 @@ namespace Zeus.Server;
 //   PS tunables             → PsSettingsStore
 //   Filter presets          → FilterPresetStore
 //   Per-band VFO/mode       → BandMemoryStore
-//   PsEnabled, PsMonitor,
+//   PsEnabled               → never persisted (PsSettingsStore.ArmIntent owns
+//                             the operator's arm decision)
 //   TxMonitorEnabled        → ephemeral (operator re-arms each session)
 //   AttOffsetDb, AgcOffsetDb → control-loop accumulators, always reset
 //   AdcOverloadWarning      → derived / transient
@@ -251,6 +253,13 @@ public sealed class RadioStateEntry
     public long RitHz { get; set; }
     public bool XitEnabled { get; set; }
     public long XitHz { get; set; }
+    // PureSignal "Monitor PA output" display toggle (issue #3060). A display
+    // source preference only: it picks which analyzer fills the TX panadapter
+    // while PS is armed and correcting, and never arms PS or reaches the wire.
+    // Kept here, not in PsSettingsStore, so no PureSignal arm, calibration or
+    // persistence path is touched. Legacy rows hydrate to false (the old
+    // per-session default).
+    public bool PsMonitorEnabled { get; set; }
     // Per-mode-family RX filter memory (abs values, always positive)
     public int SsbFilterLoAbs { get; set; } = 150;
     public int SsbFilterHiAbs { get; set; } = 2850;

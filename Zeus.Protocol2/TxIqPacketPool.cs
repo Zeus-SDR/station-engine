@@ -14,7 +14,7 @@ using System.Threading.Channels;
 
 namespace Zeus.Protocol2;
 
-internal readonly record struct RevisionedTxIqPacket(byte[] Buffer, long SafetyRevision);
+internal readonly record struct RevisionedTxIqPacket(byte[] Buffer, long SafetyRevision, int PeakQuantized = 0);
 
 /// <summary>
 /// Owns the pooled buffers queued to the synchronous Protocol-2 TX-IQ sender.

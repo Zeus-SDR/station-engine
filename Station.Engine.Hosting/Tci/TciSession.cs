@@ -1648,17 +1648,26 @@ public sealed class TciSession : IDisposable
 
     private void HandleSpot(string[] args)
     {
-        // spot:<callsign>,<mode>,<freq_hz>,<argb>[,<comment>]
-        if (args.Length < 4) return;
-        string callsign = args[0];
-        string mode = args[1];
-        if (!TciProtocol.TryParseLong(args[2], out long freqHz)) return;
-        if (!TciProtocol.TryParseInt(args[3], out int argbSigned)) return;
-        uint argb = unchecked((uint)argbSigned);
-        string? comment = args.Length > 4 ? args[4] : null;
+        if (TryAddSpot(_spots, args))
+            _log.LogDebug("tci spot added: {Call} {Mode} {Freq} Hz", args[0], args[1], args[2]);
+        else
+            _log.LogDebug("tci spot rejected: {Args}", string.Join(",", args));
+    }
 
-        _spots.AddSpot(callsign, mode, freqHz, argb, comment);
-        _log.LogDebug("tci spot added: {Call} {Mode} {Freq} Hz", callsign, mode, freqHz);
+    /// <summary>
+    /// Apply a TCI <c>spot:&lt;callsign&gt;,&lt;mode&gt;,&lt;freq_hz&gt;,&lt;argb&gt;[,&lt;comment&gt;]</c>
+    /// command. Like Thetis, the comment is everything after the fourth comma,
+    /// so a comment that contains commas arrives whole.
+    /// </summary>
+    internal static bool TryAddSpot(SpotManager spots, string[] args)
+    {
+        if (args.Length < 4) return false;
+        if (!TciProtocol.TryParseLong(args[2], out long freqHz)) return false;
+        if (!TciProtocol.TryParseArgb(args[3], out uint argb)) return false;
+        string? comment = args.Length > 4 ? string.Join(",", args, 4, args.Length - 4) : null;
+
+        spots.AddSpot(args[0], args[1], freqHz, argb, comment);
+        return true;
     }
 
     private void HandleSpotDelete(string[] args)

@@ -131,6 +131,15 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private volatile bool _captureWorkerStopping;
     private int _captureQueueOverflows;
     private int _captureQueueOverflowLogged;
+    private long _captureAgeRejects;
+    private long _captureGenerationRejects;
+    private long _diagnosticLastEnqueued;
+    private long _diagnosticLastLog;
+    private double _diagnosticQueueMs, _diagnosticWorkMs, _diagnosticCaptureGapMs;
+    private double _diagnosticSquareSum;
+    private float _diagnosticPeak;
+    private long _diagnosticSamples, _diagnosticClipped, _diagnosticSilent, _diagnosticBlocks, _diagnosticNonFinite;
+    private int _diagnosticOverflows;
     private int _captureResourceCleanupClaimed;
 
     internal TimeSpan CaptureWorkerJoinTimeout { get; set; } = TimeSpan.FromSeconds(2);
@@ -926,16 +935,65 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
                 continue;
             }
 
+            long workStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            _diagnosticQueueMs = Math.Max(_diagnosticQueueMs,
+                System.Diagnostics.Stopwatch.GetElapsedTime(enqueuedAt, workStarted).TotalMilliseconds);
+            if (_diagnosticLastEnqueued != 0 && enqueuedAt >= _diagnosticLastEnqueued)
+                _diagnosticCaptureGapMs = Math.Max(_diagnosticCaptureGapMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(_diagnosticLastEnqueued, enqueuedAt).TotalMilliseconds);
+            _diagnosticLastEnqueued = enqueuedAt;
+            float blockPeak = 0;
+            foreach (float sample in _workerBlock.AsSpan(0, length))
+            {
+                if (!float.IsFinite(sample)) { _diagnosticNonFinite++; continue; }
+                float magnitude = Math.Abs(sample);
+                blockPeak = Math.Max(blockPeak, magnitude);
+                _diagnosticSquareSum += (double)sample * sample;
+                if (magnitude >= 0.999f) _diagnosticClipped++;
+            }
+            _diagnosticPeak = Math.Max(_diagnosticPeak, blockPeak);
+            _diagnosticSamples += length;
+            _diagnosticBlocks++;
+            if (blockPeak < 0.0001f) _diagnosticSilent++;
             if (length == MicBlockSamples)
                 ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
             else
                 ProcessHostCadenceBlock(_workerBlock.AsSpan(0, length), generation, enqueuedAt);
+            _diagnosticWorkMs = Math.Max(_diagnosticWorkMs,
+                System.Diagnostics.Stopwatch.GetElapsedTime(workStarted).TotalMilliseconds);
             int overflows = Interlocked.Exchange(ref _captureQueueOverflows, 0);
+            _diagnosticOverflows += overflows;
+            LogCaptureWindow();
             if (overflows != 0 && ++_captureQueueOverflowLogged <= 4)
                 _log.LogError(
                     "audio.native.tx ingest queue overflow count={Count} (suppressed after 4); dropped oldest pending block",
                     overflows);
         }
+    }
+
+    // Worker-only aggregation: no logging, sample recording or allocation on the native callback.
+    private void LogCaptureWindow()
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_diagnosticLastLog == 0) { _diagnosticLastLog = now; return; }
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_diagnosticLastLog, now).TotalSeconds < 1) return;
+        long ageRejects = Interlocked.Exchange(ref _captureAgeRejects, 0);
+        long generationRejects = Interlocked.Exchange(ref _captureGenerationRejects, 0);
+        var decisions = _ingest.TakeHostDecisionDiagnostics();
+        if (_ingest.AudioDiagnosticsActive || _diagnosticOverflows > 0 || ageRejects > 0
+            || decisions.Browser + decisions.Tci + decisions.Wav + decisions.PreKeyZeros > 0)
+            _log.LogInformation(
+                "audio.native.tx.window blocks={Blocks} samples={Samples} captureBlockGapMsMax={GapMs:F2} queueAgeMsMax={AgeMs:F2} workerMsMax={WorkMs:F2} overflowBlocks={Overflow} ageRejectedChecks={AgeRejects} generationRejectedChecks={GenerationRejects} rawPeak={Peak:F4} rawRms={Rms:F4} rawClippedSamples={Clipped} rawSilentBlocks={Silent} rawNonFinite={NonFinite} generation={Generation} hostBlockSamples={HostBlock} browserSuppressedSamples48k={BrowserSuppressed} tciSuppressedSamples48k={TciSuppressed} wavSuppressedSamples48k={WavSuppressed} preKeyOnsetZeroIqSamples={PreKeyZeros}",
+                _diagnosticBlocks, _diagnosticSamples, _diagnosticCaptureGapMs, _diagnosticQueueMs,
+                _diagnosticWorkMs, _diagnosticOverflows, ageRejects, generationRejects,
+                _diagnosticPeak, Math.Sqrt(_diagnosticSquareSum / Math.Max(1, _diagnosticSamples)),
+                _diagnosticClipped, _diagnosticSilent, _diagnosticNonFinite, Volatile.Read(ref _captureGeneration), HostBlockSamples,
+                decisions.Browser, decisions.Tci, decisions.Wav, decisions.PreKeyZeros);
+        _diagnosticLastLog = now;
+        _diagnosticBlocks = _diagnosticSamples = _diagnosticClipped = _diagnosticSilent = _diagnosticNonFinite = 0;
+        _diagnosticSquareSum = _diagnosticPeak = 0;
+        _diagnosticQueueMs = _diagnosticWorkMs = _diagnosticCaptureGapMs = 0;
+        _diagnosticOverflows = 0;
     }
 
     private void CleanupCaptureWorkerResources()
@@ -1059,9 +1117,20 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         }
     }
 
-    private bool IsCapturedBlockCurrent(long generation, long enqueuedAt) =>
-        generation == Volatile.Read(ref _captureGeneration)
-        && System.Diagnostics.Stopwatch.GetElapsedTime(enqueuedAt) <= MaximumCaptureBlockAge;
+    private bool IsCapturedBlockCurrent(long generation, long enqueuedAt)
+    {
+        if (generation != Volatile.Read(ref _captureGeneration))
+        {
+            Interlocked.Increment(ref _captureGenerationRejects);
+            return false;
+        }
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(enqueuedAt) > MaximumCaptureBlockAge)
+        {
+            Interlocked.Increment(ref _captureAgeRejects);
+            return false;
+        }
+        return true;
+    }
 
     private static float[][] CreateCaptureQueue()
     {

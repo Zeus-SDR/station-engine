@@ -612,14 +612,14 @@ public sealed class ProductPluginAudioPort : IDisposable
 
     internal bool TryActivateLeaseForTest(string leaseId) => TryActivateLease(leaseId, out _);
 
-    internal void PumpInjectionForTest(string leaseId)
+    internal void PumpInjectionForTest(string leaseId, long? nowTicks = null, bool force = true)
     {
         InjectionSession? session;
         lock (_gate)
             session = _sessions.TryGetValue(leaseId, out var candidate)
                 ? candidate as InjectionSession
                 : null;
-        if (session is not null) PumpInjection(session, force: true);
+        if (session is not null) PumpInjection(session, force, nowTicks);
     }
 
     internal void ExpireInjectionForTest(string leaseId)
@@ -701,7 +701,7 @@ public sealed class ProductPluginAudioPort : IDisposable
         }
     }
 
-    private void PumpInjection(InjectionSession session, bool force)
+    private void PumpInjection(InjectionSession session, bool force, long? nowTicks = null)
     {
         if (!session.TryAddRef()) return;
         try
@@ -767,12 +767,17 @@ public sealed class ProductPluginAudioPort : IDisposable
                 session.HasPendingBlock = true;
             }
 
-            var now = Stopwatch.GetTimestamp();
+            var now = nowTicks ?? Stopwatch.GetTimestamp();
             var delivery = Volatile.Read(ref session.NextDeliveryTicks);
             if (!force && now < delivery) return;
             if (!session.HasPendingBlock)
             {
-                if (!keyed) return;
+                if (!keyed)
+                {
+                    // An empty local source has no clock debt to recover.
+                    Volatile.Write(ref session.NextDeliveryTicks, 0);
+                    return;
+                }
                 if (!session.ReplayLastBlockOnUnderflow)
                 {
                     RevokeSession(session, "tx injection underflow (replay disabled)");
@@ -830,9 +835,22 @@ public sealed class ProductPluginAudioPort : IDisposable
             }
 
             var pendingCount = session.PendingCount;
+            if (session.Destination == ProductPluginInjectionDestination.LocalMonitor)
+            {
+                var monitorSink = Volatile.Read(ref _monitorSink);
+                // A full monitor ring is backpressure. Keep this block and its
+                // deadline for the next poll instead of dropping waveform data.
+                if (monitorSink is null || !monitorSink(session.Scratch.AsSpan(0, pendingCount)))
+                    return;
+            }
             session.HasPendingBlock = false;
             var nextDelivery = delivery > 0 ? delivery + BlockTicks : now + BlockTicks;
-            if (nextDelivery <= now) nextDelivery = now + BlockTicks;
+            // Local playback must recover queued blocks after a late poll.
+            // Re-anchoring every late deadline permanently loses samples per
+            // second and eventually exhausts the downstream audio reserve.
+            // The bounded producer ring limits catch-up; TX retains its pacing.
+            if (session.Destination == ProductPluginInjectionDestination.Tx && nextDelivery <= now)
+                nextDelivery = now + BlockTicks;
             Volatile.Write(ref session.NextDeliveryTicks, nextDelivery);
 
             if (session.Destination == ProductPluginInjectionDestination.Tx)
@@ -852,12 +870,6 @@ public sealed class ProductPluginAudioPort : IDisposable
                 var lastDelivered = session.LastDeliveredBlock ?? new float[pendingCount];
                 session.Scratch.AsSpan(0, pendingCount).CopyTo(lastDelivered);
                 session.LastDeliveredBlock = lastDelivered;
-            }
-            else
-            {
-                var sink = Volatile.Read(ref _monitorSink);
-                if (sink is null || !sink(session.Scratch.AsSpan(0, pendingCount)))
-                    Interlocked.Increment(ref _droppedInjectionBlocks);
             }
         }
         catch (Exception)

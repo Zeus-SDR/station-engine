@@ -90,12 +90,12 @@ public static class WaveformEndpoints
             int? receiver, bool? tx, double? windowMs) =>
             Results.Ok(pipeline.GetWaveformSnapshot(receiver ?? 0, tx ?? false, windowMs ?? 50)));
         endpoints.MapPost("/api/display/waveform/capture", (DspPipelineService pipeline,
-            int? receiver, bool? tx, int? durationMs) =>
+            int? receiver, bool? tx, int? durationMs, bool? mic, bool? monitor) =>
         {
             int rx = receiver ?? 0, duration = durationMs ?? 3000;
-            if (rx is < 0 or > 7 || duration is not (1000 or 3000 or 5000 or 10000))
+            if (((mic == true ? 1 : 0) + (tx == true ? 1 : 0) + (monitor == true ? 1 : 0) > 1) || rx is < 0 or > 7 || duration is not (1000 or 3000 or 5000 or 10000))
                 return Results.BadRequest(new { error = "Invalid receiver or duration" });
-            var capture = pipeline.StartWaveformCapture(rx, tx ?? false, duration, out var error);
+            var capture = pipeline.StartWaveformCapture(rx, tx ?? false, duration, out var error, mic ?? false, monitor ?? false);
             return capture is null ? Results.Conflict(new { error })
                 : Results.Json(capture, statusCode: StatusCodes.Status202Accepted);
         });

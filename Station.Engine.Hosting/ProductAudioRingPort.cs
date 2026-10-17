@@ -50,6 +50,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     private long _processedBlocks;
     private long _bypassedBlocks;
     private int _audioBusy;
+    private int _txEpochResetPending;
     private int _rxAudioBusy;
     private long _rxAttemptedBlocks;
     private long _rxProcessedBlocks;
@@ -320,6 +321,10 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         }
     }
 
+    // The keying thread only requests reset. The existing TX owner consumes it
+    // after claiming _audioBusy, so a reset never races a render or blocks audio.
+    public void BeginVoiceTxEpoch() => Interlocked.Exchange(ref _txEpochResetPending, 1);
+
     /// <summary>
     /// Realtime TX seam. The callback never waits for Product: it drains a
     /// completed prior response, publishes the current block, and emits either
@@ -351,13 +356,15 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
         try
         {
+            bool resetEpoch = Interlocked.Exchange(ref _txEpochResetPending, 0) != 0;
+            if (resetEpoch) session.TxPipeline.Reset();
             while (session.Owner.TryReadOutput(
                        _txProcessed,
                        out var completedSequence,
                        out var completedCount,
                        out var processingDelayBlocks))
             {
-                if (completedCount <= 0 || completedCount > _txProcessed.Length)
+                if (resetEpoch || completedCount <= 0 || completedCount > _txProcessed.Length)
                     continue;
                 session.TxPipeline.RememberProcessed(
                     completedSequence,
@@ -799,6 +806,9 @@ internal sealed class ProductAudioTransportPipeline
         ReadOnlySpan<float> block,
         int processingDelayBlocks)
     {
+        // A response already in flight when a new voice epoch began may
+        // arrive late, even after this slot was reused by current audio.
+        if (_firstSequence != 0 && responseSequence < _firstSequence) return;
         var index = Index(responseSequence);
         block.CopyTo(_processed[index]);
         _processedCounts[index] = block.Length;

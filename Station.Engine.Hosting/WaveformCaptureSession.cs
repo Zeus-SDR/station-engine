@@ -17,6 +17,7 @@ internal sealed class WaveformCaptureSession
     public readonly int Receiver, Duration, Channels;
     public readonly bool Tx;
     public readonly string Mode;
+    private readonly bool _microphone, _monitor;
     public readonly long Started;
     public long Generation;
     public long LastBlock, Finished;
@@ -28,9 +29,10 @@ internal sealed class WaveformCaptureSession
     private readonly object _serializationSync = new();
 
     public WaveformCaptureSession(object context, int receiver, bool tx, int duration, string mode,
-        long generation, long now)
+        long generation, long now, bool microphone = false, bool monitor = false)
     {
-        Id = (tx ? "t" : "r" + receiver) + Guid.NewGuid().ToString("N");
+        _microphone = microphone; _monitor = monitor;
+        Id = (monitor ? "p" : microphone ? "m" : tx ? "t" : "r" + receiver) + Guid.NewGuid().ToString("N");
         Context = context; Receiver = receiver; Tx = tx; Duration = duration;
         Channels = tx ? 2 : 1; Mode = mode; Generation = generation; Started = now;
         _samples = new float[checked(768000 * (duration / 1000) * Channels)];
@@ -40,7 +42,8 @@ internal sealed class WaveformCaptureSession
     public void Stop(string status, string? error, long now)
     {
         if (Status != "capturing") return;
-        Status = status; Error = error; Finished = now;
+        Error = error; Finished = now;
+        Volatile.Write(ref Status, status);
         if (status != "complete") _samples = null;
     }
     public void Check(object? context, long now, bool missed = false)
@@ -72,8 +75,8 @@ internal sealed class WaveformCaptureSession
         if (Received == Target) Stop("complete", null, now);
     }
     public WaveformCaptureMetadata Metadata() => new(Id, Status, Received, Target, Rate,
-        Channels, Tx ? "complex" : "real", Tx ? "digital-tx" : "rx-demodulated",
-        Tx ? "tx-output" : "rx-post-demod", "relative", Receiver, Generation, Duration, Mode, Error);
+        Channels, Tx ? "complex" : "real", _monitor ? "tx-monitor" : _microphone ? "mic-input" : Tx ? "digital-tx" : "rx-demodulated",
+        _monitor ? "tx-post-demod" : _microphone ? "mic-pre-dsp" : Tx ? "tx-output" : "rx-post-demod", "relative", Receiver, Generation, Duration, Mode, Error);
     public byte[]? Bytes()
     {
         if (Status != "complete") return null;

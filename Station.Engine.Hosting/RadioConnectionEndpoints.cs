@@ -163,9 +163,7 @@ public static class RadioConnectionEndpoints
                 var finalProbe = await p2Connection.ProbeAsync(ipEndpoint, ctx.RequestAborted)
                     .ConfigureAwait(false);
 
-                var boardKind = req.BoardId is byte rawBoardId
-                    ? MapBoardByteP2(rawBoardId)
-                    : finalProbe?.BoardKind ?? HpsdrBoardKind.Unknown;
+                var boardKind = ResolveP2BoardKind(req.BoardId, finalProbe);
                 var rateKhz = ResolveP2RateKhz(req.SampleRate);
                 rateKhz = await dsp.ConnectP2WithLifecycleGateHeldAsync(
                     ipEndpoint,
@@ -323,97 +321,12 @@ public static class RadioConnectionEndpoints
                 });
             }
 
-            // HARDWARE-SAFETY GUARD (relay chatter / PSU brown-out).
-            // Before opening the relay-bearing high-priority stream, unicast-probe
-            // the radio and refuse to connect if it reports Busy — i.e. another
-            // controller (a co-located saturn-go / p2app stack, or another
-            // Zeus/Thetis client) is already driving it. Two masters publishing
-            // DIFFERENT band/antenna/ALEX-relay selections make the FPGA flip the
-            // BPF/LPF/T-R relay matrix every packet; the relay inrush can brown
-            // out a shared PSU and reboot the host (observed 2026-06-23 on a
-            // co-located CM5 Saturn all-in-one). A single Zeus master is fine —
-            // the danger requires a second, disagreeing controller. The operator
-            // can reclaim an abandoned stream deliberately. Reclaim sends run=0,
-            // requires the radio to remain Idle beyond the normal keepalive
-            // cadence, and then re-connects through this same guard. A live old
-            // controller therefore reasserts Busy and the takeover aborts. The
-            // probe fails OPEN for ordinary connects: a radio that
-            // doesn't answer the probe is NOT blocked, so this never strands a
-            // legitimate connect. The probe must NOT weaken the co-located
-            // ephemeral-port bind — it only reads discovery, it doesn't touch the
-            // connect socket.
-            // Probe result is reused after the busy-gate to capture the
-            // firmware version for the diagnostics snapshot.
-            Protocol2ConnectionProbe? probe = null;
-            if (!CanBypassBusyProbe(isP2: true, req.Force))
-            {
-                try
-                {
-                    probe = await p2Connection.ProbeAsync(
-                        ipEndpoint,
-                        ctx.RequestAborted).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
-                {
-                    log.LogWarning(ex, "api.connect.p2 busy-probe failed — allowing connect");
-                }
-
-                if (probe?.Busy == true)
-                {
-                    log.LogWarning(
-                        "api.connect.p2 REFUSED — radio {Ip} reports BUSY (another controller owns it); refusing second-master connect",
-                        ipEndpoint.Address);
-                    return Results.Json(
-                        new
-                        {
-                            error =
-                                "This radio is already in use by another controller. Connecting Zeus as a " +
-                                "second master would make the band/antenna/T-R relays chatter and can brown " +
-                                "out the radio. Stop the other controller (e.g. saturn-go / another client), " +
-                                "or use Take over to safely clear an abandoned radio stream.",
-                            busy = true,
-                            reclaimable = true,
-                        },
-                        statusCode: StatusCodes.Status409Conflict);
-                }
-            }
-
-            var rateKhz = ResolveP2RateKhz(req.SampleRate);
-
-            // Plumb the discovered board byte through so RadioService can
-            // surface the real board kind instead of defaulting to OrionMkII
-            // for every P2 connection (issue #171 — Brick2 is Hermes/0x01 on P2).
-            var boardKind = req.BoardId is byte b
-                ? MapBoardByteP2(b)
-                : HpsdrBoardKind.Unknown;
-
-            try
-            {
-                // Firmware version for the "Report a problem" diagnostic snapshot.
-                rateKhz = await p2Connection.ConnectAsync(
-                    ipEndpoint,
-                    rateKhz,
-                    boardKind,
-                    probe?.Firmware,
-                    sampleRateExplicit: true,
-                    ctx.RequestAborted).ConfigureAwait(false);
-                return Results.Ok(new
-                {
-                    protocol = "P2",
-                    endpoint = req.Endpoint,
-                    sampleRateKhz = rateKhz,
-                });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return Results.Conflict(new { error = ex.Message });
-            }
-            catch (Exception ex)
-            {
-                log.LogError(ex, "api.connect.p2 failed");
-                return Results.Problem(ex.Message, statusCode: 500);
-            }
+            return await ConnectP2CoreAsync(
+                req,
+                ipEndpoint,
+                p2Connection,
+                log,
+                ctx.RequestAborted).ConfigureAwait(false);
         });
 
         endpoints.MapPost("/api/disconnect/p2", async (
@@ -654,6 +567,110 @@ public static class RadioConnectionEndpoints
         }
     }
 
+    // Probe, busy guard, board identity and connect for POST /api/connect/p2,
+    // after the route's DSP-readiness and already-connected checks. Kept apart
+    // from the route so tests drive the exact production sequence through a
+    // fake connector.
+    internal static async Task<IResult> ConnectP2CoreAsync(
+        ConnectRequest req,
+        IPEndPoint ipEndpoint,
+        IProtocol2ConnectionConnector p2Connection,
+        ILogger log,
+        CancellationToken cancellationToken)
+    {
+        // HARDWARE-SAFETY GUARD (relay chatter / PSU brown-out).
+        // Before opening the relay-bearing high-priority stream, unicast-probe
+        // the radio and refuse to connect if it reports Busy — i.e. another
+        // controller (a co-located saturn-go / p2app stack, or another
+        // Zeus/Thetis client) is already driving it. Two masters publishing
+        // DIFFERENT band/antenna/ALEX-relay selections make the FPGA flip the
+        // BPF/LPF/T-R relay matrix every packet; the relay inrush can brown
+        // out a shared PSU and reboot the host (observed 2026-06-23 on a
+        // co-located CM5 Saturn all-in-one). A single Zeus master is fine —
+        // the danger requires a second, disagreeing controller. The operator
+        // can reclaim an abandoned stream deliberately. Reclaim sends run=0,
+        // requires the radio to remain Idle beyond the normal keepalive
+        // cadence, and then re-connects through this same guard. A live old
+        // controller therefore reasserts Busy and the takeover aborts. The
+        // probe fails OPEN for ordinary connects: a radio that
+        // doesn't answer the probe is NOT blocked, so this never strands a
+        // legitimate connect. The probe must NOT weaken the co-located
+        // ephemeral-port bind — it only reads discovery, it doesn't touch the
+        // connect socket.
+        // Probe result is reused after the busy-gate to capture the
+        // firmware version for the diagnostics snapshot.
+        Protocol2ConnectionProbe? probe = null;
+        if (!CanBypassBusyProbe(isP2: true, req.Force))
+        {
+            try
+            {
+                probe = await p2Connection.ProbeAsync(
+                    ipEndpoint,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "api.connect.p2 busy-probe failed — allowing connect");
+            }
+
+            if (probe?.Busy == true)
+            {
+                log.LogWarning(
+                    "api.connect.p2 REFUSED — radio {Ip} reports BUSY (another controller owns it); refusing second-master connect",
+                    ipEndpoint.Address);
+                return Results.Json(
+                    new
+                    {
+                        error =
+                            "This radio is already in use by another controller. Connecting Zeus as a " +
+                            "second master would make the band/antenna/T-R relays chatter and can brown " +
+                            "out the radio. Stop the other controller (e.g. saturn-go / another client), " +
+                            "or use Take over to safely clear an abandoned radio stream.",
+                        busy = true,
+                        reclaimable = true,
+                    },
+                    statusCode: StatusCodes.Status409Conflict);
+            }
+        }
+
+        var rateKhz = ResolveP2RateKhz(req.SampleRate);
+
+        // Plumb the discovered board byte through so RadioService can
+        // surface the real board kind instead of defaulting to OrionMkII
+        // for every P2 connection (issue #171 — Brick2 is Hermes/0x01 on P2).
+        // A manually entered IP carries no board byte; the busy probe's
+        // reply names the board, so use it rather than Unknown (#3070).
+        var boardKind = ResolveP2BoardKind(req.BoardId, probe);
+
+        try
+        {
+            // Firmware version for the "Report a problem" diagnostic snapshot.
+            rateKhz = await p2Connection.ConnectAsync(
+                ipEndpoint,
+                rateKhz,
+                boardKind,
+                probe?.Firmware,
+                sampleRateExplicit: true,
+                cancellationToken).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                protocol = "P2",
+                endpoint = req.Endpoint,
+                sampleRateKhz = rateKhz,
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Conflict(new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            log.LogError(ex, "api.connect.p2 failed");
+            return Results.Problem(ex.Message, statusCode: 500);
+        }
+    }
+
     internal static HpsdrBoardKind ResolveP1BoardKind(byte? rawBoardId, P1Radio? probe)
     {
         if (probe is not null)
@@ -670,6 +687,16 @@ public static class RadioConnectionEndpoints
             ? ReplyParser.ClassifyBoard(raw, codeVersion: null)
             : HpsdrBoardKind.Unknown;
     }
+
+    // Same precedence on every P2 connect path: an explicit board byte from
+    // discovery wins, then the board named by the connect-time probe reply,
+    // then Unknown when the radio did not answer the probe.
+    internal static HpsdrBoardKind ResolveP2BoardKind(
+        byte? rawBoardId,
+        Protocol2ConnectionProbe? probe) =>
+        rawBoardId is byte raw
+            ? MapBoardByteP2(raw)
+            : probe?.BoardKind ?? HpsdrBoardKind.Unknown;
 
     // Protocol 2 uses different wire numbering for the dual-ADC family
     // (Angelia/Orion/OrionMkII). This P2-only map mirrors its reply parser;

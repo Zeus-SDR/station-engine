@@ -328,6 +328,18 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     private long _overrunSamples;
     private long _totalSamplesIn;
     private long _totalSamplesOut;
+    private long _monitorLastPublishTicks;
+    private long _monitorLogTicks;
+    private long _monitorSamples;
+    private long _monitorClippedSamples;
+    private long _monitorNonFiniteSamples;
+    private long _monitorPartialPadding;
+    private long _monitorRecentProducerEmptySamples;
+    private long _monitorTrimmedSamples;
+    private long _monitorMaxGapTicks;
+    private long _monitorRestartGapTicks;
+    private double _monitorSquareSum;
+    private float _monitorPeak;
     private long _previewSamplesIn;
     private long _previewSamplesOut;
     private long _droppedFormatSamplesTotal;
@@ -659,6 +671,8 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // (best-effort snapshot, may be off by one in a race window).
     internal int CurrentRingDepth => _ring.Count;
     internal int CurrentTxMonitorRingDepth => _txMonitorRing.Count;
+    internal (long PartialPadding, long RecentProducerEmpty) MonitorCallbackDiagnostics =>
+        (Interlocked.Read(ref _monitorPartialPadding), Interlocked.Read(ref _monitorRecentProducerEmptySamples));
 
     internal void RenderPlaybackForTest(Span<float> output, uint frameCount, uint channels) =>
         OnPlaybackData(output, frameCount, channels);
@@ -751,6 +765,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
         var src = frame.Samples.Span;
         _txMonitorRing.Write(src);
+        RecordMonitorDiagnostics(src);
         // TX preview is an audible producer in its own right. In particular,
         // mute-exempt preview may be the only audio reaching this sink, so it
         // must keep the playback-callback watchdog alive even while RX is muted.
@@ -797,11 +812,23 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         // preserves the ring's SPSC contract.
         int txMonitorQueued = _txMonitorRing.Count;
         if (txMonitorQueued > totalFrames * 2)
-            _txMonitorRing.Skip(txMonitorQueued - totalFrames);
+            Interlocked.Add(ref _monitorTrimmedSamples,
+                _txMonitorRing.Skip(txMonitorQueued - totalFrames));
         int txMonitorRead = _txMonitorRing.Read(mono);
+        // Observe complete starvation only within 100 ms of a producer frame.
+        // MON-off and a stopped producer are indistinguishable here; this bounded
+        // observation includes the release edge but never counts idle indefinitely.
+        long monitorPublishedAt = Interlocked.Read(ref _monitorLastPublishTicks);
+        if (txMonitorRead == 0 && monitorPublishedAt != 0
+            && System.Diagnostics.Stopwatch.GetTimestamp() - monitorPublishedAt
+                <= System.Diagnostics.Stopwatch.Frequency / 10)
+            Interlocked.Add(ref _monitorRecentProducerEmptySamples, totalFrames);
         bool renderingTxMonitor = txMonitorRead > 0;
         if (renderingTxMonitor && txMonitorRead < totalFrames)
+        {
+            Interlocked.Add(ref _monitorPartialPadding, totalFrames - txMonitorRead);
             mono[txMonitorRead..].Clear();
+        }
         if (renderingTxMonitor)
         {
             // TX monitor replaces local RX at the pipeline. Clear the RX tail
@@ -1090,6 +1117,52 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
                 Interlocked.Exchange(ref _recoveryScheduled, 0);
             }
         });
+    }
+
+    // Producer-side summary only; the device callback updates counters without logging.
+    private void RecordMonitorDiagnostics(ReadOnlySpan<float> samples)
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        long frequency = System.Diagnostics.Stopwatch.Frequency;
+        long previous = Interlocked.Exchange(ref _monitorLastPublishTicks, now);
+        // A one-second absence starts a fresh producer window. Preserve the
+        // restart interval explicitly: it may be MON-off or a stalled producer.
+        if (previous != 0 && now - previous >= frequency)
+        {
+            _monitorRestartGapTicks = now - previous;
+            _monitorLogTicks = now;
+            _monitorSamples = _monitorClippedSamples = _monitorNonFiniteSamples = _monitorMaxGapTicks = 0;
+            _monitorSquareSum = 0;
+            _monitorPeak = 0;
+        }
+        else if (previous != 0)
+            _monitorMaxGapTicks = Math.Max(_monitorMaxGapTicks, now - previous);
+        if (_monitorLogTicks == 0) _monitorLogTicks = now;
+        _monitorSamples += samples.Length;
+        foreach (float sample in samples)
+        {
+            if (!float.IsFinite(sample)) { _monitorNonFiniteSamples++; continue; }
+            float magnitude = Math.Abs(sample);
+            _monitorPeak = Math.Max(_monitorPeak, magnitude);
+            _monitorSquareSum += (double)sample * sample;
+            if (magnitude >= 1f) _monitorClippedSamples++;
+        }
+        if (now - _monitorLogTicks < frequency) return;
+        _log.LogInformation(
+            "audio.native.monitor samples={Samples} producerWindowMs={WindowMs:F1} publishGapMsMax={GapMs:F2} restartGapMs={RestartMs:F1} rms={Rms:F5} peak={Peak:F5} clipped={Clipped} nonFinite={NonFinite} partialPaddingSamples={Padding} recentProducerEmptySamples={Empty} latencyTrimSamples={Trimmed} queued={Queued}",
+            _monitorSamples, (now - _monitorLogTicks) * 1000.0 / frequency,
+            _monitorMaxGapTicks * 1000.0 / frequency,
+            _monitorRestartGapTicks * 1000.0 / frequency,
+            Math.Sqrt(_monitorSquareSum / Math.Max(1, _monitorSamples)), _monitorPeak,
+            _monitorClippedSamples, _monitorNonFiniteSamples,
+            Interlocked.Exchange(ref _monitorPartialPadding, 0),
+            Interlocked.Exchange(ref _monitorRecentProducerEmptySamples, 0),
+            Interlocked.Exchange(ref _monitorTrimmedSamples, 0), _txMonitorRing.Count);
+        _monitorLogTicks = now;
+        _monitorSamples = _monitorClippedSamples = _monitorNonFiniteSamples = _monitorMaxGapTicks = 0;
+        _monitorSquareSum = 0;
+        _monitorPeak = 0;
+        _monitorRestartGapTicks = 0;
     }
 
     private void MaybeLog()

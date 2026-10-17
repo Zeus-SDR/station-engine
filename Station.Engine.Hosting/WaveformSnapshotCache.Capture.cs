@@ -4,6 +4,14 @@ namespace Zeus.Server;
 public sealed partial class WaveformSnapshotCache
 {
     private WaveformCaptureSession? _session;
+    internal bool IsCaptureActive
+    {
+        get
+        {
+            var session = Volatile.Read(ref _session);
+            return session is not null && Volatile.Read(ref session.Status) == "capturing";
+        }
+    }
     private Timer? _captureExpiry;
     private int _startingCapture;
     private void ExpireCapture(object? unused)
@@ -21,7 +29,7 @@ public sealed partial class WaveformSnapshotCache
         }
     }
     public WaveformCaptureMetadata? StartCapture(object? context, long now, int receiver,
-        bool tx, int durationMs, string mode, out string? error)
+        bool tx, int durationMs, string mode, out string? error, bool microphone = false, bool monitor = false)
     {
         // Large sample storage is allocated outside the producer lock and DSP thread.
         if (context is null) { error = "Signal source is unavailable"; return null; }
@@ -35,7 +43,7 @@ public sealed partial class WaveformSnapshotCache
                 _session?.Check(context, now, Volatile.Read(ref _missed) != 0);
                 if (_session?.Status == "capturing") { error = "A capture is already running"; return null; }
             }
-            var pending = new WaveformCaptureSession(context, receiver, tx, durationMs, mode, 0, now);
+            var pending = new WaveformCaptureSession(context, receiver, tx, durationMs, mode, 0, now, microphone, monitor);
             lock (_sync)
             {
                 _session?.Check(context, now, Volatile.Read(ref _missed) != 0);

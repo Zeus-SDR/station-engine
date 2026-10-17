@@ -614,9 +614,10 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     // we send as fast as packets are ready so the radio never underruns.
     private const double TxFifoTargetSamples = 1250.0;
     // Keep live TX realtime if the producer briefly overruns the paced DUC
-    // sender. 32 packets is about 40 ms at 800 packets/s, enough for normal
-    // WDSP bursts but too small to become audible delayed speech.
-    private const int TxIqVoiceMaxQueuedPackets = 32;
+    // sender. Retain the existing 40 ms burst budget plus the 20 ms startup
+    // reserve; restoring the old cap after priming could discard its first
+    // speech samples when the next complete WDSP burst arrives.
+    private const int TxIqVoiceMaxQueuedPackets = 48;
     // TX_CHRONO backlog gating keeps the steady-state queue near one chunk.
     // This 320 ms ceiling only needs to absorb large client chunks without
     // dropping: an 8192-sample chunk at 48 kHz needs ~137 packets.
@@ -627,7 +628,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     public bool TxIqTimingExact
     {
         get => _txIqTimingExact;
-        set => _txIqTimingExact = value;
+        set
+        {
+            _txIqTimingExact = value;
+            SignalTxIqQueue();
+        }
     }
 
     private readonly float[] _txIqScratch = new float[TxIqSamplesPerPacket * 2];
@@ -643,6 +648,9 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private readonly Channel<RevisionedTxIqPacket> _txIqQueue = Channel.CreateUnbounded<RevisionedTxIqPacket>();
     private readonly TxIqPacketPool _txIqPacketPool = new(BufLen);
     private Task? _txIqSenderTask;
+    private readonly TxIqStartupBuffer _txIqStartupBuffer = new();
+    private readonly TxIqSilenceRuns _txIqSilenceRuns = new();
+    private long _txIqStartupDrainEpoch = -1;
     private long _txIqInputComplexSamples;
     private long _txIqPacketsQueued;
     private long _txIqPacketsSent;
@@ -2504,6 +2512,10 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     public bool WaitForTxIqQueueIdle(TimeSpan timeout)
     {
+        // A short over may not fill a cadence. Tail drains explicitly release
+        // startup before waiting; never hold the first syllable until unkey.
+        Interlocked.Exchange(ref _txIqStartupDrainEpoch, Interlocked.Read(ref _txIqTimingEpoch));
+        SignalTxIqQueue();
         long start = Stopwatch.GetTimestamp();
         long timeoutTicks = timeout <= TimeSpan.Zero
             ? 0
@@ -2584,6 +2596,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         {
             Interlocked.Add(ref _txIqResetDrainedPackets, drained);
         }
+        SignalTxIqQueue();
     }
 
     private void FlushTxIqLocked()
@@ -2597,12 +2610,14 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         try
         {
             WriteBeU32(p, 0, _seqCmdTxIq++);
+            int peakQuantized = 0;
             for (int i = 0; i < TxIqSamplesPerPacket; i++)
             {
                 float fi = _txIqScratch[i * 2];
                 float fq = _txIqScratch[i * 2 + 1];
                 int vi = Int24Clamp(fi);
                 int vq = Int24Clamp(fq);
+                peakQuantized = Math.Max(peakQuantized, Math.Max(Math.Abs(vi), Math.Abs(vq)));
                 int off = 4 + i * 6;
                 p[off + 0] = (byte)((vi >> 16) & 0xff);
                 p[off + 1] = (byte)((vi >> 8) & 0xff);
@@ -2616,7 +2631,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             // 8-packet burst from one WDSP cycle straight to the wire overfills
             // then starves the FIFO, showing up as a pulsed carrier.
             DropStaleTxIqPacketsIfBackedUpLocked();
-            var queued = new RevisionedTxIqPacket(p, _txIqScratchRevision);
+            var queued = new RevisionedTxIqPacket(p, _txIqScratchRevision, peakQuantized);
             // Publish the count before the packet. The sender can dequeue as
             // soon as TryWrite succeeds; incrementing afterward lets its
             // decrement observe zero and leaves a phantom queued packet that
@@ -2691,16 +2706,28 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     private bool WaitForTxIqPacket(CancellationToken ct)
     {
-        if (ct.IsCancellationRequested) return false;
-        if (_txIqQueue.Reader.TryPeek(out _)) return true;
-        // Match the direct producer-to-sender wake-up used by the native mic
-        // worker and pihpsdr's TX semaphore. Channel's asynchronous wait can
-        // need a normal ThreadPool worker even though this thread is promoted.
+        // Direct producer wake-up keeps startup and cancellation independent
+        // of ThreadPool availability, just like the steady-state sender.
         lock (_txIqGate)
         {
             while (!ct.IsCancellationRequested)
             {
-                if (_txIqQueue.Reader.TryPeek(out _)) return true;
+                if (_txIqQueue.Reader.TryPeek(out _))
+                {
+                    long epoch = Interlocked.Read(ref _txIqTimingEpoch);
+                    bool bypass = !_moxOn || _tuneActive || Volatile.Read(ref _cwActive)
+                        || TxIqTimingExact || _txIqTimingExactTailQueued
+                        || Interlocked.Read(ref _txIqStartupDrainEpoch) == epoch;
+                    int waitMs = _txIqStartupBuffer.WaitMilliseconds(
+                        epoch, Stopwatch.GetTimestamp(), Stopwatch.Frequency, bypass);
+                    if (waitMs == 0) return true;
+                    Monitor.Wait(_txIqGate, waitMs);
+                    continue;
+                }
+                // Return to the sender to publish the short final content window
+                // after unkey/reset, even though no next packet is queued.
+                if (_txIqSilenceRuns.HasSamples
+                    && _txIqSilenceRuns.Epoch != Interlocked.Read(ref _txIqTimingEpoch)) return true;
                 if (_txIqQueue.Reader.Completion.IsCompleted) return false;
                 Monitor.Wait(_txIqGate);
             }
@@ -2726,6 +2753,10 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         var ep = new IPEndPoint(_radioEndpoint!.Address, 1029);
         double fifoSamples = 0.0;
         long primedEpoch = -1;
+        long diagnosticEpoch = -1, diagnosticEpochStarted = 0;
+        int diagnosticUnderrunEvents = 0;
+        double diagnosticFirstUnderrunAgeMs = -1;
+        double diagnosticUnderrunMsMax = 0;
         long lastTicks = Stopwatch.GetTimestamp();
         double ticksPerSecond = Stopwatch.Frequency;
         // 1 Hz TX-IQ rate log (mirrors P1's p1.tx.rate). The radio's DUC needs
@@ -2735,6 +2766,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         int rateCount = 0;
         long lastRateTicks = lastTicks;
         var sendTiming = new TxIqSendTiming();
+        var silenceRuns = _txIqSilenceRuns;
         using var cancelWake = ct.UnsafeRegister(
             static state => ((Protocol2Client)state!).SignalTxIqQueue(), this);
         try
@@ -2745,6 +2777,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                 if (!WaitForTxIqPacket(ct)) break;
                 long phaseEpoch = Interlocked.Read(ref _txIqTimingEpoch);
                 sendTiming.RecordPhase(TxIqSendTiming.Phase.Input, Stopwatch.GetTimestamp() - phaseStarted, phaseEpoch);
+                if (silenceRuns.Epoch != phaseEpoch)
+                {
+                    if (silenceRuns.HasSamples) LogTxIqContent(silenceRuns.TakeWindow(), "end");
+                    silenceRuns.Observe(phaseEpoch, (int)TxDacSampleRate, 0, false, false);
+                }
                 if (!reader.TryRead(out var queued)) continue;
                 // Transfer the packet from queued to in-flight without an
                 // observable idle gap. Tail drains must not return while the
@@ -2765,13 +2802,29 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                     {
                         // Drain by wall-clock since the previous send.
                         long now = Stopwatch.GetTimestamp();
+                        if (diagnosticEpoch != phaseEpoch)
+                        {
+                            diagnosticEpoch = phaseEpoch;
+                            diagnosticEpochStarted = now;
+                            diagnosticUnderrunEvents = 0;
+                            diagnosticFirstUnderrunAgeMs = -1;
+                            diagnosticUnderrunMsMax = 0;
+                        }
                         double elapsedSec = (now - lastTicks) / ticksPerSecond;
                         fifoSamples -= elapsedSec * TxDacSampleRate;
                         if (fifoSamples < 0.0)
                         {
                             // Emptied since a send in this same keying epoch:
                             // the radio played out everything we gave it.
-                            if (primedEpoch == phaseEpoch) Interlocked.Increment(ref _txIqUnderruns);
+                            if (primedEpoch == phaseEpoch)
+                            {
+                                Interlocked.Increment(ref _txIqUnderruns);
+                                diagnosticUnderrunEvents++;
+                                double deficitMs = -fifoSamples * 1000 / TxDacSampleRate;
+                                diagnosticUnderrunMsMax = Math.Max(diagnosticUnderrunMsMax, deficitMs);
+                                if (diagnosticFirstUnderrunAgeMs < 0)
+                                    diagnosticFirstUnderrunAgeMs = (now - diagnosticEpochStarted) * 1000 / ticksPerSecond;
+                            }
                             fifoSamples = 0.0;
                         }
                         lastTicks = now;
@@ -2792,6 +2845,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                             lastTicks = now;
                         }
 
+                        bool packetSent = false;
+                        long sentEpoch = phaseEpoch;
                         try
                         {
                             // Decision 12: a packet dequeued before an unkey/trip
@@ -2822,12 +2877,22 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                                 rateCount++;
                                 primedEpoch = timingEpoch;
                                 Interlocked.Increment(ref _txIqPacketsSent);
+                                sentEpoch = timingEpoch;
+                                packetSent = true;
                             }
                         }
                         catch (ObjectDisposedException) { break; }
                         catch (SocketException ex)
                         {
                             RecordTxIqSendFailure(ex, Stopwatch.GetTimestamp());
+                        }
+
+                        // Only actual successful egress contributes content. Producer
+                        // stale drops, rejected revisions and socket failures do not.
+                        if (packetSent)
+                        {
+                            silenceRuns.Observe(sentEpoch, (int)TxDacSampleRate, TxIqSamplesPerPacket,
+                                queued.PeakQuantized == 0, queued.PeakQuantized <= 8388); // <= 0.001 full scale
                         }
 
                         if (now - lastRateTicks >= ticksPerSecond)
@@ -2845,13 +2910,18 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                                 var timing = sendTiming.TakeWindow();
                                 var phases = sendTiming.TakePhases();
                                 long socketUs = TxIqSendTiming.Microseconds(Interlocked.Exchange(ref _txIqSocketMaxTicks, 0));
-                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps} inputWaitUsMax={InputUs} pacingUsMax={PacingUs} sendGateUsMax={SendGateUs} datagramUsMax={DatagramUs} socketUsMax={SocketUs}",
+                                _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps} inputWaitUsMax={InputUs} pacingUsMax={PacingUs} sendGateUsMax={SendGateUs} datagramUsMax={DatagramUs} socketUsMax={SocketUs} epoch={Epoch} txAgeMs={AgeMs:F0} modeledUnderruns={Underruns} modeledEmptyMsMax={EmptyMs:F2} firstModeledUnderrunAgeMs={FirstAgeMs:F2}",
                                     rateCount, fifoSamples, Interlocked.Read(ref _txIqSendFailures),
                                     _txIqSuppressedSendWarnings, 0L,
                                     Interlocked.Read(ref _txIqNotWritable), Interlocked.Read(ref _txIqSocketErrors),
                                     Interlocked.Read(ref _txIqSafetyRejected), Interlocked.Read(ref _txIqStaleQueueDrops),
                                     timing.MaxGapUs, timing.GapsOver10Ms,
-                                    phases.InputUs, phases.PacingUs, phases.SendGateUs, phases.DatagramUs, socketUs);
+                                    phases.InputUs, phases.PacingUs, phases.SendGateUs, phases.DatagramUs, socketUs,
+                                    phaseEpoch, (now - diagnosticEpochStarted) * 1000 / ticksPerSecond,
+                                    diagnosticUnderrunEvents, diagnosticUnderrunMsMax, diagnosticFirstUnderrunAgeMs);
+                                LogTxIqContent(silenceRuns.TakeWindow(), "window");
+                                diagnosticUnderrunEvents = 0;
+                                diagnosticUnderrunMsMax = 0;
                             }
                             catch { /* never let a diagnostic kill TX */ }
                             rateCount = 0;
@@ -2873,6 +2943,24 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         {
             _log.LogWarning(ex, "p2.txiq sender exited with error");
         }
+        finally
+        {
+            if (silenceRuns.HasSamples) LogTxIqContent(silenceRuns.TakeWindow(), "end");
+        }
+    }
+
+    private void LogTxIqContent(TxIqSilenceRuns.Window content, string phase)
+    {
+        try
+        {
+            _log.LogInformation(
+                "p2.tx.content phase={Phase} epoch={Epoch} samples={Samples} zeroSamples={Zeros} quietSamples={Quiet} sampleTimeMs={TimeMs:F2} currentZeroMs={ZeroMs:F2} maxZeroMs={ZeroMaxMs:F2} currentQuietMs={QuietMs:F2} maxQuietMs={QuietMaxMs:F2} initialQuietMs={InitialMs:F2} quietResumptionsGe50ms={Resumed} quietThreshold=0.001",
+                phase, content.Epoch, content.Samples, content.ZeroSamples, content.QuietSamples,
+                content.SampleTimeMs, content.CurrentZeroMs, content.MaxZeroMs,
+                content.CurrentQuietMs, content.MaxQuietMs, content.InitialQuietMs,
+                content.QuietResumptionsOver50Ms);
+        }
+        catch { /* never let a diagnostic kill TX */ }
     }
 
     internal static int Int24Clamp(float v)

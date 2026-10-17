@@ -71,6 +71,9 @@ public interface IProductTxAudioPort
 {
     bool Active { get; }
     void ProcessTx(Span<float> block48k);
+    /// <summary>Discard transport history from the previous voice transmission.
+    /// Processing/plugin state and shared-ring sequence numbers remain intact.</summary>
+    void BeginVoiceTxEpoch() { }
     void ProcessRx(Span<float> block48k) { }
 
     /// <summary>

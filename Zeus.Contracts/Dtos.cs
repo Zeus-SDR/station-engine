@@ -1650,9 +1650,9 @@ public sealed record StateDto(
     // PS-feedback analyzer fed from the radio's loopback ADC, so the
     // operator sees the actual on-air signal. Default off — preserves the
     // Thetis-style predistorted view. Hidden / disabled in the UI on
-    // boards that have no PS feedback path (e.g. HermesLite2). NOT
-    // persisted server-side: this is an operator viewing preference,
-    // resets to off each session.
+    // boards that have no PS feedback path (e.g. HermesLite2). Persisted
+    // by RadioStateStore as an operator viewing preference (issue #3060);
+    // it never arms PS. The engine ignores it on HermesLite2.
     bool PsMonitorEnabled = false,
     // TX Monitor — operator-facing preview toggle (issue #106 follow-up).
     // When true, the engine demodulates the post-CFIR TX IQ back to mono

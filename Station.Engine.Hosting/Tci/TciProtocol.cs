@@ -190,6 +190,24 @@ public static class TciProtocol
         int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
 
     /// <summary>
+    /// Try parse a TCI spot colour. ExpertSDR and Thetis clients send ARGB as an
+    /// unsigned decimal (opaque blue is 4278190335), which overflows a signed
+    /// int; a signed value (-16776961) is still accepted for older clients.
+    /// </summary>
+    public static bool TryParseArgb(string arg, out uint value)
+    {
+        if (uint.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            return true;
+        if (int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out int signed))
+        {
+            value = unchecked((uint)signed);
+            return true;
+        }
+        value = 0;
+        return false;
+    }
+
+    /// <summary>
     /// Try parse a long integer TCI arg (VFO frequencies are 64-bit).
     /// </summary>
     public static bool TryParseLong(string arg, out long value) =>

@@ -2216,6 +2216,7 @@ public partial class DspPipelineService : BackgroundService,
 
     public override void Dispose()
     {
+        if (_micCaptureIngest is not null) _micCaptureIngest.MicPcmTapped -= CaptureMicWaveform;
         _hub.CwDecodeRequestChanged -= OnCwNoiseReductionDemandChanged;
         ClearCwNoiseReductionBypass();
         if (_sMeterCalibrationStore is not null)
@@ -6978,7 +6979,7 @@ public partial class DspPipelineService : BackgroundService,
         if (_appliedTxMonitorEnabled != s.TxMonitorEnabled)
         {
             _log.LogInformation("txMonitor.latch enabled={Enabled}", s.TxMonitorEnabled);
-            engine.SetTxMonitorEnabled(s.TxMonitorEnabled);
+            ReconcileCaptureMonitor(engine, s);
             _appliedTxMonitorEnabled = s.TxMonitorEnabled;
             // Meter-only is a per-monitor-session flag — drop it whenever the
             // monitor turns off so a later audible Preview is never silenced by
@@ -9762,6 +9763,7 @@ public partial class DspPipelineService : BackgroundService,
         if (engine is null) return true;
 
         var state = _radio.Snapshot();
+        ReconcileCaptureMonitor(engine, state);
         ReconcileExternalPureSignalStatusForTick(engine, state);
         CaptureBandwidthSpectra(engine, state);
         // Synthetic engine stays open while disconnected so SetMode/SetFilter
@@ -9896,13 +9898,17 @@ public partial class DspPipelineService : BackgroundService,
             // TX analyzer if the PS-FB analyzer hasn't produced a fresh FFT yet
             // — same shape as the existing TX → RX fallback. Default-off
             // toggle: when off the codepath is identical to pre-#121, byte for
-            // byte, on every board.
+            // byte, on every board. The toggle persists across restarts
+            // (issue #3060) and the UI hides it on HermesLite2, so a value
+            // saved while another radio was connected is ignored there: HL2
+            // keeps the exact monitor-off path it has always had.
             bool g2eP2PsDisplay = _keyed && _appliedPsEnabled
                 && _p2DisplayDuplexForCurrentTx
                 && _radio.ConnectedBoardKind == HpsdrBoardKind.HermesC10;
             if (_keyed && _appliedPsEnabled && (!_p2DisplayDuplexForCurrentTx || g2eP2PsDisplay))
             {
                 if (_appliedPsEnabled && _psMonitorEnabled
+                    && _radio.ConnectedBoardKind != HpsdrBoardKind.HermesLite2
                     && (psFeedbackCorrecting = engine.GetPsStageMeters().Correcting))
                 {
                     pan = engine.TryGetPsFeedbackDisplayPixels(DisplayPixout.Panadapter, panBuf);
@@ -10337,6 +10343,7 @@ public partial class DspPipelineService : BackgroundService,
         // don't broadcast it. The VST RX seam still fires on the drained RX
         // so RX-side plugins keep running even while monitor is on.
         bool txMonitorOn = engine.IsTxMonitorOn;
+        bool txMonitorMeterOnly = _txMonitorMeterOnly || !state.TxMonitorEnabled;
         // Read once, up front: everything below that decides which receiver's
         // audio survives this tick (RX1, each secondary, and the publish
         // branch) needs to agree on the same keyed/post-TX-drain snapshot.
@@ -10426,7 +10433,7 @@ public partial class DspPipelineService : BackgroundService,
         // TX monitor normally replaces RX (including the per-receiver taps).
         // Under DUP the monitor is mixed WITH receive audio, so the taps keep
         // flowing too.
-        bool streamLocalRx = txMonitorOn
+        bool streamLocalRx = txMonitorOn && state.TxMonitorEnabled
             ? duplexLocalRxLive
             : !suppressRxAudioForTx || allowLocalRxDuringSuppression;
         // Suppression drops the owner from the modem. Mute does not: the
@@ -10600,7 +10607,7 @@ public partial class DspPipelineService : BackgroundService,
         // block (captured at the publish point) with the TX monitor, as Thetis
         // mixes RX and MON on its audio bus while full duplex is on.
         bool duplexRxUnderTxMonitor =
-            txMonitorOn && !_txMonitorMeterOnly && duplexCarriesLocalRx;
+            txMonitorOn && !txMonitorMeterOnly && duplexCarriesLocalRx;
         int duplexMonitorRxCount = 0;
         // With DUP active, the bus can carry live local audio even while the
         // keyed/post-TX suppression clock is running. Only fall back to the
@@ -10647,7 +10654,7 @@ public partial class DspPipelineService : BackgroundService,
             // rx.post-demod manifest slot, wired through _rxAudioPluginHandler
             // below. The two never share plugin instances or IIR state.
 
-            if (externalRxPreserved && (!txMonitorOn || _txMonitorMeterOnly))
+            if (externalRxPreserved && (!txMonitorOn || txMonitorMeterOnly))
             {
                 // Preserve the established local-TX suppressed lane (silence
                 // plus optional sidetone) and add Kiwi only at its output.
@@ -10663,7 +10670,7 @@ public partial class DspPipelineService : BackgroundService,
                 MarkTxSuppressedAudioBlockPublished();
             }
             else if (duplexRxUnderTxMonitor
-                || ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly))
+                || ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, txMonitorMeterOnly))
             {
                 // FM squelch is owned by WDSP's FMSQ noise detector upstream;
                 // the managed adaptive audio-RMS gate is invalid for FM (open-
@@ -10843,7 +10850,7 @@ public partial class DspPipelineService : BackgroundService,
                     MarkTxSuppressedAudioBlockPublished();
                 }
             }
-            else if (!txMonitorOn && suppressPublishedRxAudio)
+            else if ((!txMonitorOn || !state.TxMonitorEnabled) && suppressPublishedRxAudio)
             {
                 PublishTxSuppressedAudio(
                     audioBuf,
@@ -10853,7 +10860,7 @@ public partial class DspPipelineService : BackgroundService,
                 MarkTxSuppressedAudioBlockPublished();
             }
         }
-        else if (!txMonitorOn && suppressPublishedRxAudio)
+        else if ((!txMonitorOn || !state.TxMonitorEnabled) && suppressPublishedRxAudio)
         {
             PublishTxSuppressedAudio(
                 audioBuf,
@@ -10862,7 +10869,7 @@ public partial class DspPipelineService : BackgroundService,
                 state.Squelch ?? new SquelchConfig());
             MarkTxSuppressedAudioBlockPublished();
         }
-        else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly) && !rxAudioMuted && MonitorBacklog > 0)
+        else if (ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, txMonitorMeterOnly) && !rxAudioMuted && MonitorBacklog > 0)
         {
             // FIX 4: RX produced no audio this tick (RX1 muted, or no band audio)
             // yet a local clip is playing back through the monitor-inject ring.
@@ -10902,7 +10909,7 @@ public partial class DspPipelineService : BackgroundService,
         // is drained exactly once per tick — no double-drain, no starvation. Like
         // FIX 4 it deliberately does NOT fire RxAudioAvailable: the RX-capture tap
         // (TCI / Recorder RX capture) must stay recorder-free and byte-identical.
-        if (rxAudioMuted && ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, _txMonitorMeterOnly) && MonitorBacklog > 0)
+        if (rxAudioMuted && ShouldPublishNormalRxAudio(txMonitorOn, suppressPublishedRxAudio, txMonitorMeterOnly) && MonitorBacklog > 0)
         {
             int monBlock = Math.Min(audioBuf.Length, MonitorInjectSilentBlockSamples);
             Array.Clear(audioBuf, 0, monBlock);
@@ -10944,7 +10951,7 @@ public partial class DspPipelineService : BackgroundService,
                     SampleCount: (ushort)monCount,
                     Samples: new ReadOnlyMemory<float>(audioBuf, 0, monCount));
                 CaptureAudioDiagnostics(
-                    _txMonitorMeterOnly ? "tx-monitor-meter-only" : "tx-monitor",
+                    txMonitorMeterOnly ? "tx-monitor-meter-only" : "tx-monitor",
                     in monFrame,
                     finalAudioRms,
                     finalAudioPeak,
@@ -10954,6 +10961,7 @@ public partial class DspPipelineService : BackgroundService,
                 // the air). Read-only fan-out to IRxAudioTapPlugin/ITxAudioTapPlugin
                 // taps; null subscriber list = no cost. Fire it before Kiwi is
                 // added to the operator monitor so the air tap stays TX-only.
+                CaptureMonitorWaveform(engine, state, audioBuf.AsSpan(0, monCount));
                 TxMonitorAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, monCount));
                 // Monitor volume is an operator playback preference, not a
                 // TX-chain control. Apply it only after diagnostics and the
@@ -10966,7 +10974,7 @@ public partial class DspPipelineService : BackgroundService,
             // broadcast; the ordinary RX path above has already carried Kiwi.
             // For the audible TX monitor, retain Kiwi alongside the local
             // sidetone/processed monitor instead of letting TX replace it.
-            if (!_txMonitorMeterOnly)
+            if (!txMonitorMeterOnly)
             {
                 int publishCount = monCount;
                 // MON can remain enabled before, during, and after a keying
@@ -10979,7 +10987,7 @@ public partial class DspPipelineService : BackgroundService,
                 bool includeDuplexRx = duplexMonitorRxCount > 0 && !rxAudioMuted;
                 bool includeExternalRx = !includeDuplexRx && ShouldMixExternalRxIntoTxMonitor(
                     externalRxCount,
-                    _txMonitorMeterOnly,
+                    txMonitorMeterOnly,
                     rxAudioMuted);
                 if (includeDuplexRx)
                 {
