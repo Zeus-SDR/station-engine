@@ -7786,7 +7786,11 @@ public partial class DspPipelineService : BackgroundService,
 
     private void AdvanceSecondaryAgc(IDspEngine engine)
     {
-        lock (_engineLock)
+        // Tick can run inline on the UDP receive thread. A filter redesign owns
+        // this gate for much longer than an IQ packet interval; defer this slew
+        // to the next tick instead of stopping IQ ingestion while it completes.
+        if (!Monitor.TryEnter(_engineLock)) return;
+        try
         {
             if (!ReferenceEquals(engine, _engine)) return;
             var state = _radio.Snapshot();
@@ -7797,6 +7801,10 @@ public partial class DspPipelineService : BackgroundService,
                 if (rx.AppliedAgcTopDb != EffectiveAgcGainDb(RadioService.ReceiverAgcState(state, index)))
                     ApplyStateToSecondaryRxChannel(engine, index, rx.ChannelId, state);
             }
+        }
+        finally
+        {
+            Monitor.Exit(_engineLock);
         }
     }
 

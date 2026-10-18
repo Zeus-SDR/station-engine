@@ -2689,7 +2689,9 @@ public sealed record CwSettingsSetRequest(
     string? Rev = null);
 
 // CW station ID timer (/api/cwid). The ID is mixed into the operator's own
-// voice transmission; it never keys the radio by itself. Wpm is capped at 20
+// voice transmission; the interval timer never keys the radio by itself. The
+// On the 10 schedule (CwIdStartRequest.OnTheTen) does: it sends on every
+// 10-minute clock mark and keys an idle radio to do so. Wpm is capped at 20
 // (FCC 97.119(b)(1) limit for a CW ID on a phone emission). LevelDb is the
 // tone peak relative to digital full scale, before the TX chain.
 public sealed record CwIdSettingsDto(
@@ -2706,14 +2708,18 @@ public sealed record CwIdSettingsSetRequest(
     int? IntervalMinutes = null);
 
 // Callsign is resolved by the client (QRZ callsign or operator override, via
-// /api/operator) and validated server-side.
-public sealed record CwIdStartRequest(string? Callsign);
+// /api/operator) and validated server-side. OnTheTen = true sends the ID on
+// every 10-minute mark of the station clock (:00, :10, :20 ...), keying the
+// radio when the operator is not transmitting; false is the interval timer.
+public sealed record CwIdStartRequest(string? Callsign, bool OnTheTen = false);
 
 // SkipFinalId = true stops without the end-of-contact ID.
 public sealed record CwIdStopRequest(bool SkipFinalId = false);
 
 // Live timer state. Due = an ID is owed and goes out on the next voice
 // transmission. SecondsUntilDue is null until the first key-down of a period.
+// OnTheTen = the clock-mark schedule is engaged; NextIdUtc is its next mark
+// (null otherwise).
 public sealed record CwIdStatusDto(
     bool Running,
     string? Callsign,
@@ -2722,7 +2728,9 @@ public sealed record CwIdStatusDto(
     bool FinalIdArmed,
     int? SecondsUntilDue,
     DateTime? LastIdUtc,
-    CwIdSettingsDto Settings);
+    CwIdSettingsDto Settings,
+    bool OnTheTen = false,
+    DateTime? NextIdUtc = null);
 
 // Hermes-Lite 2 (and the wider openHPSDR family) on-board CW keyer mode,
 // written to C&C register 0x0B C3[7:6] (gateware rtl/cw_openhpsdr.sv:32).

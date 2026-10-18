@@ -112,6 +112,14 @@ public sealed class PluginInstaller
             throw new PluginInstallException(
                 "plugin package must be a zip file containing plugin.json at the top level", ex);
         }
+        catch (JsonException ex)
+        {
+            // A plugin.json that is not valid JSON, or whose fields have the
+            // wrong shape (e.g. "permissions" as an array), must surface as a
+            // readable install error, not an unhandled 500 the UI shows as
+            // "Failed to fetch". ex.Message names the JSON path and line.
+            throw new PluginInstallException($"manifest invalid: {ex.Message}", ex);
+        }
 
         var errors = ManifestValidator.Validate(manifest);
         if (errors.Count > 0)

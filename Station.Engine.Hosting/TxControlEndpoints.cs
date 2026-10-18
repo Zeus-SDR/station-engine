@@ -158,7 +158,8 @@ public static class TxControlEndpoints
         // can reconcile its store with what the server actually stored
         // (e.g. clamped values).
         // CW station ID timer. The ID is mixed into the operator's own voice
-        // transmission (TxAudioIngest); none of these routes key the radio.
+        // transmission (TxAudioIngest). Only Instant ID and the On the 10
+        // schedule (start with OnTheTen) key the radio.
         endpoints.MapGet("/api/cwid", (CwIdService cwId) => Results.Ok(cwId.Status()));
 
         endpoints.MapPost("/api/cwid/instant", (CwIdStartRequest req, CwIdService cwId, TxService tx, HttpContext context) =>
@@ -170,7 +171,7 @@ public static class TxControlEndpoints
         });
 
         endpoints.MapPost("/api/cwid/start", (CwIdStartRequest req, CwIdService cwId) =>
-            cwId.Start(req.Callsign, out var error)
+            cwId.Start(req.Callsign, req.OnTheTen, out var error)
                 ? Results.Ok(cwId.Status())
                 : Results.BadRequest(new { error }));
 
