@@ -2753,6 +2753,27 @@ public sealed partial class RadioService : IDisposable
     public static long TxEffectiveLoHz(StateDto state) =>
         CwOffset.EffectiveLoHz(RadioFrequencyResolver.TxMode(state), TxCarrierHz(state));
 
+    // Firmware CW feeds a DC envelope to the TX NCO (I=CW_RF, Q=0).
+    // Thetis UpdateTXDDSFreq leaves that NCO on the dial; only software CW
+    // and Tune use the pitch-shifted LO to compensate their generated tone.
+    internal bool HardwareCwOwnsCarrier(StateDto state) =>
+        IsCwMode(RadioFrequencyResolver.TxMode(state)) && HardwareCwHostIdleAndUnblocked();
+
+    internal long TxHardwareLoHz(StateDto state) =>
+        HardwareCwOwnsCarrier(state) ? TxCarrierHz(state) : TxEffectiveLoHz(state);
+
+    private void PushHardwareCwTxFrequency(bool includeProtocol2 = true)
+    {
+        lock (_sync)
+        {
+            var state = ProjectedStateUnderLock();
+            if (ActiveClient is Zeus.Protocol1.Protocol1Client p1)
+                p1.SetHardwareCwTxFrequency(HardwareCwOwnsCarrier(state)
+                    ? ToHardwareFrequencyHz(TxCarrierHz(state)) : 0);
+            if (includeProtocol2)
+                _p2Client?.SetTxDucFrequency(ToHardwareFrequencyHz(TxHardwareLoHz(state)));
+        }
+    }
     public StateDto SwapVfos()
     {
         long previousTx = 0;
@@ -5453,6 +5474,7 @@ public sealed partial class RadioService : IDisposable
     internal void SetHardwareCwSafetyBlocked(bool blocked)
     {
         Volatile.Write(ref _hardwareCwSafetyBlocked, blocked ? 1 : 0);
+        PushHardwareCwTxFrequency();
         PushCwToP2();
         PushCwKeyerEnabledToP1OnEdge();
     }
@@ -5473,6 +5495,7 @@ public sealed partial class RadioService : IDisposable
     public void SetHostCwKeying(bool active)
     {
         Volatile.Write(ref _hostCwKeying, active ? 1 : 0);
+        PushHardwareCwTxFrequency();
         PushCwToP2();
         PushCwKeyerEnabledToP1OnEdge();
     }
@@ -6250,12 +6273,22 @@ public sealed partial class RadioService : IDisposable
         var paBandCfg = paBandName is not null
             ? cfg.Bands.FirstOrDefault(b => b.Band == paBandName) ?? new PaBandSettingsDto(paBandName)
             : new PaBandSettingsDto("unknown");
-        // Transverter PA calibration follows its stable profile slot. Relay
-        // masks, RF filtering, and antenna routing remain tied to the
-        // translated hardware IF band so existing safe routing is unchanged.
+        // Transverter PA calibration follows its stable profile slot.
+        // Disable-PA, RF filtering, and antenna routing remain tied to the
+        // translated hardware IF band so existing safe routing is unchanged;
+        // the OC pins are resolved separately below (ocBandCfg).
         var bandCfg = hardwareBandName is not null
             ? cfg.Bands.FirstOrDefault(b => b.Band == hardwareBandName) ?? new PaBandSettingsDto(hardwareBandName)
             : new PaBandSettingsDto("unknown");
+        // Thetis VHF OC parity (Penny.UpdateExtCtrl with Band.VHF0 + xvtr
+        // index): through a transverter the OC pins come from that profile's
+        // own row. A row set to follow its IF band keeps the pre-VHF-OC wiring
+        // (the IF band's HF row). Disable-PA, filters and antenna routing stay
+        // on the hardware IF band either way; HL2's N2ADR filter bits are
+        // composed from the IF frequency at the wire and are unaffected.
+        var ocBandCfg = txThroughTransverter && paBandCfg.OcFollowIfBand != true
+            ? paBandCfg
+            : bandCfg;
 
         bool tunActive;
         lock (_sync) tunActive = _tunActive;
@@ -6318,12 +6351,12 @@ public sealed partial class RadioService : IDisposable
             && (!txThroughTransverter || !txXvtrBand.DisablePa);
 
         _log.LogInformation(
-            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} swrFoldback={SwrFoldback} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} iqScale={IqScale:F4} paEn={PaEn} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
+            "pa.recompute tunActive={Tun} requestedPct={RequestedPct} pct={Pct} swrFoldback={SwrFoldback} driveMaxPct={DriveMaxPct} txVfo={TxVfo} txHz={TxHz} band={Band} gainDb={Gain:F2} maxW={Max} profile={Profile} -> byte={Byte} iqScale={IqScale:F4} paEn={PaEn} ocBand={OcBand} ocTx=0x{OcTx:X2} ocRx=0x{OcRx:X2} ocTune=0x{OcTune:X2} ocDxTx=0x{OcDxTx:X2} ocDxRx=0x{OcDxRx:X2}",
             tunActive, requestedPct, activePct, tunSwrFoldback, stateSnap.DriveMaxPct, stateSnap.TxVfo, txHz, paBandName ?? "?", driveGain, maxPowerWatts, driveProfile.BoardLabel, driveByte, driveOutput.IqScale, paEnabled,
-            bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune, bandCfg.OcDxTx, bandCfg.OcDxRx);
+            ocBandCfg.Band, ocBandCfg.OcTx, ocBandCfg.OcRx, ocBandCfg.OcTune, ocBandCfg.OcDxTx, ocBandCfg.OcDxRx);
 
         ActiveClient?.SetDriveOutput(driveOutput);
-        ActiveClient?.SetOcMasks(bandCfg.OcTx, bandCfg.OcRx, bandCfg.OcTune);
+        ActiveClient?.SetOcMasks(ocBandCfg.OcTx, ocBandCfg.OcRx, ocBandCfg.OcTune);
         ActiveClient?.SetPaEnabled(paEnabled);
         ActiveClient?.SetXvtrEnabled(xvtrOutputEnabled);
 
@@ -6372,17 +6405,17 @@ public sealed partial class RadioService : IDisposable
 
         PaSnapshotChanged?.Invoke(new PaRuntimeSnapshot(
             DriveByte: driveByte,
-            OcTxMask: bandCfg.OcTx,
-            OcRxMask: bandCfg.OcRx,
-            OcTuneMask: bandCfg.OcTune,
+            OcTxMask: ocBandCfg.OcTx,
+            OcRxMask: ocBandCfg.OcRx,
+            OcTuneMask: ocBandCfg.OcTune,
             PaEnabled: paEnabled,
             // Anvelina-PRO3 DX OC masks (issue #407) — always emitted in
             // the snapshot so DspPipelineService can forward them to the
             // Protocol2Client. The wire-encode in SendCmdHighPriority is
             // gated by board+variant, so non-Anvelina radios receive a
             // SetOcDxMasks call but the bytes never reach the wire.
-            OcDxTxMask: bandCfg.OcDxTx,
-            OcDxRxMask: bandCfg.OcDxRx,
+            OcDxTxMask: ocBandCfg.OcDxTx,
+            OcDxRxMask: ocBandCfg.OcDxRx,
             // External antenna (#804). HasTxAntennaRelays gates the alex0[26:24]
             // emission on the P2 client; RxAuxInput/MkiiBpfRxSelect drive the
             // operator RX-aux ORs (composed strictly before the PS coupler).
@@ -7550,6 +7583,7 @@ public sealed partial class RadioService : IDisposable
         _stateDirty = true;
         // Persist only when ARS actually changed the shift — never per tune tick.
         if (arsChanged) PersistLiveFmConfig();
+        PushHardwareCwTxFrequency(includeProtocol2: false);
         StateChanged?.Invoke(next);
     }
 

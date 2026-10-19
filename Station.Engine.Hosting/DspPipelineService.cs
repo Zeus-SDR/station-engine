@@ -6358,7 +6358,7 @@ public partial class DspPipelineService : BackgroundService,
         // capture centre away and the waterfall keeps one continuous frequency
         // frame through CTUN, XIT, split, and PureSignal overs.
         p2?.SetTxDucFrequency(
-            _radio.ToHardwareFrequencyHz(RadioService.TxEffectiveLoHz(s)));
+            _radio.ToHardwareFrequencyHz(_radio.TxHardwareLoHz(s)));
 
         // Issue #597 Phase 0: arm the RX display fast-attack when the LO
         // moves. First callback after construction only records the LO

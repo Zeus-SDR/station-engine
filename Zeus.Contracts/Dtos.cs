@@ -2976,6 +2976,14 @@ public sealed record ImportDatabaseRequest(string SourcePath, string? Name);
 // Open_Collector_Anvelina_DX spec (issue #407). Honoured by the wire path
 // only when the connected board is OrionMkII + AnvelinaPro3 variant on
 // Protocol 2; persisted on every band so DX wiring travels with the band.
+//
+// Transverter rows (Band = "xvtr:<slot>") are the Thetis VHF0..VHF13 OC rows:
+// while the radio is tuned through that transverter, its OcTx / OcRx / OcTune
+// (and DX) masks drive the OC pins instead of the hardware IF band's row.
+// OcFollowIfBand is the upgrade-compatibility switch for those rows: true
+// keeps the pre-VHF-OC behaviour (the IF band's HF row drives the pins). The
+// server reports the effective value on every transverter row and null on HF
+// rows; a PUT with null leaves the stored value unchanged.
 public sealed record PaBandSettingsDto(
     string Band,
     double PaGainDb = 0.0,
@@ -2985,7 +2993,8 @@ public sealed record PaBandSettingsDto(
     byte AutoOcMask = 0,
     byte OcDxTx = 0,
     byte OcDxRx = 0,
-    byte OcTune = 0);
+    byte OcTune = 0,
+    bool? OcFollowIfBand = null);
 
 // Globals shared across bands. PaMaxPowerWatts=0 disables the watts
 // conversion path and falls back to the legacy "drive% = raw 0-255 byte"

@@ -44,6 +44,13 @@ public sealed class PaSettingsStore : IDisposable
     private readonly ILiteCollection<PaDigitalModeDriveEntry> _digitalModeDrive;
     private readonly ILiteCollection<PaGlobalEntry> _globals;
     private readonly ILogger<PaSettingsStore> _log;
+    // Reserved pa_bands row holding the per-database "Use IF-band pins"
+    // default for transverter rows that never stored their own choice (see
+    // XvtrOcFollowIfDefaultLocked). It is not a band: GetAll/Save only touch
+    // BandUtils.PaBands keys. Keeping it in pa_bands makes the decision travel
+    // with the OC pins it was derived from through the legacy import, profile
+    // export and backup restore, which all copy pa_bands wholesale.
+    internal const string XvtrOcCompatRowKey = "meta:xvtr-oc-follow-if";
     private readonly object _sync = new();
     // Calibration edits must affect the live drive calculation without
     // becoming durable until the entire eleven-band run succeeds.  The
@@ -96,6 +103,7 @@ public sealed class PaSettingsStore : IDisposable
         _digitalModeDrive = _db.GetCollection<PaDigitalModeDriveEntry>("pa_digital_mode_drive");
         _digitalModeDrive.EnsureIndex(x => x.Mode, unique: true);
         _globals = _db.GetCollection<PaGlobalEntry>("pa_globals");
+        lock (_sync) XvtrOcFollowIfDefaultLocked();
 
         _log.LogInformation("PaSettingsStore initialized at {Path}", dbPath);
     }
@@ -128,16 +136,13 @@ public sealed class PaSettingsStore : IDisposable
                     NormalizeCalibrationSafetyPercent(g.PaCalibrationSafetyPercent));
 
             var existing = _bands.FindAll().ToDictionary(e => e.Band, e => e);
+            bool followIfDefault = XvtrOcFollowIfDefaultLocked();
             var bands = BandUtils.PaBands
                 .Select(b =>
                 {
                     var auto = AutoOcMaskFor(board, b);
-                    if (existing.TryGetValue(b, out var e))
-                    {
-                        var gain = ResolvePaGainDbForBoard(e.PaGainDb, e.Band, board, variant);
-                        return new PaBandSettingsDto(e.Band, gain, e.DisablePa, e.OcTx, e.OcRx, auto, e.OcDxTx, e.OcDxRx, e.OcTune);
-                    }
-                    return new PaBandSettingsDto(b, PaGainDb: PaDefaults.GetPaGainDb(board, b, variant), AutoOcMask: auto);
+                    existing.TryGetValue(b, out var e);
+                    return ToDto(b, e, board, variant, auto, followIfDefault);
                 })
                 .ToArray();
 
@@ -176,11 +181,63 @@ public sealed class PaSettingsStore : IDisposable
         {
             var auto = AutoOcMaskFor(board, band);
             var e = _bands.FindOne(x => x.Band == band);
-            if (e is null)
-                return new PaBandSettingsDto(band, PaGainDb: PaDefaults.GetPaGainDb(board, band, variant), AutoOcMask: auto);
-            var gain = ResolvePaGainDbForBoard(e.PaGainDb, e.Band, board, variant);
-            return new PaBandSettingsDto(e.Band, gain, e.DisablePa, e.OcTx, e.OcRx, auto, e.OcDxTx, e.OcDxRx, e.OcTune);
+            return ToDto(band, e, board, variant, auto, XvtrOcFollowIfDefaultLocked());
         }
+    }
+
+    private PaBandSettingsDto ToDto(
+        string band,
+        PaBandEntry? e,
+        HpsdrBoardKind board,
+        OrionMkIIVariant variant,
+        byte auto,
+        bool followIfDefault)
+    {
+        bool? followIf = BandUtils.IsXvtrBand(band)
+            ? e?.OcFollowIfBand ?? followIfDefault
+            : null;
+        if (e is null)
+            return new PaBandSettingsDto(
+                band,
+                PaGainDb: PaDefaults.GetPaGainDb(board, band, variant),
+                AutoOcMask: auto,
+                OcFollowIfBand: followIf);
+        var gain = ResolvePaGainDbForBoard(e.PaGainDb, e.Band, board, variant);
+        return new PaBandSettingsDto(
+            e.Band, gain, e.DisablePa, e.OcTx, e.OcRx, auto, e.OcDxTx, e.OcDxRx, e.OcTune, followIf);
+    }
+
+    // Thetis VHF OC parity: a transverter (VHF0..VHF13) drives the OC pins
+    // from its own row. Before this, Zeus drove them from the transverter's
+    // hardware IF band's HF row, and its help text told operators to wire
+    // transverter switching there. The first time a pa_bands data set is seen
+    // by a build with VHF OC (store open, or a restored backup), the store
+    // records whether it already carried any HF OC pin. If it did, every
+    // transverter row without its own stored choice keeps following its IF
+    // band, so the station's wiring is byte-for-byte unchanged until the
+    // operator opts that row into its own pins. A data set with no OC pins
+    // (fresh install, or an operator who never wired OC) gets Thetis
+    // behaviour, which is wire-identical for it because every mask is zero.
+    // Once recorded the value never changes, so wiring HF pins later can
+    // never flip a transverter back onto them. Caller holds _sync.
+    private bool XvtrOcFollowIfDefaultLocked()
+    {
+        var recorded = _bands.FindOne(x => x.Band == XvtrOcCompatRowKey);
+        if (recorded is not null) return recorded.OcFollowIfBand == true;
+        bool legacyOcPins = _bands.FindAll().Any(e =>
+            BandUtils.HfBands.Contains(e.Band)
+            && (e.OcTx | e.OcRx | e.OcTune | e.OcDxTx | e.OcDxRx) != 0);
+        _bands.Insert(new PaBandEntry
+        {
+            Band = XvtrOcCompatRowKey,
+            OcFollowIfBand = legacyOcPins,
+            UpdatedUtc = DateTime.UtcNow,
+        });
+        _log.LogInformation(
+            "pa.xvtr_oc.compat legacyHfOcPins={Legacy} -> transverter rows without a stored choice {Mode}",
+            legacyOcPins,
+            legacyOcPins ? "keep following their IF band's HF OC pins" : "use their own VHF OC pins");
+        return legacyOcPins;
     }
 
     // Sanity-check a stored PA-gain value against the connected board's drive-
@@ -441,6 +498,10 @@ public sealed class PaSettingsStore : IDisposable
                     saved.OcDxTx = dxTx;
                     saved.OcDxRx = dxRx;
                     saved.OcTune = tune;
+                    // Only transverter rows carry the IF-follow switch; null
+                    // from a client means "unchanged".
+                    if (BandUtils.IsXvtrBand(band.Band) && band.OcFollowIfBand is bool followIf)
+                        saved.OcFollowIfBand = followIf;
                     if (!calibrationCommit && gainChanged)
                         ClearCalibrationGains(saved);
                     if (calibrationCommit)
@@ -795,6 +856,11 @@ public sealed class PaBandEntry
     // (issue #1325). Rows persisted before #1325 hydrate as 0, which is the
     // pre-#1325 wire behaviour.
     public byte OcTune { get; set; }
+    // Transverter rows only: true = drive OC from the hardware IF band's HF
+    // row (pre-VHF-OC behaviour). Null = never chosen; the per-database
+    // compatibility default applies, stored on the reserved row
+    // PaSettingsStore.XvtrOcCompatRowKey.
+    public bool? OcFollowIfBand { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
 

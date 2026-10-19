@@ -39,6 +39,8 @@ internal sealed class CwDecoderCore
     private double _narrowFrequencyHz;
     private double _narrowCandidateHz;
     private int _narrowCandidateBlocks;
+    private int _narrowUnconfirmedBlocks;
+    private const double NarrowConfirmHz = 6.25; // Half the 12.5 Hz tone-evidence offset step.
     private bool _locked;
     private double _searchHalfWidthHz = GoertzelDetector.PitchSearchHalfWidthHz;
     internal const double OperatorRetargetResetHz = 50.0;
@@ -407,12 +409,25 @@ internal sealed class CwDecoderCore
         }
         else
             _narrowCandidateBlocks = 0;
+        // Before a sender is selected, the hold covers that sender's key-up
+        // only. A fix with no supported evidence at its tone for a full sender
+        // gap belongs to no sender: often a four-block noise run in a long
+        // quiet lead. Holding it would integrate the next caller off its tone.
+        if (!_locked && _legacyChoice == 0 && _narrowFrequencyHz > 0)
+        {
+            if (_toneEvidence.PhaseCoherence >= 0.95 && Math.Abs(hz - _narrowFrequencyHz) < NarrowConfirmHz)
+                _narrowUnconfirmedBlocks = 0;
+            else if (++_narrowUnconfirmedBlocks * 1000.0 * _block.Length / SampleRateHz >= SenderGapMs(_narrow))
+                ClearNarrowFrequency();
+        }
+
         return !_locked && _narrowFrequencyHz > 0 && Math.Abs(_narrowFrequencyHz - _centerHz) <= _searchHalfWidthHz ? _narrowFrequencyHz : _centerHz;
     }
 
     private void ClearNarrowFrequency()
     {
         _narrowFrequencyHz = 0;
+        _narrowUnconfirmedBlocks = 0;
         _narrowCandidateHz = 0;
         _narrowCandidateBlocks = 0;
     }

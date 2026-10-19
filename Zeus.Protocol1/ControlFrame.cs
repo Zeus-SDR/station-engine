@@ -406,7 +406,9 @@ internal static class ControlFrame
         // default None is the legacy encoding, so every caller that never sets
         // this (tests, the VNA clear and pre-start frames) is byte-identical
         // to before. ControlFrame only applies the decision; it never makes it.
-        KeyerIqGuard KeyerIqGuard = KeyerIqGuard.None);
+        KeyerIqGuard KeyerIqGuard = KeyerIqGuard.None,
+        // Independent hardware-CW TX NCO; zero keeps the shared host-IQ LO.
+        long HardwareCwTxHz = 0);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -430,7 +432,7 @@ internal static class ControlFrame
             case CcRegister.TxFreq:
                 // HL2 FPGA scan: register 0x01 is the first sweep frequency.
                 BinaryPrimitives.WriteUInt32BigEndian(
-                    cc[1..5], hl2Vna ? state.VnaStartHz : (uint)state.VfoAHz);
+                    cc[1..5], hl2Vna ? state.VnaStartHz : (uint)(state.HardwareCwTxHz > 0 ? state.HardwareCwTxHz : state.VfoAHz));
                 break;
 
             case CcRegister.RxFreq:

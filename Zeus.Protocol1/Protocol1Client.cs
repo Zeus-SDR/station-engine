@@ -96,6 +96,7 @@ public sealed class Protocol1Client : IProtocol1Client
     // Mutation state written from any thread, read from the TX thread.
     // 64-bit fields are written atomically on 64-bit .NET (Interlocked.Exchange used for safety).
     private long _vfoAHz = 7_100_000;
+    private long _hardwareCwTxHz;
     // Frequency-correction factor (issue #325) — dimensionless multiplier
     // near 1.0 applied to the incoming dial Hz before _vfoAHz is updated,
     // matching piHPSDR / Thetis. Stored as int64 bits for atomic
@@ -1753,6 +1754,14 @@ public sealed class Protocol1Client : IProtocol1Client
         return Task.CompletedTask;
     }
 
+    /// <summary>Set the independent DC carrier used by the firmware keyer.
+    /// Zero restores the shared frequency slot for host-generated IQ.</summary>
+    public void SetHardwareCwTxFrequency(long hz)
+    {
+        double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
+        long corrected = hz > 0 ? (long)Math.Round(hz * factor, MidpointRounding.AwayFromZero) : 0;
+        Interlocked.Exchange(ref _hardwareCwTxHz, corrected);
+    }
     public void SetVfoAHz(long hz)
     {
         double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
@@ -2765,7 +2774,8 @@ public sealed class Protocol1Client : IProtocol1Client
             VnaPoints: vna.Points,
             VnaFixedRxGainHigh: vna.FixedRxGainHigh,
             VnaDriveLevel: vna.DriveLevel,
-            TxIqScale: iqScale);
+            TxIqScale: iqScale,
+            HardwareCwTxHz: Interlocked.Read(ref _hardwareCwTxHz));
     }
 
     // One heap box so the TX loop swaps drive byte and IQ scale together.
