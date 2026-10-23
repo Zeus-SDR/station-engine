@@ -140,12 +140,23 @@ public sealed class AudioRingOwner : IDisposable
     /// to the caller's deadline for its matching response. Output is untouched
     /// unless a complete, sequence-matched block is available.
     /// </summary>
+    public bool LastInputAccepted { get; private set; }
+
     public bool TryRoundTrip(
         ReadOnlySpan<float> input,
         Span<float> output,
         TimeSpan timeout,
-        out long roundTripTicks)
+        out long roundTripTicks) =>
+        TryRoundTrip(input, output, timeout, out roundTripTicks, out _);
+
+    public bool TryRoundTrip(
+        ReadOnlySpan<float> input,
+        Span<float> output,
+        TimeSpan timeout,
+        out long roundTripTicks,
+        out int processingDelayBlocks)
     {
+        processingDelayBlocks = 0;
         ObjectDisposedException.ThrowIf(_disposed, this);
         ValidateBlock(input, output);
         if (timeout <= TimeSpan.Zero
@@ -156,8 +167,9 @@ public sealed class AudioRingOwner : IDisposable
 
         var started = AudioRingProtocol.Timestamp();
         var sequence = Interlocked.Increment(ref _sequence);
-        DrainResponses(sequence, input.Length, out _);
-        if (!_input.TryWrite(sequence, input))
+        DrainResponses(sequence, input.Length, out _, out _);
+        LastInputAccepted = _input.TryWrite(sequence, input);
+        if (!LastInputAccepted)
         {
             roundTripTicks = AudioRingProtocol.ElapsedTicks(started);
             return false;
@@ -174,7 +186,7 @@ public sealed class AudioRingOwner : IDisposable
             if (remainingTicks <= 0)
                 break;
 
-            if (DrainResponses(sequence, input.Length, out var found) && found)
+            if (DrainResponses(sequence, input.Length, out var found, out processingDelayBlocks) && found)
             {
                 roundTripTicks = AudioRingProtocol.ElapsedTicks(started);
                 if (roundTripTicks > timeoutTicks)
@@ -273,14 +285,16 @@ public sealed class AudioRingOwner : IDisposable
         return read;
     }
 
-    private bool DrainResponses(long wanted, int wantedSamples, out bool found)
+    private bool DrainResponses(long wanted, int wantedSamples, out bool found, out int processingDelayBlocks)
     {
         found = false;
-        while (_output.TryRead(out var sequence, out var sampleCount, _discard))
+        processingDelayBlocks = 0;
+        while (_output.TryRead(out var sequence, out var sampleCount, out var delay, _discard))
         {
             if (sequence != wanted || sampleCount != wantedSamples)
                 continue;
             found = true;
+            processingDelayBlocks = delay;
             return true;
         }
 
@@ -623,7 +637,7 @@ public sealed class AudioRingConsumer : IDisposable
             {
                 var delayBlocks = Math.Clamp(
                     processor(_block.AsSpan(0, sampleCount)),
-                    0,
+                    -1,
                     AudioRingProtocol.SlotCount - 2);
                 if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), delayBlocks))
                     _outputSignal.TrySet();

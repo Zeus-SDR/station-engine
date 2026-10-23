@@ -26,7 +26,8 @@ public partial class DspPipelineService
 
     private void ReconcileCaptureMonitor(IDspEngine engine, Zeus.Contracts.StateDto state)
     {
-        bool enabled = state.TxMonitorEnabled || _monitorWaveform.IsCaptureActive;
+        bool enabled = state.TxMonitorEnabled || _monitorWaveform.IsCaptureActive
+            || (_productPluginAudio?.HasLeasedTxMicCapture ?? false);
         if (engine.IsTxMonitorOn == enabled) return;
         engine.SetTxMonitorEnabled(enabled);
     }

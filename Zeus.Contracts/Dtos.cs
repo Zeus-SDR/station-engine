@@ -2129,7 +2129,8 @@ public sealed record ReceiverSetRequest(
 public sealed record KiwiSetRequest(
     bool? Enabled = null,
     string? Url = null,
-    string? Password = null);
+    string? Password = null,
+    bool? MuteDuringTx = null);
 
 /// <summary>Status of the KiwiSDR slice receiver — the body of
 /// <c>GET /api/kiwi</c> and the value returned from <c>POST /api/kiwi</c>.
@@ -2147,7 +2148,8 @@ public sealed record KiwiConfigDto(
     string Status,
     string? StatusDetail = null,
     int ZoomLevel = 0,
-    int ZoomCap = 0);
+    int ZoomCap = 0,
+    bool MuteDuringTx = false);
 
 /// <summary>Operator settings for the POTA/SOTA Spots feature. Persisted in
 /// zeus-prefs.db (<c>SpotsSettingsStore</c>) and shared with the frontend.

@@ -35,7 +35,8 @@ public static class KiwiEndpoints
                 req.Enabled,
                 req.Url,
                 req.Password,
-                default));
+                default,
+                req.MuteDuringTx));
         });
 
         // Kiwi-native waterfall zoom is independent of the radio-wide DDC

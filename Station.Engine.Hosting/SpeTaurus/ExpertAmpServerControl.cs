@@ -13,6 +13,7 @@
 // License for details.
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 
@@ -1848,7 +1849,8 @@ internal sealed class ExpertAmpServerControl : IDisposable
                 System.Globalization.DateTimeStyles.AssumeUniversal,
                 out var updatedAt))
             throw new InvalidDataException("Expert Amp Server returned an invalid display timestamp.");
-        var displayAge = DateTimeOffset.UtcNow - updatedAt.ToUniversalTime();
+        var displayAge = (display.ResponseTiming?.ReferenceTime ?? DateTimeOffset.UtcNow)
+            - updatedAt.ToUniversalTime();
         if (displayAge < TimeSpan.FromSeconds(-5))
             throw new InvalidDataException(
                 "Expert Amp Server returned a future-dated Taurus display frame.");
@@ -2220,7 +2222,8 @@ internal sealed class ExpertAmpServerControl : IDisposable
             status.Source,
             status.Confidence,
             status.Provenance,
-            status.LastContactAt);
+            status.LastContactAt,
+            status.ResponseTiming);
 
     private static bool IsExpectedTaurus(ExpertStatus status) =>
         ExpertAmpServerEvidence.MentionsTaurus(status.ModelName);
@@ -2336,11 +2339,16 @@ internal sealed class ExpertAmpServerControl : IDisposable
         string url,
         CancellationToken cancellationToken)
     {
-        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var request = ExpertAmpServerEvidence.CreateReadRequest(url);
+        var started = Stopwatch.GetTimestamp();
+        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var envelope = await ReadEnvelopeAsync<T>(response, cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode || !envelope.Success || envelope.Data is null)
             throw new InvalidDataException(envelope.Error ?? envelope.Message
                 ?? $"Expert Amp Server returned {(int)response.StatusCode}.");
+        var timing = ExpertAmpServerResponseTiming.Capture(response, started);
+        if (envelope.Data is ExpertAmpServerTimedResponse timed)
+            timed.ResponseTiming = timing;
         return envelope.Data;
     }
 
@@ -2423,7 +2431,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
         [property: JsonPropertyName("warningsText")] string[]? WarningsText,
         [property: JsonPropertyName("alarmsText")] string[]? AlarmsText,
         [property: JsonPropertyName("warnings")] string[]? Warnings,
-        [property: JsonPropertyName("activeAlarms")] string[]? ActiveAlarms);
+        [property: JsonPropertyName("activeAlarms")] string[]? ActiveAlarms) : ExpertAmpServerTimedResponse;
 
     private sealed record ExpertDisplayFrame(
         [property: JsonPropertyName("screenText")] string? ScreenText,
@@ -2437,7 +2445,7 @@ internal sealed class ExpertAmpServerControl : IDisposable
         [property: JsonPropertyName("updatedAt")] string? UpdatedAt,
         [property: JsonPropertyName("source")] string? Source,
         [property: JsonPropertyName("modelName")] string? ModelName,
-        [property: JsonPropertyName("screenText")] string? ScreenText);
+        [property: JsonPropertyName("screenText")] string? ScreenText) : ExpertAmpServerTimedResponse;
 
     private sealed record ExpertDisplayTextSpan(
         [property: JsonPropertyName("row")] int Row,

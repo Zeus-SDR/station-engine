@@ -295,7 +295,8 @@ internal sealed class ExpertAmpServerTunePreflight(
             status.Source,
             status.Confidence,
             status.Provenance,
-            status.LastContactAt);
+            status.LastContactAt,
+            status.ResponseTiming);
 
     private static bool IsExpectedTaurus(ExpertStatus status) =>
         ExpertAmpServerEvidence.MentionsTaurus(status.ModelName);
@@ -305,11 +306,16 @@ internal sealed class ExpertAmpServerTunePreflight(
         string url,
         CancellationToken cancellationToken)
     {
-        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var request = ExpertAmpServerEvidence.CreateReadRequest(url);
+        var started = Stopwatch.GetTimestamp();
+        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var envelope = await ReadEnvelopeAsync<T>(response, cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode || !envelope.Success || envelope.Data is null)
             throw new InvalidDataException(envelope.Error ?? envelope.Message
                 ?? $"Expert Amp Server returned {(int)response.StatusCode}.");
+        var timing = ExpertAmpServerResponseTiming.Capture(response, started);
+        if (envelope.Data is ExpertAmpServerTimedResponse timed)
+            timed.ResponseTiming = timing;
         return envelope.Data;
     }
 
@@ -344,7 +350,7 @@ internal sealed class ExpertAmpServerTunePreflight(
         [property: JsonPropertyName("confidence")] string? Confidence,
         [property: JsonPropertyName("provenance")] string? Provenance,
         [property: JsonPropertyName("recentContact")] bool RecentContact,
-        [property: JsonPropertyName("lastContactAt")] string? LastContactAt);
+        [property: JsonPropertyName("lastContactAt")] string? LastContactAt) : ExpertAmpServerTimedResponse;
 
     private sealed record ExpertButtonResult(
         [property: JsonPropertyName("name")] string? Name,

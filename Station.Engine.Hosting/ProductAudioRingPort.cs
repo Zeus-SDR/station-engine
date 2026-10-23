@@ -96,6 +96,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     }
 
     public bool Active => Volatile.Read(ref _session)?.IsLeased == true;
+    public int VoiceTailSamples48k => Volatile.Read(ref _session)?.TxPipeline.VoiceTailSamples48k ?? 0;
 
     public ProductAudioRingSnapshot Snapshot => new(
         Volatile.Read(ref _session)?.IsLeased == true,
@@ -766,6 +767,9 @@ internal sealed class ProductAudioTransportPipeline
     private long _firstSequence;
     private long _lastRenderedResponse;
     private int _lastProcessingDelay;
+    private bool _processingDelayKnown;
+    private bool _zeroSourceDelayPinned;
+    private long _lastRenderedSource;
     private bool _hasRenderedTarget;
     private ProductAudioTransportStatus _lastTargetStatus;
     private float _lastRenderedSample;
@@ -778,6 +782,7 @@ internal sealed class ProductAudioTransportPipeline
     }
 
     internal int RenderDelayBlocks => _renderDelayBlocks;
+    internal int VoiceTailSamples48k => (_renderDelayBlocks + _lastProcessingDelay) * 960;
     internal long LastRenderedResponse => _lastRenderedResponse;
 
     internal void Reset()
@@ -787,6 +792,9 @@ internal sealed class ProductAudioTransportPipeline
         _firstSequence = 0;
         _lastRenderedResponse = 0;
         _lastProcessingDelay = 0;
+        _processingDelayKnown = false;
+        _zeroSourceDelayPinned = false;
+        _lastRenderedSource = 0;
         _hasRenderedTarget = false;
         _lastTargetStatus = ProductAudioTransportStatus.Priming;
         _lastRenderedSample = 0f;
@@ -823,57 +831,70 @@ internal sealed class ProductAudioTransportPipeline
         ReadOnlySpan<float> currentDry,
         Span<float> output)
     {
-        if (submittedSequence == _firstSequence)
-        {
-            currentDry.CopyTo(output);
-            RememberRendered(output, ProductAudioTransportStatus.DryFallback);
-            return ProductAudioTransportStatus.Priming;
-        }
-
         var targetResponse = submittedSequence - _renderDelayBlocks;
-        if (targetResponse < _firstSequence)
+        if (submittedSequence == _firstSequence || targetResponse < _firstSequence)
         {
-            currentDry.CopyTo(output);
-            RememberRendered(output, ProductAudioTransportStatus.DryFallback);
+            // Keep all speech on the delayed timeline. Rendering current dry
+            // input here would replay it when the oldest response becomes due.
+            // Do not establish a dry target: the first response must not mix
+            // raw speech into a plugin delay line that still contains silence.
+            output.Clear();
             return ProductAudioTransportStatus.Priming;
         }
         _lastRenderedResponse = targetResponse;
         var responseIndex = Index(targetResponse);
-        if (Volatile.Read(ref _processedSequences[responseIndex]) == targetResponse
-            && _processedCounts[responseIndex] == currentDry.Length)
+        bool hasResponse = Volatile.Read(ref _processedSequences[responseIndex]) == targetResponse
+            && _processedCounts[responseIndex] == currentDry.Length
+            && (!_zeroSourceDelayPinned || _processedDelays[responseIndex] == 0);
+        if (hasResponse)
         {
             _lastProcessingDelay = _processedDelays[responseIndex];
-            var alignedSourceSequence = targetResponse - _lastProcessingDelay;
-            var alignedDryIndex = Index(alignedSourceSequence);
-            var transitionDry = alignedSourceSequence > 0
-                && Volatile.Read(ref _drySequences[alignedDryIndex]) == alignedSourceSequence
-                && _dryCounts[alignedDryIndex] == currentDry.Length
-                ? _dry[alignedDryIndex].AsSpan(0, currentDry.Length)
-                : currentDry;
-            _processed[responseIndex].AsSpan(0, currentDry.Length).CopyTo(output);
-            ApplyTransitionRamp(transitionDry, output, ProductAudioTransportStatus.Processed);
-            return ProductAudioTransportStatus.Processed;
+            _processingDelayKnown = true;
+        }
+        else if (!_processingDelayKnown)
+        {
+            // Preserve the first speech block when the worker has not supplied
+            // latency: commit to the existing dry timeline immediately. Only
+            // zero-delay wet replies can join this timeline until the next epoch.
+            _processingDelayKnown = true;
+            _zeroSourceDelayPinned = true;
+            _lastProcessingDelay = 0;
         }
 
+        var status = hasResponse ? ProductAudioTransportStatus.Processed
+            : ProductAudioTransportStatus.DryFallback;
         var sourceSequence = targetResponse - _lastProcessingDelay;
+        // A current response sequence does not prove the vendor delay line
+        // contains this epoch's audio. Keep pre-epoch and replayed sources silent.
+        if (sourceSequence < _firstSequence
+            || sourceSequence <= _lastRenderedSource)
+        {
+            output.Clear();
+            _hasRenderedTarget = false;
+            _lastRenderedSample = 0f;
+            return status;
+        }
+
         var dryIndex = Index(sourceSequence);
-        if (sourceSequence > 0
-            && Volatile.Read(ref _drySequences[dryIndex]) == sourceSequence
-            && _dryCounts[dryIndex] == currentDry.Length)
+        if (Volatile.Read(ref _drySequences[dryIndex]) != sourceSequence
+            || _dryCounts[dryIndex] != currentDry.Length)
         {
-            _dry[dryIndex].AsSpan(0, currentDry.Length).CopyTo(output);
+            // Missing retained history must never substitute newer microphone
+            // audio into the delayed stream or its recovery transition.
+            output.Clear();
+            _hasRenderedTarget = false;
+            _lastRenderedSample = 0f;
+            return status;
         }
+
+        var alignedDry = _dry[dryIndex].AsSpan(0, currentDry.Length);
+        if (hasResponse)
+            _processed[responseIndex].AsSpan(0, currentDry.Length).CopyTo(output);
         else
-        {
-            currentDry.CopyTo(output);
-        }
-        var fallbackDry = sourceSequence > 0
-            && Volatile.Read(ref _drySequences[dryIndex]) == sourceSequence
-            && _dryCounts[dryIndex] == currentDry.Length
-            ? _dry[dryIndex].AsSpan(0, currentDry.Length)
-            : currentDry;
-        ApplyTransitionRamp(fallbackDry, output, ProductAudioTransportStatus.DryFallback);
-        return ProductAudioTransportStatus.DryFallback;
+            alignedDry.CopyTo(output);
+        ApplyTransitionRamp(alignedDry, output, status);
+        _lastRenderedSource = sourceSequence;
+        return status;
     }
 
     private void ApplyTransitionRamp(

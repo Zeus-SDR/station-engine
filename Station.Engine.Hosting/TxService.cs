@@ -1367,8 +1367,8 @@ public sealed class TxService
             try
             {
                 if (source == MoxSource.UI && IsPreKeyVoiceMode(_radio.Snapshot().Mode)
-                    && preKeyMs <= 40 && _radio.TxMoxTailDelayMs > 0)
-                    _pipeline.BeginVoiceOnsetBuffer();
+                    && _radio.TxMoxTailDelayMs > 0)
+                    _pipeline.BeginVoiceOnsetBuffer(preKeyMs);
                 PrepareTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
                 _radio.SetTxSafetyAuthority(true);
@@ -1803,6 +1803,8 @@ public sealed class TxService
                 _radio.SetTwoTone(req);
                 _radio.NotifyTunActive(false);
                 _pipeline.SetMox(true);
+                if (!_pipeline.SanitizeProtocol2TxBeforeKeyDown())
+                    throw new InvalidOperationException("Protocol 2 pre-key TX-IQ sanitization failed");
                 if (!EvaluateAdmission(TransmitIntent.TwoTone, MoxSource.UI, out error))
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
                 _radio.SetMox(true);

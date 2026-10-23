@@ -2751,8 +2751,11 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                         output_samplerate: _txaOutputRateHz,
                         type: 1,
                         state: 0,
-                        tdelayup: 0.010,
-                        tslewup: 0.025,
+                        // Thetis cmaster.c uses no TX rise delay and a 10 ms slew.
+                        // WDSP starts this gate on the first nonzero sample;
+                        // silent priming cannot prevent a delay from erasing speech.
+                        tdelayup: 0.0,
+                        tslewup: 0.010,
                         tdelaydown: 0.0,
                         tslewdown: 0.010,
                         bfo: 1));

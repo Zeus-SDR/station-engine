@@ -59,10 +59,14 @@ public static class TciCwParser
     /// <summary>
     /// Parse <c>cw_msg:rx,part[,part...][,N];</c>. Accepts both the
     /// single-text form (<c>cw_msg:0,CQ TEST;</c>) and the prefix /
-    /// callsign / suffix form (<c>cw_msg:0,CQ ,W1AW, K;</c>). When the
-    /// trailing argument parses as a small integer (1..<see cref="MaxCwMsgRepeats"/>)
-    /// it is treated as a repeat count; otherwise it is appended verbatim
-    /// to the text — see <see cref="MaxCwMsgRepeats"/> for the bound.
+    /// callsign / suffix form (<c>cw_msg:0,TU,RA6LH,599 004;</c>). The
+    /// parts are joined with one space, as the TCI spec example keys
+    /// "TU RA6LH 599 004"; <see cref="TciProtocol.Parse"/> trims every
+    /// argument, so a part's own edge spacing never reaches this method.
+    /// Empty parts are skipped. When the trailing argument parses as a
+    /// small integer (1..<see cref="MaxCwMsgRepeats"/>) it is treated as
+    /// a repeat count; otherwise it is kept as the last part of the text —
+    /// see <see cref="MaxCwMsgRepeats"/> for the bound.
     /// </summary>
     public static CwMsgArgs? ParseCwMsg(string[] args)
     {
@@ -80,9 +84,15 @@ public static class TciCwParser
         }
 
         var sb = new StringBuilder();
-        for (int i = 1; i < endIdx; i++) sb.Append(args[i]);
+        for (int i = 1; i < endIdx; i++)
+        {
+            string part = args[i].Trim();
+            if (part.Length == 0) continue;
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(part);
+        }
         string text = sb.ToString();
-        if (string.IsNullOrWhiteSpace(text)) return null;
+        if (text.Length == 0) return null;
         return new CwMsgArgs(text, repeats);
     }
 

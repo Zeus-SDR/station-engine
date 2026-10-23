@@ -2324,7 +2324,8 @@ public partial class DspPipelineService : BackgroundService,
     /// </summary>
     public virtual bool PrimeTxDspForKeyDown() => ResolveTxIngest()?.PrimeTxDspForKeyDown() ?? false;
 
-    internal virtual void BeginVoiceOnsetBuffer() => ResolveTxIngest()?.BeginVoiceOnsetBuffer();
+    internal virtual void BeginVoiceOnsetBuffer(int preKeyDelayMs = 0) =>
+        ResolveTxIngest()?.BeginVoiceOnsetBuffer(preKeyDelayMs);
 
     internal virtual void CancelVoiceOnsetBuffer() => ResolveTxIngest()?.CancelVoiceOnsetBuffer();
 
@@ -6056,6 +6057,8 @@ public partial class DspPipelineService : BackgroundService,
     /// driving. Non-virtual — auto-attenuate is hard-gated on a P2 connection
     /// and tests don't exercise it.</summary>
     public Zeus.Protocol2.Protocol2Client? CurrentP2Client => _p2Client;
+    internal HostMicRadioClock HostMicClock { get; } = new();
+    private void ObserveHostMicClock(uint sequence, int samples) => HostMicClock.Accept(sequence, samples);
 
     /// <summary>Test seam: inject a caller-owned, socketless Protocol-2 client
     /// so service-level tests can exercise the normal P2 command fan-out and
@@ -8061,6 +8064,8 @@ public partial class DspPipelineService : BackgroundService,
         client.Disconnected += disconnectedHandler;
         _p2DisconnectedHandler = disconnectedHandler;
         _p2Client = client;
+        HostMicClock.Connect(true);
+        client.RadioMicSamplesReceived += ObserveHostMicClock;
         client.ConfigureTxIqSafetyGate(_txEgressGate.IsCurrent);
         RefreshWidebandDisplayState();
         // Sync the change-detect cache with the values we just seeded so the
@@ -8711,6 +8716,8 @@ public partial class DspPipelineService : BackgroundService,
     private async Task DisconnectP2CoreAsync(CancellationToken ct)
     {
         var client = _p2Client;
+        if (client is not null) client.RadioMicSamplesReceived -= ObserveHostMicClock;
+        HostMicClock.Connect(false);
         _p2Client = null;
         Interlocked.Increment(ref _p2ConnectionGeneration);
         var disconnectedHandler = _p2DisconnectedHandler;
@@ -10970,6 +10977,10 @@ public partial class DspPipelineService : BackgroundService,
                 // taps; null subscriber list = no cost. Fire it before Kiwi is
                 // added to the operator monitor so the air tap stays TX-only.
                 CaptureMonitorWaveform(engine, state, audioBuf.AsSpan(0, monCount));
+                // Recorder capture follows the final TX chain, before local
+                // monitor volume and receive mixing. Its lease keeps this
+                // demodulator running silently when the operator's MON is off.
+                _productPluginAudio?.PublishTxMic(AudioOutputRateHz, audioBuf.AsSpan(0, monCount));
                 TxMonitorAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, monCount));
                 // Monitor volume is an operator playback preference, not a
                 // TX-chain control. Apply it only after diagnostics and the

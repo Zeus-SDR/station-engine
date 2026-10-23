@@ -71,6 +71,9 @@ public interface IProductTxAudioPort
 {
     bool Active { get; }
     void ProcessTx(Span<float> block48k);
+    /// <summary>Bounded samples still retained by the TX insert after its last
+    /// input. The voice tail clocks this many silence samples through the insert.</summary>
+    int VoiceTailSamples48k => 0;
     /// <summary>Discard transport history from the previous voice transmission.
     /// Processing/plugin state and shared-ring sequence numbers remain intact.</summary>
     void BeginVoiceTxEpoch() { }

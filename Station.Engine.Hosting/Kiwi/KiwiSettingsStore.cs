@@ -57,7 +57,7 @@ public sealed class KiwiSettingsStore : IDisposable
                 var e = _entries.FindAll().FirstOrDefault();
                 return e is null
                     ? new KiwiSettings(false, null, null)
-                    : new KiwiSettings(e.Enabled, e.Url, e.Password);
+                    : new KiwiSettings(e.Enabled, e.Url, e.Password, e.MuteDuringTx);
             }
             catch (Exception ex)
             {
@@ -80,20 +80,21 @@ public sealed class KiwiSettingsStore : IDisposable
 
     /// <summary>Patch the stored settings. Null fields are left unchanged; an
     /// empty <paramref name="password"/> string clears the stored password.</summary>
-    public KiwiSettings Set(bool? enabled = null, string? url = null, string? password = null)
+    public KiwiSettings Set(bool? enabled = null, string? url = null, string? password = null, bool? muteDuringTx = null)
     {
         lock (_sync)
         {
             var e = PrefsSingleRow.ReadOrRefuse(_entries, CollectionName)
                 ?? new KiwiSettingsEntry { Id = 1 };
             if (enabled.HasValue) e.Enabled = enabled.Value;
+            if (muteDuringTx.HasValue) e.MuteDuringTx = muteDuringTx.Value;
             if (url is not null) e.Url = string.IsNullOrWhiteSpace(url) ? null : url.Trim();
             if (password is not null) e.Password = password.Length == 0 ? null : password;
             _entries.Upsert(e);
             _log.LogInformation("kiwi.settings.set enabled={Enabled} url={Url} hasPw={HasPw}",
                 e.Enabled, e.Url, e.Password is not null);
             Changed?.Invoke();
-            return new KiwiSettings(e.Enabled, e.Url, e.Password);
+            return new KiwiSettings(e.Enabled, e.Url, e.Password, e.MuteDuringTx);
         }
     }
 
@@ -101,13 +102,14 @@ public sealed class KiwiSettingsStore : IDisposable
 }
 
 /// <summary>Immutable snapshot of the persisted Kiwi settings.</summary>
-public sealed record KiwiSettings(bool Enabled, string? Url, string? Password);
+public sealed record KiwiSettings(bool Enabled, string? Url, string? Password, bool MuteDuringTx = false);
 
 /// <summary>LiteDB row for <see cref="KiwiSettingsStore"/>.</summary>
 public sealed class KiwiSettingsEntry
 {
     [BsonId] public int Id { get; set; } = 1;
     public bool Enabled { get; set; }
+    public bool MuteDuringTx { get; set; }
     public string? Url { get; set; }
     public string? Password { get; set; }
 }

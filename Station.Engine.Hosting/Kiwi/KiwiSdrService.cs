@@ -91,6 +91,8 @@ public sealed class KiwiSdrService : BackgroundService,
     // while interpolating across each returned block to avoid scalar steps.
     private double _appliedAfGainLinear = 1.0;
     private bool _muted;
+    private bool _muteDuringTx;
+    internal Func<bool> IsTransmitActive { get; set; } = static () => false;
     // Kiwi-native waterfall zoom. z7 preserves the integration's previous
     // initial ~234 kHz view; every subsequent integer step halves the span.
     private int _zoomLevel = 7;
@@ -254,6 +256,12 @@ public sealed class KiwiSdrService : BackgroundService,
             dropped += n;
         }
         int read = _audioBus.Read(dst);
+        // Keep draining while keyed so receive resumes with current audio.
+        if (Volatile.Read(ref _muteDuringTx) && IsTransmitActive())
+        {
+            dst[..read].Clear();
+            return read;
+        }
         if (read > 0)
         {
             double startGain = _appliedAfGainLinear;
@@ -303,7 +311,7 @@ public sealed class KiwiSdrService : BackgroundService,
         // but ONLY once a radio is connected (the Kiwi rides the radio-clocked
         // mix bus). It does not auto-connect on a headless/idle server.
         var s = _store.Get();
-        lock (_sync) { _enabled = s.Enabled; }
+        lock (_sync) { _enabled = s.Enabled; _muteDuringTx = s.MuteDuringTx; }
 
         // Subscribe to the radio connect/disconnect lifecycle. Resolved here (not
         // in the ctor) so RadioService — which depends on this service via
@@ -318,6 +326,7 @@ public sealed class KiwiSdrService : BackgroundService,
         Action<StateDto> onState = s => ApplySquelchConfig(s.Squelch);
         if (radio is not null)
         {
+            IsTransmitActive = radio.IsTxActive;
             radio.Connected += onP1Connect;
             radio.P2Connected += onP2Connect;
             radio.Disconnected += onDisconnect;
@@ -355,6 +364,7 @@ public sealed class KiwiSdrService : BackgroundService,
 
         if (radio is not null)
         {
+            IsTransmitActive = static () => false;
             radio.Connected -= onP1Connect;
             radio.P2Connected -= onP2Connect;
             radio.Disconnected -= onDisconnect;
@@ -456,14 +466,19 @@ public sealed class KiwiSdrService : BackgroundService,
                 _status,
                 _statusDetail,
                 Math.Clamp(_zoomLevel, 0, cap),
-                cap);
+                cap,
+                s.MuteDuringTx);
         }
     }
 
-    public async Task<KiwiConfigDto> SetConfigAsync(bool? enabled, string? url, string? password, CancellationToken ct)
+    public async Task<KiwiConfigDto> SetConfigAsync(bool? enabled, string? url, string? password, CancellationToken ct, bool? muteDuringTx = null)
     {
-        var s = _store.Set(enabled, url, password);
-        lock (_sync) { _enabled = s.Enabled; }
+        var previous = _store.Get();
+        var s = _store.Set(enabled, url, password, muteDuringTx);
+        lock (_sync) { _enabled = s.Enabled; _muteDuringTx = s.MuteDuringTx; }
+        // Audio policy changes do not interrupt the remote connection.
+        if (muteDuringTx.HasValue && previous.Enabled == s.Enabled && previous.Url == s.Url && previous.Password == s.Password)
+            return GetConfig();
         bool wantOn = s.Enabled && !string.IsNullOrWhiteSpace(s.Url);
         // The operator just changed state — invalidate any pending auto-reconnect
         // so a queued attempt can't race the manual restart below.

@@ -604,6 +604,11 @@ public sealed class ProductPluginAudioPort : IDisposable
         PublishCapture(session, samples);
     }
 
+    /// <summary>A live TX capture needs the processed chain even with MOX and
+    /// audible monitor off. Pending attachments do not start processing.</summary>
+    public bool HasLeasedTxMicCapture =>
+        Volatile.Read(ref _txMicCapture) is { IsLeased: true };
+
     public void PublishTxMic(int sampleRate, ReadOnlySpan<float> samples)
     {
         if (sampleRate != AudioRingProtocol.SampleRate) return;

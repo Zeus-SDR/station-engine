@@ -142,12 +142,19 @@ public sealed class TxAudioIngest : IDisposable
     private readonly float[] _muteIq = new float[4096];
     private const int IdlePreRollSamples = 3 * MicBlockSamples;
     private const int MaxVoiceOnsetSamples = 10 * MicBlockSamples;
+    private int _voiceOnsetCapacitySamples = MaxVoiceOnsetSamples;
     private readonly Queue<(float[] Samples, MicBlockSource Source, MicBlockValidity? Validity)> _idlePreRoll = new();
     private readonly Queue<(float[] Samples, MicBlockSource Source, MicBlockValidity? Validity)> _voiceOnset = new();
     private int _idlePreRollSamples;
     private int _voiceOnsetSamples;
     private int _preKeyZeroRemainder;
     private bool _voiceOnsetArmed;
+    private readonly VoicePreKeyIqBuffer _voicePreKeyIq = new();
+    private bool _voicePreKeyIqActive;
+    private MicBlockValidity? _voiceIqValidity;
+    private long _voiceIqSourceEpoch;
+    private MicBlockSource _voiceIqSource;
+    private readonly float[] _productTailSilence = new float[MicBlockSamples];
     // While a tail replays held speech, a concurrent live mic callback must
     // yield without erasing the replay's partial WDSP input block.
     private bool _preserveOnsetAccumulatorDuringTail;
@@ -268,6 +275,8 @@ public sealed class TxAudioIngest : IDisposable
     // Default Host so a fresh / un-switched ingest is byte/behaviour-identical
     // to today.
     private MicBlockSource _activeSource = MicBlockSource.Host;
+    private long _activeSourceEpoch;
+    internal long ActiveSourceEpoch { get { lock (_sync) return _activeSourceEpoch; } }
     // The normal operator-selected source is retained while the separately
     // managed virtual-cable test route is active. Disabling that route restores
     // this source without changing the radio's audio-source setting.
@@ -328,6 +337,8 @@ public sealed class TxAudioIngest : IDisposable
     {
         if (_activeSource == source) return;
         _activeSource = source;
+        _activeSourceEpoch++;
+        ResetVoicePreKeyIq();
         _idlePreRoll.Clear();
         _voiceOnset.Clear();
         _idlePreRollSamples = 0;
@@ -339,10 +350,29 @@ public sealed class TxAudioIngest : IDisposable
         _accumulatorFill = 0;
     }
 
-    internal void BeginVoiceOnsetBuffer()
+    internal void BeginVoiceOnsetBuffer(int preKeyDelayMs = 0)
     {
         lock (_sync)
         {
+            ResetVoicePreKeyIq();
+            var engine = _engineProvider();
+            int blockSize = engine?.TxBlockSamples ?? 0;
+            int iqOut = engine?.TxOutputSamples ?? 0;
+            if (preKeyDelayMs > 0 && blockSize > 0 && iqOut > 0)
+            {
+                // Maximum supported relay delay plus bounded transaction
+                // headroom and one append block before the oldest IQ is read.
+                int heldBlocks = (TxRateHz * (RadioService.MaxPreKeyDelayMs + 100) / 1000
+                    + blockSize - 1) / blockSize;
+                _voicePreKeyIq.Configure(checked(2 * iqOut * (heldBlocks + 1)));
+                _voicePreKeyIqActive = true;
+            }
+            // Retain the configured gate, idle pre-roll, and two callbacks of
+            // key-transaction headroom. Keep the historical 200 ms minimum,
+            // with a hard 600 ms ceiling at the supported 500 ms pre-key limit.
+            int preKeyBlocks = (Math.Clamp(preKeyDelayMs, 0, RadioService.MaxPreKeyDelayMs) + 19) / 20;
+            _voiceOnsetCapacitySamples = Math.Max(MaxVoiceOnsetSamples,
+                preKeyBlocks * MicBlockSamples + IdlePreRollSamples + 2 * MicBlockSamples);
             _voiceOnset.Clear();
             _voiceOnsetSamples = 0;
             _preKeyZeroRemainder = 0;
@@ -361,6 +391,7 @@ public sealed class TxAudioIngest : IDisposable
     {
         lock (_sync)
         {
+            ResetVoicePreKeyIq();
             _voiceOnsetArmed = false;
             _voiceOnset.Clear();
             _idlePreRoll.Clear();
@@ -392,6 +423,72 @@ public sealed class TxAudioIngest : IDisposable
             _ring.Write(new ReadOnlySpan<float>(_muteIq, 0, 2 * chunk));
             _forwardP2?.Invoke(new ReadOnlyMemory<float>(_muteIq, 0, 2 * chunk));
             pairs -= chunk;
+        }
+    }
+
+    private void ResetVoicePreKeyIq()
+    {
+        _voicePreKeyIq.Reset();
+        _voicePreKeyIqActive = false;
+        _voiceIqValidity = null;
+    }
+
+    private bool DrainProcessedVoiceOnset(long frequency, Func<bool>? shouldAbort)
+    {
+        lock (_sync) if (!_voicePreKeyIqActive) return true;
+        long paceAt = _stopwatchTicks();
+        // A short utterance can still be inside the external insert after its
+        // final input. Clock that history before draining retained IQ or TXA.
+        int flushed = 0;
+        while (_voicePreKeyIqActive && _productAudio.Active
+            && flushed < Math.Clamp(_productAudio.VoiceTailSamples48k, 0, 31 * MicBlockSamples))
+        {
+            if (shouldAbort?.Invoke() == true || !_isMoxOn()) return false;
+            lock (_sync)
+            {
+                if (_voiceIqSourceEpoch != _activeSourceEpoch || !IsBufferedCurrent(_voiceIqValidity))
+                {
+                    ResetVoicePreKeyIq();
+                    return false;
+                }
+                ProcessMicPcm(_productTailSilence, _voiceIqSource, _voiceIqValidity,
+                    bypassOnset: true, tailReplay: true);
+            }
+            flushed += MicBlockSamples;
+            paceAt += frequency / 50;
+            long waitTicks = paceAt - _stopwatchTicks();
+            if (waitTicks > 0)
+                _voiceTailWait((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
+        }
+
+        while (true)
+        {
+            if (shouldAbort?.Invoke() == true || !_isMoxOn()) return false;
+            int components;
+            int outputRate;
+            lock (_sync)
+            {
+                if (!_voicePreKeyIqActive) return true;
+                if (_voicePreKeyIq.Failed || _voiceIqSourceEpoch != _activeSourceEpoch
+                    || !IsBufferedCurrent(_voiceIqValidity)) return false;
+                var engine = _engineProvider();
+                int blockSize = engine?.TxBlockSamples ?? 0;
+                int iqOut = engine?.TxOutputSamples ?? 0;
+                if (blockSize <= 0 || iqOut <= 0) return false;
+                outputRate = TxRateHz * iqOut / blockSize;
+                components = _voicePreKeyIq.Read(_tailIq.AsSpan(0, Math.Min(2 * iqOut, _tailIq.Length)));
+                if (components == 0)
+                {
+                    ResetVoicePreKeyIq();
+                    return true;
+                }
+                _ring.Write(_tailIq.AsSpan(0, components));
+                _forwardP2?.Invoke(_tailIq.AsMemory(0, components));
+            }
+            paceAt += (long)(frequency * (double)components / (2 * outputRate));
+            long waitTicks = paceAt - _stopwatchTicks();
+            if (waitTicks > 0)
+                _voiceTailWait((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
         }
     }
 
@@ -456,35 +553,70 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _voiceOnset.Clear();
                 _voiceOnsetSamples = 0;
+                _voicePreKeyIq.Reset();
             }
             long openAt = _preKeyOpenAtTicks();
             bool gateOpen = moxNow && !TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks());
-            if (gateOpen)
+            if (gateOpen || (moxNow && _voicePreKeyIqActive))
             {
-                if (!_voiceOnset.TryDequeue(out var oldest)) return false;
+                if (!_voiceOnset.TryDequeue(out var oldest))
+                {
+                    if (!_voicePreKeyIqActive) return false;
+                    ProcessMicPcm(samples, source, validity, bypassOnset: true);
+                    return true;
+                }
                 _voiceOnsetSamples -= oldest.Samples.Length;
                 // Replace exactly one queued frame with this arrival, then
                 // replay exactly one. A full queue does not shed an extra
                 // opening frame merely because the gate just opened.
-                _voiceOnset.Enqueue((samples.ToArray(), source, validity));
-                _voiceOnsetSamples += samples.Length;
+                EnqueueVoiceOnset(samples, source, validity);
                 if (IsBufferedCurrent(oldest.Validity))
                     ProcessMicPcm(oldest.Samples, oldest.Source, oldest.Validity,
                         bypassOnset: true);
                 return true;
             }
 
-            while (_voiceOnsetSamples + samples.Length > MaxVoiceOnsetSamples
-                   && _voiceOnset.TryDequeue(out var old))
-            {
-                _voiceOnsetSamples -= old.Samples.Length;
-                _log.LogWarning("tx.voice.onset bounded queue overflow; oldest {Samples} samples dropped",
-                    old.Samples.Length);
-            }
-            _voiceOnset.Enqueue((samples.ToArray(), source, validity));
-            _voiceOnsetSamples += samples.Length;
+            EnqueueVoiceOnset(samples, source, validity);
             if (moxNow) SendPreKeyZeroIq(samples.Length);
             return true;
+        }
+    }
+
+    private void EnqueueVoiceOnset(ReadOnlySpan<float> samples, MicBlockSource source, MicBlockValidity? validity)
+    {
+        while (_voiceOnsetSamples + samples.Length > _voiceOnsetCapacitySamples
+               && _voiceOnset.TryDequeue(out var old))
+        {
+            _voiceOnsetSamples -= old.Samples.Length;
+            _log.LogWarning("tx.voice.onset bounded queue overflow; oldest {Samples} samples dropped",
+                old.Samples.Length);
+        }
+        _voiceOnset.Enqueue((samples.ToArray(), source, validity));
+        _voiceOnsetSamples += samples.Length;
+    }
+
+    private bool WaitForVoiceOnsetPreKey(long frequency, Func<bool>? shouldAbort)
+    {
+        lock (_sync)
+        {
+            if (_voiceOnsetSamples == 0 && !_voicePreKeyIqActive) return true;
+            // The tail owns zero feeding now. Late live callbacks must not
+            // append more speech or feed a second pre-key silence stream.
+            _voiceOnsetArmed = false;
+        }
+        long maximumWait = _stopwatchTicks() + frequency * (RadioService.MaxPreKeyDelayMs + 1) / 1000;
+        while (true)
+        {
+            if (shouldAbort?.Invoke() == true || !_isMoxOn()) return false;
+            long openAt = _preKeyOpenAtTicks();
+            long now = _stopwatchTicks();
+            if (!TxService.IsPreKeyMuteOpen(openAt, now)) return true;
+            // A pending key transaction sentinel is not a finite relay delay.
+            if (openAt == long.MaxValue || openAt > maximumWait || now >= maximumWait)
+                return false;
+            int waitMs = (int)Math.Min(20, Math.Ceiling((openAt - now) * 1000.0 / frequency));
+            SendPreKeyZeroIq(waitMs * (TxRateHz / 1000));
+            _voiceTailWait(waitMs, shouldAbort);
         }
     }
 
@@ -509,6 +641,7 @@ public sealed class TxAudioIngest : IDisposable
             if (engine is null || engine.TxBlockSamples <= 0 || engine.TxOutputSamples <= 0
                 || engine.TxBlockSamples > _tailMic.Length || engine.TxOutputSamples > _tailIq.Length / 2) return false;
             _instantCwIdReserved = true;
+            ResetVoicePreKeyIq();
             _voiceOnsetArmed = false;
             _voiceOnset.Clear();
             _voiceOnsetSamples = 0;
@@ -855,8 +988,12 @@ public sealed class TxAudioIngest : IDisposable
         bool transportDrained = true;
         try
         {
+            // Releasing during relay settling must not replay held speech
+            // into the still-muted IQ path. Keep the original deadline.
+            if (!WaitForVoiceOnsetPreKey(freq, shouldAbort)) return false;
             onsetDrained = DrainVoiceOnsetPaced(freq, shouldAbort, _voiceTailWait);
             if (shouldAbort?.Invoke() == true) return false;
+            if (!DrainProcessedVoiceOnset(freq, shouldAbort)) return false;
 
             lock (_sync)
             {
@@ -958,6 +1095,7 @@ public sealed class TxAudioIngest : IDisposable
             lock (_sync)
             {
                 _voiceOnsetArmed = false;
+                ResetVoicePreKeyIq();
                 _voiceOnset.Clear();
                 _voiceOnsetSamples = 0;
                 _preserveOnsetAccumulatorDuringTail = false;
@@ -1117,8 +1255,10 @@ public sealed class TxAudioIngest : IDisposable
             // Finish voice already held by the UI key transaction before the
             // station ID starts. The CW-ID tail otherwise skips the ordinary
             // voice tail and would discard these final queued syllables.
+            if (!_instantCwIdReserved && !WaitForVoiceOnsetPreKey(freq, shouldAbort)) return false;
             int onsetDrained = _instantCwIdReserved ? 0 : DrainVoiceOnsetPaced(freq, shouldAbort);
             if (shouldAbort?.Invoke() == true) return false;
+            if (!_instantCwIdReserved && !DrainProcessedVoiceOnset(freq, shouldAbort)) return false;
             lock (_sync)
             {
                 residualSamples = _instantCwIdReserved ? 0 : Math.Min(_accumulatorFill, blockSize);
@@ -1173,6 +1313,7 @@ public sealed class TxAudioIngest : IDisposable
             lock (_sync)
             {
                 _voiceOnsetArmed = false;
+                ResetVoicePreKeyIq();
                 _voiceOnset.Clear();
                 _voiceOnsetSamples = 0;
                 _preserveOnsetAccumulatorDuringTail = false;
@@ -1210,8 +1351,9 @@ public sealed class TxAudioIngest : IDisposable
 
     /// <summary>
     /// Shared end of a synthesized release tail (roger beep, CW ID): clock
-    /// silence through TXA until its delayed output decays (two quiet blocks,
-    /// bounded by <see cref="RogerBeepDspFlushCeilingMs"/>), let the P1/P2
+    /// silence through TXA until its delayed output decays (two quiet blocks
+    /// after TXA's latency, bounded by <see cref="RogerBeepDspFlushCeilingMs"/>
+    /// beyond it), let the P1/P2
     /// transport drain, then hold a short guard so the last IQ reaches the
     /// radio before the wire MOX bit drops. <paramref name="shouldAbort"/>
     /// (an emergency release waiting on the key) ends the flush at the next
@@ -1222,9 +1364,13 @@ public sealed class TxAudioIngest : IDisposable
         ref long deadline, ref float iqPeak, Func<bool>? shouldAbort = null)
     {
         Array.Clear(_tailMic, 0, blockSize);
-        int maxFlushBlocks = Math.Max(
-            1,
-            TxRateHz * RogerBeepDspFlushCeilingMs / 1000 / blockSize);
+        // The delayed output can be quiet in a Morse gap while the last
+        // characters of a CW ID are still inside TXA (about 210 ms with CFC at
+        // a 96 kHz DSP rate). Quiet output counts only after TXA's latency has
+        // been clocked through, as in the voice tail; otherwise the ID is cut
+        // on air and the rest goes out at the start of the next over (#3223).
+        int latencyBlocks = TxaLatencyBlocks(blockSize);
+        int maxFlushBlocks = latencyBlocks + TailFlushCeilingBlocks(blockSize);
         int silentBlocks = 0;
         int flushBlocks = 0;
         int emittedBlocks = 0;
@@ -1234,7 +1380,7 @@ public sealed class TxAudioIngest : IDisposable
                 return new TxTailFlush(emittedBlocks, flushBlocks, DspFlushed: false, TransportDrained: false);
             emittedBlocks += ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak);
             flushBlocks++;
-            silentBlocks = blockPeak <= RogerBeepFlushIqThreshold
+            silentBlocks = b >= latencyBlocks && blockPeak <= RogerBeepFlushIqThreshold
                 ? silentBlocks + 1
                 : 0;
             deadline += periodTicks;
@@ -1253,6 +1399,20 @@ public sealed class TxAudioIngest : IDisposable
         SleepUnlessAborted(RogerBeepTailGuardMs, shouldAbort);
         return new TxTailFlush(emittedBlocks, flushBlocks, dspFlushed, transportDrained);
     }
+
+    /// <summary>Whole input blocks covering how long audio can still be inside
+    /// TXA after it was fed (<see cref="_voiceDspLatencyMs"/>, the bound the
+    /// voice tail uses). Zero when the engine reports no latency.</summary>
+    private int TxaLatencyBlocks(int blockSize)
+    {
+        int latencyMs = Math.Clamp(_voiceDspLatencyMs(), 0, 2000);
+        return latencyMs == 0 ? 0 : (int)Math.Ceiling(latencyMs * (double)TxRateHz / 1000.0 / blockSize);
+    }
+
+    /// <summary>Blocks a synthesized-tail flush may run past TXA's latency
+    /// waiting for quiet output (<see cref="RogerBeepDspFlushCeilingMs"/>).</summary>
+    private static int TailFlushCeilingBlocks(int blockSize) =>
+        Math.Max(1, TxRateHz * RogerBeepDspFlushCeilingMs / 1000 / blockSize);
 
     private const int TailAbortPollMs = 10;
 
@@ -1322,7 +1482,9 @@ public sealed class TxAudioIngest : IDisposable
     /// Prime WDSP TXA with silence immediately after MOX-on, before the radio
     /// wire key is asserted. Some TXA backends retain output from the previous
     /// tail; this clocks that state through and discards it so the next over
-    /// starts with fresh mic audio, not the previous roger beep.
+    /// starts with fresh mic audio, not the previous roger beep, CW ID or
+    /// speech. At least <see cref="KeyDownPrimeBlocks"/> blocks and TXA's
+    /// latency, then until the output is quiet.
     /// </summary>
     public bool PrimeTxDspForKeyDown()
     {
@@ -1357,28 +1519,46 @@ public sealed class TxAudioIngest : IDisposable
             // voice epoch before WDSP priming so old wet speech cannot reappear.
             _productAudio.BeginVoiceTxEpoch();
             Array.Clear(_tailMic, 0, blockSize);
-            for (int b = 0; b < KeyDownPrimeBlocks; b++)
+            // Whatever the last over left inside TXA leaves only after its full
+            // latency (about 210 ms with CFC at a 96 kHz DSP rate), and its
+            // delayed output can be quiet in a Morse gap or a speech pause
+            // before then. So clock at least that much silence, then until the
+            // output is quiet, bounded like the release flush (#3223).
+            int latencyBlocks = TxaLatencyBlocks(blockSize);
+            int maxBlocks = Math.Max(KeyDownPrimeBlocks, latencyBlocks + TailFlushCeilingBlocks(blockSize));
+            int quietBlocks = 0;
+            int processed = 0;
+            while (processed < maxBlocks)
             {
                 int produced = engine.ProcessTxBlock(
                     new ReadOnlySpan<float>(_tailMic, 0, blockSize),
                     new Span<float>(_tailIq, 0, 2 * iqOut));
-                if (produced <= 0) continue;
-
-                var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
-                for (int i = 0; i < iqSpan.Length; i++)
+                processed++;
+                float blockPeak = 0f;
+                if (produced > 0)
                 {
-                    float sampleAbs = iqSpan[i];
-                    if (sampleAbs < 0) sampleAbs = -sampleAbs;
-                    if (sampleAbs > iqPeak) iqPeak = sampleAbs;
+                    var iqSpan = new ReadOnlySpan<float>(_tailIq, 0, 2 * produced);
+                    for (int i = 0; i < iqSpan.Length; i++)
+                    {
+                        float sampleAbs = iqSpan[i];
+                        if (sampleAbs < 0) sampleAbs = -sampleAbs;
+                        if (sampleAbs > blockPeak) blockPeak = sampleAbs;
+                    }
+                    if (blockPeak > iqPeak) iqPeak = blockPeak;
+                    blocks++;
                 }
-                blocks++;
+                quietBlocks = processed > latencyBlocks && blockPeak <= RogerBeepFlushIqThreshold
+                    ? quietBlocks + 1
+                    : 0;
+                if (processed >= KeyDownPrimeBlocks && quietBlocks >= RogerBeepFlushSilentBlocks)
+                    break;
             }
 
             double primeMs = (System.Diagnostics.Stopwatch.GetTimestamp() - startTs)
                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             _log.LogInformation(
-                "tx.keyDownPrime beforeWireKey blocks={Blocks} iqPeak={IqPeak:F4} elapsedMs={Elapsed:F2}",
-                blocks, iqPeak, primeMs);
+                "tx.keyDownPrime beforeWireKey blocks={Blocks} latencyBlocks={LatencyBlocks} iqPeak={IqPeak:F4} quietAtEnd={QuietAtEnd} elapsedMs={Elapsed:F2}",
+                blocks, latencyBlocks, iqPeak, quietBlocks >= RogerBeepFlushSilentBlocks, primeMs);
             return blocks > 0;
         }
         catch (Exception ex)
@@ -1552,6 +1732,23 @@ public sealed class TxAudioIngest : IDisposable
     /// </summary>
     private static string FormatGapMs(double ms) =>
         ms < 0 ? "n/a" : ms.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+
+    // Called only by the native capture worker at a radio-clock discontinuity.
+    internal void ResetNativeHostContinuity()
+    {
+        _hostFanoutFill = 0;
+        lock (_sync)
+        {
+            if (_accumulatorSource == MicBlockSource.Host) _accumulatorFill = 0;
+            if (_activeSource != MicBlockSource.Host || _txOwnedByTuneDriver()
+                || Volatile.Read(ref _tailDraining) != 0 || _audioModem.Active
+                || Volatile.Read(ref _productPluginInjectionActive) != 0
+                || ShouldSuppressHostSource(Environment.TickCount64, 0)) return;
+            _latencyGovernor.Reset();
+            _productAudio.BeginVoiceTxEpoch();
+            ResetVoicePreKeyIq();
+        }
+    }
 
     internal void OnHostMicSamplesFromMic(ReadOnlySpan<float> samples, MicBlockValidity validity)
     {
@@ -1727,10 +1924,9 @@ public sealed class TxAudioIngest : IDisposable
             }
         }
 
-        // Non-destructive mic tap, fired BEFORE the MOX/monitor gate so a
-        // recorder can capture the raw mic whether or not the operator is
-        // keyed or monitoring (silent capture). The engine mic-meter service
-        // also observes this seam, so desktop native mic, browser mic, radio
+        // Raw mic metering and waveform analysis observe this seam before
+        // the MOX/monitor gate. Recorder capture uses the final processed
+        // TX audio in DspPipelineService instead. Desktop mic, browser mic, radio
         // jack, TCI, and playback all use the same pre-MOX metering path.
         MicPcmTapped?.Invoke(f32lePayload, source);
         Span<float> samples = stackalloc float[MicBlockSamples];
@@ -1738,7 +1934,6 @@ public sealed class TxAudioIngest : IDisposable
         for (var index = 0; index < samples.Length; index++)
             samples[index] = BinaryPrimitives.ReadSingleLittleEndian(
                 bytes.Slice(index * sizeof(float), sizeof(float)));
-        _productPluginAudio?.PublishTxMic(TxRateHz, samples);
         if (!processAir) return; // ASIO fast path already sent these samples
         if (Volatile.Read(ref _productPluginInjectionActive) != 0)
         {
@@ -1861,6 +2056,7 @@ public sealed class TxAudioIngest : IDisposable
                 if (_fmBurst.IsActive || _fmBurstBypassApplied) CancelFmToneBurstLocked(engine);
                 if (_lastSeenMox)
                 {
+                    ResetVoicePreKeyIq();
                     // MOX fell since our last frame — drain the IQ ring so the
                     // next keyed TX starts clean, without the tail of this one.
                     _ring.Clear();
@@ -1926,7 +2122,8 @@ public sealed class TxAudioIngest : IDisposable
         // audible, self-rising monitor tone. Speech opens the preview gate
         // immediately and the hang keeps it open through phrase pauses so the
         // preview does not sound gated; only sustained idle closes it. Keyed
-        // TX, TCI, and WAV playback bypass this gate entirely.
+        // TX, TCI, WAV playback, and processed recording bypass this gate so
+        // capture retains the full signal rather than the preview envelope.
         //
         // Substitute digital silence rather than dropping the block: while the
         // monitor is on it REPLACES the RX audio at every sink, so a dropped
@@ -1942,7 +2139,7 @@ public sealed class TxAudioIngest : IDisposable
         // below. Fully open blocks pass bit-identical; fully closed are zeros.
         float previewGainStart = 1f;
         float previewGainEnd = 1f;
-        if (monitorOn && !moxNow
+        if (monitorOn && !moxNow && !(_productPluginAudio?.HasLeasedTxMicCapture ?? false)
             && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable)
         {
             (previewGainStart, previewGainEnd) = AdvanceIdleMonitorPreviewGate(samples);
@@ -2213,6 +2410,26 @@ public sealed class TxAudioIngest : IDisposable
                         bool mute = openAt != 0L
                             && TxService.IsPreKeyMuteOpen(openAt, _stopwatchTicks())
                             && !wavRecent;
+
+                        if (bypassOnset && _voicePreKeyIqActive)
+                        {
+                            if (_voicePreKeyIq.Count > 0
+                                && (_voiceIqSourceEpoch != _activeSourceEpoch || !IsBufferedCurrent(_voiceIqValidity)))
+                                _voicePreKeyIq.Reset();
+                            if (_voicePreKeyIq.Count == 0)
+                            {
+                                _voiceIqValidity = validity;
+                                _voiceIqSourceEpoch = _activeSourceEpoch;
+                                _voiceIqSource = source;
+                            }
+                            bool alreadyFailed = _voicePreKeyIq.Failed;
+                            if (!_voicePreKeyIq.Render(_scratchIq.AsSpan(0, 2 * produced), mute) && !alreadyFailed)
+                                _log.LogError("tx.voice.prekey IQ retention exceeded its bounded gate budget; silencing this transmission");
+                            if (mute) Interlocked.Add(ref _preKeyOnsetZeroSamples, produced);
+                            // Retention already substituted cadence-preserving
+                            // zeros. Never discard the processed opening speech.
+                            mute = false;
+                        }
 
                         // P1 path — EP2 packer in Protocol1Client drains the ring.
                         if (mute) _diagnosticPreKeyMutedSamples += produced;

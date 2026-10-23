@@ -130,6 +130,7 @@ public sealed partial class RadioService : IDisposable
     // 2026-06-25). Writes stay frontend/front-panel driven; this is read-only.
     private readonly BandMemoryStore? _bandMemoryStore;
     private string? _squelchBandKey;
+    private string? _ritXitBandKey;
     private long? _legacySquelchStartupHz;
     private bool _legacySquelchStartupEnabled;
     // Global (per-radio, NOT per-band) TX-audio source selection. Pushed via
@@ -1015,6 +1016,7 @@ public sealed partial class RadioService : IDisposable
             };
         }
         InitializeBandSquelch();
+        InitializeBandRitXit();
         // Seed the ARS latch with the hydrated dial so startup never rewrites a
         // persisted manual shift; only a real tune / mode change re-evaluates.
         _arsLastKey = ArsKeyLocked(_state);
@@ -6752,6 +6754,28 @@ public sealed partial class RadioService : IDisposable
         return Snapshot();
     }
 
+    private static BandRitXitMemory RitXitMemory(StateDto state) =>
+        new(state.RitEnabled, state.RitHz, state.XitEnabled, state.XitHz);
+
+    private static StateDto WithRitXitMemory(StateDto state, BandRitXitMemory memory) => state with
+    {
+        RitEnabled = memory.RitEnabled,
+        RitHz = Math.Clamp(memory.RitHz, -RitXitMaxHz, RitXitMaxHz),
+        XitEnabled = memory.XitEnabled,
+        XitHz = Math.Clamp(memory.XitHz, -RitXitMaxHz, RitXitMaxHz),
+    };
+
+    private void InitializeBandRitXit()
+    {
+        if (_bandMemoryStore is null) return;
+        _ritXitBandKey = RuntimeBandKey(_state.VfoHz);
+        if (_ritXitBandKey is not { } band) return;
+        // Migrate the old station-wide snapshot only to its startup band.
+        var memory = _bandMemoryStore.GetRitXit(band) ?? RitXitMemory(_state);
+        _state = WithRitXitMemory(_state, memory);
+        _bandMemoryStore.SetRitXit(band, RitXitMemory(_state));
+    }
+
     private void InitializeBandSquelch()
     {
         if (_bandMemoryStore is null) return;
@@ -7527,6 +7551,12 @@ public sealed partial class RadioService : IDisposable
                 // radio connects or its layout/profile selection changes.
                 string? squelchBand = _bandMemoryStore is null
                     ? null : RuntimeBandKey(next.VfoHz);
+                bool ritXitBandChanged = _bandMemoryStore is not null && squelchBand != _ritXitBandKey;
+                if (ritXitBandChanged)
+                {
+                    var memory = squelchBand is null ? null : _bandMemoryStore!.GetRitXit(squelchBand);
+                    next = WithRitXitMemory(next, memory ?? new(false, 0, false, 0));
+                }
                 bool? seedSquelch = null;
                 if (_bandMemoryStore is not null && (squelchBand != _squelchBandKey
                     || (_legacySquelchStartupHz is { } startupHz && startupHz != next.VfoHz)))
@@ -7559,7 +7589,11 @@ public sealed partial class RadioService : IDisposable
                 // keyed-while-tuning shift is validated on the shifted carrier.
                 next = ApplyAutoRepeaterShiftLocked(next, out arsChanged);
                 TransmitSafetyStateChanging?.Invoke(_state, next);
+                bool ritXitChanged = RitXitMemory(_state) != RitXitMemory(next);
                 _state = next;
+                _ritXitBandKey = squelchBand;
+                if (squelchBand is not null && (ritXitBandChanged || ritXitChanged))
+                    _bandMemoryStore!.SetRitXit(squelchBand, RitXitMemory(next));
                 _currentMode = (int)next.Mode;
                 _squelchBandKey = squelchBand;
                 if (_legacySquelchStartupHz is { } pendingHz && pendingHz != next.VfoHz

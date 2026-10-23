@@ -4,8 +4,11 @@
 // Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
 //                         Christian Suarez (N9WAR), and contributors.
 
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Net.Http.Headers;
+using System.Text.Json.Serialization;
 
 namespace Zeus.Server.SpeTaurus;
 
@@ -72,4 +75,58 @@ internal static class ExpertAmpServerEvidence
             CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
             out contact);
+
+    internal static bool HasFreshProtocolStatus(
+        string? source,
+        string? confidence,
+        string? provenance,
+        string? lastContactAt,
+        ExpertAmpServerResponseTiming? timing) =>
+        timing is { } response
+            ? HasFreshProtocolStatus(source, confidence, provenance, lastContactAt, response.ReferenceTime)
+                && TryParseContact(lastContactAt, out var contact)
+                && response.Age(contact) <= MaximumContactAge
+            : HasFreshProtocolStatus(source, confidence, provenance, lastContactAt);
+
+    internal static HttpRequestMessage CreateReadRequest(string url) => new(HttpMethod.Get, url)
+    {
+        Headers = { CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true } },
+    };
+}
+
+// Timing is captured from this HTTP response, never from the JSON payload or a
+// previously observed offset. Contact and Date share the server's clock; local
+// monotonic time accounts conservatively for transport and subsequent use.
+internal readonly record struct ExpertAmpServerResponseTiming(
+    DateTimeOffset ReferenceTime,
+    TimeSpan RequestDuration,
+    long ReceivedTimestamp,
+    TimeSpan TimestampUncertainty = default)
+{
+    internal static ExpertAmpServerResponseTiming Capture(HttpResponseMessage response, long requestStarted)
+    {
+        if (response.Headers.Age is { } age && age > TimeSpan.Zero)
+            throw new InvalidDataException("Expert Amp Server returned a cached response.");
+        var received = Stopwatch.GetTimestamp();
+        var serverDate = response.Headers.Date;
+        return new(serverDate ?? DateTimeOffset.UtcNow,
+            serverDate.HasValue ? Stopwatch.GetElapsedTime(requestStarted, received) : TimeSpan.Zero,
+            received,
+            serverDate.HasValue ? TimeSpan.FromSeconds(1) : TimeSpan.Zero);
+    }
+
+    internal TimeSpan Age(DateTimeOffset evidenceTime)
+    {
+        // HTTP Date has whole-second precision. Do not let its rounding grant
+        // extra lifetime, or let a slow response hide future-dated evidence.
+        var age = ReferenceTime - evidenceTime;
+        return (age > TimeSpan.Zero ? age : TimeSpan.Zero)
+            + TimestampUncertainty + RequestDuration + Stopwatch.GetElapsedTime(ReceivedTimestamp);
+    }
+}
+
+internal abstract record ExpertAmpServerTimedResponse
+{
+    [JsonIgnore]
+    public ExpertAmpServerResponseTiming? ResponseTiming { get; set; }
 }

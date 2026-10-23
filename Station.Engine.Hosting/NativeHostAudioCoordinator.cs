@@ -229,6 +229,18 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         {
             var previous = _activeSettings;
             var previousBackend = _activeBackend;
+            // Inactive ASIO preferences can be saved without interrupting System audio.
+            if (previousBackend == AudioHostApi.System
+                && previous.Backend == AudioHostApi.System
+                && proposed.Backend == AudioHostApi.System
+                && proposed.InputDeviceId == previous.InputDeviceId
+                && proposed.OutputDeviceId == previous.OutputDeviceId
+                && proposed.InputChannel == previous.InputChannel)
+            {
+                _settingsStore.Set(proposed);
+                _activeSettings = proposed;
+                return State;
+            }
             if (proposed.Backend == AudioHostApi.Asio)
                 Volatile.Write(ref _lastAsioAttemptDriverId, proposed.AsioDriverId);
             StopActive();

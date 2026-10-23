@@ -62,9 +62,8 @@ namespace Zeus.Server;
 /// PostGen overwrites the silent midbuff regardless of mic content, so the
 /// same pump path works for both modes — we just gate on either flag.
 ///
-/// Starts and stops via <see cref="TxService.IsTunOn"/> /
-/// <see cref="TxService.IsTwoToneOn"/> polling; not worth building a
-/// subscription pattern for a feature that toggles at click rate.
+/// Committed TX intent wakes the idle pump immediately. Polling remains a
+/// fallback for engine availability; it must not delay the first IQ after keying.
 /// </summary>
 internal sealed class TxTuneDriver : BackgroundService
 {
@@ -86,6 +85,8 @@ internal sealed class TxTuneDriver : BackgroundService
     private readonly ILogger<TxTuneDriver> _log;
     private readonly Func<long> _stopwatchTicks;
     private readonly Action<ILogger> _promoteThread;
+    private readonly TimeSpan _idlePoll;
+    private readonly Action? _idleWaiting;
 
     // Scheduling policy for the dedicated pump thread. Bounded (QoS + managed
     // priority floor) rather than the hard 1 ms/5 ms mach real-time reservation
@@ -107,7 +108,9 @@ internal sealed class TxTuneDriver : BackgroundService
         TxIqRing ring,
         ILogger<TxTuneDriver> log,
         Func<long> stopwatchTicks,
-        Action<ILogger>? promoteThread = null)
+        Action<ILogger>? promoteThread = null,
+        TimeSpan? idlePoll = null,
+        Action? idleWaiting = null)
     {
         _tx = tx;
         _pipeline = pipeline;
@@ -115,6 +118,8 @@ internal sealed class TxTuneDriver : BackgroundService
         _log = log;
         _stopwatchTicks = stopwatchTicks;
         _promoteThread = promoteThread ?? DefaultThreadPromotion;
+        _idlePoll = idlePoll ?? PollIdle;
+        _idleWaiting = idleWaiting;
     }
 
     protected override Task ExecuteAsync(CancellationToken ct)
@@ -137,6 +142,36 @@ internal sealed class TxTuneDriver : BackgroundService
 
     private void PumpLoop(CancellationToken ct)
     {
+        using var activation = new AutoResetEvent(false);
+        bool ended = false;
+        void Wake(bool active)
+        {
+            // A captured invocation may outlive event unsubscription.
+            lock (activation)
+            {
+                if (!ended) activation.Set();
+            }
+        }
+        _tx.TxActiveChanged += Wake;
+        try
+        {
+            PumpLoopCore(ct, [ct.WaitHandle, activation]);
+        }
+        finally
+        {
+            _tx.TxActiveChanged -= Wake;
+            lock (activation) ended = true;
+        }
+    }
+
+    private bool WaitIdle(WaitHandle[] handles)
+    {
+        _idleWaiting?.Invoke();
+        return WaitHandle.WaitAny(handles, _idlePoll) == 0;
+    }
+
+    private void PumpLoopCore(CancellationToken ct, WaitHandle[] idleHandles)
+    {
         _promoteThread(_log);
         float[]? micScratch = null;
         float[]? iqScratch = null;
@@ -154,7 +189,7 @@ internal sealed class TxTuneDriver : BackgroundService
                 if (!_tx.IsTunOn && !_tx.IsTwoToneOn)
                 {
                     pacing = false;
-                    if (ct.WaitHandle.WaitOne(PollIdle)) return;
+                    if (WaitIdle(idleHandles)) return;
                     continue;
                 }
 
@@ -165,7 +200,7 @@ internal sealed class TxTuneDriver : BackgroundService
                 {
                     // No TXA yet — retry on the slow cadence.
                     pacing = false;
-                    if (ct.WaitHandle.WaitOne(PollIdle)) return;
+                    if (WaitIdle(idleHandles)) return;
                     continue;
                 }
 
@@ -254,7 +289,7 @@ internal sealed class TxTuneDriver : BackgroundService
             {
                 _log.LogWarning(ex, "tx.tune driver tick failed");
                 pacing = false;
-                if (ct.WaitHandle.WaitOne(PollIdle)) return;
+                if (WaitIdle(idleHandles)) return;
             }
         }
     }

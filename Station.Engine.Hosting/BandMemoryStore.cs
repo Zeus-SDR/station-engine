@@ -138,6 +138,28 @@ public sealed class BandMemoryStore : IDisposable
         return e?.ZoomLevel;
     }
 
+    public BandRitXitMemory? GetRitXit(string band)
+    {
+        var entry = _entries.FindOne(x => x.Band == band);
+        return entry?.RitEnabled is bool rit && entry.XitEnabled is bool xit
+            ? new(rit, entry.RitHz ?? 0, xit, entry.XitHz ?? 0) : null;
+    }
+
+    public void SetRitXit(string band, BandRitXitMemory memory)
+    {
+        lock (_mutationSync)
+        {
+            var entry = _entries.FindOne(x => x.Band == band)
+                ?? new BandMemoryEntry { Band = band };
+            entry.RitEnabled = memory.RitEnabled;
+            entry.RitHz = memory.RitHz;
+            entry.XitEnabled = memory.XitEnabled;
+            entry.XitHz = memory.XitHz;
+            entry.UpdatedUtc = DateTime.UtcNow;
+            _entries.Upsert(entry);
+        }
+    }
+
     public bool? GetSquelchEnabled(string band) =>
         _entries.FindOne(x => x.Band == band)?.SquelchEnabled;
 
@@ -427,6 +449,11 @@ public sealed class BandMemoryEntry
     public double? WfDbMax { get; set; }
     public double? WfTxDbMin { get; set; }
     public double? WfTxDbMax { get; set; }
+    // Nullable fields distinguish legacy rows from remembered off/zero values.
+    public bool? RitEnabled { get; set; }
+    public long? RitHz { get; set; }
+    public bool? XitEnabled { get; set; }
+    public long? XitHz { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }
 
@@ -438,3 +465,5 @@ public sealed record BandWaterfallSettingsDto(
     double? WfDbMax,
     double? WfTxDbMin,
     double? WfTxDbMax);
+
+public sealed record BandRitXitMemory(bool RitEnabled, long RitHz, bool XitEnabled, long XitHz);

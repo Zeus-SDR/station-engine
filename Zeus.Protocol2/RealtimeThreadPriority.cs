@@ -46,7 +46,8 @@ namespace Zeus.Protocol2;
 ///
 /// This file is intentionally duplicated across <c>Zeus.Protocol1</c>,
 /// <c>Zeus.Protocol2</c>, and <c>Zeus.Dsp.Wdsp</c>; the projects don't share
-/// a utility assembly. Keep all three copies in sync.
+/// a utility assembly. Keep their default policies in sync. Protocol 2 alone
+/// exposes a sender opt-in for the Thetis outbound worker's MMCSS priority.
 /// </remarks>
 // Public so Station.Engine.Hosting (TxTuneDriver pump) can promote its dedicated
 // thread too — same RT need as the protocol RX/TX threads (#559).
@@ -55,15 +56,17 @@ public static partial class RealtimeThreadPriority
     /// <summary>
     /// Promote the calling thread to the platform's pro-audio class. Safe
     /// to call once per long-running thread (e.g. at the top of an RxLoop).
+    /// The sender may opt into Windows MMCSS critical priority; other platforms
+    /// and callers retain their existing policies.
     /// </summary>
-    public static void PromoteCallingThreadToProAudio(ILogger log)
+    public static void PromoteCallingThreadToProAudio(ILogger log, bool windowsCritical = false)
     {
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
                 PromoteMacOs(log);
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                PromoteWindows(log);
+                PromoteWindows(log, windowsCritical);
             else
                 PromoteFallback(log);
         }
@@ -243,30 +246,69 @@ public static partial class RealtimeThreadPriority
                    StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     private static partial IntPtr AvSetMmThreadCharacteristicsW(string TaskName, out uint TaskIndex);
 
-    private static void PromoteWindows(ILogger log)
+    [LibraryImport("avrt.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool AvSetMmThreadPriority(IntPtr avrtHandle, int priority);
+
+    internal interface IWindowsAudioScheduler
+    {
+        IntPtr Register(string taskName, out uint taskIndex);
+        bool SetPriority(IntPtr handle, int priority);
+        int LastError { get; }
+    }
+
+    private sealed class WindowsAudioScheduler : IWindowsAudioScheduler
+    {
+        public IntPtr Register(string taskName, out uint taskIndex) =>
+            AvSetMmThreadCharacteristicsW(taskName, out taskIndex);
+        public bool SetPriority(IntPtr handle, int priority) => AvSetMmThreadPriority(handle, priority);
+        public int LastError => Marshal.GetLastPInvokeError();
+    }
+
+    private static void PromoteWindows(ILogger log, bool critical = false) =>
+        PromoteWindows(log, critical, new WindowsAudioScheduler(), () => TrySetThreadPriorityHighest(log));
+
+    internal static void PromoteWindows(
+        ILogger log, bool critical, IWindowsAudioScheduler scheduler, Action fallback)
     {
         uint taskIdx = 0;
         IntPtr handle;
         try
         {
-            handle = AvSetMmThreadCharacteristicsW("Pro Audio", out taskIdx);
+            handle = scheduler.Register("Pro Audio", out taskIdx);
         }
         catch (DllNotFoundException)
         {
             log.LogWarning("thread.priority avrt.dll not available — falling back to ThreadPriority.Highest");
-            TrySetThreadPriorityHighest(log);
+            fallback();
             return;
         }
 
         if (handle != IntPtr.Zero)
         {
             log.LogInformation("thread.priority promoted to MMCSS Pro Audio (Windows, taskIdx={Idx})", taskIdx);
+            if (critical)
+            {
+                try
+                {
+                    // Thetis ChannelMaster/obbuffs.c ob_main: Pro Audio, then
+                    // AVRT_PRIORITY_CRITICAL (2) for the outbound worker.
+                    if (scheduler.SetPriority(handle, 2))
+                        log.LogInformation("thread.priority MMCSS Pro Audio critical granted (Windows)");
+                    else
+                        log.LogWarning("thread.priority AvSetMmThreadPriority err={Err} — retaining MMCSS Pro Audio", scheduler.LastError);
+                }
+                catch (Exception ex)
+                {
+                    log.LogWarning(ex, "thread.priority critical promotion threw — retaining MMCSS Pro Audio");
+                }
+            }
         }
         else
         {
-            int err = Marshal.GetLastPInvokeError();
+            int err = scheduler.LastError;
             log.LogWarning("thread.priority AvSetMmThreadCharacteristicsW err={Err} — falling back to ThreadPriority.Highest", err);
-            TrySetThreadPriorityHighest(log);
+            fallback();
         }
     }
 

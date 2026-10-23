@@ -44,6 +44,22 @@ namespace Zeus.Server;
 /// </summary>
 internal sealed class NativeMicCapture : IHostedService, IDisposable
 {
+    private HostMicRadioClock? _radioClock;
+    private IHostMicRateMatcher? _rateMatcher;
+    private readonly Func<IHostMicRateMatcher> _rateMatcherFactory;
+    private bool _rateMatcherUnavailable;
+    private int _rateMatcherEpoch = -1;
+    private long _rateMatcherGeneration = -1;
+    private long _rateMatcherSourceEpoch = -1;
+    private readonly float[] _rateInput = new float[64];
+    private readonly float[] _rateOutput = new float[64];
+    private int _rateInputFill;
+    private long _rateLatestInputAt;
+    private long _rateLastDiagnostic;
+    private long _rateOutputEpoch = long.MinValue;
+    private readonly Func<long, long, bool> _matchedCaptureValidator;
+    private readonly Func<long, bool> _matchedBufferedValidator;
+
     private const int MicBlockSamples = 960;        // 20 ms @ 48 kHz, matches browser worklet
     private const int MicBlockBytes = MicBlockSamples * 4;
     // The queue holds at most 80 ms of mic audio. If processing falls farther
@@ -159,13 +175,14 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         TxAudioIngest ingest,
         ITxAudioPreviewProcessor previewProcessor,
         ILogger<NativeMicCapture> log,
-        AudioDeviceSettingsStore? deviceSettings = null)
+        AudioDeviceSettingsStore? deviceSettings = null,
+        DspPipelineService? pipeline = null)
         : this(
             ingest,
             previewProcessor,
             log,
             deviceSettings,
-            new NativeMicInputFactory())
+            new NativeMicInputFactory(), radioClock: pipeline?.HostMicClock)
     {
     }
 
@@ -175,8 +192,15 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         ILogger<NativeMicCapture> log,
         AudioDeviceSettingsStore? deviceSettings,
         INativeMicInputFactory inputFactory,
-        Action? promoteWorker = null)
+        Action? promoteWorker = null,
+        HostMicRadioClock? radioClock = null,
+        Func<IHostMicRateMatcher>? rateMatcherFactory = null)
     {
+        _matchedCaptureValidator = IsMatchedBlockCurrent;
+        _matchedBufferedValidator = IsMatchedBlockBufferedCurrent;
+        _rateMatcherFactory = rateMatcherFactory ?? (static () => new HostMicRateMatcher());
+        _radioClock = radioClock;
+        if (_radioClock is not null) _radioClock.Ready += WakeRadioClock;
         _ingest = ingest;
         _previewProcessor = previewProcessor;
         _log = log;
@@ -279,6 +303,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
     public void Dispose()
     {
+        if (_radioClock is not null) _radioClock.Ready -= WakeRadioClock;
         if (_disposed) return;
         _disposed = true;
         lock (_deviceSync)
@@ -896,9 +921,126 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         }
         finally
         {
+            ResetRateMatcher();
             if (_disposed)
                 CleanupCaptureWorkerResources();
         }
+    }
+
+    private void WakeRadioClock()
+    {
+        lock (_captureQueueSync)
+            if (!_captureWorkerStopping) _captureQueueReady.Set();
+    }
+
+    private void ResetRateMatcher()
+    {
+        if (_rateMatcher is not null)
+        {
+            _rateMatcher.Dispose();
+            _rateOutputEpoch++;
+            _previewAccumFill = 0;
+            _ingest.ResetNativeHostContinuity();
+        }
+        _rateMatcher = null;
+        _rateInputFill = 0;
+        _rateLatestInputAt = 0;
+    }
+
+    private bool IsMatchedBlockBufferedCurrent(long epoch) =>
+        epoch == _rateOutputEpoch
+        && _rateMatcherGeneration == Volatile.Read(ref _captureGeneration)
+        && _rateMatcherSourceEpoch == _ingest.ActiveSourceEpoch;
+
+    private bool IsMatchedBlockCurrent(long epoch, long timestamp) =>
+        IsMatchedBlockBufferedCurrent(epoch)
+        && IsCapturedBlockCurrent(_rateMatcherGeneration, timestamp);
+
+    // All native matcher calls belong to this worker. The socket thread only
+    // supplies bounded packet-clock credits; it never waits for DSP.
+    private bool RunRadioClock(ReadOnlySpan<float> input, long generation, long capturedAt)
+    {
+        var clock = _radioClock;
+        if (clock is null || _rateMatcherUnavailable) return false;
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var state = clock.Take(now);
+        var source = _ingest.ActiveSource;
+        long sourceEpoch = _ingest.ActiveSourceEpoch;
+        long currentGeneration = Volatile.Read(ref _captureGeneration);
+        if (!state.Connected || source != MicBlockSource.Host)
+        {
+            ResetRateMatcher();
+            return false;
+        }
+        if (!state.Running) { ResetRateMatcher(); return true; }
+        if (state.Epoch != _rateMatcherEpoch || currentGeneration != _rateMatcherGeneration
+            || sourceEpoch != _rateMatcherSourceEpoch)
+        {
+            ResetRateMatcher();
+            _rateMatcherEpoch = state.Epoch;
+            _rateMatcherGeneration = currentGeneration;
+            _rateMatcherSourceEpoch = sourceEpoch;
+        }
+        if (_rateMatcher is null)
+        {
+            try
+            {
+                _rateMatcher = _rateMatcherFactory();
+                _previewAccumFill = 0;
+                _ingest.ResetNativeHostContinuity();
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+            {
+                _rateMatcherUnavailable = true;
+                _log.LogWarning(ex, "audio.native.tx radio clock bridge unavailable; retaining capture-clock path");
+                return false;
+            }
+        }
+        if (!input.IsEmpty)
+        {
+            // Reserve the remaining age budget for the bounded native ring.
+            // Late captured speech is discarded, never given a fresh timestamp.
+            if (generation != currentGeneration
+                || System.Diagnostics.Stopwatch.GetElapsedTime(capturedAt, now).TotalMilliseconds > 20)
+            {
+                ResetRateMatcher();
+                return true;
+            }
+            foreach (float sample in input)
+            {
+                _rateInput[_rateInputFill++] = sample;
+                if (_rateInputFill == 64)
+                {
+                    _rateMatcher.Push(_rateInput);
+                    _rateInputFill = 0;
+                    _rateLatestInputAt = capturedAt;
+                }
+            }
+        }
+        // Preserve capture provenance across buffered resampling. The ring's
+        // current occupancy bounds the retained input duration; allow another
+        // 2 ms for the fixed input/output block and filter phase.
+        int retained = Math.Max(0, _rateMatcher.Diagnostics().Occupancy);
+        long oldestPossible = _rateLatestInputAt - (long)(System.Diagnostics.Stopwatch.Frequency * (retained / 48000.0 + .002));
+        for (int count = 0; count < state.Samples; count += 64)
+        {
+            _rateMatcher.Pull(_rateOutput);
+            if (_rateLatestInputAt != 0 && IsCapturedBlockCurrent(currentGeneration, oldestPossible))
+                ProcessHostCadenceBlock(_rateOutput, currentGeneration, oldestPossible,
+                    new MicBlockValidity(_matchedCaptureValidator, _rateOutputEpoch,
+                        oldestPossible, _matchedBufferedValidator));
+        }
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_rateLastDiagnostic, now).TotalSeconds >= 1)
+        {
+            _rateLastDiagnostic = now;
+            if (_ingest.AudioDiagnosticsActive)
+            {
+                var d = _rateMatcher.Diagnostics();
+                _log.LogInformation("audio.native.tx.clock underflows={Underflows} overflows={Overflows} ratio={Ratio:F8} occupancy={Occupancy} capacity={Capacity} epoch={Epoch}",
+                    d.Underflows, d.Overflows, d.Ratio, d.Occupancy, d.Capacity, state.Epoch);
+            }
+        }
+        return true;
     }
 
     private void CaptureWorkerLoopCore()
@@ -931,6 +1073,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
 
             if (!haveBlock)
             {
+                RunRadioClock(ReadOnlySpan<float>.Empty, 0, 0);
                 _captureQueueReady.WaitOne();
                 continue;
             }
@@ -955,10 +1098,13 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
             _diagnosticSamples += length;
             _diagnosticBlocks++;
             if (blockPeak < 0.0001f) _diagnosticSilent++;
-            if (length == MicBlockSamples)
-                ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
-            else
-                ProcessHostCadenceBlock(_workerBlock.AsSpan(0, length), generation, enqueuedAt);
+            if (!RunRadioClock(_workerBlock.AsSpan(0, length), generation, enqueuedAt))
+            {
+                if (length == MicBlockSamples)
+                    ProcessCapturedBlock(_workerBlock, generation, enqueuedAt);
+                else
+                    ProcessHostCadenceBlock(_workerBlock.AsSpan(0, length), generation, enqueuedAt);
+            }
             _diagnosticWorkMs = Math.Max(_diagnosticWorkMs,
                 System.Diagnostics.Stopwatch.GetElapsedTime(workStarted).TotalMilliseconds);
             int overflows = Interlocked.Exchange(ref _captureQueueOverflows, 0);
@@ -1064,9 +1210,10 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
     private void ProcessHostCadenceBlock(
         ReadOnlySpan<float> block,
         long generation,
-        long enqueuedAt)
+        long enqueuedAt,
+        MicBlockValidity? matchedValidity = null)
     {
-        if (!IsCapturedBlockCurrent(generation, enqueuedAt))
+        if (!(matchedValidity?.IsCurrent ?? IsCapturedBlockCurrent(generation, enqueuedAt)))
         {
             _previewAccumFill = 0;
             return;
@@ -1075,7 +1222,7 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         {
             _ingest.OnHostMicSamplesFromMic(
                 block,
-                new MicBlockValidity(_captureBlockValidator, generation, enqueuedAt,
+                matchedValidity ?? new MicBlockValidity(_captureBlockValidator, generation, enqueuedAt,
                     _bufferedCaptureValidator));
         }
         catch (Exception ex)
