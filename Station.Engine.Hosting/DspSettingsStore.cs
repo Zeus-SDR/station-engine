@@ -653,7 +653,8 @@ public sealed class DspSettingsStore : IDisposable
             PostEqEnabled: e.CfcPostEqEnabled ?? false,
             PreCompDb: e.CfcPreCompDb ?? 0.0,
             PrePeqDb: e.CfcPrePeqDb ?? 0.0,
-            Bands: bands);
+            Bands: bands,
+            FftSize: e.CfcFftSize is int size && CfcConfig.IsSupportedFftSize(size) ? size : 16384);
     }
 
     public void Upsert(NrConfig config, string profileId = "default")
@@ -741,6 +742,7 @@ public sealed class DspSettingsStore : IDisposable
     public void Upsert(CfcConfig config, string profileId = "default")
     {
         ArgumentNullException.ThrowIfNull(config);
+        config.Validated();
         if (config.Bands is null || config.Bands.Length != 10)
             throw new ArgumentException($"Bands must have exactly 10 entries; got {config.Bands?.Length ?? 0}", nameof(config));
 
@@ -776,6 +778,7 @@ public sealed class DspSettingsStore : IDisposable
         e.CfcPostEqEnabled = c.PostEqEnabled;
         e.CfcPreCompDb = c.PreCompDb;
         e.CfcPrePeqDb = c.PrePeqDb;
+        e.CfcFftSize = c.FftSize;
         e.CfcBand1Freq = c.Bands[0].FreqHz;  e.CfcBand1Comp = c.Bands[0].CompLevelDb;  e.CfcBand1Post = c.Bands[0].PostGainDb;
         e.CfcBand2Freq = c.Bands[1].FreqHz;  e.CfcBand2Comp = c.Bands[1].CompLevelDb;  e.CfcBand2Post = c.Bands[1].PostGainDb;
         e.CfcBand3Freq = c.Bands[2].FreqHz;  e.CfcBand3Comp = c.Bands[2].CompLevelDb;  e.CfcBand3Post = c.Bands[2].PostGainDb;
@@ -1016,6 +1019,7 @@ public sealed class DspSettingsEntry
     public bool? CfcPostEqEnabled { get; set; }
     public double? CfcPreCompDb { get; set; }
     public double? CfcPrePeqDb { get; set; }
+    public int? CfcFftSize { get; set; }
     public double CfcBand1Freq { get; set; }  public double CfcBand1Comp { get; set; }  public double CfcBand1Post { get; set; }
     public double CfcBand2Freq { get; set; }  public double CfcBand2Comp { get; set; }  public double CfcBand2Post { get; set; }
     public double CfcBand3Freq { get; set; }  public double CfcBand3Comp { get; set; }  public double CfcBand3Post { get; set; }

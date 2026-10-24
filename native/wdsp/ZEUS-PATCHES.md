@@ -1,35 +1,79 @@
-# WDSP 2.10 source and Zeus integration
+# WDSP 2.11 source and Zeus integration
 
-WDSP revision **2.1.0**, dated **2026-09-04**, returns **210** from
-`GetWDSPVersion`; the existing Zeus version formatter displays **2.10**.
-KB2UKA authorized the upstream PureSignal calibration changes on 2026-09-05.
+WDSP revision **2.1.1**, dated **2026-10-15**, returns **211** from
+`GetWDSPVersion`; the existing Zeus version formatter displays **2.11**.
+KB2UKA authorized the upstream PureSignal calibration changes of 2.10 on
+2026-09-05 and the 2.11 `PSSaveCorr`/`PSRestoreCorr` filename bound on
+2026-10-23 (no calibration change).
 
 ## Pinned sources
 
-Warren Pratt's personal repository is https://github.com/NR0V/wdsp. His release
-repository is https://github.com/TAPR/OpenHPSDR-wdsp. At import time the latter
-still contained 2.00 at `584e8aca5ba1c4c6bc66fc0cc164ce567c8ba1e3`.
+Warren Pratt's release repository is https://github.com/TAPR/OpenHPSDR-wdsp.
+2.11 is imported from its `wdsp 2.11/Source` directory at
+`e69de50d1d702216098019013899ad87534c64e0` (four commits of 2026-10-15 by
+NR0V), merged three-way onto Zeus's tree with `wdsp 2.10/Source` at the same
+revision as the base, so only Warren's 2.10 -> 2.11 changes were applied. The
+manual is `wdsp 2.11/WDSP_Guide__Rev_2_1_1.pdf` in the same directory.
 
-This upgrade uses the published 2.10 source mirror in
-[the September 4 port](https://github.com/abhishekprakash22/zeus/tree/db86c1152d286705e820c0e008a0c6adc3bc5d69/native/wdsp),
-which identifies its input as `2026-09-04 WDSP, ver 210.zip`. This is a ported
-mirror, not a claim that TAPR has published that revision. Cross-checks used
-[deskHPSDR's independent import](https://github.com/dl1bz/deskhpsdr/tree/e307f0fafe7b410a87c1eb1f2d5a909c6bcfa457/wdsp-2.10)
-and [Warren's revision 2.1.0 manual](https://github.com/dl1bz/deskhpsdr/blob/e307f0fafe7b410a87c1eb1f2d5a909c6bcfa457/wdsp-2.10/WDSP_Guide__Rev_2_1_0.pdf).
-The manual's revision history confirms the new neural noise reduction, PureSignal
-calibration tuning, and filter-generation efficiency changes. Both ports carry
-identical model tokens despite different formatting.
+Before import the 2.10 -> 2.11 delta was audited line by line: no network,
+process, registry, dynamic-loading or memory-protection calls anywhere in the
+tree, licence headers unchanged (GPL v2 or later), and the manual PDF carries
+no active content.
 
-The source models in the first mirror have SHA-256:
+NNR model data (raw blob SHA-256, the bytes inside the C array):
 
-- `nnr_model_0.c`: `af9174a63cd0683efed03feb97d45419ca52a881943c25153299b02aed607a98`
-- `nnr_model_1.c`: `62593d935c5a7b4970fac988b76aa28d038e97f7b56a48480a3be7346749a331`
+- `nnr_model_0.c` (voice Standard): `e1ebfed6f522746b...`, byte-identical to 2.10
+- `nnr_model_1.c` (voice Premium): `925fdb6830627d84...`, byte-identical to 2.10
+- `nnr_model_2.c` (CW Standard): `bf8bae198ddd3b94c4a1473a4075fa7d28312c839c8f4009a83d7ea9f85090eb`
+- `nnr_model_3.c` (CW Premium): `bf6facf2e039eee6b31f2c5eb015eb940ceb8fae3142898928db50ab5a960f67`
 
-Upstream copyright, licence and acknowledgment notices remain intact. Trailing
+Zeus keeps its existing `nnr_model_0.c`/`nnr_model_1.c` files; 2.11 changed
+only their text formatting. Upstream copyright, licence and acknowledgment
+notices remain intact. Line endings are normalised to LF and trailing
 whitespace may be removed when importing. Do not overwrite this directory
-wholesale: Zeus's prior version is **2.00**, and its later fixes are required.
+wholesale: Zeus's later fixes are required.
+
+## 2.11 changes taken, and how
+
+- NNR CW networks: `nnrbypass.{c,h}` (new; its Windows-only includes are
+  replaced by `comm.h`), `nnr.{c,h}`, `nnet.{c,h}`, `nnio.c`,
+  `nnr_model_2.c`, `nnr_model_3.c`. `NNET_NSLOTS` is 4. `SetRXANNRPosition`
+  is deprecated upstream and has no effect; NNR placement follows the model.
+- `RXA.c`: the training-band bypass path in `xrxa`, `RXAbp1Position`, and the
+  new `RXAbp1Set`. Zeus NR3/NR4 are carried through: they count towards bp1's
+  run and position like ANF/ANR/EMNR, their pre-AGC instances are skipped with
+  the other pre-AGC blocks while the bypass runs, and `rnnr.c`/`sbnr.c` pass
+  the bypass flag to `RXAbp1CheckEx` and call `RXAbp1Set` from their position
+  setters instead of writing `bp1.position` directly.
+- `SetChannelState` (channel.c) turn-on and already-off waits.
+- Bounds checks: `nnio.c`, `emnr.c` (zetaHat.bin must be 60x60; Zeus's shipped
+  file is), `nurbs_fit.c`, `nurbs_spline.c`, `siphon.c` (folded into Zeus's
+  reader functions), `cfcomp.c`, `calcc.c`, `wisdom.c` (may now return -1),
+  and Zeus's own `impulse_cache.c` reader (ported by hand: entry count, entry
+  size, allocation failure, partial cache freed on error).
+- Fixes: `emnr.c` getZeta bound (`i_xi`, not `xi_dB`; Trained gain read past
+  the 3600-entry tables for a-priori SNR above +20.5 dB), `emph.c`/`fmd.c`
+  NC setters (use-after-free; Zeus does not call them), `SetTXAPostGenNoiseMag`.
+- Not taken: `wdsp_align.h` and its includes (Zeus's `linux_port.h` already
+  maps `_aligned_malloc`; the inline definitions would collide with that
+  macro), the 2.11 `wdsp.h` (Zeus keeps its own public header; the new export
+  is declared there), and the reformatting of `destroy_rxa`/`flush_rxa`.
+
+`CloseChannel`: the 2.11 README asks hosts to call `SetChannelState(ch, 0, 1)`
+first so no flush runs while the channel is destroyed. Zeus satisfies the
+condition without the call: in 2.11 a channel that is ON cannot have a flush
+pending (turn-on waits for it), and a Zeus channel that is OFF was turned off
+by a blocking `SetChannelState(id, 0, 1)` that completed or timed out
+(clearing the flush flag). Adding the call after the worker has stopped would
+cost the full 100-200 ms timeout per channel on every disconnect and rate
+change, because no IQ is flowing then.
 
 ## Integration patches to preserve
+
+- `cfcomp.c`, `wdsp.h`: selectable CFC FFT sizes via `SetTXACFCOMPFftSize`.
+  Preserve the 16384-point default, operator profiles through workspace rebuilds,
+  and the display getter's DSP lock through its complete array read. See
+  [CFC FFT latency](../../docs/lessons/cfc-fft-latency.md).
 
 - `CMakeLists.txt`, `linux_port.{c,h}`, `wdsp_export.h`: Zeus build, exports,
   POSIX thread/semaphore handling and aligned allocation. The Linux thread-name
@@ -44,7 +88,9 @@ wholesale: Zeus's prior version is **2.00**, and its later fixes are required.
   destroy hooks coexist with upstream NNR. `RXAbp1CheckEx` includes NR3/NR4 in
   bandpass gating; the upstream-signature wrapper serves upstream callers.
   NNR is created disabled, as upstream specifies. Existing NR modes and defaults
-  are unchanged; this dependency upgrade adds no new operator controls.
+  are unchanged. Managed code picks the NNR slot from the operator's
+  Standard/Premium choice and the mode (CW networks in CWU/CWL only;
+  `WdspDspEngine.NnrSlotFor`).
 - `TXA.{c,h}`, `bandpass.{c,h}`, `fir.c`, `firmin.{c,h}`,
   `impulse_cache.{c,h}`: preserve Zeus's filter profile, minimum-phase and
   ultra-resolution changes from PRs #1350 and #1366. In particular, call
@@ -85,8 +131,9 @@ updated EMNR implementation no longer references it.
 Build from source for every packaged RID and refresh **all** committed WDSP
 libraries together. Source exports alone do not prove the packaged binary.
 `WdspRuntimeCompatibilityTests` loads the packaged runtime, verifies every
-managed `LibraryImport` entry point (including aliases), requires version 210,
-and checks both existing NR engines and the new NNR exports. Run the existing
+managed `LibraryImport` entry point (including aliases), requires version 211,
+checks both existing NR engines and the NNR exports, and selects each of the
+four NNR slots to prove the packaged library carries every network. Run the existing
 DSP fixtures, the opt-in NR combination walk and CESSB CTest harness as well as
 all repository gates. Check exported-symbol sets against the prior native build.
 

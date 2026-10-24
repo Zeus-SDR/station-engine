@@ -158,7 +158,7 @@ void SetRXARNNRRun (int channel, int run) {
 
   if (a->run != run) {
     RXAbp1CheckEx (channel, rxa[channel].amd.p->run, rxa[channel].snba.p->run,
-                 rxa[channel].emnr.p->run, getRun_nnr(rxa[channel].nnr.p), rxa[channel].anf.p->run, rxa[channel].anr.p->run,
+                 rxa[channel].emnr.p->run, getRun_nnrbypass (rxa[channel].nnrbypass.p), rxa[channel].anf.p->run, rxa[channel].anr.p->run,
                  run, rxa[channel].sbnr.p->run); // NR3 + NR4 support
     EnterCriticalSection (&ch[channel].csDSP);
     a->run = run;
@@ -384,7 +384,7 @@ PORT
 void SetRXARNNRPosition(int channel, int position) {
   EnterCriticalSection(&ch[channel].csDSP);
   rxa[channel].rnnr.p->position = position;
-  rxa[channel].bp1.p->position = position;
+  RXAbp1Set (channel);
   LeaveCriticalSection(&ch[channel].csDSP);
 }
 

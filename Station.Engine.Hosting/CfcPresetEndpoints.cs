@@ -87,6 +87,11 @@ public static class CfcPresetEndpoints
             error = "CFC preCompDb and prePeqDb must be finite";
             return false;
         }
+        if (!CfcConfig.IsSupportedFftSize(cfc.FftSize))
+        {
+            error = "CFC FFT size must be 2048, 4096, 8192, or 16384";
+            return false;
+        }
         if (cfc.Bands is null || cfc.Bands.Length != 10)
         {
             error = $"Bands must have exactly 10 entries; got {cfc.Bands?.Length ?? 0}";

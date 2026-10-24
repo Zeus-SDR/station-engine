@@ -9,6 +9,7 @@ public static class ContestLogEndpoints
 {
     public static IEndpointRouteBuilder MapContestLogEndpoints(this IEndpointRouteBuilder endpoints)
     {
+        endpoints.MapContestHistoryManagementEndpoints();
         endpoints.MapGet("/api/contest-log", (ContestLogStore store) =>
         {
             var snapshot = store.Get();

@@ -291,6 +291,7 @@ extern void SetRXACBLRun(int channel, int setit);
 //
 
 extern void SetTXACFCOMPRun (int channel, int run);
+extern int SetTXACFCOMPFftSize (int channel, int size);
 extern void SetTXACFCOMPPosition (int channel, int pos);
 extern void SetTXACFCOMPprofile (int channel, int nfreqs, double* F, double* G, double *E);
 extern void SetTXACFCOMPPrecomp (int channel, double precomp);
@@ -603,6 +604,7 @@ extern void SetTXAPreGenPulseToneFreq (int channel, double freq);
 extern void SetTXAPreGenPulseTransition (int channel, double transtime);
 extern void SetTXAPostGenRun (int channel, int run);
 extern void SetTXAPostGenMode (int channel, int mode);
+extern void SetTXAPostGenNoiseMag (int channel, double mag);
 extern void SetTXAPostGenToneMag (int channel, double mag);
 extern void SetTXAPostGenToneFreq (int channel, double freq);
 extern void SetTXAPostGenTTMag (int channel, double mag1, double mag2);
@@ -1054,6 +1056,7 @@ extern void SetRXANNRMaxGain (int channel, double gmax_db);
 
 extern int SetRXANNRModel (int channel, int slot);
 
+/* Deprecated in WDSP 2.11: position is chosen from the model; the call has no effect. */
 extern void SetRXANNRPosition (int channel, int position);
 
 extern void SetRXANNRRun (int channel, int setit);

@@ -176,6 +176,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     public static bool NativeLibraryLoadable => WdspNativeLoader.TryProbe();
 
+    public static bool CfcFftSizeAvailable => WdspNativeLoader.TryProbeExport("SetTXACFCOMPFftSize");
+
     public static bool EmnrPost2Available => AllNativeExportsAvailable(EmnrPost2RequiredExports);
 
     public static bool Nr4SbnrAvailable => AllNativeExportsAvailable(SbnrRequiredExports);
@@ -448,6 +450,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private bool _txaNativeOwned;
     private readonly IWdspTxControlNative _txControlNative;
     private readonly Func<int, int, int, int> _setTxMonitorChannelState;
+    // Receive-side SetChannelState for the half-duplex key-down turn-off.
+    // Injectable so tests can record the begin/wait order without libwdsp.
+    private readonly Func<int, int, int, int> _setRxChannelState;
+    private readonly bool? _parallelRxTurnOffOverride;
     // Tracked so SetTxMode can re-sign bandpass bounds (LSB family wants negative,
     // USB family positive) the same way RXA does through ApplyBandpassForMode.
     private RxaMode _txCurrentMode = RxaMode.USB;
@@ -758,11 +764,15 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         IWdspTxControlNative txControlNative,
         bool registerNativeResolver,
         int rxAnalyzerFftSize = AnalyzerFftSize,
-        Func<int, int, int, int>? setTxMonitorChannelState = null)
+        Func<int, int, int, int>? setTxMonitorChannelState = null,
+        Func<int, int, int, int>? setRxChannelState = null,
+        bool? parallelRxTurnOff = null)
     {
         _log = logger ?? NullLogger<WdspDspEngine>.Instance;
         _txControlNative = txControlNative ?? throw new ArgumentNullException(nameof(txControlNative));
         _setTxMonitorChannelState = setTxMonitorChannelState ?? NativeMethods.SetChannelState;
+        _setRxChannelState = setRxChannelState ?? NativeMethods.SetChannelState;
+        _parallelRxTurnOffOverride = parallelRxTurnOff;
         _rxAnalyzerFftSize = NormalizeRxAnalyzerFftSize(rxAnalyzerFftSize);
         if (registerNativeResolver)
         {
@@ -792,6 +802,51 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     }
 
     internal int? TxMonitorChannelIdForTests => _monitorChannelId;
+
+    // Registers a receive channel with no native state or worker, so MOX
+    // sequencing can be tested without libwdsp. Remove with
+    // ClearReceiveChannelsForTests before disposing the engine.
+    internal void AddReceiveChannelForTests(
+        int id,
+        bool primary = false,
+        bool isDisplayOnly = false,
+        bool isTxMonitor = false,
+        bool stopped = false,
+        bool suppressed = false)
+    {
+        var state = new ChannelState
+        {
+            Id = id,
+            Generation = Interlocked.Increment(ref _channelGeneration),
+            IsDisplayOnly = isDisplayOnly,
+            IsTxMonitor = isTxMonitor,
+            SampleRateHz = 48_000,
+            PixelWidth = 0,
+            SnrAnalyzerId = -1,
+            SnrAnalyzerGeneration = 0,
+            OutDoubles = 0,
+            InQueue = new BlockingCollection<RxIqWorkItem>(boundedCapacity: 1),
+            InQueueCapacity = 1,
+            Worker = new Thread(static () => { }),
+            Stopped = stopped,
+            RxDspSuppressedForMox = suppressed,
+        };
+        _channels[id] = state;
+        if (primary) Volatile.Write(ref _primaryRxaChannelId, id);
+    }
+
+    internal (bool Suppressed, bool FlushOnSilence) GetReceiveMoxStateForTests(int id)
+    {
+        var state = _channels[id];
+        lock (state.MoxGate) return (state.RxDspSuppressedForMox, state.NativeFlushOnSilence);
+    }
+
+    internal void ClearReceiveChannelsForTests()
+    {
+        foreach (var state in _channels.Values) state.InQueue.Dispose();
+        _channels.Clear();
+        Volatile.Write(ref _primaryRxaChannelId, -1);
+    }
 
     internal void SetCessbForTests(bool enabled, int bandwidthHz)
     {
@@ -1334,6 +1389,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 NativeMethods.SetRXAMode(channelId, (int)mapped);
                 state.CurrentMode = mapped;
                 ApplyBandpassForMode(state);
+                // A CW network left selected in a voice mode would take the
+                // training-band path there; follow the mode while NNR runs.
+                if (state.CurrentNrMode == NrMode.Nnr && state.OperatorNr is { } nr)
+                    ApplyNnrModel(channelId, nr, mapped);
             });
         }
         _log.LogInformation("wdsp.setMode channel={Id} mode={Mode}", channelId, mapped);
@@ -1776,6 +1835,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 TrySetSbnrRun(channelId, 0);
                 TrySetRnnrRun(channelId, 0);
                 TrySetNnrPosition(channelId, NrDefaults.Position);
+                ApplyNnrModel(channelId, cfg, state.CurrentMode);
                 ApplyNnr(channelId, cfg);
                 TrySetNnrRun(channelId, 1);
                 break;
@@ -2090,11 +2150,35 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         catch (EntryPointNotFoundException) { /* pre-2.10 libwdsp; position is moot */ }
     }
 
+    // WDSP 2.11 compiles four NNR networks into the library: voice Standard and
+    // Premium in slots 0 and 1, CW Standard and Premium in slots 2 and 3. The
+    // operator chooses Standard or Premium (NnrModel 0/1); the mode chooses the
+    // voice or CW network, as the WDSP Reference Manual §5.3.20 recommends.
+    // DIGU/DIGL stay on the voice networks.
+    internal static int NnrSlotFor(int? operatorModel, bool cwMode) =>
+        Math.Clamp(operatorModel ?? 0, 0, 1) + (cwMode ? 2 : 0);
+
+    private static bool IsCwMode(RxaMode mode) => mode is RxaMode.CWU or RxaMode.CWL;
+
+    // SetRXANNRModel returns the slot actually in use; a library without the
+    // CW networks stays on the slot it had, so log what really happened.
+    private void ApplyNnrModel(int channelId, NrConfig cfg, RxaMode mode)
+    {
+        int requested = NnrSlotFor(cfg.NnrModel, IsCwMode(mode));
+        try
+        {
+            int inUse = NativeMethods.SetRXANNRModel(channelId, requested);
+            if (inUse != requested)
+                _log.LogWarning("wdsp.nnr.model channel={Id} requested={Requested} inUse={InUse} (slot not in this libwdsp)",
+                    channelId, requested, inUse);
+        }
+        catch (EntryPointNotFoundException) { /* pre-2.10 libwdsp; NNR remains off */ }
+    }
+
     private static void ApplyNnr(int channelId, NrConfig cfg)
     {
         try
         {
-            NativeMethods.SetRXANNRModel(channelId, Math.Clamp(cfg.NnrModel ?? 0, 0, 1));
             NativeMethods.SetRXANNRMaskFloor(channelId, Math.Clamp(cfg.NnrMaskFloorDb ?? -25.0, -60.0, 0.0));
             NativeMethods.SetRXANNRAlpha(channelId, Math.Clamp(cfg.NnrAlpha ?? 1.0, 0.0, 4.0));
             NativeMethods.SetRXANNRAlphaKnee(channelId, Math.Clamp(cfg.NnrKneeDb ?? 10.0, 0.0, 40.0));
@@ -3115,13 +3199,15 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     }
                     else
                     {
+                        var receivers = new List<ChannelState>();
                         foreach (var receive in _channels.Values)
                         {
                             if (receive.Stopped || receive.IsDisplayOnly || receive.IsTxMonitor)
                                 continue;
                             if (receive.RxDspSuppressedForMox) continue;
-                            SetReceiveMoxSuppressed(receive, suppressed: true);
+                            receivers.Add(receive);
                         }
+                        SuppressReceiversForMox(receivers);
                     }
                 }
             }
@@ -3231,7 +3317,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (receive.MoxGate) receive.RxDspSuppressedForMox = false;
     }
 
-    private static void SetReceiveMoxSuppressed(ChannelState receive, bool suppressed)
+    private static void MarkReceiveMoxSuppressed(ChannelState receive, bool suppressed)
     {
         lock (receive.MoxGate)
         {
@@ -3246,6 +3332,53 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     receive.AudioCount = 0;
             }
         }
+    }
+
+    // First engine whose waiting SetChannelState(id, 0, 1) also waits for a
+    // turn-off already begun with dmode 0 (WDSP Guide Rev 2.1.1 §3.2.1).
+    // Older engines return from that call immediately.
+    internal const int ParallelRxTurnOffMinRaw = 211;
+
+    internal static bool SupportsParallelRxTurnOff(int engineRaw) => engineRaw >= ParallelRxTurnOffMinRaw;
+
+    private bool ParallelRxTurnOff =>
+        _parallelRxTurnOffOverride ?? SupportsParallelRxTurnOff(ResolveEngineVersion().Raw);
+
+    // Half-duplex key-down: mute and flush every audible receiver. WDSP 2.11
+    // recommends beginning every receiver's turn-off with dmode 0 and then
+    // waiting on each with dmode 1, so the receivers slew down and flush at the
+    // same time and key-down costs the slowest receiver instead of the sum.
+    // Same flush and silence feed as SetReceiveMoxSuppressed per receiver.
+    private void SuppressReceiversForMox(IReadOnlyList<ChannelState> receivers)
+    {
+        if (receivers.Count == 0) return;
+        foreach (var receive in receivers)
+        {
+            MarkReceiveMoxSuppressed(receive, suppressed: true);
+            lock (receive.MoxGate) receive.NativeFlushOnSilence = true;
+        }
+        try
+        {
+            if (ParallelRxTurnOff)
+            {
+                foreach (var receive in receivers) _setRxChannelState(receive.Id, 0, 0);
+                foreach (var receive in receivers) _setRxChannelState(receive.Id, 0, 1);
+            }
+            else
+            {
+                foreach (var receive in receivers) _setRxChannelState(receive.Id, 0, 1);
+            }
+        }
+        finally
+        {
+            foreach (var receive in receivers)
+                lock (receive.MoxGate) receive.NativeFlushOnSilence = false;
+        }
+    }
+
+    private static void SetReceiveMoxSuppressed(ChannelState receive, bool suppressed)
+    {
+        MarkReceiveMoxSuppressed(receive, suppressed);
         if (!suppressed) return;
         // Discard receive state that may have ingested leakage before
         // suppression began, as develop's key-down channel stop did: this is
@@ -5000,6 +5133,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     public void SetCfcConfig(CfcConfig cfg)
     {
         ArgumentNullException.ThrowIfNull(cfg);
+        cfg.Validated();
         if (cfg.Bands is null) throw new ArgumentException("Bands must not be null", nameof(cfg));
         if (cfg.Bands.Length != 10)
             throw new ArgumentException($"Bands must have exactly 10 entries; got {cfg.Bands.Length}", nameof(cfg));
@@ -5035,6 +5169,18 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             // _txaLock callers use.
             if (_txaChannelId is not int id) return;
 
+            if (_txControlNative.IsExportAvailable("SetTXACFCOMPFftSize"))
+            {
+                RunNativeLifecycleCriticalSection(() =>
+                {
+                    if (_txControlNative.SetTXACFCOMPFftSize(id, cached.FftSize) == 0)
+                        throw new ArgumentException("Unsupported CFC FFT size", nameof(cfg));
+                });
+            }
+            else if (cached.FftSize != 16384)
+            {
+                throw new NotSupportedException("The loaded WDSP library does not support configurable CFC FFT size.");
+            }
             _cfcConfig = cached;
             _txControlNative.SetTXACFCOMPprofile(id, nfreqs, f, g, e);
             _txControlNative.SetTXACFCOMPPrecomp(id, cached.PreCompDb);
@@ -5044,8 +5190,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         }
 
         _log.LogInformation(
-            "wdsp.setCfc enabled={Enabled} peq={Peq} precomp={Pre:F1}dB prepeq={PrePeq:F1}dB",
-            cfg.Enabled, cfg.PostEqEnabled, cfg.PreCompDb, cfg.PrePeqDb);
+            "wdsp.setCfc enabled={Enabled} peq={Peq} precomp={Pre:F1}dB prepeq={PrePeq:F1}dB fftSize={FftSize}",
+            cfg.Enabled, cfg.PostEqEnabled, cfg.PreCompDb, cfg.PrePeqDb, cfg.FftSize);
     }
 
     private static CfcConfig CloneCfcConfig(CfcConfig cfg) =>

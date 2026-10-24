@@ -921,3 +921,11 @@ void SetTXAPostGenTTPulseIQout(int channel, int IQout) {
   txa[channel].gen1.p->ttpulse.IQout = IQout;
   LeaveCriticalSection(&ch[channel].csDSP);
 }
+
+PORT
+void SetTXAPostGenNoiseMag(int channel, double mag) {
+  EnterCriticalSection(&ch[channel].csDSP);
+  txa[channel].gen1.p->noise.mag = mag;
+  LeaveCriticalSection(&ch[channel].csDSP);
+}
+

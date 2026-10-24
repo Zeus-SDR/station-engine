@@ -116,7 +116,8 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     private const int TxMonitorRingCapacity = 4_096;
 
     private readonly ILogger<NativeAudioSink> _log;
-    private readonly bool _outputEnabled;
+    private readonly bool _hostOutputEnabled;
+    private int _runtimeAsioOutputEnabled;
     private readonly AudioDeviceSettingsStore? _deviceSettings;
     // Shared operator-mute flag (issue #1252). Owned by the DI container;
     // SetMuted writes here, so every RX sink subscribed to the same state
@@ -192,8 +193,14 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     private volatile bool _previewEnabled;
 
     public bool IsMuted => _muteState.IsMuted;
-    public bool IsEnabled => _previewEnabled;
-    public bool OutputEnabled => _outputEnabled;
+    public bool IsEnabled => OutputEnabled && _previewEnabled;
+    public bool HostOutputEnabled => _hostOutputEnabled;
+    public bool OutputEnabled => _hostOutputEnabled || Volatile.Read(ref _runtimeAsioOutputEnabled) != 0;
+    internal void SetRuntimeAsioOutputEnabled(bool enabled)
+    {
+        Volatile.Write(ref _runtimeAsioOutputEnabled, enabled ? 1 : 0);
+        if (!enabled) _previewRing.Clear();
+    }
     public string? ConfiguredOutputDeviceId => _deviceSettings?.Get().OutputDeviceId;
     public string? ActiveOutputDeviceId => _externalOutputOpen
         ? _externalOutputDeviceId
@@ -228,7 +235,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         }
 
         return new(
-            OutputEnabled: _outputEnabled,
+            OutputEnabled: OutputEnabled,
             UnderrunSamplesTotal: Interlocked.Read(ref _underrunSamplesTotal),
             OverrunSamplesTotal: Interlocked.Read(ref _overrunSamplesTotal),
             RebufferEvents: Interlocked.Read(ref _rebufferEvents),
@@ -244,7 +251,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
             OutputChannels: outputChannels,
             TotalSamplesIn: Interlocked.Read(ref _totalSamplesIn),
             TotalSamplesOut: Interlocked.Read(ref _totalSamplesOut),
-            PreviewEnabled: _previewEnabled,
+            PreviewEnabled: IsEnabled,
             PreviewRingDepthSamples: _previewRing.Count,
             PreviewRingCapacitySamples: PreviewRingCapacity,
             PreviewSamplesIn: Interlocked.Read(ref _previewSamplesIn),
@@ -296,7 +303,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     public void SetEnabled(bool enabled)
     {
-        _previewEnabled = _outputEnabled && enabled;
+        _previewEnabled = enabled;
         // Drain the preview ring on disable so re-enabling doesn't
         // replay the tail of the prior preview session.
         if (!enabled) _previewRing.Clear();
@@ -310,7 +317,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         // No-op when preview is off — keeps the realtime path on the
         // mic capture thread cheap (one volatile read + return) when the
         // operator hasn't engaged the feature.
-        if (!_previewEnabled) return;
+        if (!IsEnabled) return;
         if (sampleRate != FrameRateHz) return;   // defence in depth — mic is always 48 kHz
         if (_muteState.IsMuted) return;           // RX mute also silences preview
 
@@ -364,7 +371,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         Action? onStallRecovery = null)
     {
         _log = log;
-        _outputEnabled = outputEnabled;
+        _hostOutputEnabled = outputEnabled;
         _deviceSettings = deviceSettings;
         _services = services;
         _muteState = muteState ?? new RxAudioMuteState();
@@ -388,7 +395,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        if (!_outputEnabled)
+        if (!_hostOutputEnabled)
         {
             _log.LogInformation("audio.native.rx output disabled by host configuration");
         }
@@ -450,7 +457,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     {
         string? normalized = NormalizeDeviceId(deviceId);
         _deviceSettings?.SetOutputDeviceId(normalized);
-        if (!_outputEnabled) return Task.CompletedTask;
+        if (!_hostOutputEnabled || _externalOutputOpen) return Task.CompletedTask;
 
         lock (_deviceSync)
         {
@@ -478,7 +485,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     internal void ActivateSystemOutput(string? deviceId)
     {
-        if (!_outputEnabled) return;
+        if (!_hostOutputEnabled) return;
         lock (_deviceSync)
         {
             if (_shutdown || _output is not null) return;
@@ -677,12 +684,21 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     internal void RenderPlaybackForTest(Span<float> output, uint frameCount, uint channels) =>
         OnPlaybackData(output, frameCount, channels);
 
-    internal void RenderPlaybackForHost(Span<float> output, uint frameCount, uint channels) =>
+    internal void RenderPlaybackForHost(Span<float> output, uint frameCount, uint channels)
+    {
+        // A native driver may finish Start after its open deadline. Preload
+        // silence until the coordinator adopts that successfully started route.
+        if (!OutputEnabled || !_externalOutputOpen)
+        {
+            output.Clear();
+            return;
+        }
         OnPlaybackData(output, frameCount, channels);
+    }
 
     public void Publish(in AudioFrame frame)
     {
-        if (!_outputEnabled) return;
+        if (!OutputEnabled) return;
         var frameSamples = frame.Samples.Length;
         Volatile.Write(ref _lastInputSampleRateHz, checked((int)frame.SampleRateHz));
         Volatile.Write(ref _lastInputChannels, frame.Channels);
@@ -731,7 +747,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // ring and overrun/throughput accounting as Publish so diagnostics stay coherent.
     public void PublishExempt(in AudioFrame frame)
     {
-        if (!_outputEnabled) return;
+        if (!OutputEnabled) return;
         if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz)
             return;
 
@@ -759,7 +775,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     private void PublishTxMonitorCore(in AudioFrame frame)
     {
-        if (!_outputEnabled) return;
+        if (!OutputEnabled) return;
         if (frame.Channels != 1 || frame.SampleRateHz != FrameRateHz)
             return;
 
@@ -789,6 +805,11 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     private void OnPlaybackData(Span<float> output, uint frameCount, uint channels)
     {
+        if (!OutputEnabled)
+        {
+            output.Clear();
+            return;
+        }
         // miniaudio's buffer is interleaved float32 sized frameCount * channels.
         // We hold mono samples in the ring; expand to N channels by replication.
         int totalFrames = (int)frameCount;
@@ -918,7 +939,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         // just hears silence for that gap, which is what they expect when the
         // publisher isn't producing.
         bool mixedPreview = false;
-        if (_previewEnabled)
+        if (IsEnabled)
         {
             Span<float> aud = totalFrames <= 4096
                 ? stackalloc float[totalFrames]
@@ -1033,6 +1054,8 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
 
     private void ScheduleRecovery(int stoppedGeneration)
     {
+        // ASIO owns external output recovery; miniaudio must not open a second device.
+        if (!_hostOutputEnabled || _externalOutputOpen) return;
         if (!DeviceStopRecovery.ShouldSchedule(
                 _shutdown,
                 _intentionalStop,
@@ -1069,7 +1092,8 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
                         lock (_deviceSync)
                         {
                             ct.ThrowIfCancellationRequested();
-                            if (_shutdown || _intentionalStop || recoveryEpoch != Volatile.Read(ref _recoveryEpoch))
+                            if (_shutdown || _intentionalStop || !_hostOutputEnabled || _externalOutputOpen
+                                || recoveryEpoch != Volatile.Read(ref _recoveryEpoch))
                             {
                                 abandoned = true;
                                 return Task.FromResult(true);

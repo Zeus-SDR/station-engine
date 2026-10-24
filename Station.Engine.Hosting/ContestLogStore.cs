@@ -5,7 +5,7 @@ using LiteDB;
 
 namespace Zeus.Server;
 
-public sealed class ContestLogStore : IDisposable
+public sealed partial class ContestLogStore : IDisposable
 {
     private const int SingletonId = 1;
     private readonly Zeus.Data.SharedLiteDatabase.Lease _lease;
@@ -13,6 +13,7 @@ public sealed class ContestLogStore : IDisposable
     private readonly ILiteCollection<ContestLogSessionEntry> _sessions;
     private readonly ILiteCollection<ContestLogActiveEntry> _active;
     private readonly ILiteCollection<ContestLogQsoEntry> _qsos;
+    private readonly ILiteCollection<ContestLogDeletedArchive> _deletedArchives;
     private readonly ILogger<ContestLogStore> _log;
     private readonly object _sync = new();
 
@@ -27,6 +28,7 @@ public sealed class ContestLogStore : IDisposable
         _sessions = _db.GetCollection<ContestLogSessionEntry>("contest_log_sessions");
         _active = _db.GetCollection<ContestLogActiveEntry>("contest_log_active");
         _qsos = _db.GetCollection<ContestLogQsoEntry>("contest_log_qsos");
+        _deletedArchives = _db.GetCollection<ContestLogDeletedArchive>("contest_log_deleted_archives");
         _sessions.EnsureIndex(x => x.StartedUtc);
         _qsos.EnsureIndex(x => x.SessionId);
         _qsos.EnsureIndex(x => x.Order);
@@ -62,6 +64,7 @@ public sealed class ContestLogStore : IDisposable
         var incoming = BuildQsos(snapshot.Qsos, id);
         lock (_sync)
         {
+            if (_deletedArchives.Exists(x => x.Id == id)) throw Conflict("This contest was deleted and cannot be restored by a pending save.");
             var active = ActiveId();
             if (active is not null && active != id) throw Conflict("Snapshot belongs to another active contest.");
             var session = _sessions.FindById(id);
@@ -98,6 +101,7 @@ public sealed class ContestLogStore : IDisposable
         var id = ContestLogSnapshotDto.SessionId(value);
         lock (_sync)
         {
+            if (_deletedArchives.Exists(x => x.Id == id)) throw Conflict("This contest was deleted and cannot be restored by a pending save.");
             var active = ActiveId();
             if (active is not null && active != id) throw Conflict("Finish the active contest before starting another.");
             var old = _sessions.FindById(id);
@@ -204,7 +208,7 @@ public sealed class ContestLogStore : IDisposable
         var row = _sessions.FindById(id);
         return row is null ? null : new ContestLogSnapshotDto(
             Parse(row.SessionJson), QsoRows(id).Select(x => Parse(x.QsoJson)).ToList(),
-            Utc(row.StartedUtc), row.FinishedUtc is null ? null : Utc(row.FinishedUtc.Value));
+            Utc(row.StartedUtc), row.FinishedUtc is null ? null : Utc(row.FinishedUtc.Value), row.ArchiveRevision);
     }
 
     private ContestLogSummaryDto Summary(ContestLogSessionEntry row)
@@ -255,6 +259,7 @@ public sealed class ContestLogStore : IDisposable
             {
                 var json = Parse(old.SessionJson);
                 var id = ContestLogSnapshotDto.SessionId(json);
+                if (_deletedArchives.Exists(x => x.Id == id)) return;
                 var start = Started(json, old.UpdatedUtc == default ? DateTime.UtcNow : old.UpdatedUtc);
                 InTransaction(() =>
                 {
@@ -338,7 +343,7 @@ public sealed class ContestLogStore : IDisposable
 
 public sealed record ContestLogSnapshotDto(
     JsonElement Session, IReadOnlyList<JsonElement> Qsos,
-    DateTime? StartedUtc = null, DateTime? FinishedUtc = null)
+    DateTime? StartedUtc = null, DateTime? FinishedUtc = null, long Revision = 0)
 {
     public static ContestLogSnapshotDto FromValidated(JsonElement root)
     {
@@ -392,6 +397,7 @@ public sealed class ContestLogSessionEntry
     public DateTime StartedUtc { get; set; }
     public DateTime? FinishedUtc { get; set; }
     public DateTime UpdatedUtc { get; set; }
+    public long ArchiveRevision { get; set; }
     public long NextQsoOrder { get; set; }
     public bool OrderCounterInitialized { get; set; }
 }
@@ -411,3 +417,5 @@ public sealed class LegacyContestLogSessionEntry
     public DateTime UpdatedUtc { get; set; }
 }
 public sealed class ContestLogConflictException(string message) : InvalidOperationException(message);
+
+public sealed class ContestLogDeletedArchive { [BsonId] public string Id { get; set; } = string.Empty; }

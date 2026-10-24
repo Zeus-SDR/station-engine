@@ -62,6 +62,7 @@ public sealed class CfcPresetStore : IDisposable
     public CfcPreset Save(string name, CfcConfig config)
     {
         ArgumentNullException.ThrowIfNull(config);
+        config.Validated();
         if (config.Bands is null || config.Bands.Length != 10)
             throw new ArgumentException($"Bands must have exactly 10 entries; got {config.Bands?.Length ?? 0}", nameof(config));
 

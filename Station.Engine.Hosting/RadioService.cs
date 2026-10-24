@@ -7033,10 +7033,15 @@ public sealed partial class RadioService : IDisposable
     // Mirrors the SetNr shape: validate, mutate state, persist, return
     // snapshot. DspPipelineService picks up the change-detect on the next
     // OnRadioStateChanged tick and pushes through to the engine.
+    internal Func<bool> CfcFftSizeAvailable { get; set; } = () => Zeus.Dsp.Wdsp.WdspDspEngine.CfcFftSizeAvailable;
+
     public StateDto SetCfc(CfcSetRequest req)
     {
         ArgumentNullException.ThrowIfNull(req);
         var cfg = req.Config ?? throw new ArgumentException("Config required", nameof(req));
+        cfg.Validated();
+        if (cfg.FftSize != 16384 && !CfcFftSizeAvailable())
+            throw new ArgumentException("The installed DSP library does not support configurable CFC FFT size. Update the native runtime before selecting a smaller FFT.", nameof(req));
         if (cfg.Bands is null || cfg.Bands.Length != 10)
             throw new ArgumentException($"Bands must have exactly 10 entries; got {cfg.Bands?.Length ?? 0}", nameof(req));
 

@@ -256,6 +256,12 @@ public sealed class WdspWisdomInitializer
 
             _log.LogInformation("wdsp.wisdom initialising dir={Dir}", dirForNative);
             int result = _runWisdom(dirForNative);
+            // WDSP 2.11 returns -1 when the directory is NULL or the resulting
+            // path exceeds its 1023-character buffer; no wisdom was loaded or
+            // built, so this is a failure, not "built".
+            if (result < 0)
+                throw new InvalidOperationException(
+                    $"WDSPwisdom rejected the wisdom directory (result={result}): path missing or longer than WDSP's 1023-character limit");
             var status = _getWisdomStatus();
             _log.LogInformation(
                 "wdsp.wisdom ready result={Result} ({Source}) status={Status}",

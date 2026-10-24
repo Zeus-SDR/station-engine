@@ -70,6 +70,10 @@ public sealed class NullTxAudioPreviewProcessor : ITxAudioPreviewProcessor
 public interface IProductTxAudioPort
 {
     bool Active { get; }
+    /// <summary>Whether TX must wait for processed insert audio rather than use current dry samples.</summary>
+    bool RequiresTxProcessing => Active;
+    /// <summary>Publish a dry observation block without delaying the on-air path.</summary>
+    void ObserveTx(ReadOnlySpan<float> block48k) { }
     void ProcessTx(Span<float> block48k);
     /// <summary>Bounded samples still retained by the TX insert after its last
     /// input. The voice tail clocks this many silence samples through the insert.</summary>

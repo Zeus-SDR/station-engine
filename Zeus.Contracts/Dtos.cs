@@ -3634,8 +3634,18 @@ public sealed record CfcConfig(
     bool PostEqEnabled,
     double PreCompDb,
     double PrePeqDb,
-    CfcBand[] Bands)
+    CfcBand[] Bands,
+    int FftSize = 16384)
 {
+    public static bool IsSupportedFftSize(int size) => size is 2048 or 4096 or 8192 or 16384;
+
+    public CfcConfig Validated()
+    {
+        if (!IsSupportedFftSize(FftSize))
+            throw new ArgumentException("CFC FFT size must be 2048, 4096, 8192, or 16384.");
+        return this;
+    }
+
     /// <summary>Pihpsdr's vfo.c:284-314 baseline — 10 bands at the voice-band
     /// frequencies operators recognise from PowerSDR. All compression and
     /// gains zeroed so enabling neutral CFC is audibly transparent.</summary>

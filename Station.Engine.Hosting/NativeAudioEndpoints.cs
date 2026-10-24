@@ -16,19 +16,8 @@ public static class NativeAudioEndpoints
         // truthful diagnostics, while desktop mode enables it. The SPA uses
         // its in-browser AudioContext path whenever native output is disabled.
         endpoints.MapGet("/api/audio/native", (IServiceProvider sp) =>
-        {
-            var sink = sp.GetService<NativeAudioSink>();
-            var hostAudio = sp.GetService<NativeHostAudioCoordinator>()?.State;
-            return Results.Ok(new
-            {
-                supported = sink?.OutputEnabled == true,
-                muted = sink?.IsMuted ?? false,
-                backend = (hostAudio?.Backend ?? AudioHostApi.System).ToString().ToLowerInvariant(),
-                asio = hostAudio?.AsioRuntime,
-                asioError = hostAudio?.AsioError,
-                diagnostics = sink?.GetDiagnostics(),
-            });
-        });
+            Results.Ok(BuildNativeAudioStatusResponse(
+                sp.GetService<NativeAudioSink>(), sp.GetService<NativeHostAudioCoordinator>())));
         endpoints.MapPost("/api/audio/native/mute", (NativeMuteRequest body, IServiceProvider sp) =>
         {
             var sink = sp.GetService<NativeAudioSink>();
@@ -83,7 +72,6 @@ public static class NativeAudioEndpoints
     private static IResult GetNativeAudioDevices(IServiceProvider sp)
     {
         var sink = sp.GetService<NativeAudioSink>();
-        if (sink?.OutputEnabled != true) sink = null;
         var mic = sp.GetService<NativeMicCapture>();
         var coordinator = sp.GetService<NativeHostAudioCoordinator>();
         if (sink is null && mic is null)
@@ -193,24 +181,30 @@ public static class NativeAudioEndpoints
     {
         if (body?.InputChannel is < -1)
             return Results.BadRequest(new { error = "input channel must be -1 or greater" });
+        if (body?.AsioBufferFrames is < 0)
+            return Results.BadRequest(new { error = "ASIO buffer frames must be zero or greater" });
         if (body?.AsioInputChannel is < 0)
             return Results.BadRequest(new { error = "ASIO input channel must be zero or greater" });
         if (body?.AsioOutputChannel is < 0)
             return Results.BadRequest(new { error = "ASIO output channel must be zero or greater" });
 
         var sink = sp.GetService<NativeAudioSink>();
-        if (sink?.OutputEnabled != true) sink = null;
         var mic = sp.GetService<NativeMicCapture>();
         var coordinator = sp.GetService<NativeHostAudioCoordinator>();
         if (sink is null && mic is null)
             return Results.NotFound(new { error = "native audio not active in this host mode" });
 
+        if (body?.DirectAsioMonitoring == true && coordinator is null)
+            return Results.BadRequest(new { error = "Direct ASIO monitoring is unavailable in this host mode" });
+
         string? inputDeviceId = NormalizeDeviceId(body?.InputDeviceId);
         string? outputDeviceId = NormalizeDeviceId(body?.OutputDeviceId);
 
         AudioHostApi requestedBackend;
-        if (!TryParseBackend(body?.Backend, coordinator?.State.Backend ?? AudioHostApi.System, out requestedBackend))
+        if (!TryParseBackend(body?.Backend, coordinator?.State.Settings.Backend ?? AudioHostApi.System, out requestedBackend))
             return Results.BadRequest(new { error = "backend must be 'system' or 'asio'" });
+        if (requestedBackend == AudioHostApi.System && body?.DirectAsioMonitoring == true)
+            return Results.BadRequest(new { error = "Select ASIO before enabling direct ASIO monitoring" });
 
         MiniAudioDeviceSnapshot snapshot;
         try
@@ -235,7 +229,7 @@ public static class NativeAudioEndpoints
             currentInput: mic?.ConfiguredInputDeviceId,
             requestedInput: inputDeviceId,
             availableInputIds: snapshot.Inputs.Select(d => d.Id).ToArray(),
-            hasSink: sink is not null,
+            hasSink: sink?.OutputEnabled == true,
             currentOutput: sink?.ConfiguredOutputDeviceId,
             requestedOutput: outputDeviceId,
             availableOutputIds: snapshot.Outputs.Select(d => d.Id).ToArray());
@@ -263,6 +257,11 @@ public static class NativeAudioEndpoints
                 AsioDriverId = asioDriverId,
                 AsioInputChannel = body?.AsioInputChannel ?? current.AsioInputChannel,
                 AsioOutputChannel = body?.AsioOutputChannel ?? current.AsioOutputChannel,
+                DirectAsioMonitoring = requestedBackend == AudioHostApi.System
+                    ? false : body?.DirectAsioMonitoring ?? current.DirectAsioMonitoring,
+                AsioBufferFrames = body?.AsioBufferFrames
+                    ?? (string.Equals(asioDriverId, current.AsioDriverId, StringComparison.OrdinalIgnoreCase)
+                        ? current.AsioBufferFrames : 0),
             };
 
             if (requestedBackend == AudioHostApi.Asio)
@@ -312,6 +311,25 @@ public static class NativeAudioEndpoints
             coordinator: null));
     }
 
+    internal static NativeAudioStatusResponse BuildNativeAudioStatusResponse(
+        NativeAudioSink? sink, NativeHostAudioCoordinator? coordinator)
+    {
+        var host = coordinator?.State;
+        return new(
+            Supported: sink?.OutputEnabled == true,
+            Muted: sink?.IsMuted ?? false,
+            Backend: (host?.Backend ?? AudioHostApi.System).ToString().ToLowerInvariant(),
+            Asio: host?.AsioRuntime,
+            AsioError: host?.AsioError,
+            Diagnostics: sink?.GetDiagnostics(),
+            OutputEnabled: sink?.OutputEnabled == true,
+            OutputOpen: sink?.OutputOpen == true,
+            DirectAsioMonitoring: host?.Settings.DirectAsioMonitoring ?? false,
+            DirectAsioMonitoringActive: host?.DirectAsioMonitoringActive ?? false,
+            DirectAsioMonitoringAllowed: host?.DirectAsioMonitoringAllowed ?? false,
+            OutputTransitioning: host?.OutputTransitioning ?? false);
+    }
+
     internal static NativeAudioDevicesResponse BuildNativeAudioDevicesResponse(
         NativeAudioSink? sink,
         NativeMicCapture? mic,
@@ -326,7 +344,7 @@ public static class NativeAudioEndpoints
         string? selectedDriverId = host?.Settings.AsioDriverId;
         if (!asioDrivers.Any(driver => string.Equals(driver.Id, selectedDriverId, StringComparison.OrdinalIgnoreCase)))
             selectedDriverId = null;
-        AsioDriverProbe? probe = coordinator?.ProbeAsioDriver(selectedDriverId);
+        AsioDriverProbe? probe = host?.OutputTransitioning == true ? null : coordinator?.ProbeAsioDriver(selectedDriverId);
         IReadOnlyList<AsioChannelInfo> asioInputs = probe?.Inputs ?? runtime?.Inputs ?? [];
         IReadOnlyList<AsioChannelInfo> asioOutputs = probe?.Outputs ?? runtime?.Outputs ?? [];
         int configuredInput = host?.Settings.AsioInputChannel ?? 0;
@@ -371,7 +389,14 @@ public static class NativeAudioEndpoints
             AsioBufferMinFrames: probe?.BufferMinFrames,
             AsioBufferMaxFrames: probe?.BufferMaxFrames,
             AsioBufferPreferredFrames: probe?.BufferPreferredFrames,
-            AsioBufferGranularity: probe?.BufferGranularity);
+            AsioBufferGranularity: probe?.BufferGranularity,
+            AsioRequestedBufferFrames: host?.Settings.AsioBufferFrames ?? 0,
+            OutputEnabled: sink?.OutputEnabled == true,
+            OutputOpen: sink?.OutputOpen == true,
+            DirectAsioMonitoring: host?.Settings.DirectAsioMonitoring ?? false,
+            DirectAsioMonitoringActive: host?.DirectAsioMonitoringActive ?? false,
+            DirectAsioMonitoringAllowed: host?.DirectAsioMonitoringAllowed ?? false,
+            OutputTransitioning: host?.OutputTransitioning ?? false);
     }
 
     private static int? FirstSupportedOutputPair(IReadOnlyList<AsioChannelInfo> outputs)
@@ -448,7 +473,9 @@ internal sealed record NativeAudioDevicesSetRequest(
     string? Backend = null,
     string? AsioDriverId = null,
     int? AsioInputChannel = null,
-    int? AsioOutputChannel = null);
+    int? AsioOutputChannel = null,
+    int? AsioBufferFrames = null,
+    bool? DirectAsioMonitoring = null);
 internal sealed record NativeAudioDeviceDto(
     string Id,
     string Name,
@@ -500,4 +527,25 @@ internal sealed record NativeAudioDevicesResponse(
     uint? AsioBufferMinFrames = null,
     uint? AsioBufferMaxFrames = null,
     uint? AsioBufferPreferredFrames = null,
-    int? AsioBufferGranularity = null);
+    int? AsioBufferGranularity = null,
+    int AsioRequestedBufferFrames = 0,
+    bool OutputEnabled = false,
+    bool OutputOpen = false,
+    bool DirectAsioMonitoring = false,
+    bool DirectAsioMonitoringActive = false,
+    bool DirectAsioMonitoringAllowed = false,
+    bool OutputTransitioning = false);
+
+internal sealed record NativeAudioStatusResponse(
+    bool Supported,
+    bool Muted,
+    string Backend,
+    AsioSessionRuntime? Asio,
+    string? AsioError,
+    NativeAudioSink.Diagnostics? Diagnostics,
+    bool OutputEnabled,
+    bool OutputOpen,
+    bool DirectAsioMonitoring,
+    bool DirectAsioMonitoringActive,
+    bool DirectAsioMonitoringAllowed,
+    bool OutputTransitioning = false);

@@ -20,7 +20,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 The author can be reached by email at
 
-warren@wpratt.com
+warren@pratt.one
 
 */
 
@@ -159,6 +159,10 @@ struct _rxa
 	} sbnr;
 	struct
 	{
+		NNRBYPASS p;
+	} nnrbypass;
+	struct
+	{
 		WCPAGC p;
 	} agc;
 	struct
@@ -227,8 +231,8 @@ extern __declspec (dllexport) void SetRXAMode (int channel, int mode);
 
 extern void RXAResCheck (int channel);
 
-extern void RXAbp1Check (int channel, int amd_run, int snba_run,
-	int emnr_run, int nnr_run, int anf_run, int anr_run);
+extern void RXAbp1Check (int channel, int amd_run, int snba_run, 
+	int emnr_run, int nnrbypass_run, int anf_run, int anr_run);
 
 // Zeus: the upstream signature above reads the NR3 / NR4 run flags from the
 // channel itself, so upstream callers are untouched. rnnr.c / sbnr.c call

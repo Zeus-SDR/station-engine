@@ -96,7 +96,54 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
     }
 
     public bool Active => Volatile.Read(ref _session)?.IsLeased == true;
-    public int VoiceTailSamples48k => Volatile.Read(ref _session)?.TxPipeline.VoiceTailSamples48k ?? 0;
+    public bool RequiresTxProcessing
+    {
+        get
+        {
+            var session = Volatile.Read(ref _session);
+            if (session?.IsLeased != true || !session.TryAddRef()) return false;
+            try { return !CanUseTransparentTx(session); }
+            finally { session.Release(); }
+        }
+    }
+
+    private static bool CanUseTransparentTx(Session session)
+    {
+        // A live processed stream owns queued wet/ramp audio. Adopt the dry
+        // fast path only at a fresh voice epoch or after the stream is idle.
+        // Revocation takes effect immediately; adoption never jumps over speech.
+        long last = Interlocked.Read(ref session.LastTxProcessingAt);
+        return session.Owner.ConsumerIsTransparent
+            && (last == 0 || Stopwatch.GetTimestamp() - last > Stopwatch.Frequency / 4);
+    }
+
+    public int VoiceTailSamples48k => RequiresTxProcessing
+        ? Volatile.Read(ref _session)?.TxPipeline.VoiceTailSamples48k ?? 0 : 0;
+
+    public void ObserveTx(ReadOnlySpan<float> block48k)
+    {
+        var session = Volatile.Read(ref _session);
+        if (session?.IsLeased != true || block48k.IsEmpty
+            || block48k.Length > AudioRingProtocol.MaxSamplesPerBlock || !session.TryAddRef()) return;
+        if (Interlocked.CompareExchange(ref _audioBusy, 1, 0) != 0)
+        {
+            session.Release();
+            return;
+        }
+        try
+        {
+            // Keep meters and configuration discovery alive, but never render
+            // an observation response into the current dry ASIO timeline.
+            while (session.Owner.TryReadOutput(_txProcessed, out _, out _)) { }
+            session.Owner.TryPublish(block48k, out _);
+            Interlocked.Exchange(ref _txEpochResetPending, 1);
+        }
+        finally
+        {
+            Volatile.Write(ref _audioBusy, 0);
+            session.Release();
+        }
+    }
 
     public ProductAudioRingSnapshot Snapshot => new(
         Volatile.Read(ref _session)?.IsLeased == true,
@@ -324,7 +371,12 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
     // The keying thread only requests reset. The existing TX owner consumes it
     // after claiming _audioBusy, so a reset never races a render or blocks audio.
-    public void BeginVoiceTxEpoch() => Interlocked.Exchange(ref _txEpochResetPending, 1);
+    public void BeginVoiceTxEpoch()
+    {
+        Interlocked.Exchange(ref _txEpochResetPending, 1);
+        var session = Volatile.Read(ref _session);
+        if (session is not null) Interlocked.Exchange(ref session.LastTxProcessingAt, 0);
+    }
 
     /// <summary>
     /// Realtime TX seam. The callback never waits for Product: it drains a
@@ -357,6 +409,16 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
 
         try
         {
+            if (CanUseTransparentTx(session))
+            {
+                // A leased but unity-dry suite is an observer, not an audio
+                // delay line. Preserve the caller's current samples exactly.
+                while (session.Owner.TryReadOutput(_txProcessed, out _, out _)) { }
+                session.Owner.TryPublish(block48k, out _);
+                Interlocked.Exchange(ref _txEpochResetPending, 1);
+                return;
+            }
+            Interlocked.Exchange(ref session.LastTxProcessingAt, Stopwatch.GetTimestamp());
             bool resetEpoch = Interlocked.Exchange(ref _txEpochResetPending, 0) != 0;
             if (resetEpoch) session.TxPipeline.Reset();
             while (session.Owner.TryReadOutput(
@@ -676,6 +738,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         public AudioRingOwner Owner { get; } = owner;
         public AudioRingOwner RxOwner { get; } = rxOwner;
         public ProductAudioTransportPipeline TxPipeline { get; } = new();
+        public long LastTxProcessingAt;
         public Timer? PendingTimer { get; set; }
         public bool IsLeased => Volatile.Read(ref _leased) != 0;
 

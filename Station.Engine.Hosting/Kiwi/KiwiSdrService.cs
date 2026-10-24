@@ -141,6 +141,8 @@ public sealed class KiwiSdrService : BackgroundService,
     // unsolicited socket closes as status="dropped", and OnClientStatus schedules
     // a back-off reconnect from here. Single-in-flight; _reconnectGen invalidates
     // any pending attempt when the operator/radio explicitly changes state.
+    private long _clientSession;     // identifies the client that owns status callbacks
+    private long _droppedClientSession = -1; // coalesce SND and W/F drops from one client
     private int _reconnectAttempt;   // resets on a fresh "connected" handshake
     private int _reconnectBusy;      // 0/1 — a reconnect loop is running
     private int _reconnectPending;   // 0/1 — a fresh drop arrived while the loop was busy
@@ -298,7 +300,8 @@ public sealed class KiwiSdrService : BackgroundService,
     // attempt counter + busy flag the schedule sets.
     internal void SetEnabledForTest(bool v) { lock (_sync) _enabled = v; }
     internal void SetRadioConnectedForTest(bool v) { lock (_sync) _radioConnected = v; }
-    internal void OnClientStatusForTest(string status, string? detail) => OnClientStatus(status, detail);
+    internal void OnClientStatusForTest(string status, string? detail, long? session = null) => OnClientStatus(status, detail, session);
+    internal long BeginClientSessionForTest() { lock (_sync) return ++_clientSession; }
     internal void OnRadioDisconnectedForTest() => OnRadioDisconnected();
     internal int ReconnectAttemptForTest => Volatile.Read(ref _reconnectAttempt);
     internal bool ReconnectBusyForTest => Volatile.Read(ref _reconnectBusy) == 1;
@@ -743,7 +746,9 @@ public sealed class KiwiSdrService : BackgroundService,
                 if (ReferenceEquals(_client, client)) _zoomLevel = Math.Min(_zoomLevel, cap);
             }
         };
-        client.StatusChanged = OnClientStatus;
+        long session;
+        lock (_sync) session = ++_clientSession;
+        client.StatusChanged = (status, detail) => OnClientStatus(status, detail, session);
         // The Kiwi S-meter is NOT broadcast (RxMeterFrame carries no RxId, so it
         // would overwrite RX1's meter — the panadapter/waterfall convey the Kiwi
         // level visually). It IS consumed internally to drive the audio squelch
@@ -789,7 +794,7 @@ public sealed class KiwiSdrService : BackgroundService,
     private async Task StopClientAsync()
     {
         KiwiSdrClient? client;
-        lock (_sync) { client = _client; _client = null; _pacer?.Dispose(); _pacer = null; }
+        lock (_sync) { ++_clientSession; client = _client; _client = null; _pacer?.Dispose(); _pacer = null; }
         if (client is not null)
         {
             try { await client.DisposeAsync().ConfigureAwait(false); }
@@ -797,7 +802,7 @@ public sealed class KiwiSdrService : BackgroundService,
         }
     }
 
-    private void OnClientStatus(string status, string? detail)
+    private void OnClientStatus(string status, string? detail, long? session = null)
     {
         // The client reports "handshake" once the auth/rate handshake completes
         // but BEFORE any stream frame has decoded. That is not a live receiver:
@@ -808,6 +813,7 @@ public sealed class KiwiSdrService : BackgroundService,
         {
             lock (_sync)
             {
+                if (session.HasValue && session.Value != _clientSession) return;
                 // ...but a LATE handshake must not regress a live session. The
                 // two legs race: on some receivers the W/F socket decodes its
                 // first row (promoting us to "connected") before the SND
@@ -830,6 +836,14 @@ public sealed class KiwiSdrService : BackgroundService,
 
         lock (_sync)
         {
+            if (session.HasValue && session.Value != _clientSession) return;
+            // Both sockets can close independently. Only the first close from
+            // this client may queue recovery; the second is the same failure.
+            if (status == "dropped")
+            {
+                if (_droppedClientSession == _clientSession) return;
+                _droppedClientSession = _clientSession;
+            }
             _status = stored;
             _statusDetail = storedDetail;
             if (status == "dropped") _lastDropReason = storedDetail;

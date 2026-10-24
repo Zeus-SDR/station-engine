@@ -41,6 +41,7 @@ mw0lge@grange-lane.co.uk
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "comm.h"
+#include <limits.h>
 
 /********************************************************************************************************
 *                                                   *
@@ -302,7 +303,7 @@ int read_impulse_cache(const char* path) {
   for (size_t b = 0; b < buckets; b++) {
     uint32_t count;
 
-    if (fread(&count, sizeof(count), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
+    if (fread(&count, sizeof(count), 1, fp) != 1 || count > MAX_CACHE_ENTRIES) { free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
     cache_entry* tail = NULL;
 
@@ -310,13 +311,17 @@ int read_impulse_cache(const char* path) {
       HASH_T hash;
       int    N;
 
-      if (fread(&hash, sizeof(HASH_T), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
+      if (fread(&hash, sizeof(HASH_T), 1, fp) != 1) { free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      if (fread(&N, sizeof(N), 1, fp) != 1) { LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
+      if (fread(&N, sizeof(N), 1, fp) != 1) { free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      double* data = (double*)malloc0(N * sizeof(complex));
+      if (N <= 0 || (size_t)N > INT_MAX / sizeof(complex)) { free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
-      if (fread(data, sizeof(complex), N, fp) != (size_t)N) { _aligned_free(data); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
+      double* data = (double*)malloc0((size_t)N * sizeof(complex));
+
+      if (!data) { free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
+
+      if (fread(data, sizeof(complex), N, fp) != (size_t)N) { _aligned_free(data); free_impulse_cache_unlocked(); LeaveCriticalSection(&_cs_cache); fclose(fp); return -1; }
 
       cache_entry* e = (cache_entry*)malloc0(sizeof(cache_entry));
       e->hash = hash;

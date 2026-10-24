@@ -1771,7 +1771,7 @@ public sealed class TxAudioIngest : IDisposable
         int offset = 0;
         while (offset < samples.Length)
         {
-            if (_hostFanoutFill == 0) _hostFanoutAirPerChunk = !_productAudio.Active;
+            if (_hostFanoutFill == 0) _hostFanoutAirPerChunk = !_productAudio.RequiresTxProcessing;
             int take = Math.Min(MicBlockSamples - _hostFanoutFill, samples.Length - offset);
             var chunk = samples.Slice(offset, take);
             chunk.CopyTo(_hostFanout.AsSpan(_hostFanoutFill));
@@ -1785,13 +1785,18 @@ public sealed class TxAudioIngest : IDisposable
                 && Volatile.Read(ref _productPluginInjectionActive) == 0
                 && ActiveSource == MicBlockSource.Host)
             {
-                ProcessMicPcm(chunk, MicBlockSource.Host, validity);
+                ProcessMicPcm(chunk, MicBlockSource.Host, validity, observeTransparentProduct: false);
             }
 
             if (_hostFanoutFill == MicBlockSamples)
             {
                 _hostFanoutFill = 0;
                 MemoryMarshal.AsBytes(_hostFanout.AsSpan()).CopyTo(_hostFanoutPayload);
+                if (_hostFanoutAirPerChunk && _productAudio.Active
+                    && ActiveSource == MicBlockSource.Host
+                    && Volatile.Read(ref _productPluginInjectionActive) == 0
+                    && (_isMoxOn() || _engineProvider()?.IsTxMonitorOn == true))
+                    _productAudio.ObserveTx(_hostFanout);
                 OnMicPcmBytes(_hostFanoutPayload, MicBlockSource.Host, validity,
                     processAir: !_hostFanoutAirPerChunk);
             }
@@ -2026,7 +2031,8 @@ public sealed class TxAudioIngest : IDisposable
         MicBlockSource source,
         MicBlockValidity? validity = null,
         bool bypassOnset = false,
-        bool tailReplay = false)
+        bool tailReplay = false,
+        bool observeTransparentProduct = true)
     {
         if (!bypassOnset && HoldOrReplayVoiceOnset(samples, source, validity, _isMoxOn()))
             return;
@@ -2254,7 +2260,10 @@ public sealed class TxAudioIngest : IDisposable
                     || Volatile.Read(ref _productPluginSpeechBypassGeneration) == 0))
             {
                 long productStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-                _productAudio.ProcessTx(incoming);
+                if (_productAudio.RequiresTxProcessing)
+                    _productAudio.ProcessTx(incoming);
+                else if (observeTransparentProduct)
+                    _productAudio.ObserveTx(incoming);
                 _diagnosticProductMs = Math.Max(_diagnosticProductMs,
                     System.Diagnostics.Stopwatch.GetElapsedTime(productStarted).TotalMilliseconds);
             }

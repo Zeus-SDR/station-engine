@@ -26,6 +26,9 @@ john.d.melton@googlemail.com
 */
 
 #include <errno.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #include "linux_port.h"
 #include "comm.h"
@@ -229,6 +232,22 @@ HANDLE _beginthread( void( __cdecl *start_address )( void * ), unsigned stack_si
   if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) {
     return (HANDLE) -1;
   }
+
+#ifdef __APPLE__
+  //
+  // Zeus #3241: the channel DSP and display-analyzer workers would otherwise
+  // inherit the default QoS class, which macOS may run on efficiency cores;
+  // demoting the engine there clicks the receiver and jumps the panadapter.
+  // Create them in USER_INTERACTIVE. QoS only, no mach real-time reservation
+  // (Zeus #2069). Windows promotes wdspmain itself via MMCSS (main.c).
+  //
+  {
+    void sendbuf(void *arg); // declared in analyzer.c but not in header file
+    if (start_address == &wdspmain || start_address == &sendbuf) {
+      (void) pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+  }
+#endif
 
   if (pthread_create(&threadid, &attr, (void * (*)(void * ))start_address, arglist)) {
     return (HANDLE) -1;

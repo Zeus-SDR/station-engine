@@ -3,7 +3,7 @@
 This directory vendors the WDSP DSP engine (Warren Pratt, GPL-2.0-or-later) and builds it
 as a shared library that `Zeus.Dsp` loads via P/Invoke.
 
-Source baseline: **WDSP 2.10 (upstream revision 2.1.0)** (Warren Pratt) plus a
+Source baseline: **WDSP 2.11 (upstream revision 2.1.1)** (Warren Pratt) plus a
 `linux_port.{c,h}` portability shim and `#ifdef _WIN32` guards to get WDSP off
 MSVC. Thetis's own WDSP tree is MSVC-only and is **not** suitable as an
 upstream.
@@ -12,7 +12,7 @@ Layout:
 
 ```
 native/
-  wdsp/                  # vendored WDSP 2.10 .c/.h
+  wdsp/                  # vendored WDSP 2.11 .c/.h
   wdsp/stubs/nr3/        # no-op rnnr_stub.c + rnnoise.h (used when WDSP_WITH_NR3=OFF)
   wdsp/stubs/nr4/        # no-op sbnr_stub.c + specbleach_adenoiser.h (used when WDSP_WITH_NR4=OFF)
   wdsp/wdsp_export.h     # WDSP_EXPORT visibility macro (replaces PORT)
@@ -173,7 +173,7 @@ Release packaging status:
 
 ## Source provenance and local patches
 
-See [wdsp/ZEUS-PATCHES.md](wdsp/ZEUS-PATCHES.md) for the pinned 2.10 source
+See [wdsp/ZEUS-PATCHES.md](wdsp/ZEUS-PATCHES.md) for the pinned 2.11 source
 mirrors, upstream manual, and the exact integration changes to retain when
 upgrading. Zeus carries NR3/NR4, CESSB controls, filter/cache improvements,
 PureSignal compatibility and platform fixes; replacing every C/header file

@@ -16,6 +16,7 @@ internal interface IWdspTxControlNative
     void SetTXAosctrlRun(int channel, int run);
     void SetTXAosctrlBandwidth(int channel, double bandwidth);
     void SetTXACFCOMPRun(int channel, int run);
+    int SetTXACFCOMPFftSize(int channel, int size) => 1;
     void SetTXACFCOMPprofile(int channel, int nfreqs, double[] f, double[] g, double[] e);
     void SetTXACFCOMPPrecomp(int channel, double precomp);
     void SetTXACFCOMPPrePeq(int channel, double prepeq);
@@ -84,6 +85,9 @@ internal sealed class WdspTxControlNative : IWdspTxControlNative
 
     public void SetTXACFCOMPRun(int channel, int run) =>
         NativeMethods.SetTXACFCOMPRun(channel, run);
+
+    public int SetTXACFCOMPFftSize(int channel, int size) =>
+        NativeMethods.SetTXACFCOMPFftSize(channel, size);
 
     public unsafe void SetTXACFCOMPprofile(int channel, int nfreqs, double[] f, double[] g, double[] e)
     {

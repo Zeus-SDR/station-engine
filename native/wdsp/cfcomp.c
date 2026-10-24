@@ -559,6 +559,25 @@ void setSize_cfcomp (CFCOMP a, int size)
 *																										*
 ********************************************************************************************************/
 
+PORT
+int SetTXACFCOMPFftSize (int channel, int size)
+{
+	if (size != 2048 && size != 4096 && size != 8192 && size != 16384) return 0;
+	CFCOMP a = txa[channel].cfcomp.p;
+	EnterCriticalSection (&ch[channel].csDSP);
+	if (a->fsize != size)
+	{
+		// Rebuild only the FFT workspace. Profile, curves, gains and run flags
+		// belong to the operator and survive the history reset.
+		decalc_cfcomp (a);
+		a->fsize = size;
+		calc_cfcomp (a);
+		flush_cfcomp (a);
+	}
+	LeaveCriticalSection (&ch[channel].csDSP);
+	return 1;
+}
+
 // Use for both Compressor and Equalizer.  Per another call below, the Equalizer can be separately
 //    turned OFF/ON, as long as this is set to Run.  However, the Equalizer cannot run without this
 //    being set to Run and the Compressor also being enabled.  That should be OK as there is not much
@@ -596,6 +615,11 @@ void SetTXACFCOMPprofile (int channel, int nfreqs, double* F, double* G, double 
 {
 	CFCOMP a = txa[channel].cfcomp.p;
 	EnterCriticalSection (&ch[channel].csDSP);
+	if (nfreqs < 1 || nfreqs > a->max_freqs || F == 0 || G == 0 || E == 0)
+	{
+		LeaveCriticalSection (&ch[channel].csDSP);
+		return;
+	}
 	a->nfreqsG = nfreqs;
 	a->nfreqsE = nfreqs;
 	memcpy (a->Fg, F, a->nfreqsG * sizeof (double));
@@ -613,6 +637,11 @@ void SetTXACFCOMPGprofile(int channel, int nfreqs, double* F, double* G)
 {
 	CFCOMP a = txa[channel].cfcomp.p;
 	EnterCriticalSection(&ch[channel].csDSP);
+	if (nfreqs < 1 || nfreqs > a->max_freqs || F == 0 || G == 0)
+	{
+		LeaveCriticalSection (&ch[channel].csDSP);
+		return;
+	}
 	a->nfreqsG = nfreqs;
 	memcpy(a->Fg, F, a->nfreqsG * sizeof(double));
 	memcpy(a->G,  G, a->nfreqsG * sizeof(double));
@@ -626,6 +655,11 @@ void SetTXACFCOMPEprofile(int channel, int nfreqs, double* F, double* E)
 {
 	CFCOMP a = txa[channel].cfcomp.p;
 	EnterCriticalSection(&ch[channel].csDSP);
+	if (nfreqs < 1 || nfreqs > a->max_freqs || F == 0 || E == 0)
+	{
+		LeaveCriticalSection (&ch[channel].csDSP);
+		return;
+	}
 	a->nfreqsE = nfreqs;
 	memcpy(a->Fe, F, a->nfreqsE * sizeof(double));
 	memcpy(a->E,  E, a->nfreqsE * sizeof(double));
@@ -687,7 +721,6 @@ void GetTXACFCOMPDisplayCompression(int channel, double* comp_values, int* ready
 		memcpy(a->cfc_gain_copy, a->cfc_gain, a->msize * sizeof(double));
 		a->mask_ready = 0;
 	}
-	LeaveCriticalSection(&ch[channel].csDSP);
 	if (*ready)
 	{
 		int step = (a->msize - 1) / 1024;
@@ -713,6 +746,7 @@ void GetTXACFCOMPDisplayCompression(int channel, double* comp_values, int* ready
 			}
 		}
 	}
+	LeaveCriticalSection(&ch[channel].csDSP);
 }
 
 PORT

@@ -21,7 +21,7 @@ public static class TxaVoiceLatencyModel
     // input/output resamplers, P2 CFIR). Measured 20-31 ms on libwdsp.
     internal const int PipelineAllowanceMs = 35;
 
-    // TXA.c create_cfcomp: fixed 16384-point FFT with 4x overlap. A sample
+    // TXA.c create_cfcomp defaults to 16384 points with 4x overlap. A sample
     // leaves the CFC (fsize - dsp_size) samples after it entered.
     internal const int CfcFftSize = 16384;
 
@@ -38,8 +38,11 @@ public static class TxaVoiceLatencyModel
         int dspRateHz,
         bool compressorEnabled,
         bool cessbEnabled,
-        bool cfcEnabled)
+        bool cfcEnabled,
+        int cfcFftSize = CfcFftSize)
     {
+        if (!CfcConfig.IsSupportedFftSize(cfcFftSize))
+            throw new ArgumentOutOfRangeException(nameof(cfcFftSize));
         if (dspRateHz <= 0) dspRateHz = 48_000;
         int filterMs;
         if (phase == FilterPhaseMode.Linear)
@@ -54,7 +57,7 @@ public static class TxaVoiceLatencyModel
             filterMs = (int)Math.Ceiling(2.0 * TxaDspSize * 1000.0 / dspRateHz);
         }
         int cfcMs = cfcEnabled
-            ? (int)Math.Ceiling((CfcFftSize - TxaDspSize) * 1000.0 / dspRateHz)
+            ? (int)Math.Ceiling((cfcFftSize - TxaDspSize) * 1000.0 / dspRateHz)
             : 0;
         return filterMs + cfcMs + PipelineAllowanceMs;
     }

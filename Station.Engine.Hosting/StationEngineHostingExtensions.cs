@@ -239,10 +239,9 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<IRxAudioSink>(sp => sp.GetRequiredService<RadioSpeakerAudioSink>());
         services.AddSingleton<IRxAudioSink>(sp => sp.GetRequiredService<SaturnSpeakerAudioSink>());
         services.AddSingleton<IRxAudioSink>(sp => sp.GetRequiredService<WebSocketAudioSink>());
-        if (options.NativeAudioOutputEnabled)
-        {
-            services.AddSingleton<IRxAudioSink>(sp => sp.GetRequiredService<NativeAudioSink>());
-        }
+        // Register the inert sink too: a runtime ASIO opt-in reuses this same
+        // DSP destination without constructing a second capture/output session.
+        services.AddSingleton<IRxAudioSink>(sp => sp.GetRequiredService<NativeAudioSink>());
         services.AddSingleton<IPreviewAudioSink>(sp => sp.GetRequiredService<NativeAudioSink>());
 
         services.AddSingleton<WdspWisdomInitializer>();

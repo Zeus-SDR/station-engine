@@ -2398,11 +2398,16 @@ public partial class DspPipelineService : BackgroundService,
     // How long speech can still be inside TXA after the last mic block: the
     // measured TXA bound (bandpass stages, CFC, fixed pipeline lag) plus DEXP
     // look-ahead and any reported TX plugin latency.
-    internal virtual int EstimateVoiceTxDspLatencyMs() =>
-        ComposeVoiceTxDspLatencyMs(
-            _radio.Snapshot(),
-            ResolveTxDspRateHz(_engine),
+    internal virtual int EstimateVoiceTxDspLatencyMs()
+    {
+        var state = _radio.Snapshot();
+        // A profile saved by a newer installation can be reopened against an
+        // older native library. Its fixed 16384-point CFC still owns the tail.
+        if (!WdspDspEngine.CfcFftSizeAvailable && state.Cfc is { } cfc)
+            state = state with { Cfc = cfc with { FftSize = 16384 } };
+        return ComposeVoiceTxDspLatencyMs(state, ResolveTxDspRateHz(_engine),
             Math.Max(0, Volatile.Read(ref _txPluginLatencyMs)?.Invoke() ?? 0));
+    }
 
     internal static int ComposeVoiceTxDspLatencyMs(StateDto state, int txDspRateHz, int pluginLatencyMs)
     {
@@ -2413,7 +2418,8 @@ public partial class DspPipelineService : BackgroundService,
             txDspRateHz,
             leveling.CompressorEnabled,
             leveling.CessbEnabled,
-            state.Cfc?.Enabled == true);
+            state.Cfc?.Enabled == true,
+            state.Cfc?.FftSize ?? 16384);
         var dexp = state.Dexp;
         if (dexp is { Enabled: true, LookAheadEnabled: true })
             delayMs += (int)Math.Ceiling(dexp.LookAheadMs);
@@ -7009,6 +7015,7 @@ public partial class DspPipelineService : BackgroundService,
         if (a.PostEqEnabled != b.PostEqEnabled) return false;
         if (a.PreCompDb != b.PreCompDb) return false;
         if (a.PrePeqDb != b.PrePeqDb) return false;
+        if (a.FftSize != b.FftSize) return false;
         if (a.Bands is null || b.Bands is null) return ReferenceEquals(a.Bands, b.Bands);
         if (a.Bands.Length != b.Bands.Length) return false;
         for (int i = 0; i < a.Bands.Length; i++)

@@ -44,7 +44,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # -----------------------------------------------------------------------------
-# Source list (mirrors upstream WDSP 2.10 Makefile SOURCES, minus rnnr.c and
+# Source list (mirrors upstream WDSP 2.11 Makefile SOURCES, minus rnnr.c and
 # sbnr.c which are gated below per-flag).
 # -----------------------------------------------------------------------------
 set(WDSP_SOURCES
@@ -53,7 +53,8 @@ set(WDSP_SOURCES
     delay.c dexp.c div.c doublepole.c eer.c emnr.c emph.c eq.c extrapolate.c fcurve.c
     FDnoiseIQ.c fir.c firmin.c fm_tone.c fmd.c fmmod.c fmsq.c gain.c gaussian.c gen.c
     icfir.c iir.c impulse_cache.c iobuffs.c iqc.c linux_port.c lmath.c main.c
-    matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c nob.c nobII.c nurbs.c nurbs_fit.c
+    matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c
+    nnr_model_2.c nnr_model_3.c nnrbypass.c nob.c nobII.c nurbs.c nurbs_fit.c
     nurbs_spline.c osctrl.c patchpanel.c phrot.c resample.c reshb.c rmatch.c
     RXA.c sender.c shift.c sip_cursor.c siphon.c slew.c snb.c snoop.c ssql.c syncbuffs.c
     TXA.c utilities.c varsamp.c version.c wbfm.c wcpAGC.c wisdom.c zetaHat.c

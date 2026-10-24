@@ -17,7 +17,9 @@ public sealed record AudioDeviceSettings(
     AudioHostApi Backend = AudioHostApi.System,
     string? AsioDriverId = null,
     int AsioInputChannel = 0,
-    int AsioOutputChannel = 0);
+    int AsioOutputChannel = 0,
+    int AsioBufferFrames = 0,
+    bool DirectAsioMonitoring = false);
 
 public sealed class AudioDeviceSettingsStore : IDisposable
 {
@@ -63,7 +65,9 @@ public sealed class AudioDeviceSettingsStore : IDisposable
                     Backend: Enum.IsDefined(e.Backend) ? e.Backend : AudioHostApi.System,
                     AsioDriverId: Normalize(e.AsioDriverId),
                     AsioInputChannel: Math.Max(0, e.AsioInputChannel),
-                    AsioOutputChannel: Math.Max(0, e.AsioOutputChannel));
+                    AsioOutputChannel: Math.Max(0, e.AsioOutputChannel),
+                    AsioBufferFrames: Math.Max(0, e.AsioBufferFrames),
+                    DirectAsioMonitoring: e.DirectAsioMonitoring);
         }
     }
 
@@ -138,7 +142,7 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         ArgumentNullException.ThrowIfNull(settings);
         if (settings.InputChannel is < 0)
             throw new ArgumentOutOfRangeException(nameof(settings));
-        if (settings.AsioInputChannel < 0 || settings.AsioOutputChannel < 0)
+        if (settings.AsioInputChannel < 0 || settings.AsioOutputChannel < 0 || settings.AsioBufferFrames < 0)
             throw new ArgumentOutOfRangeException(nameof(settings));
 
         lock (_sync)
@@ -151,6 +155,8 @@ public sealed class AudioDeviceSettingsStore : IDisposable
             e.AsioDriverId = Normalize(settings.AsioDriverId);
             e.AsioInputChannel = settings.AsioInputChannel;
             e.AsioOutputChannel = settings.AsioOutputChannel;
+            e.AsioBufferFrames = settings.AsioBufferFrames;
+            e.DirectAsioMonitoring = settings.DirectAsioMonitoring;
             SaveEntry(e);
         }
     }
@@ -184,6 +190,8 @@ public sealed class AudioDeviceSettingsEntry
     public string? AsioDriverId { get; set; }
     public int AsioInputChannel { get; set; }
     public int AsioOutputChannel { get; set; }
+    public int AsioBufferFrames { get; set; }
+    public bool DirectAsioMonitoring { get; set; }
     public string? VirtualCableInputDeviceId { get; set; }
     public DateTime UpdatedUtc { get; set; }
 }

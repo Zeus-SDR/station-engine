@@ -73,6 +73,20 @@ public sealed class AudioRingOwner : IDisposable
         return _output.ReadRealtimeMarker();
     }
 
+    /// <summary>True only while an upgraded consumer renews its unity-dry promise.
+    /// Older consumers leave this reserved header field zero.</summary>
+    public bool ConsumerIsTransparent
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            long stamp = _output.ReadTransparentTimestamp();
+            long age = AudioRingProtocol.Timestamp() - stamp;
+            return stamp > 0 && age >= 0
+                && age <= System.Diagnostics.Stopwatch.Frequency / 4;
+        }
+    }
+
     public static AudioRingOwner Create()
     {
         var token = Guid.NewGuid().ToString("N")[..12];
@@ -453,8 +467,14 @@ public sealed class AudioRingOwner : IDisposable
             Volatile.Write(ref Int32At(28), SlotBytes);
             Volatile.Write(ref Int64At(32), unchecked((long)sessionToken));
             Volatile.Write(ref Int32At(40), 0);
+            Volatile.Write(ref Int64At(48), 0);
             Interlocked.MemoryBarrier();
         }
+
+        public long ReadTransparentTimestamp() => Volatile.Read(ref Int64At(48));
+
+        public void WriteTransparentTimestamp(long value) =>
+            Volatile.Write(ref Int64At(48), value);
 
         public int ReadRealtimeMarker() => Volatile.Read(ref Int32At(40));
 
@@ -579,6 +599,11 @@ public sealed class AudioRingConsumer : IDisposable
     private readonly AudioRingOwner.MappedRing _output;
     private readonly float[] _block = new float[AudioRingProtocol.MaxSamplesPerBlock];
     private long _injectSequence;
+    private int _transparencyRevision;
+    private int _processedTransparencyRevision;
+    // Control callbacks can outlive event unsubscription. Serialize their
+    // mapped write with teardown; the audio pump is joined before disposal.
+    private readonly object _controlLifetimeGate = new();
     private bool _disposed;
 
     public AudioRingConsumer(AudioRingEndpoint endpoint)
@@ -600,6 +625,17 @@ public sealed class AudioRingConsumer : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _output.WriteRealtimeMarker(value);
+    }
+
+    /// <summary>Revoke a previously advertised unity-dry fast path before a configuration change.</summary>
+    public void RevokeTransparentPassthrough()
+    {
+        lock (_controlLifetimeGate)
+        {
+            if (_disposed) return;
+            Interlocked.Increment(ref _transparencyRevision);
+            _output.WriteTransparentTimestamp(0);
+        }
     }
 
     public void Run(AudioBlockProcessor processor, CancellationToken cancellationToken)
@@ -627,22 +663,42 @@ public sealed class AudioRingConsumer : IDisposable
     /// </summary>
     public void RunWithDelay(
         DelayAwareAudioBlockProcessor processor,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<bool>? transparentPassthrough = null)
     {
         ArgumentNullException.ThrowIfNull(processor);
-        while (!cancellationToken.IsCancellationRequested)
+        void AdvertiseTransparency()
         {
-            _inputSignal.Wait(TimeSpan.FromMilliseconds(50));
-            while (_input.TryRead(out var sequence, out var sampleCount, _block))
+            int revision = Volatile.Read(ref _transparencyRevision);
+            bool transparent = revision == _processedTransparencyRevision
+                && transparentPassthrough?.Invoke() == true;
+            _output.WriteTransparentTimestamp(transparent ? AudioRingProtocol.Timestamp() : 0);
+            // A control-thread revoke must win even if it raced the predicate.
+            if (revision != Volatile.Read(ref _transparencyRevision))
+                _output.WriteTransparentTimestamp(0);
+        }
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var delayBlocks = Math.Clamp(
-                    processor(_block.AsSpan(0, sampleCount)),
-                    -1,
-                    AudioRingProtocol.SlotCount - 2);
-                if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), delayBlocks))
-                    _outputSignal.TrySet();
+                AdvertiseTransparency();
+                _inputSignal.Wait(TimeSpan.FromMilliseconds(50));
+                while (_input.TryRead(out var sequence, out var sampleCount, _block))
+                {
+                    int revision = Volatile.Read(ref _transparencyRevision);
+                    AdvertiseTransparency();
+                    var delayBlocks = Math.Clamp(
+                        processor(_block.AsSpan(0, sampleCount)),
+                        -1,
+                        AudioRingProtocol.SlotCount - 2);
+                    if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), delayBlocks))
+                        _outputSignal.TrySet();
+                    _processedTransparencyRevision = revision;
+                    AdvertiseTransparency();
+                }
             }
         }
+        finally { RevokeTransparentPassthrough(); }
     }
 
     /// <summary>
@@ -704,14 +760,17 @@ public sealed class AudioRingConsumer : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-        _disposed = true;
-        _inputSignal.Dispose();
-        _outputSignal.Dispose();
-        _input.Dispose();
-        _output.Dispose();
-        _view.Dispose();
-        _map.Dispose();
+        lock (_controlLifetimeGate)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            _inputSignal.Dispose();
+            _outputSignal.Dispose();
+            _input.Dispose();
+            _output.Dispose();
+            _view.Dispose();
+            _map.Dispose();
+        }
     }
 }

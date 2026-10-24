@@ -603,7 +603,7 @@ internal static partial class NativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int RNNRmodelLoaded();
 
-    // NNR — neural noise reduction added upstream in WDSP 2.10.
+    // NNR — neural noise reduction added upstream in WDSP 2.10; CW networks in 2.11.
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXANNRRun(int channel, int run);
@@ -614,6 +614,9 @@ internal static partial class NativeMethods
 
     [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int SetRXANNRModel(int channel, int slot);
+
+    [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int GetRXANNRModel(int channel);
     [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetRXANNRMaskFloor(int channel, double floorDb);
     [LibraryImport(LibraryName)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -1009,6 +1012,10 @@ internal static partial class NativeMethods
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void SetTXACFCOMPRun(int channel, int run);
+
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int SetTXACFCOMPFftSize(int channel, int size);
 
     // CFC (Continuous Frequency Compressor — multi-band frequency-domain
     // compressor sitting in xtxa between xeqp and xbandpass). Issue #123.

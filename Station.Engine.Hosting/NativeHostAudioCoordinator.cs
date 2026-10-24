@@ -12,7 +12,11 @@ internal sealed record NativeHostAudioState(
     string? AsioError,
     bool InputEnabled,
     bool OutputEnabled,
-    string? AsioAttemptedDriverId = null);
+    string? AsioAttemptedDriverId = null,
+    bool OutputOpen = false,
+    bool DirectAsioMonitoringActive = false,
+    bool DirectAsioMonitoringAllowed = false,
+    bool OutputTransitioning = false);
 
 internal interface ISystemHostAudioController
 {
@@ -68,6 +72,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
     private readonly ISystemHostAudioController _system;
     private readonly ILogger<NativeHostAudioCoordinator> _log;
     private readonly TimeSpan _probeTimeout;
+    private readonly bool _receiveOnly;
     private readonly Dictionary<string, AsioDriverProbe> _probeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _probeFailures = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _changeGate = new(1, 1);
@@ -78,6 +83,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
     private string? _asioError;
     private string? _lastAsioAttemptDriverId;
     private int _recoveryScheduled;
+    private int _pendingOutputChanges;
     private bool _started;
     private bool _stopping;
     private bool _disposed;
@@ -93,7 +99,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             services.GetService(typeof(NativeMicCapture)) as NativeMicCapture,
             asioFactory,
             log,
-            system: null)
+            system: null,
+            receiveOnly: (services.GetService(typeof(StationReceiveOnlyPolicy)) as StationReceiveOnlyPolicy)?.Enabled == true)
     {
     }
 
@@ -104,8 +111,10 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         IAsioSessionFactory asioFactory,
         ILogger<NativeHostAudioCoordinator> log,
         ISystemHostAudioController? system = null,
-        TimeSpan? probeTimeout = null)
+        TimeSpan? probeTimeout = null,
+        bool receiveOnly = false)
     {
+        _receiveOnly = receiveOnly;
         _settingsStore = settingsStore;
         _sink = sink;
         _mic = mic;
@@ -116,6 +125,16 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         _activeSettings = settingsStore.Get();
         if (sink is null && mic is null)
             throw new InvalidOperationException("A native input or output processor is required.");
+    }
+
+    internal bool DirectAsioMonitoringAllowed => OperatingSystem.IsWindows() && !_receiveOnly && _sink is not null;
+    private bool WantsAsioOutput(AudioDeviceSettings settings) => _sink is not null
+        && (_sink.HostOutputEnabled || settings.DirectAsioMonitoring);
+
+    private void ValidateDirectAsioMonitoring(AudioDeviceSettings settings)
+    {
+        if (settings.DirectAsioMonitoring && !DirectAsioMonitoringAllowed)
+            throw new InvalidOperationException("Direct ASIO monitoring requires a Windows station with local audio output and is unavailable in receive-only mode.");
     }
 
     internal NativeHostAudioState State
@@ -131,7 +150,12 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 Volatile.Read(ref _asioError),
                 InputEnabled: _mic is not null,
                 OutputEnabled: _sink?.OutputEnabled == true,
-                AsioAttemptedDriverId: Volatile.Read(ref _lastAsioAttemptDriverId));
+                AsioAttemptedDriverId: Volatile.Read(ref _lastAsioAttemptDriverId),
+                OutputOpen: _sink?.OutputOpen == true,
+                DirectAsioMonitoringActive: _activeBackend == AudioHostApi.Asio
+                    && _activeSettings.DirectAsioMonitoring && _sink?.OutputOpen == true,
+                DirectAsioMonitoringAllowed: DirectAsioMonitoringAllowed,
+                OutputTransitioning: Volatile.Read(ref _pendingOutputChanges) > 0);
         }
     }
 
@@ -223,8 +247,20 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         AudioDeviceSettings proposed,
         CancellationToken cancellationToken)
     {
+        if (proposed.Backend == AudioHostApi.System)
+            proposed = proposed with { DirectAsioMonitoring = false };
         Validate(proposed);
-        await _changeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        ValidateDirectAsioMonitoring(proposed);
+        Interlocked.Increment(ref _pendingOutputChanges);
+        try
+        {
+            await _changeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            Interlocked.Decrement(ref _pendingOutputChanges);
+            throw;
+        }
         try
         {
             var previous = _activeSettings;
@@ -239,10 +275,19 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             {
                 _settingsStore.Set(proposed);
                 _activeSettings = proposed;
-                return State;
+                return State with { OutputTransitioning = Volatile.Read(ref _pendingOutputChanges) > 1 };
             }
             if (proposed.Backend == AudioHostApi.Asio)
                 Volatile.Write(ref _lastAsioAttemptDriverId, proposed.AsioDriverId);
+            // Reject unsupported sizes against known geometry without interrupting audio.
+            // A driver switch still probes after stopping: many ASIO drivers are exclusive.
+            if (proposed.Backend == AudioHostApi.Asio && proposed.AsioDriverId is { } driverId
+                && _probeCache.TryGetValue(driverId, out var knownProbe))
+            {
+                AsioBufferSizePolicy.Validate(proposed.AsioBufferFrames, knownProbe);
+                if (WantsAsioOutput(proposed) && FirstSupportedOutputPair(knownProbe.Outputs) is null)
+                    throw new InvalidOperationException("The ASIO driver has no adjacent supported PCM output pair.");
+            }
             StopActive();
             try
             {
@@ -253,7 +298,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 _settingsStore.Set(prepared);
                 _activeSettings = prepared;
                 Volatile.Write(ref _asioError, null);
-                return State;
+                return State with { OutputTransitioning = Volatile.Read(ref _pendingOutputChanges) > 1 };
             }
             catch (Exception applyError)
             {
@@ -290,6 +335,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         }
         finally
         {
+            Interlocked.Decrement(ref _pendingOutputChanges);
             _changeGate.Release();
         }
     }
@@ -317,11 +363,14 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
     private AudioDeviceSettings PrepareAsioSettings(AudioDeviceSettings settings, bool forceRefresh)
     {
+        ValidateDirectAsioMonitoring(settings);
         if (string.IsNullOrWhiteSpace(settings.AsioDriverId))
             throw new InvalidOperationException("Select an ASIO driver before enabling ASIO.");
         var probe = ProbeAsioDriverCore(settings.AsioDriverId, forceRefresh);
         if (!probe.Supports48000)
             throw new InvalidOperationException("The ASIO driver does not support the required 48000 Hz sample rate.");
+
+        AsioBufferSizePolicy.Validate(settings.AsioBufferFrames, probe);
 
         int inputChannel = settings.AsioInputChannel;
         if (_mic is not null)
@@ -333,7 +382,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         }
 
         int outputChannel = settings.AsioOutputChannel;
-        if (_sink?.OutputEnabled == true)
+        if (WantsAsioOutput(settings))
         {
             int? firstPair = FirstSupportedOutputPair(probe.Outputs);
             if (firstPair is null)
@@ -425,6 +474,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
     private void StartSystem(AudioDeviceSettings settings)
     {
+        _sink?.SetRuntimeAsioOutputEnabled(false);
         _system.Start(settings);
         _activeBackend = AudioHostApi.System;
     }
@@ -436,6 +486,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
     private void StartAsio(AudioDeviceSettings settings)
     {
+        ValidateDirectAsioMonitoring(settings);
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("ASIO is available only on Windows.");
         if (string.IsNullOrWhiteSpace(settings.AsioDriverId))
@@ -446,9 +497,11 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             settings.AsioInputChannel,
             settings.AsioOutputChannel,
             EnableInput: _mic is not null,
-            EnableOutput: _sink?.OutputEnabled == true);
+            EnableOutput: WantsAsioOutput(settings),
+            BufferFrames: checked((uint)settings.AsioBufferFrames));
         if (!config.EnableInput && !config.EnableOutput)
             throw new InvalidOperationException("No native ASIO input or output route is enabled in this host mode.");
+        _sink?.SetRuntimeAsioOutputEnabled(settings.DirectAsioMonitoring);
         var recoveryPending = 0;
         var recoveryHandlerArmed = 0;
         void RecoveryHandler()
@@ -527,15 +580,29 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
     {
         var session = _asio;
         var recoveryHandler = _asioRecoveryHandler;
-        _asio = null;
         _asioRecoveryHandler = null;
+        if (session is not null)
+        {
+            if (recoveryHandler is not null)
+                session.RecoveryRequested -= recoveryHandler;
+            try { session.Stop(); }
+            finally
+            {
+                session.Dispose();
+                _asio = null;
+                ClearAsioOutputState();
+            }
+        }
+        else ClearAsioOutputState();
+    }
+
+    private void ClearAsioOutputState()
+    {
+        // Output remains advertised open until Stop/Dispose completes, so a
+        // browser cannot resume while the old native device is still playing.
         _mic?.SetExternalInputState(false, null, 0, 0);
         _sink?.SetExternalOutputState(false, null, 0, 0);
-        if (session is null) return;
-        if (recoveryHandler is not null)
-            session.RecoveryRequested -= recoveryHandler;
-        try { session.Stop(); }
-        finally { session.Dispose(); }
+        _sink?.SetRuntimeAsioOutputEnabled(false);
     }
 
     private void StopActive()
@@ -618,6 +685,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
     private static void Validate(AudioDeviceSettings settings)
     {
+        if (settings.AsioBufferFrames < 0)
+            throw new InvalidOperationException("ASIO buffer frames must be zero or greater.");
         if (!Enum.IsDefined(settings.Backend))
             throw new ArgumentOutOfRangeException(nameof(settings), "Unknown audio backend.");
         if (settings.InputChannel is < 0 || settings.AsioInputChannel < 0 || settings.AsioOutputChannel < 0)
