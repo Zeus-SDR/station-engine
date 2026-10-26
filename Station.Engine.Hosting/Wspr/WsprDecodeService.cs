@@ -30,6 +30,10 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
 
     private readonly DspPipelineService? _dsp;
     private readonly RadioService? _radio;
+    private readonly ExternalReceiverPort? _externalReceiver;
+    // Serialises the choice between the external receiver context and the
+    // radio snapshot with the write it decides.
+    private readonly object _receiveStateGate = new();
     private readonly ILogger<WsprDecodeService> _log;
     private readonly TimeProvider _time;
     private readonly WsprDecoderCore _core;
@@ -46,8 +50,9 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
     public WsprDecodeService(
         DspPipelineService dsp,
         RadioService radio,
-        ILogger<WsprDecodeService> log)
-        : this(dsp, radio, log, TimeProvider.System, new NativeWsprSlotDecoder(NativeWsprSlotDecoder.DefaultDataDirectory()))
+        ILogger<WsprDecodeService> log,
+        ExternalReceiverPort? externalReceiver = null)
+        : this(dsp, radio, log, TimeProvider.System, new NativeWsprSlotDecoder(NativeWsprSlotDecoder.DefaultDataDirectory()), externalReceiver)
     {
     }
 
@@ -57,10 +62,12 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
         RadioService? radio,
         ILogger<WsprDecodeService> log,
         TimeProvider time,
-        IWsprSlotDecoder decoder)
+        IWsprSlotDecoder decoder,
+        ExternalReceiverPort? externalReceiver = null)
     {
         _dsp = dsp;
         _radio = radio;
+        _externalReceiver = externalReceiver;
         _log = log;
         _time = time;
         _core = new WsprDecoderCore(decoder);
@@ -102,6 +109,11 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
             _radio.StateChanged += OnRadioStateChanged;
             _radio.MoxChanged += OnMoxChanged;
             _radio.TunActiveChanged += OnTunChanged;
+            if (_externalReceiver is not null)
+            {
+                _externalReceiver.ContextChanged += OnExternalReceiverContextChanged;
+                OnExternalReceiverContextChanged();
+            }
         }
 
         _stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -129,6 +141,8 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
             _radio.StateChanged -= OnRadioStateChanged;
             _radio.MoxChanged -= OnMoxChanged;
             _radio.TunActiveChanged -= OnTunChanged;
+            if (_externalReceiver is not null)
+                _externalReceiver.ContextChanged -= OnExternalReceiverContextChanged;
         }
         var stop = _stop;
         if (stop is null) return Task.CompletedTask;
@@ -156,7 +170,47 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
             SignalWake(_captureWake);
     }
 
-    private void OnRadioStateChanged(StateDto state) => _core.OnRadioState(ProjectTuning(state), UtcNowMs);
+    private void OnRadioStateChanged(StateDto state)
+    {
+        lock (_receiveStateGate)
+        {
+            if (TryGetExternalContext(out var external))
+            {
+                _core.OnRadioState(ProjectExternalTuning(external), UtcNowMs);
+                return;
+            }
+            _core.OnRadioState(ProjectTuning(state), UtcNowMs);
+        }
+    }
+
+    private bool TryGetExternalContext(out ExternalReceiverContext context)
+    {
+        if (_externalReceiver is not null && _externalReceiver.TryGetContext(0, out context))
+            return true;
+        context = default;
+        return false;
+    }
+
+    /// <summary>The external receiver is the only present receiver while active.</summary>
+    internal static IReadOnlyList<WsprReceiverTuning> ProjectExternalTuning(ExternalReceiverContext context)
+    {
+        var tuning = new WsprReceiverTuning[WireContract.MaxReceivers];
+        if ((uint)context.Receiver < (uint)tuning.Length)
+            tuning[context.Receiver] = new WsprReceiverTuning(true, context.VfoHz, context.Mode);
+        return tuning;
+    }
+
+    // Port thread: the external context was set, changed or cleared. Re-derive
+    // dial, mode and transmit from the context, or from the radio once it is gone.
+    private void OnExternalReceiverContextChanged()
+    {
+        if (_radio is null) return;
+        // Read the radio before taking the gate: no RadioService lock is ever
+        // acquired while the gate is held.
+        StateDto state = _radio.Snapshot();
+        OnRadioStateChanged(state);
+        PublishTransmit();
+    }
 
     internal static IReadOnlyList<WsprReceiverTuning> ProjectTuning(StateDto state)
     {
@@ -191,7 +245,14 @@ public sealed class WsprDecodeService : IHostedService, IDisposable
 
     private void PublishTransmit()
     {
-        _core.OnTransmit(Volatile.Read(ref _mox) != 0 || Volatile.Read(ref _tunActive) != 0);
+        lock (_receiveStateGate)
+        {
+            // While the external receiver is active its context owns transmit.
+            if (TryGetExternalContext(out var external))
+                _core.OnTransmit(external.Transmitting);
+            else
+                _core.OnTransmit(Volatile.Read(ref _mox) != 0 || Volatile.Read(ref _tunActive) != 0);
+        }
         SignalWake(_captureWake);
     }
 

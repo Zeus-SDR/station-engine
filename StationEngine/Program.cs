@@ -177,9 +177,12 @@ public partial class Program
             tciEnabled,
             tciBindAddress,
             tciPort);
-        builder.Services.AddSingleton(tciListener);
-
         var persistedCat = LoadPersistedCat();
+        tciListener = StationControlPortConflict.YieldTciToCat(
+            tciListener,
+            StationControlPortConflict.EffectiveCat(
+                builder.Configuration.GetSection("Cat"), persistedCat, options.ReceiveOnly));
+        builder.Services.AddSingleton(tciListener);
         builder.Host.UseDefaultServiceProvider(options =>
         {
             options.ValidateOnBuild = true;
@@ -545,7 +548,7 @@ public partial class Program
 
         Environment.SetEnvironmentVariable(PrefsDbPath.EnginePathEnvironmentVariable, enginePath);
 
-        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var env = EditionPaths.ScopedOverride("ZEUS_PREFS_PATH");
         var anchor = string.IsNullOrEmpty(env)
             ? PrefsDbPath.DataDir
             : Path.GetDirectoryName(Path.GetFullPath(env)) ?? PrefsDbPath.DataDir;
@@ -559,7 +562,7 @@ public partial class Program
 
     private static string StationFeaturePluginRoot()
     {
-        var configured = Environment.GetEnvironmentVariable(PluginRoot.EnvVar);
+        var configured = EditionPaths.ScopedOverride(PluginRoot.EnvVar);
         if (!string.IsNullOrWhiteSpace(configured))
             return configured;
 

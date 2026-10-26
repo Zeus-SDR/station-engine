@@ -63,6 +63,7 @@ internal static class DatabaseBackupPolicy
         "mobile_lan_access",
         "hamclock_sidecar_state",
         "windows_firewall_grant",
+        "flex_client_identities",
     ];
 
     /// <summary>Secret top-level fields (BSON names) inside otherwise-portable
@@ -114,6 +115,23 @@ internal static class DatabaseBackupPolicy
             ["product_bundle_settings"] = ("Json", ProductBundleKey),
         };
 
+    internal const string FlexAgentKey = "flex-agent";
+    internal const string FlexAgentFileName = "flex-agent.db";
+
+    internal static string LiteDatabaseJournalPath(string path) => System.IO.Path.Combine(
+        System.IO.Path.GetDirectoryName(path) ?? ".",
+        System.IO.Path.GetFileNameWithoutExtension(path) + "-log" + System.IO.Path.GetExtension(path));
+
+    internal static FileStream AcquireFlexAgentRestoreLock(string databasePath)
+    {
+        var path = System.IO.Path.GetFullPath(databasePath);
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+        // Either host can recover a rollback after Product exits while its
+        // Agent is still alive. Lock the recorded database's own sidecar.
+        return new FileStream(path + ".instance.lock",
+            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+    }
+
     internal const string ProductBundleKey = "product-bundle";
     internal const string ProductBundleFileName = "product-bundle.json";
     internal const string ProductDataDirectoryEnvironmentVariable = "ZEUS_PRODUCT_DATA_DIR";
@@ -139,14 +157,12 @@ internal static class DatabaseBackupPolicy
     /// </summary>
     internal static IReadOnlyList<ProductSettingsFile> ProductSettingsFiles()
     {
-        var voyeurLocal = LocalApplicationDataOverrideForTests ?? Environment.GetFolderPath(
-            Environment.SpecialFolder.LocalApplicationData,
-            Environment.SpecialFolderOption.DoNotVerify);
+        var voyeurLocal = LocalApplicationDataOverrideForTests ?? EditionPaths.LocalApplicationData(Environment.SpecialFolderOption.DoNotVerify);
         if (string.IsNullOrWhiteSpace(voyeurLocal))
             voyeurLocal = System.IO.Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zeus");
         var pluginLocal = LocalApplicationDataOverrideForTests
-            ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            ?? EditionPaths.LocalApplicationData();
         var plugins = System.IO.Path.Combine(pluginLocal, "Zeus", "Product", "plugins");
         return
         [
@@ -162,6 +178,16 @@ internal static class DatabaseBackupPolicy
         ];
     }
 
+    // Match the Agent's persisted address normalization, including its blank default.
+    private static string FlexTciBind(BsonDocument config)
+    {
+        var bind = config["BindAddress"].IsString ? config["BindAddress"].AsString.Trim() : "";
+        return bind.Length == 0 ? "127.0.0.1" : bind.ToLowerInvariant();
+    }
+
+    private static bool IsFlexTciLoopback(string bind) => bind == "localhost"
+        || System.Net.IPAddress.TryParse(bind, out var address) && System.Net.IPAddress.IsLoopback(address);
+
     /// <summary>Removes every local-only collection and strips every secret in
     /// <paramref name="database"/> (a private snapshot/staging copy, never a
     /// live store).</summary>
@@ -172,6 +198,20 @@ internal static class DatabaseBackupPolicy
             database.DropCollection(name);
 
         var existing = database.GetCollectionNames().ToHashSet(StringComparer.Ordinal);
+        // A portable backup may restore the TCI port and address, but cannot
+        // grant network access on the destination machine.
+        if (existing.Contains("flex_tci_config"))
+        {
+            var configs = database.GetCollection("flex_tci_config");
+            foreach (var document in configs.FindAll().ToArray())
+            {
+                if (!IsFlexTciLoopback(FlexTciBind(document)))
+                {
+                    document["Enabled"] = false;
+                    configs.Update(document);
+                }
+            }
+        }
         foreach (var (collectionName, rules) in BsonSecretRules)
         {
             if (!existing.Contains(collectionName))
@@ -256,6 +296,7 @@ internal static class DatabaseBackupPolicy
                     StringComparer.Ordinal);
             localDocuments = BsonSecretRules.Keys
                 .Concat(JsonInBsonFields.Keys)
+                .Append("flex_tci_config")
                 .Where(names.Contains)
                 .ToDictionary(
                     name => name,
@@ -298,6 +339,18 @@ internal static class DatabaseBackupPolicy
                     || !locals.TryGetValue(id, out var localDocument))
                     continue;
                 var changed = false;
+                // LAN authorization belongs to this machine and this listener
+                // target. Loopback enablement remains a portable preference.
+                if (name == "flex_tci_config"
+                    && !IsFlexTciLoopback(FlexTciBind(document))
+                    && FlexTciBind(document) == FlexTciBind(localDocument)
+                    && document["Port"].IsInt32 && localDocument["Port"].IsInt32
+                    && document["Port"].AsInt32 == localDocument["Port"].AsInt32)
+                {
+                    document["Enabled"] = localDocument["Enabled"].IsBoolean
+                        && localDocument["Enabled"].AsBoolean;
+                    changed = true;
+                }
                 if (BsonSecretRules.TryGetValue(name, out var rules))
                 {
                     foreach (var rule in rules)

@@ -41,15 +41,13 @@ public static class PrefsDbPath
     {
         get
         {
-            var appDataDir = Environment.GetFolderPath(
-                Environment.SpecialFolder.LocalApplicationData,
-                Environment.SpecialFolderOption.Create);
+            var appDataDir = global::Zeus.Server.EditionPaths.LocalApplicationData(Environment.SpecialFolderOption.Create);
             return Path.Combine(appDataDir, "Zeus");
         }
     }
 
     public static string Get() =>
-        Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH")
+        EditionPaths.ScopedOverride("ZEUS_PREFS_PATH")
         ?? Path.Combine(DataDir, ActiveRelativePath());
 
     /// <summary>
@@ -60,7 +58,7 @@ public static class PrefsDbPath
     /// </summary>
     public static string EngineGet()
     {
-        var engineOverride = Environment.GetEnvironmentVariable(
+        var engineOverride = EditionPaths.ScopedOverride(
             EnginePathEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(engineOverride))
             return engineOverride;
@@ -100,7 +98,7 @@ public static class PrefsDbPath
     // fork per profile — there is exactly one logbook per data directory.
     public static string LogbookPath()
     {
-        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var env = EditionPaths.ScopedOverride("ZEUS_PREFS_PATH");
         var dir = string.IsNullOrEmpty(env)
             ? DataDir
             : (Path.GetDirectoryName(Path.GetFullPath(env)) ?? DataDir);
@@ -114,7 +112,7 @@ public static class PrefsDbPath
     // throwaway data dir instead of the operator's real %LOCALAPPDATA%/Zeus.
     public static string LogDir()
     {
-        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var env = EditionPaths.ScopedOverride("ZEUS_PREFS_PATH");
         var dir = string.IsNullOrEmpty(env)
             ? DataDir
             : (Path.GetDirectoryName(Path.GetFullPath(env)) ?? DataDir);
@@ -126,7 +124,7 @@ public static class PrefsDbPath
     // write beside their throwaway prefs DB instead of the operator's real dir.
     public static string VersionFloorPath()
     {
-        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var env = EditionPaths.ScopedOverride("ZEUS_PREFS_PATH");
         var dir = string.IsNullOrEmpty(env)
             ? DataDir
             : (Path.GetDirectoryName(Path.GetFullPath(env)) ?? DataDir);
@@ -142,7 +140,7 @@ public static class PrefsDbPath
     // the logs so tests/dev never touch the operator's real data dir.
     public static string CrashDir()
     {
-        var env = Environment.GetEnvironmentVariable("ZEUS_PREFS_PATH");
+        var env = EditionPaths.ScopedOverride("ZEUS_PREFS_PATH");
         var dir = string.IsNullOrEmpty(env)
             ? DataDir
             : (Path.GetDirectoryName(Path.GetFullPath(env)) ?? DataDir);

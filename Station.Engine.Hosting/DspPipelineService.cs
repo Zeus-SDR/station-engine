@@ -1331,6 +1331,80 @@ public partial class DspPipelineService : BackgroundService,
         return (effective.FilterLowHz, effective.FilterHighHz);
     }
 
+    /// <summary>
+    /// TXA and TX-monitor mode plus the bandpass and modulator filter to push.
+    /// A processed-TX subscriber runs AM, SAM, and FM carrierless (DSB): the
+    /// subscriber supplies the carrier or the deviation, and
+    /// <see cref="RadioService"/> keeps the operator mode. The bandpass is the
+    /// operator's symmetric AM/SAM pair, with the voice low-cut left on the
+    /// modulator filter, or the FM TX audio cuts. A capture lease alone does
+    /// not switch the modulator. Shipped libwdsp's DSB modulator copies the I
+    /// sample and does not apply that high-pass; the low-cut is still pushed.
+    /// </summary>
+    internal readonly record struct CarrierlessTxPlan(
+        RxMode Mode,
+        int FilterLowHz,
+        int FilterHighHz,
+        int AmHighPassHz,
+        int AmLowPassHz);
+
+    internal static CarrierlessTxPlan ResolveCarrierlessTxPlan(StateDto s, bool processedTxStreamRequested)
+    {
+        var op = RadioFrequencyResolver.TxReceiver(s).Mode;
+        var operatorEngine = RadioService.EffectiveEngineMode(op, RadioFrequencyResolver.TxFrequencyHz(s));
+        var (opLow, opHigh) = SignedTxFilterFor(s, operatorEngine);
+        var am = AmModulatorFilterFor(s);
+        bool carrierless = processedTxStreamRequested && op is RxMode.AM or RxMode.SAM or RxMode.FM;
+        if (!carrierless)
+            return new(operatorEngine, opLow, opHigh, am.HighPassHz, am.LowPassHz);
+        if (op == RxMode.FM)
+        {
+            var fm = (s.Fm ?? FmConfig.Default).Normalized();
+            return new(RxMode.DSB, -fm.TxHighCutHz, fm.TxHighCutHz, fm.TxLowCutHz, fm.TxHighCutHz);
+        }
+        return new(RxMode.DSB, opLow, opHigh, am.HighPassHz, am.LowPassHz);
+    }
+
+    /// <summary>
+    /// Push <see cref="ResolveCarrierlessTxPlan"/>. Mode goes out before the
+    /// bandpass: <c>SetTxFilter</c> republishes the FM audio cuts when the
+    /// live TX mode is still FM. <paramref name="force"/> is for a fresh
+    /// channel whose latches may already match the plan.
+    /// </summary>
+    private void PushCarrierlessTx(IDspEngine engine, StateDto s, bool force)
+    {
+        var receiver = RadioFrequencyResolver.TxReceiver(s);
+        var plan = ResolveCarrierlessTxPlan(s, _hub.ProcessedTxStreamRequested);
+        var txLeveling = ProcessedTxPublish.LevelingFor(
+            receiver.Mode,
+            _hub.ProcessedTxStreamRequested,
+            receiver.Mode == RxMode.FreeDv ? FreeDvTxLevelingProfile : ResolveEffectiveTxAudioProfile(s, plan.Mode).TxLeveling);
+        if (force || !txLeveling.Equals(_appliedTxLeveling))
+        {
+            engine.SetTxLeveling(_channelId, txLeveling);
+            _appliedTxLeveling = txLeveling;
+        }
+        if (force || receiver.Mode != _appliedTxMode || plan.Mode != _appliedTxEngineMode)
+        {
+            engine.SetTxMode(plan.Mode);
+            engine.SetTxDigitalBypass(IsDigitalTxZeusMode(receiver.Mode));
+            _appliedTxMode = receiver.Mode;
+            _appliedTxEngineMode = plan.Mode;
+        }
+        if (force || plan.FilterLowHz != _appliedTxLowHz || plan.FilterHighHz != _appliedTxHighHz)
+        {
+            engine.SetTxFilter(plan.FilterLowHz, plan.FilterHighHz);
+            _appliedTxLowHz = plan.FilterLowHz;
+            _appliedTxHighHz = plan.FilterHighHz;
+        }
+        var amFilter = (plan.AmHighPassHz, plan.AmLowPassHz);
+        if (force || amFilter != _appliedAmModFilter)
+        {
+            engine.SetTxAmFilter(plan.AmHighPassHz, plan.AmLowPassHz);
+            _appliedAmModFilter = amFilter;
+        }
+    }
+
     internal static bool IsDigitalTxZeusMode(RxMode mode) =>
         mode is RxMode.DIGU or RxMode.DIGL or RxMode.FreeDv;
 
@@ -2047,6 +2121,9 @@ public partial class DspPipelineService : BackgroundService,
     private readonly TxGatedAudioModemPort _txAudioModem;
     private readonly IProductTxAudioPort _productAudio;
     private readonly ProductPluginAudioPort? _productPluginAudio;
+    private readonly TxMicBlockResampler _processedTxResampler;
+    private readonly float[] _processedTxScratch = new float[TxMicBlockResampler.OutputBlockSamples];
+    private readonly byte[] _processedTxBytes = new byte[TxMicBlockResampler.OutputBlockBytes];
 
     public DspPipelineService(
         RadioService radio,
@@ -2065,9 +2142,11 @@ public partial class DspPipelineService : BackgroundService,
         IProductTxAudioPort? productAudio = null,
         ProductPluginAudioPort? productPluginAudio = null,
         SMeterCalibrationStore? sMeterCalibrationStore = null,
-        TxMonitorSettingsStore? txMonitorSettingsStore = null)
+        TxMonitorSettingsStore? txMonitorSettingsStore = null,
+        ExternalReceiverPort? externalReceiverPort = null)
     {
         _radio = radio;
+        _externalReceiverPort = externalReceiverPort;
         _vrxPool = new(maximumFrequencyHz: radio.ReceiveOnly
             ? StationReceiveOnlyPolicy.MaximumFrequencyHz
             : Zeus.Server.PublicListen.GuestReceiverSettings.MaxHz);
@@ -2087,6 +2166,7 @@ public partial class DspPipelineService : BackgroundService,
         _productAudio = productAudio ?? new NullProductTxAudioPort();
         _productPluginAudio = productPluginAudio;
         _productPluginAudio?.ConfigureLocalMonitorSink(EnqueueMonitorAudio);
+        _processedTxResampler = new TxMicBlockResampler(EmitProcessedTxBlock);
         _guestPool.LeasesChanged += OnGuestLeasesChanged;
         _vrxPool.ReceiversChanged += OnVrxReceiversChanged;
         _externalRxAudioSource = externalRxAudioSource ?? new NullExternalRxAudioSource();
@@ -2175,6 +2255,7 @@ public partial class DspPipelineService : BackgroundService,
             _secondaryRx[i] = new SecondaryRx(_panadapterWidth);
 
         _hub.CwDecodeRequestChanged += OnCwNoiseReductionDemandChanged;
+        _hub.ProcessedTxDemandChanged += OnProcessedTxDemandChanged;
 
         _nr3ModelStore = nr3ModelStore;
         if (_nr3ModelStore is not null)
@@ -2214,10 +2295,20 @@ public partial class DspPipelineService : BackgroundService,
         }
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        // ExecuteAsync's finally closes the engine when the loop ran. A stop
+        // before the loop starts (or a host that never called StartAsync)
+        // still has to dispose the offline preview created for the session.
+        CloseCurrentEngine();
+    }
+
     public override void Dispose()
     {
         if (_micCaptureIngest is not null) _micCaptureIngest.MicPcmTapped -= CaptureMicWaveform;
         _hub.CwDecodeRequestChanged -= OnCwNoiseReductionDemandChanged;
+        _hub.ProcessedTxDemandChanged -= OnProcessedTxDemandChanged;
         ClearCwNoiseReductionBypass();
         if (_sMeterCalibrationStore is not null)
             _sMeterCalibrationStore.Changed -= OnSMeterCalibrationChanged;
@@ -6324,7 +6415,6 @@ public partial class DspPipelineService : BackgroundService,
         bool txFreeDvMode = txReceiver.Mode == RxMode.FreeDv;
         _txReceiverIsFreeDv = txFreeDvMode;
         var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, txEngineMode);
-        bool txDigitalBypass = IsDigitalTxZeusMode(txReceiver.Mode);
         // Forward VFO changes to the P2 client when it's active. RadioService
         // does this for P1 via ActiveClient?.SetVfoAHz() inside SetVfo, but
         // ActiveClient is null for P2 connections, so the radio never learns
@@ -6518,13 +6608,6 @@ public partial class DspPipelineService : BackgroundService,
             _appliedMode = s.Mode;
             _appliedEngineMode = engineMode;
         }
-        if (txReceiver.Mode != _appliedTxMode || txEngineMode != _appliedTxEngineMode)
-        {
-            engine.SetTxMode(txEngineMode);
-            engine.SetTxDigitalBypass(txDigitalBypass);
-            _appliedTxMode = txReceiver.Mode;
-            _appliedTxEngineMode = txEngineMode;
-        }
         // FreeDV's stored bandpass is USB-positive; re-sign it for the effective
         // sideband so an LSB (sub-10 MHz) FreeDV demod gets a negative-frequency
         // passband instead of a dead positive one. Non-FreeDv modes carry their
@@ -6575,13 +6658,9 @@ public partial class DspPipelineService : BackgroundService,
             engine.SetFmConfig(fm);
             _appliedFm = fm;
         }
-        var (txLow, txHigh) = SignedTxFilterFor(s, txEngineMode);
-        if (txLow != _appliedTxLowHz || txHigh != _appliedTxHighHz)
-        {
-            engine.SetTxFilter(txLow, txHigh);
-            _appliedTxLowHz = txLow;
-            _appliedTxHighHz = txHigh;
-        }
+        // After FM config. AM/SAM/FM go carrierless only while a processed-TX
+        // subscriber is waiting; the operator mode above is unchanged.
+        PushCarrierlessTx(engine, s, force: false);
         if (s.RxFilterWindow != _appliedRxBandpassWindow)
         {
             engine.SetRxBandpassWindow(channel, s.RxFilterWindow);
@@ -6708,9 +6787,10 @@ public partial class DspPipelineService : BackgroundService,
             if (rx2Channel >= 0) engine.SetSquelch(rx2Channel, squelch);
             _appliedSquelch = squelch;
         }
-        var txLeveling = txFreeDvMode
-            ? FreeDvTxLevelingProfile
-            : effectiveTxAudio.TxLeveling;
+        var txLeveling = ProcessedTxPublish.LevelingFor(
+            txReceiver.Mode,
+            _hub.ProcessedTxStreamRequested,
+            txFreeDvMode ? FreeDvTxLevelingProfile : effectiveTxAudio.TxLeveling);
         if (!txLeveling.Equals(_appliedTxLeveling))
         {
             engine.SetTxLeveling(channel, txLeveling);
@@ -6733,12 +6813,6 @@ public partial class DspPipelineService : BackgroundService,
         {
             engine.SetTxAmBroadcast(amBroadcast);
             _appliedAmBroadcast = amBroadcast;
-        }
-        var amModFilter = AmModulatorFilterFor(s);
-        if (amModFilter != _appliedAmModFilter)
-        {
-            engine.SetTxAmFilter(amModFilter.HighPassHz, amModFilter.LowPassHz);
-            _appliedAmModFilter = amModFilter;
         }
         ApplyVisibleDdcZoom(engine, s);
 
@@ -7319,29 +7393,24 @@ public partial class DspPipelineService : BackgroundService,
             openTxReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
         bool openTxFreeDvMode = openTxReceiver.Mode == RxMode.FreeDv;
         var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, openTxEngineMode);
-        var txLeveling = openTxFreeDvMode
-            ? FreeDvTxLevelingProfile
-            : effectiveTxAudio.TxLeveling;
+        var txLeveling = ProcessedTxPublish.LevelingFor(
+            openTxReceiver.Mode,
+            _hub.ProcessedTxStreamRequested,
+            openTxFreeDvMode ? FreeDvTxLevelingProfile : effectiveTxAudio.TxLeveling);
         var txPhaseRotator = effectiveTxAudio.TxPhaseRotator;
         var cfc = effectiveTxAudio.Cfc;
         engine.SetRxDigitalBypass(channelId, s.Mode == RxMode.FreeDv);
         engine.SetRxCwNoiseReductionBypass(channelId, CwNoiseReductionBypassForReceiver(s, 0));
         engine.SetMode(channelId, openEngineMode);
-        // Sync TXA modulator with RX mode at engine-open time so the first
-        // key-down lands with the correct sideband (no-op on Synthetic / pre-
-        // OpenTxChannel).
-        engine.SetTxMode(openTxEngineMode);
-        engine.SetTxDigitalBypass(IsDigitalTxZeusMode(openTxReceiver.Mode));
         // FM config ahead of the TX filter (see OnRadioStateChanged). The
         // engine also caches it for TXA/RXA channels it opens later.
         var openFm = (s.Fm ?? FmConfig.Default).Normalized();
         engine.SetFmConfig(openFm);
+        // Mode, then bandpass, then the modulator filter. A processed-TX
+        // subscriber opens AM/SAM/FM carrierless; the operator mode stays.
+        PushCarrierlessTx(engine, s, force: true);
         var (openRxLow, openRxHigh) = SignedRxFilterFor(s, openEngineMode);
         engine.SetFilter(channelId, openRxLow, openRxHigh);
-        // Sign the TX bandpass from the live mode (see SignedTxFilterFor) so a
-        // fresh engine doesn't key up with a USB-positive default while in LSB.
-        var (txOpenLow, txOpenHigh) = SignedTxFilterFor(s, openTxEngineMode);
-        engine.SetTxFilter(txOpenLow, txOpenHigh);
         // Issue #871 — push the operator's chosen FIR window onto the fresh
         // engine so a reconnect rebuilds the RX/TX bandpass at the saved
         // shoulder shape rather than the WDSP open-time Sharp default.
@@ -7376,8 +7445,6 @@ public partial class DspPipelineService : BackgroundService,
         engine.SetTxAmCarrierLevel(carrierLevel);
         var openAmBroadcast = (s.AmBroadcast ?? AmBroadcastConfig.Default).Clamped();
         engine.SetTxAmBroadcast(openAmBroadcast);
-        var openAmModFilter = AmModulatorFilterFor(s);
-        engine.SetTxAmFilter(openAmModFilter.HighPassHz, openAmModFilter.LowPassHz);
         engine.SetNoiseReduction(channelId, nr);
         // Force-apply AGC mode/custom params on a fresh engine so the operator's
         // persisted choice survives a reconnect. The engine's channel-open path
@@ -7420,15 +7487,14 @@ public partial class DspPipelineService : BackgroundService,
         engine.SetZoom(channelId, ddcZoomLevel);
         _appliedMode = s.Mode;
         _appliedEngineMode = openEngineMode;
-        _appliedTxMode = openTxReceiver.Mode;
-        _appliedTxEngineMode = openTxEngineMode;
-        // Cache the SIGNED values we actually pushed (FreeDv re-signs by sideband)
-        // so the first OnRadioStateChanged tick doesn't see a phantom width change.
+        // TXA mode, bandpass, and modulator-filter latches belong to
+        // PushCarrierlessTx, which already ran for this fresh channel.
+        // Cache the SIGNED RX values we actually pushed (FreeDv re-signs by
+        // sideband) so the first OnRadioStateChanged tick doesn't see a
+        // phantom width change.
         _appliedLowHz = openRxLow;
         _appliedHighHz = openRxHigh;
         _appliedCtunOffsetHz = ctunShiftHz;
-        _appliedTxLowHz = txOpenLow;
-        _appliedTxHighHz = txOpenHigh;
         _appliedAgcCeilingDb = effectiveAgc;
         _appliedRxAfGainDb = EffectiveAfGainDb(s.RxAfGainDb, s.Rx1AfGainDb);
         // Reset every secondary's per-RX AF-gain slew state — the engine has
@@ -7441,7 +7507,6 @@ public partial class DspPipelineService : BackgroundService,
         _appliedTxLevelerMaxGainDb = levelerMax;
         _appliedTxAmCarrierLevel = carrierLevel;
         _appliedAmBroadcast = openAmBroadcast;
-        _appliedAmModFilter = openAmModFilter;
         _appliedFm = openFm;
         _appliedNr = nr;
         _appliedAgc = agc;
@@ -10988,6 +11053,7 @@ public partial class DspPipelineService : BackgroundService,
                 // monitor volume and receive mixing. Its lease keeps this
                 // demodulator running silently when the operator's MON is off.
                 _productPluginAudio?.PublishTxMic(AudioOutputRateHz, audioBuf.AsSpan(0, monCount));
+                OfferProcessedTxAudio(AudioOutputRateHz, audioBuf.AsSpan(0, monCount));
                 TxMonitorAudioAvailable?.Invoke(0, AudioOutputRateHz, new ReadOnlyMemory<float>(audioBuf, 0, monCount));
                 // Monitor volume is an operator playback preference, not a
                 // TX-chain control. Apply it only after diagnostics and the

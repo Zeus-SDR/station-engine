@@ -13,11 +13,14 @@ public static class PluginRoot
     public const string EnvVar = "ZEUS_PLUGINS_PATH";
 
     public static string Get() =>
-        Environment.GetEnvironmentVariable(EnvVar)
+        global::Zeus.Server.EditionPaths.ScopedOverride(EnvVar)
         ?? DefaultPath();
 
     public static string DefaultPath()
     {
+        if (global::Zeus.Server.EditionPaths.DataRoot is { } edition)
+            return Path.Combine(edition, "Zeus", "plugins");
+
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             var appData = Environment.GetFolderPath(

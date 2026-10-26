@@ -39,6 +39,7 @@ using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Options;
 using Zeus.Contracts;
+using Zeus.Server.Cat;
 using Zeus.Server.Tci;
 
 namespace Zeus.Server;
@@ -57,6 +58,8 @@ public sealed class TciManagementService
     private readonly TciListenerBinding _listener;
     private readonly TciOptions _startupOptions;
     private readonly TciConfigStore _store;
+    private readonly CatOptions _catStartupOptions;
+    private readonly CatConfigStore _catStore;
 
     // In-memory pending config (what the user wants for next restart)
     private TciRuntimeConfig _pendingConfig;
@@ -66,13 +69,17 @@ public sealed class TciManagementService
         TciServer tciServer,
         TciListenerBinding listener,
         IOptions<TciOptions> options,
-        TciConfigStore store)
+        TciConfigStore store,
+        IOptions<CatOptions> catOptions,
+        CatConfigStore catStore)
     {
         _log = log;
         _tciServer = tciServer;
         _listener = listener;
         _startupOptions = options.Value;
         _store = store;
+        _catStartupOptions = catOptions.Value;
+        _catStore = catStore;
 
         // Load or initialize pending config from the persisted store. When
         // nothing is persisted yet, mirror the startup options so a "no
@@ -95,12 +102,29 @@ public sealed class TciManagementService
         // as occupied, while deriving status from Enabled alone falsely reports
         // a rejected stale address as running.
         var portAvailable = !_startupOptions.Enabled || _listener.IsActive;
-        var error = _listener.Error;
+        var pendingCollision = PendingCatCollision();
+        var error = _listener.Error ?? pendingCollision;
 
         // Check if pending config differs from startup config (requires restart)
         var requiresRestart = _pendingConfig.Enabled != _startupOptions.Enabled
                             || _pendingConfig.Port != currentPort
                             || _pendingConfig.BindAddress != currentBindAddress;
+
+        // TCI yielded to CAT at startup and the operator has since separated
+        // them: the startup error no longer applies, a restart does. If TCI
+        // was switched off instead, there is nothing left to explain.
+        if (_listener.YieldedToCat && pendingCollision is null)
+        {
+            if (_pendingConfig.Enabled)
+            {
+                error = StationControlPortConflict.CollisionClearedMessage(_listener.Port);
+                requiresRestart = true;
+            }
+            else
+            {
+                error = null;
+            }
+        }
 
         return new TciStatus(
             CurrentlyEnabled: currentlyEnabled,
@@ -113,6 +137,21 @@ public sealed class TciManagementService
             PortAvailable: portAvailable,
             RequiresRestart: requiresRestart,
             Error: error);
+    }
+
+    // Warn as soon as the saved TCI and CAT ports collide, before the restart
+    // that would leave TCI off (see StationControlPortConflict).
+    private string? PendingCatCollision()
+    {
+        var cat = _catStore.Get();
+        var catEnabled = cat?.Enabled ?? _catStartupOptions.Enabled;
+        var catBindAddress = cat?.BindAddress ?? _catStartupOptions.BindAddress;
+        var catPort = cat?.Port ?? _catStartupOptions.Port;
+        return StationControlPortConflict.Collides(
+            _pendingConfig.Enabled, _pendingConfig.BindAddress, _pendingConfig.Port,
+            catEnabled, catBindAddress, catPort)
+            ? StationControlPortConflict.PendingCollisionMessage("CAT", _pendingConfig.Port)
+            : null;
     }
 
     public TciStatus SetConfig(TciRuntimeConfig config)

@@ -15,7 +15,7 @@ namespace Zeus.Plugins.Host;
 public sealed class PluginLoader
 {
     internal static readonly string ShadowBaseRoot = Path.Combine(
-        Path.GetTempPath(), "zeus-plugin-shadow");
+        global::Zeus.Server.EditionPaths.DataRoot ?? Path.GetTempPath(), "zeus-plugin-shadow");
     private static readonly long ProcessStartUtcTicks =
         Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks;
     internal static readonly string ShadowRoot = Path.Combine(

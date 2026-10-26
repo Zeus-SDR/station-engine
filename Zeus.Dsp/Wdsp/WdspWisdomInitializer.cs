@@ -294,7 +294,7 @@ public sealed class WdspWisdomInitializer
 
     private static string GetDefaultWisdomDirectory() =>
         Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            global::Zeus.Dsp.EditionPaths.LocalApplicationData(),
             "Zeus");
 
     private string ResolveCurrentStamp()

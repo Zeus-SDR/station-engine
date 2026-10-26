@@ -274,6 +274,8 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, IT
 
     public void SetTxPanelGain(double linearGain) => _tx.SetTxPanelGain(linearGain);
 
+    public void SetLegacyTxEq(LegacyTxEqConfig config) => _tx.SetLegacyTxEq(config);
+
     public void SetTxLevelerMaxGain(double maxGainDb) => _tx.SetTxLevelerMaxGain(maxGainDb);
 
     public void SetTxTune(bool on) => _tx.SetTxTune(on);

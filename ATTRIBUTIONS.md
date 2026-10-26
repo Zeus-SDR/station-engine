@@ -26,8 +26,11 @@ version 2 or (at your option) any later version** (GPL-2.0-or-later). The full
 licence text and composition rules are in [`LICENSE`](LICENSE).
 
 The Zeus SDR web client under [`zeus-web/`](zeus-web/), the `ZeusProduct/`
-program, and the native VST3 and Audio Unit bridges are proprietary and carry
-proprietary per-file license identifiers. The web client's in-tree notice is
+program, the `Zeus.FlexRadio/` FlexRadio client and its tests, and the native
+VST3 and Audio Unit bridges are proprietary and carry proprietary per-file
+license identifiers. `Zeus.FlexRadio/` is first-party clean-room work derived
+solely from the vendor's published API documentation; it depends on no GPL
+code and is not part of the station-engine closure. The web client's in-tree notice is
 [`zeus-web/LICENSE`](zeus-web/LICENSE). Proprietary client components and the
 station engine are separate programs, and nothing in a proprietary notice
 limits the rights granted under the GPL for the station engine.

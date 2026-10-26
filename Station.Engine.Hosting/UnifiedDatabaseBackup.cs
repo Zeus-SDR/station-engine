@@ -105,7 +105,8 @@ internal static class UnifiedDatabaseBackup
         bool DatabaseExisted,
         bool LogExisted,
         string DatabaseBackupPath,
-        string LogBackupPath);
+        string LogBackupPath,
+        string? Kind = null);
 
     internal static byte[] BuildContainer() => BuildContainer(DiscoverStores());
 
@@ -126,7 +127,9 @@ internal static class UnifiedDatabaseBackup
                 if (!seenPaths.Add(fullPath) || !File.Exists(fullPath))
                     continue;
 
-                var bytes = store.Kind == "litedb"
+                var bytes = store.Key == DatabaseBackupPolicy.FlexAgentKey
+                    ? SnapshotFlexAgent(fullPath, snapshotPath => liteDatabaseSnapshotObserver?.Invoke(store, snapshotPath))
+                    : store.Kind == "litedb"
                     ? SnapshotLiteDatabase(
                         fullPath,
                         store.StationOwned,
@@ -203,7 +206,7 @@ internal static class UnifiedDatabaseBackup
         finally
         {
             TryDelete(incomingPath);
-            TryDelete(incomingPath + "-log");
+            TryDelete(DatabaseBackupPolicy.LiteDatabaseJournalPath(incomingPath));
         }
     }
 
@@ -285,7 +288,7 @@ internal static class UnifiedDatabaseBackup
             {
                 CreateRollback(pendingDirectory, prepared);
                 foreach (var item in prepared)
-                    ReplacePreparedEntryWithRetry(item.PreparedPath, item.Store.Path);
+                    ReplacePreparedEntryWithRetry(item.PreparedPath, item.Store.Path, kind: item.Store.Kind);
 
                 var rollbackDirectory = Path.Combine(pendingDirectory, RollbackDirectoryName);
                 // Removing the rollback marker is the commit point. If cleanup
@@ -341,7 +344,7 @@ internal static class UnifiedDatabaseBackup
             foreach (var item in prepared)
             {
                 TryDelete(item.PreparedPath);
-                TryDelete(item.PreparedPath + "-log");
+                TryDelete(JournalPath(item.Store.Kind, item.PreparedPath));
             }
         }
 
@@ -387,6 +390,8 @@ internal static class UnifiedDatabaseBackup
             new("preferences", "litedb", PrefsDbPath.Get(), StationOwned: true),
             new("station-engine", "litedb", PrefsDbPath.EngineGet(), StationOwned: true),
             new("link-product", "litedb", ProductPreferencesPath(), StationOwned: false),
+            new(DatabaseBackupPolicy.FlexAgentKey, "litedb",
+                Path.Combine(ProductDataDirectory(), DatabaseBackupPolicy.FlexAgentFileName), StationOwned: false),
             new("logbook", "litedb", PrefsDbPath.LogbookPath(), StationOwned: true),
             new("link-logbook", "litedb", ProductLogbookPath(), StationOwned: false),
             new("audio-suite", "file", ProductPreferencesPath() + ".audio-suite.json", StationOwned: false),
@@ -403,13 +408,11 @@ internal static class UnifiedDatabaseBackup
 
     private static string ProductPreferencesPath()
     {
-        var configured = Environment.GetEnvironmentVariable(
+        var configured = EditionPaths.ScopedOverride(
             ProductPreferencesPathEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(configured))
             return configured;
-        var local = Environment.GetFolderPath(
-            Environment.SpecialFolder.LocalApplicationData,
-            Environment.SpecialFolderOption.Create);
+        var local = global::Zeus.Server.EditionPaths.LocalApplicationData(Environment.SpecialFolderOption.Create);
         return Path.Combine(local, "Zeus", "zeus-link-product.db");
     }
 
@@ -420,14 +423,51 @@ internal static class UnifiedDatabaseBackup
     // host-parity test pins the two equal.
     private static string ProductDataDirectory()
     {
-        var configured = Environment.GetEnvironmentVariable(
+        var configured = EditionPaths.ScopedOverride(
             ProductDataDirectoryEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(configured))
             return configured;
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var local = global::Zeus.Server.EditionPaths.LocalApplicationData();
         if (string.IsNullOrWhiteSpace(local))
             local = AppContext.BaseDirectory;
         return Path.Combine(local, "ZeusProduct");
+    }
+
+    private static byte[] SnapshotFlexAgent(string sourcePath, Action<string>? observer)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"zeus-flex-snapshot-{Guid.NewGuid():N}.db");
+        try
+        {
+            // The Agent uses Shared connections. Join its cross-process mutex for
+            // one transaction so committed WAL contents and all collections agree.
+            // The engine's Direct-connection lease must never own this live file.
+            using (var source = new LiteDatabase(new ConnectionString
+            {
+                Filename = sourcePath, Connection = ConnectionType.Shared,
+            }))
+            {
+                if (!source.BeginTrans()) throw new InvalidOperationException("Could not snapshot Flex settings.");
+                try
+                {
+                    using var snapshot = new LiteDatabase(tempPath);
+                    foreach (var name in source.GetCollectionNames().ToArray())
+                    {
+                        var documents = source.GetCollection(name).FindAll().ToArray();
+                        if (documents.Length > 0) snapshot.GetCollection(name).InsertBulk(documents);
+                    }
+                    snapshot.Checkpoint();
+                }
+                finally { source.Rollback(); }
+            }
+            observer?.Invoke(tempPath);
+            SanitizeSnapshotCopy(tempPath);
+            return File.ReadAllBytes(tempPath);
+        }
+        finally
+        {
+            TryDelete(tempPath);
+            TryDelete(DatabaseBackupPolicy.LiteDatabaseJournalPath(tempPath));
+        }
     }
 
     private static byte[] SnapshotLiteDatabase(
@@ -453,8 +493,8 @@ internal static class UnifiedDatabaseBackup
                 // open or checkpoint that process's authoritative file: copy
                 // the database and transaction sidecar, then open only the copy.
                 CopySnapshotFile(sourcePath, tempPath);
-                if (File.Exists(sourcePath + "-log"))
-                    CopySnapshotFile(sourcePath + "-log", tempPath + "-log");
+                if (File.Exists(DatabaseBackupPolicy.LiteDatabaseJournalPath(sourcePath)))
+                    CopySnapshotFile(DatabaseBackupPolicy.LiteDatabaseJournalPath(sourcePath), DatabaseBackupPolicy.LiteDatabaseJournalPath(tempPath));
             }
 
             snapshotObserver?.Invoke(tempPath);
@@ -468,10 +508,10 @@ internal static class UnifiedDatabaseBackup
                 // checkpoint landing between them can tear the pair. One
                 // bounded recopy converges on a consistent snapshot.
                 TryDelete(tempPath);
-                TryDelete(tempPath + "-log");
+                TryDelete(DatabaseBackupPolicy.LiteDatabaseJournalPath(tempPath));
                 CopySnapshotFile(sourcePath, tempPath);
-                if (File.Exists(sourcePath + "-log"))
-                    CopySnapshotFile(sourcePath + "-log", tempPath + "-log");
+                if (File.Exists(DatabaseBackupPolicy.LiteDatabaseJournalPath(sourcePath)))
+                    CopySnapshotFile(DatabaseBackupPolicy.LiteDatabaseJournalPath(sourcePath), DatabaseBackupPolicy.LiteDatabaseJournalPath(tempPath));
                 SanitizeSnapshotCopy(tempPath);
             }
             return File.ReadAllBytes(tempPath);
@@ -479,7 +519,7 @@ internal static class UnifiedDatabaseBackup
         finally
         {
             TryDelete(tempPath);
-            TryDelete(tempPath + "-log");
+            TryDelete(DatabaseBackupPolicy.LiteDatabaseJournalPath(tempPath));
         }
     }
 
@@ -744,7 +784,7 @@ internal static class UnifiedDatabaseBackup
         finally
         {
             TryDelete(temporaryPath);
-            TryDelete(temporaryPath + "-log");
+            TryDelete(DatabaseBackupPolicy.LiteDatabaseJournalPath(temporaryPath));
         }
     }
 
@@ -794,7 +834,7 @@ internal static class UnifiedDatabaseBackup
         catch
         {
             TryDelete(temporaryPath);
-            TryDelete(temporaryPath + "-log");
+            TryDelete(JournalPath(entry.Kind, temporaryPath));
             throw;
         }
     }
@@ -824,18 +864,20 @@ internal static class UnifiedDatabaseBackup
             var databaseBackup = $"{item.Entry.Key}.db.original";
             var logBackup = $"{item.Entry.Key}.db-log.original";
             var databaseExisted = File.Exists(item.Store.Path);
-            var logExisted = File.Exists(item.Store.Path + "-log");
+            var journalPath = JournalPath(item.Store.Kind, item.Store.Path);
+            var logExisted = File.Exists(journalPath);
             if (databaseExisted)
                 CopyFileDurably(item.Store.Path, Path.Combine(rollbackDirectory, databaseBackup));
             if (logExisted)
-                CopyFileDurably(item.Store.Path + "-log", Path.Combine(rollbackDirectory, logBackup));
+                CopyFileDurably(journalPath!, Path.Combine(rollbackDirectory, logBackup));
             entries.Add(new RollbackEntry(
                 item.Entry.Key,
                 Path.GetFullPath(item.Store.Path),
                 databaseExisted,
                 logExisted,
                 databaseBackup,
-                logBackup));
+                logBackup,
+                item.Store.Kind));
         }
 
         var manifestPath = Path.Combine(rollbackDirectory, RollbackManifestName);
@@ -860,6 +902,10 @@ internal static class UnifiedDatabaseBackup
             var entries = JsonSerializer.Deserialize<List<RollbackEntry>>(
                 File.ReadAllBytes(manifestPath), Json)
                 ?? throw new InvalidOperationException("The restore rollback manifest is empty.");
+            var agentPath = entries.Where(entry => entry.Key == DatabaseBackupPolicy.FlexAgentKey)
+                .Select(entry => entry.DestinationPath).FirstOrDefault();
+            using var agentLock = agentPath is null ? null
+                : DatabaseBackupPolicy.AcquireFlexAgentRestoreLock(agentPath);
             foreach (var entry in entries)
             {
                 var destinationDirectory = Path.GetDirectoryName(entry.DestinationPath)
@@ -869,10 +915,11 @@ internal static class UnifiedDatabaseBackup
                     entry.DatabaseExisted,
                     Path.Combine(rollbackDirectory, entry.DatabaseBackupPath),
                     entry.DestinationPath);
-                RestoreOriginal(
-                    entry.LogExisted,
-                    Path.Combine(rollbackDirectory, entry.LogBackupPath),
-                    entry.DestinationPath + "-log");
+                if (RollbackJournalPath(entry) is { } journalPath)
+                    RestoreOriginal(
+                        entry.LogExisted,
+                        Path.Combine(rollbackDirectory, entry.LogBackupPath),
+                        journalPath);
             }
             TryDeleteDirectory(rollbackDirectory);
             return true;
@@ -884,18 +931,30 @@ internal static class UnifiedDatabaseBackup
         }
     }
 
+    private static string? JournalPath(string kind, string path) => kind == "litedb"
+        ? DatabaseBackupPolicy.LiteDatabaseJournalPath(path) : null;
+
+    // Either host may recover this shared rollback marker. Retain the naming
+    // used by manifests written before the entry kind was recorded.
+    private static string? RollbackJournalPath(RollbackEntry entry) => entry.Kind is not null
+        ? JournalPath(entry.Kind, entry.DestinationPath)
+        : entry.Key == DatabaseBackupPolicy.FlexAgentKey
+            ? DatabaseBackupPolicy.LiteDatabaseJournalPath(entry.DestinationPath)
+            : entry.DestinationPath + "-log";
+
     internal static void ReplacePreparedEntryWithRetry(
         string preparedPath,
         string destinationPath,
         Action<int>? beforeAttempt = null,
-        Action? waitBetweenAttempts = null)
+        Action? waitBetweenAttempts = null,
+        string kind = "litedb")
     {
         for (var attempt = 0; ; attempt++)
         {
             try
             {
                 beforeAttempt?.Invoke(attempt);
-                DeleteIfExists(destinationPath + "-log");
+                DeleteIfExists(JournalPath(kind, destinationPath));
                 File.Move(preparedPath, destinationPath, overwrite: true);
                 return;
             }
@@ -933,9 +992,9 @@ internal static class UnifiedDatabaseBackup
         destination.Flush(flushToDisk: true);
     }
 
-    private static void DeleteIfExists(string path)
+    private static void DeleteIfExists(string? path)
     {
-        if (File.Exists(path))
+        if (path is not null && File.Exists(path))
             File.Delete(path);
     }
 
@@ -1076,7 +1135,7 @@ internal static class UnifiedDatabaseBackup
 
     private static string PendingDirectory()
     {
-        var configured = Environment.GetEnvironmentVariable(
+        var configured = EditionPaths.ScopedOverride(
             PendingRestoreDirectoryEnvironmentVariable);
         if (!string.IsNullOrWhiteSpace(configured))
             return Path.GetFullPath(configured);
@@ -1206,7 +1265,7 @@ internal static class UnifiedDatabaseBackup
         ? StringComparison.OrdinalIgnoreCase
         : StringComparison.Ordinal;
 
-    private static void TryDelete(string path)
+    private static void TryDelete(string? path)
     {
         try { if (File.Exists(path)) File.Delete(path); }
         catch { }

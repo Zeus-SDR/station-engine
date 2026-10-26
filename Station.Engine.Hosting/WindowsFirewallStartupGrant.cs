@@ -41,7 +41,8 @@ public sealed class WindowsFirewallStartupGrant : BackgroundService
 {
     // Registered by the Zeus Link / Zeus installer, elevated, at install time.
     // Running it needs no elevation of our own and raises no UAC prompt.
-    internal const string HelperTaskName = @"\ZeusSDR\GrantNetworkAccess";
+    internal static string HelperTaskName => EditionPaths.DataRoot is null
+        ? @"\ZeusSDR\GrantNetworkAccess" : @"\ZeusSDR Flex\GrantNetworkAccess";
 
     private readonly IWindowsFirewallService _firewall;
     private readonly WindowsFirewallGrantStore _store;

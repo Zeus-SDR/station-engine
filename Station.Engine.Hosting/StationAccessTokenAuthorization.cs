@@ -66,6 +66,9 @@ public static class StationAccessTokenAuthorization
                 "/api/station/rx-audio",
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(
+                "/api/station/external-receiver",
+                StringComparison.OrdinalIgnoreCase)
+            || request.Path.StartsWithSegments(
                 "/api/station/tx-audio",
                 StringComparison.OrdinalIgnoreCase)
             || request.Path.StartsWithSegments(

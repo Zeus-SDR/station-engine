@@ -24,12 +24,74 @@ public partial class DspPipelineService
         return signal is null || ingest is null ? null : new(signal, ingest.ActiveSource);
     }
 
+    /// <summary>
+    /// Recorder lease or a processed-TX websocket subscriber: run the TX
+    /// monitor demod silently (operator MON still gates audible sinks).
+    /// </summary>
+    internal static bool HasProcessedTxDemand(StreamingHub? hub, ProductPluginAudioPort? product) =>
+        (hub?.ProcessedTxStreamRequested ?? false) || (product?.HasLeasedTxMicCapture ?? false);
+
+    /// <summary>The meter loop's view of <see cref="HasProcessedTxDemand"/>.</summary>
+    internal bool ProcessedTxDemandActive => HasProcessedTxDemand(_hub, _productPluginAudio);
+
+    private readonly object _processedTxResampleLock = new();
+
     private void ReconcileCaptureMonitor(IDspEngine engine, Zeus.Contracts.StateDto state)
     {
         bool enabled = state.TxMonitorEnabled || _monitorWaveform.IsCaptureActive
-            || (_productPluginAudio?.HasLeasedTxMicCapture ?? false);
+            || HasProcessedTxDemand(_hub, _productPluginAudio);
         if (engine.IsTxMonitorOn == enabled) return;
         engine.SetTxMonitorEnabled(enabled);
+    }
+
+    private void OfferProcessedTxAudio(int sampleRate, ReadOnlySpan<float> samples)
+    {
+        if (!_hub.ProcessedTxStreamRequested || samples.Length == 0) return;
+        lock (_processedTxResampleLock)
+        {
+            if (!_hub.ProcessedTxStreamRequested) return;
+            _processedTxResampler.Accept(samples, sampleRate);
+        }
+    }
+
+    /// <summary>
+    /// A processed-TX subscriber arrived or left. Open or close the silent
+    /// monitor now; the DSP tick still reconciles, but the first syllables
+    /// must not wait for it. Reset the resampler only when the websocket
+    /// stream itself goes idle, so a recorder lease does not drop the tail.
+    /// </summary>
+    private void OnProcessedTxDemandChanged()
+    {
+        // The subscriber count is already updated. Take the engine lock so
+        // this edge and OnRadioStateChanged cannot push two TX plans at once.
+        // The websocket receive thread does not hold the lock on the way in.
+        lock (_engineLock)
+        {
+            var engine = _engine;
+            if (engine is not null)
+            {
+                var state = _radio.Snapshot();
+                ReconcileCaptureMonitor(engine, state);
+                PushCarrierlessTx(engine, state, force: false);
+            }
+        }
+        if (_hub.ProcessedTxStreamRequested) return;
+        lock (_processedTxResampleLock)
+            _processedTxResampler.Reset();
+    }
+
+    private void EmitProcessedTxBlock(ReadOnlySpan<float> block)
+    {
+        if (!_hub.ProcessedTxStreamRequested) return;
+        block.CopyTo(_processedTxScratch);
+        var publishMode = ResolveCarrierlessTxPlan(
+            _radio.Snapshot(), _hub.ProcessedTxStreamRequested).Mode;
+        ProcessedTxPublish.Apply(_processedTxScratch, publishMode);
+        for (int i = 0; i < _processedTxScratch.Length; i++)
+            BinaryPrimitives.WriteSingleLittleEndian(
+                _processedTxBytes.AsSpan(i * sizeof(float), sizeof(float)),
+                _processedTxScratch[i]);
+        _hub.BroadcastProcessedTxPcm(_processedTxBytes);
     }
 
     private void CaptureMonitorWaveform(IDspEngine engine, Zeus.Contracts.StateDto state, ReadOnlySpan<float> samples)

@@ -2198,12 +2198,42 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // "NR3 unavailable on this build" instead of silently succeeding. Zeus
     // builds rnnoise without a baked-in model, so clearing the path leaves NR3
     // inert (audio passes through) rather than falling back to a stock model.
+    private static long _nr3ModelLoads;
+    internal static long Nr3ModelLoadsForTest => Interlocked.Read(ref _nr3ModelLoads);
+    private static string? _loadedNr3ModelPath;
+    private static Nr3ModelLoadResult _cachedNr3ModelResult;
+
+    internal static void InvalidateNr3ModelCache()
+    {
+        lock (_nativeLifecycleLock)
+        {
+            _loadedNr3ModelPath = null;
+            _cachedNr3ModelResult = Nr3ModelLoadResult.Cleared;
+        }
+    }
+
+    // Private audio channels share WDSP's process-global model. The ordinary
+    // receiver loader still reloads explicitly (including same-path updates).
+    internal Nr3ModelLoadResult EnsureNr3ModelLoaded(string? modelFilePath)
+    {
+        lock (_nativeLifecycleLock)
+        {
+            if (_cachedNr3ModelResult == Nr3ModelLoadResult.Loaded
+                && string.Equals(_loadedNr3ModelPath, modelFilePath, StringComparison.Ordinal))
+                return _cachedNr3ModelResult;
+            return LoadNr3Model(modelFilePath);
+        }
+    }
+
     public Nr3ModelLoadResult LoadNr3Model(string? modelFilePath)
     {
         lock (_nativeLifecycleLock)
         {
+            _loadedNr3ModelPath = null;
+            _cachedNr3ModelResult = Nr3ModelLoadResult.Cleared;
             try
             {
+                Interlocked.Increment(ref _nr3ModelLoads);
                 NativeMethods.RNNRloadModel(modelFilePath ?? string.Empty);
             }
             catch (EntryPointNotFoundException ex)
@@ -2237,6 +2267,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
             _log.LogInformation("wdsp.rnnr.loadModel path=\"{Path}\" verified={Verified}",
                 modelFilePath, loaded.HasValue);
+            _loadedNr3ModelPath = modelFilePath;
+            _cachedNr3ModelResult = Nr3ModelLoadResult.Loaded;
             return Nr3ModelLoadResult.Loaded;
         }
     }

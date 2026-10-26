@@ -24,6 +24,11 @@ public sealed class CwDecoderService : IHostedService, IDisposable
     private readonly DspPipelineService _dsp;
     private readonly RadioService _radio;
     private readonly StreamingHub _hub;
+    private readonly ExternalReceiverPort? _externalReceiver;
+    // Serialises the choice between the external receiver context and the
+    // radio snapshot with the write it decides, so a radio event that lost
+    // the race cannot overwrite a newer external context (or vice versa).
+    private readonly object _receiveStateGate = new();
     private readonly ILogger<CwDecoderService> _log;
     private readonly FloatSpscRing _ring = new(RingCapacity);
     private readonly AutoResetEvent _wake = new(false);
@@ -59,11 +64,13 @@ public sealed class CwDecoderService : IHostedService, IDisposable
         DspPipelineService dsp,
         RadioService radio,
         StreamingHub hub,
-        ILogger<CwDecoderService> log)
+        ILogger<CwDecoderService> log,
+        ExternalReceiverPort? externalReceiver = null)
     {
         _dsp = dsp;
         _radio = radio;
         _hub = hub;
+        _externalReceiver = externalReceiver;
         _log = log;
         _decodedHandler = OnDecoded;
     }
@@ -88,6 +95,11 @@ public sealed class CwDecoderService : IHostedService, IDisposable
         {
             UpdateRadioState(_radio.Snapshot());
             Volatile.Write(ref _isMox, _radio.IsMox ? 1 : 0);
+            if (_externalReceiver is not null)
+            {
+                _externalReceiver.ContextChanged += OnExternalReceiverContextChanged;
+                OnExternalReceiverContextChanged();
+            }
             // ReceiverAudioAvailable is the per-receiver tap, RX1 included,
             // before the speaker mix and before mute. RxAudioAvailable is the
             // mixed bus and only ever names receiver 0.
@@ -117,6 +129,8 @@ public sealed class CwDecoderService : IHostedService, IDisposable
             _radio.MoxChanged -= OnMoxChanged;
             _hub.CwDecodeRequestChanged -= OnGateChanged;
             _hub.CwDecodeTargetChanged -= OnTargetChanged;
+            if (_externalReceiver is not null)
+                _externalReceiver.ContextChanged -= OnExternalReceiverContextChanged;
         }
         CancellationTokenSource? stop = _stop;
         Task? worker = _worker;
@@ -191,9 +205,52 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     private void UpdateRadioState(StateDto state)
     {
-        Volatile.Write(ref _pitchHz, NormalizePitchHz(state.CwPitchHz));
-        CopyReceiverCwModes(state, _cwModeByReceiver);
-        Volatile.Write(ref _isCwMode, _cwModeByReceiver[0]);
+        lock (_receiveStateGate)
+        {
+            Volatile.Write(ref _pitchHz, NormalizePitchHz(state.CwPitchHz));
+            if (TryGetExternalContext(out var external))
+            {
+                CopyExternalCwModes(external, _cwModeByReceiver);
+            }
+            else
+            {
+                CopyReceiverCwModes(state, _cwModeByReceiver);
+            }
+            Volatile.Write(ref _isCwMode, _cwModeByReceiver[0]);
+        }
+    }
+
+    private bool TryGetExternalContext(out ExternalReceiverContext context)
+    {
+        if (_externalReceiver is not null && _externalReceiver.TryGetContext(0, out context))
+            return true;
+        context = default;
+        return false;
+    }
+
+    /// <summary>
+    /// The external receiver drives only its own receiver index; every other
+    /// index is closed while it is active. Revert happens on the next
+    /// <see cref="UpdateRadioState"/> after the port detaches.
+    /// </summary>
+    internal static void CopyExternalCwModes(ExternalReceiverContext context, int[] modes)
+    {
+        for (int i = 0; i < modes.Length; i++)
+            Volatile.Write(ref modes[i], 0);
+        if ((uint)context.Receiver < (uint)modes.Length && context.Mode is RxMode.CWU or RxMode.CWL)
+            Volatile.Write(ref modes[context.Receiver], 1);
+    }
+
+    // Port thread: the external context was set, changed or cleared. Re-derive
+    // mode and MOX from the context, or from the radio once it is gone.
+    private void OnExternalReceiverContextChanged()
+    {
+        // Read the radio before taking the gate: no RadioService lock is ever
+        // acquired while the gate is held.
+        StateDto state = _radio.Snapshot();
+        bool radioMox = _radio.IsMox;
+        UpdateRadioState(state);
+        OnMoxChanged(radioMox);
     }
 
     /// <summary>
@@ -311,8 +368,13 @@ public sealed class CwDecoderService : IHostedService, IDisposable
 
     internal void OnMoxChanged(bool mox)
     {
-        Volatile.Write(ref _isMox, mox ? 1 : 0);
-        if (mox) Interlocked.Increment(ref _transmitSequence);
+        lock (_receiveStateGate)
+        {
+            // While the external receiver is active its context owns MOX.
+            if (TryGetExternalContext(out var external)) mox = external.Transmitting;
+            Volatile.Write(ref _isMox, mox ? 1 : 0);
+            if (mox) Interlocked.Increment(ref _transmitSequence);
+        }
         SignalWake(_wake);
     }
 

@@ -5,6 +5,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <DefineConstants>$(DefineConstants);ZEUS_DSP_HOST</DefineConstants>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Keep ordinary RID-less Windows development usable and retain the
          runtime in NuGet packs, but never propagate the GPL-3-only ASIO DLL
@@ -13,6 +14,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\Station.Engine.Hosting\EditionPaths.cs" Link="EditionPaths.cs" />
     <ProjectReference Include="..\Zeus.Contracts\Zeus.Contracts.csproj" />
     <InternalsVisibleTo Include="Zeus.Dsp.Tests" />
     <InternalsVisibleTo Include="Zeus.Server.Hosting" />

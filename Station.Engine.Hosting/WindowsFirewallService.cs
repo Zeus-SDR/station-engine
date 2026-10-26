@@ -61,12 +61,14 @@ public sealed record WindowsFirewallApplyResult(
 public sealed class WindowsFirewallService : IWindowsFirewallService
 {
     public const string RuleName = "ZeusSDR (HPSDR receive)";
+    internal const string FlexRuleName = "ZeusSDR Flex (HPSDR receive)";
 
     // The firewall rule shipped under the pre-rebrand product name. We delete it
     // whenever we (re)apply the rule so an upgraded-over install doesn't leave an
     // orphaned duplicate in Windows Defender Firewall. Never re-added.
     public const string LegacyRuleName = "OpenHPSDR Zeus (HPSDR receive)";
 
+    private readonly string _ruleName = EditionPaths.DataRoot is null ? RuleName : FlexRuleName;
     private readonly ILogger<WindowsFirewallService> _log;
     private readonly IWindowsFirewallCommandRunner _runner;
     private readonly Func<bool> _isWindows;
@@ -100,7 +102,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
             return new(
                 Supported: false,
                 CanApply: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: null,
                 Message: "Windows Firewall rule management is only available on Windows.");
         }
@@ -111,7 +113,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
             return new(
                 Supported: true,
                 CanApply: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: null,
                 Message: "Could not resolve the Zeus executable path.");
         }
@@ -119,7 +121,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
         return new(
             Supported: true,
             CanApply: true,
-            RuleName,
+            _ruleName,
             ProgramPath: programPath,
             Message: "Ready to add the Zeus inbound allow rule.");
     }
@@ -133,7 +135,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
         FirewallRuleProbe probe;
         try
         {
-            probe = await _runner.ProbeAsync(RuleName, status.ProgramPath, ct);
+            probe = await _runner.ProbeAsync(_ruleName, status.ProgramPath, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -184,7 +186,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: false,
                 ElevationAttempted: false,
                 ElevationCanceled: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: status.Message);
         }
@@ -194,7 +196,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
         // there is nothing to change, and re-adding it would needlessly trigger the
         // Windows UAC elevation prompt on every launch. Short-circuit before touching
         // netsh add / runas.
-        var probe = await _runner.ProbeAsync(RuleName, status.ProgramPath, ct);
+        var probe = await _runner.ProbeAsync(_ruleName, status.ProgramPath, ct);
         if (probe.Exists && probe.MatchesProgram)
         {
             _log.LogInformation(
@@ -204,12 +206,12 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: true,
                 ElevationAttempted: false,
                 ElevationCanceled: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows Firewall rule already present.");
         }
 
-        var direct = await _runner.ApplyAsync(RuleName, status.ProgramPath, elevated: false, ct);
+        var direct = await _runner.ApplyAsync(_ruleName, status.ProgramPath, elevated: false, ct);
         if (direct.ExitCode == 0)
         {
             _log.LogInformation("windows.firewall.rule applied path={ProgramPath} elevated=false", status.ProgramPath);
@@ -218,7 +220,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: true,
                 ElevationAttempted: false,
                 ElevationCanceled: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows Firewall rule applied.");
         }
@@ -235,7 +237,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: false,
                 ElevationAttempted: false,
                 ElevationCanceled: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows Firewall rule needs administrator approval.");
         }
@@ -244,7 +246,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
             "windows.firewall.rule direct apply failed exit={ExitCode}; requesting elevation",
             direct.ExitCode);
 
-        var elevated = await _runner.ApplyAsync(RuleName, status.ProgramPath, elevated: true, ct);
+        var elevated = await _runner.ApplyAsync(_ruleName, status.ProgramPath, elevated: true, ct);
         if (elevated.ExitCode == 0)
         {
             _log.LogInformation("windows.firewall.rule applied path={ProgramPath} elevated=true", status.ProgramPath);
@@ -253,7 +255,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: true,
                 ElevationAttempted: true,
                 ElevationCanceled: false,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows Firewall rule applied.");
         }
@@ -265,7 +267,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
                 Applied: false,
                 ElevationAttempted: true,
                 ElevationCanceled: true,
-                RuleName,
+                _ruleName,
                 ProgramPath: status.ProgramPath,
                 Message: "Windows administrator approval was cancelled.");
         }
@@ -279,7 +281,7 @@ public sealed class WindowsFirewallService : IWindowsFirewallService
             Applied: false,
             ElevationAttempted: true,
             ElevationCanceled: false,
-            RuleName,
+            _ruleName,
             ProgramPath: status.ProgramPath,
             Message: "Windows did not accept the firewall rule. Try running Zeus as administrator, then apply it again.");
     }
@@ -357,27 +359,9 @@ internal sealed class ProcessWindowsFirewallCommandRunner : IWindowsFirewallComm
         string programPath,
         CancellationToken ct)
     {
-        // Remove any pre-rebrand rule first so upgraders don't accumulate a
-        // stale "OpenHPSDR Zeus (HPSDR receive)" duplicate. Idempotent.
-        await RunNetshAsync(
-            [
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=" + WindowsFirewallService.LegacyRuleName,
-            ],
-            ct);
-
-        var delete = await RunNetshAsync(
-            [
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=" + ruleName,
-            ],
-            ct);
+        FirewallCommandResult delete = new(0, "");
+        foreach (var name in RulesToReplace(ruleName))
+            delete = await RunNetshAsync(["advfirewall", "firewall", "delete", "rule", "name=" + name], ct);
 
         var add = await RunNetshAsync(
             [
@@ -429,6 +413,11 @@ internal sealed class ProcessWindowsFirewallCommandRunner : IWindowsFirewallComm
         }
     }
 
+    internal static IReadOnlyList<string> RulesToReplace(string ruleName) =>
+        ruleName == WindowsFirewallService.FlexRuleName
+            ? [ruleName]
+            : [WindowsFirewallService.LegacyRuleName, ruleName];
+
     internal static string BuildElevatedPowerShellScript(string ruleName, string programPath)
     {
         var netsh = ResolveTool("netsh.exe");
@@ -438,10 +427,9 @@ internal sealed class ProcessWindowsFirewallCommandRunner : IWindowsFirewallComm
                 "$ErrorActionPreference = 'SilentlyContinue'",
                 "$netsh = " + PowerShellLiteral(netsh),
                 "$rule = " + PowerShellLiteral(ruleName),
-                "$legacyRule = " + PowerShellLiteral(WindowsFirewallService.LegacyRuleName),
                 "$program = " + PowerShellLiteral(programPath),
-                "& $netsh advfirewall firewall delete rule (\"name=\" + $legacyRule) | Out-Null",
-                "& $netsh advfirewall firewall delete rule (\"name=\" + $rule) | Out-Null",
+                .. RulesToReplace(ruleName).Select(name =>
+                    "& $netsh advfirewall firewall delete rule " + PowerShellLiteral("name=" + name) + " | Out-Null"),
                 "$ErrorActionPreference = 'Stop'",
                 "& $netsh advfirewall firewall add rule (\"name=\" + $rule) dir=in action=allow (\"program=\" + $program) enable=yes",
                 "exit $LASTEXITCODE",

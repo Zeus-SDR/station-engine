@@ -172,6 +172,9 @@ internal sealed class OperatorDownloadsDirectory
 
     private IReadOnlyList<string> Candidates()
     {
+        var edition = EditionPaths.DownloadsRoot(_getEnvironmentVariable);
+        if (edition is not null) return [edition];
+
         var candidates = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var home = _getUserProfile()?.Trim() ?? string.Empty;

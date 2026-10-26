@@ -90,6 +90,14 @@ public enum MsgType : byte
     // already in flight from the previous press.
     NativeMicStreamRequest = 0x24,
 
+    // Client → server (control). Requests an on-demand copy of the processed
+    // TX audio (TX-monitor demod, pre monitor volume) for this loopback
+    // websocket session. Same trusted-loopback authorization as
+    // NativeMicStreamRequest. Friend PTT keeps NativeMicPcm (0x3D); this
+    // stream is what an external transmitter should put on the air.
+    // Payload: [type:1][enable:u8][generation:u32 LE].
+    ProcessedTxStreamRequest = 0x29,
+
     // Client → server (control). Enables the first-party receive-side CW
     // decoder while at least one Telegraph Console panel is mounted. The
     // request is refcounted per connected session and unwound on disconnect.
@@ -388,4 +396,19 @@ public enum MsgType : byte
     // browser can never play it and the listener fan-out can never accept
     // an operator 0x02 frame. The host Opus-encodes it for the listener track.
     PublicAudioPcm = 0x43,
+
+    // Server → client (processed TX audio for an external transmitter).
+    // Carries the TX-monitor demod of the TXA output, 960 × f32 LE mono at
+    // 48 kHz, before operator monitor volume. Emitted only to a trusted
+    // loopback websocket session while that session holds a
+    // ProcessedTxStreamRequest. Payload:
+    // [type:1][generation:u32 LE]
+    // [960 × f32 LE mono @ 48 kHz].
+    ProcessedTxPcm = 0x44,
+
+    // Server → client (processed TX stream request denied). Sent once when a
+    // ProcessedTxStreamRequest(enable=true) fails the same trusted-loopback
+    // authorization as NativeMicStreamDenied. Payload: [type:1]
+    // [generation:u32 LE].
+    ProcessedTxStreamDenied = 0x45,
 }

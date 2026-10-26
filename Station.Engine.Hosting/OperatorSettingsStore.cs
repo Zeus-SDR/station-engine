@@ -42,6 +42,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["spectrum-display"] = "display_aux_settings",
             ["spectrum-splits"] = "display_aux_settings",
             ["vfo-popouts"] = "display_aux_settings",
+            ["flex-operating"] = "display_aux_settings",
             ["vox"] = "vox_settings",
         };
 

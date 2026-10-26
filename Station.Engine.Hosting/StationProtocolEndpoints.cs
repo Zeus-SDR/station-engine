@@ -99,6 +99,28 @@ public static class StationProtocolEndpoints
             await port.HoldLeaseAsync(leaseId, context).ConfigureAwait(false);
         });
 
+        // Receive audio and receiver context from a product-operated radio
+        // while the engine has no radio of its own
+        // (docs/designs/external-receiver-audio-port.md). Like product-audio
+        // attach this is an originless native-process seam: a web page must
+        // not be able to feed the engine's receive consumers.
+        endpoints.MapGet("/api/station/external-receiver", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            var port = context.RequestServices.GetService<ExternalReceiverPort>();
+            var dsp = context.RequestServices.GetService<DspPipelineService>();
+            if (port is null || dsp is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+            await port.RunAsync(context, dsp).ConfigureAwait(false);
+        });
+
         endpoints.MapPost("/api/station/rx-audio/attach", async (HttpContext context) =>
         {
             if (!IsLoopback(context))

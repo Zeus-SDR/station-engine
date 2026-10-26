@@ -88,6 +88,7 @@ internal sealed class WebSocketSendQueue
                 var dropped = discardable ??
                     FindOldestAudio() ??
                     FindOldestType(MsgType.NativeMicPcm) ??
+                    FindOldestType(MsgType.ProcessedTxPcm) ??
                     _items.First!;
                 droppedType = FrameType(dropped.Value);
                 _items.Remove(dropped);
@@ -210,7 +211,7 @@ internal sealed class WebSocketSendQueue
     }
 
     private static bool IsRealtimePcm(MsgType? type) =>
-        type is MsgType.AudioPcm or MsgType.NativeMicPcm;
+        type is MsgType.AudioPcm or MsgType.NativeMicPcm or MsgType.ProcessedTxPcm;
 
     private static bool IsLowPriorityTelemetry(MsgType? type) => type is
         MsgType.DisplayFrame or

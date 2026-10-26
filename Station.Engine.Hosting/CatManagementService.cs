@@ -12,6 +12,7 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Options;
 using Zeus.Contracts;
 using Zeus.Server.Cat;
+using Zeus.Server.Tci;
 
 namespace Zeus.Server;
 
@@ -29,6 +30,8 @@ public sealed class CatManagementService
     private readonly CatServer _catServer;
     private readonly CatOptions _startupOptions;
     private readonly CatConfigStore _store;
+    private readonly TciOptions _tciStartupOptions;
+    private readonly TciConfigStore _tciStore;
 
     private CatRuntimeConfig _pendingConfig;
 
@@ -36,12 +39,16 @@ public sealed class CatManagementService
         ILogger<CatManagementService> log,
         CatServer catServer,
         IOptions<CatOptions> options,
-        CatConfigStore store)
+        CatConfigStore store,
+        IOptions<TciOptions> tciOptions,
+        TciConfigStore tciStore)
     {
         _log = log;
         _catServer = catServer;
         _startupOptions = options.Value;
         _store = store;
+        _tciStartupOptions = tciOptions.Value;
+        _tciStore = tciStore;
 
         _pendingConfig = _store.Get() ?? new CatRuntimeConfig(
             Enabled: _startupOptions.Enabled,
@@ -64,7 +71,7 @@ public sealed class CatManagementService
         // switch to?" is answered by TestPort, which the panel calls before a
         // bind/port change. (Same lesson as TciManagementService.)
         bool portAvailable = true;
-        string? error = null;
+        string? error = PendingTciCollision();
 
         var requiresRestart = _pendingConfig.Enabled != currentlyEnabled
                             || _pendingConfig.Port != currentPort
@@ -84,6 +91,21 @@ public sealed class CatManagementService
             PortAvailable: portAvailable,
             RequiresRestart: requiresRestart,
             Error: error);
+    }
+
+    // CAT keeps the port at startup and TCI yields (StationControlPortConflict),
+    // so warn here too: the operator may have just moved CAT onto TCI's port.
+    private string? PendingTciCollision()
+    {
+        var tci = _tciStore.Get();
+        var tciEnabled = tci?.Enabled ?? _tciStartupOptions.Enabled;
+        var tciBindAddress = tci?.BindAddress ?? _tciStartupOptions.BindAddress;
+        var tciPort = tci?.Port ?? _tciStartupOptions.Port;
+        return StationControlPortConflict.Collides(
+            tciEnabled, tciBindAddress, tciPort,
+            _pendingConfig.Enabled, _pendingConfig.BindAddress, _pendingConfig.Port)
+            ? StationControlPortConflict.PendingCollisionMessage("TCI", _pendingConfig.Port)
+            : null;
     }
 
     public CatStatus SetConfig(CatRuntimeConfig config)

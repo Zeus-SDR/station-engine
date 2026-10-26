@@ -21,4 +21,11 @@
     <InternalsVisibleTo Include="Zeus.Server.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="..\Station.Engine.Hosting\.zeus-edition-isolation-v1"
+             Link=".zeus-edition-isolation-v1"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest"
+             ExcludeFromSingleFile="true" />
+  </ItemGroup>
 </Project>

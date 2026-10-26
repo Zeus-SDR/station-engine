@@ -2145,7 +2145,7 @@ public sealed class TxAudioIngest : IDisposable
         // below. Fully open blocks pass bit-identical; fully closed are zeros.
         float previewGainStart = 1f;
         float previewGainEnd = 1f;
-        if (monitorOn && !moxNow && !(_productPluginAudio?.HasLeasedTxMicCapture ?? false)
+        if (monitorOn && !moxNow && !DspPipelineService.HasProcessedTxDemand(_hub, _productPluginAudio)
             && source is MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic or MicBlockSource.VirtualCable)
         {
             (previewGainStart, previewGainEnd) = AdvanceIdleMonitorPreviewGate(samples);

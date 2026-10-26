@@ -212,9 +212,7 @@ public static class LanCertificate
 
     private static string ResolveCertPath()
     {
-        var directory = Environment.GetFolderPath(
-            Environment.SpecialFolder.LocalApplicationData,
-            Environment.SpecialFolderOption.Create);
+        var directory = global::Zeus.Server.EditionPaths.LocalApplicationData(Environment.SpecialFolderOption.Create);
         return Path.Combine(directory, "Zeus", "certs", CertFileName);
     }
 

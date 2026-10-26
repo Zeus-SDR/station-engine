@@ -74,9 +74,7 @@ public sealed class Nr3ModelStore
     public Nr3ModelStore(ILogger<Nr3ModelStore> log)
     {
         _log = log;
-        var appData = Environment.GetFolderPath(
-            Environment.SpecialFolder.LocalApplicationData,
-            Environment.SpecialFolderOption.Create);
+        var appData = global::Zeus.Server.EditionPaths.LocalApplicationData(Environment.SpecialFolderOption.Create);
         _dir = Path.Combine(appData, "Zeus", "nr3-models");
         var bundled = Path.Combine(AppContext.BaseDirectory, BundledDefaultFileName);
         _bundledDefaultPath = File.Exists(bundled) ? bundled : null;

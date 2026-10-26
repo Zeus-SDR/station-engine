@@ -166,7 +166,7 @@ public static class TciHostingExtensions
         localAddresses.Any(localAddress =>
             candidate.GetAddressBytes().SequenceEqual(localAddress.GetAddressBytes()));
 
-    private static IReadOnlyCollection<IPAddress> GetLocalAddresses() =>
+    internal static IReadOnlyCollection<IPAddress> GetLocalAddresses() =>
         NetworkInterface.GetAllNetworkInterfaces()
             .SelectMany(networkInterface => networkInterface.GetIPProperties().UnicastAddresses)
             .Select(unicastAddress => unicastAddress.Address)
@@ -178,4 +178,8 @@ public sealed record TciListenerBinding(
     string BindAddress,
     int Port,
     IPAddress? Address,
-    string? Error);
+    string? Error)
+{
+    /// <summary>True when TCI stayed off because CAT claims its port.</summary>
+    public bool YieldedToCat { get; init; }
+}

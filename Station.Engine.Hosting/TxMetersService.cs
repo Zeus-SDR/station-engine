@@ -667,11 +667,11 @@ public sealed class TxMetersService : BackgroundService
                 }
                 else
                 {
-                    // Zero the TX fields while idle so the UI doesn't latch a
-                    // stale pre-unkey reading. Stage meters go to Silent (−∞)
-                    // so the diagnostic strip renders empty instead of latching
-                    // last-during-TX values.
-                    frame = BuildFrame(0f, 0f, 1.0f, TxStageMeters.Silent);
+                    // Unkeyed. With no processed-TX subscriber this is the idle
+                    // frame (silent stage meters). A subscriber still needs the
+                    // live stage meters; forward, reflected, and SWR stay idle
+                    // because this radio is not the one making power.
+                    frame = BuildUnkeyedFrame();
                     // Clear the trip timer when not keyed so a brief spike doesn't
                     // carry over into the next TX.
                     _tx.Safety.ObserveConfirmedIdle();
@@ -720,7 +720,7 @@ public sealed class TxMetersService : BackgroundService
                     _hub.Broadcast(new PaTempFrame(ConvertPaTempAdcToCelsius(paAdc)));
                 }
 
-                try { await Task.Delay(mox ? MoxTick : IdleTick, ct).ConfigureAwait(false); }
+                try { await Task.Delay(MeterTickDelay(mox), ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { return; }
             }
         }
@@ -876,11 +876,25 @@ public sealed class TxMetersService : BackgroundService
     }
 
     /// <summary>
-    /// Compose a <see cref="TxMetersV2Frame"/> from the protection readings
-    /// (FWD/REF/SWR) and the latest stage-meter snapshot. Kept as a small
-    /// helper so the MOX and idle branches in <see cref="ExecuteAsync"/>
-    /// stay symmetric and a future v3 frame is a one-line change. Pure
-    /// function — no instance state.
+    /// Unkeyed publish. Processed-TX demand reads the engine stage meters at
+    /// the keyed cadence. Power, reflected power, and SWR stay at the idle
+    /// values. No demand is the historical silent frame.
+    /// </summary>
+    internal TxMetersV2Frame BuildUnkeyedFrame()
+    {
+        var stage = _pipe.ProcessedTxDemandActive
+            ? _pipe.CurrentEngine?.GetTxStageMeters() ?? TxStageMeters.Silent
+            : TxStageMeters.Silent;
+        return BuildFrame(0f, 0f, 1f, stage);
+    }
+
+    /// <summary>Keyed, or a processed-TX subscriber is waiting: 10 Hz. Otherwise 2 Hz.</summary>
+    internal TimeSpan MeterTickDelay(bool keyed) =>
+        (keyed || _pipe.ProcessedTxDemandActive) ? MoxTick : IdleTick;
+
+    /// <summary>
+    /// Compose a TxMetersV2Frame from the protection readings and the
+    /// latest stage-meter snapshot. Pure: no instance state.
     /// </summary>
     internal static TxMetersV2Frame BuildFrame(float fwdW, float refW, float swr, TxStageMeters stage)
         => new(

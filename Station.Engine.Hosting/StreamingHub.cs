@@ -90,6 +90,11 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     // friend PTT. Audio is returned only to the requesting session as 0x3D.
     private const byte MsgTypeNativeMicStreamRequest = 0x24;
 
+    // Trusted loopback clients may request the processed TX audio (TX-monitor
+    // demod) for an external transmitter. Returned only to the requesting
+    // session as 0x44, under the same authorization as native mic.
+    private const byte MsgTypeProcessedTxStreamRequest = 0x29;
+
     // Matches MsgType.CwDecoderRequest; clients ask to start/stop the
     // first-party receive decoder for their session.
     private const byte MsgTypeCwDecoderRequest = 0x25;
@@ -252,6 +257,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     private int _displayStreamRequests;
     private int _preferredDisplayStreamRequests;
     private int _nativeMicStreamRequests;
+    private int _processedTxStreamRequests;
 
     /// <summary>
     /// True when at least one connected client has requested the RX audio
@@ -344,6 +350,14 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
     internal bool NativeMicStreamRequested => Volatile.Read(ref _nativeMicStreamRequests) > 0;
 
     internal int NativeMicSubscriberCount => Volatile.Read(ref _nativeMicStreamRequests);
+
+    /// <summary>True while at least one trusted local client needs processed TX PCM.</summary>
+    internal bool ProcessedTxStreamRequested => Volatile.Read(ref _processedTxStreamRequests) > 0;
+
+    /// <summary>Raised when the processed-TX subscriber count crosses zero, either way.</summary>
+    internal event Action? ProcessedTxDemandChanged;
+
+    internal int ProcessedTxSubscriberCount => Volatile.Read(ref _processedTxStreamRequests);
 
     public StreamingHub(
         ILogger<StreamingHub> log,
@@ -505,6 +519,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         {
             case MsgType.AudioPcm:
             case MsgType.NativeMicPcm:
+            case MsgType.ProcessedTxPcm:
                 Interlocked.Increment(ref _dropsAudio);
                 break;
             case MsgType.DisplayFrame:
@@ -666,6 +681,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             session.SetWantsCwDecode(false);
             session.SetWantsDisplay(false);
             session.SetWantsNativeMic(false);
+            session.SetWantsProcessedTx(false);
             lock (_cwStatusGate)
             {
                 _cwStatusDelivered.Remove(session);
@@ -1193,6 +1209,33 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Fan a 960-sample processed TX-monitor block only to trusted sessions
+    /// that explicitly requested it. Each requesting session queue receives
+    /// an owned copy. Never forwarded to remote WebRTC sinks.
+    /// </summary>
+    internal void BroadcastProcessedTxPcm(ReadOnlySpan<byte> f32lePayload)
+    {
+        if (!ProcessedTxStreamRequested || f32lePayload.Length != MicPcmFrameBytes) return;
+
+        foreach (var session in _webSocketClients.Values)
+        {
+            if (!session.WantsProcessedTx) continue;
+            if (!session.IsNativeMicStreamAuthorized())
+            {
+                session.LogProcessedTxAuthorizationRevoked();
+                session.SetWantsProcessedTx(false);
+                continue;
+            }
+            var payload = new byte[1 + sizeof(uint) + MicPcmFrameBytes];
+            payload[0] = (byte)MsgType.ProcessedTxPcm;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1, sizeof(uint)), session.ProcessedTxGeneration);
+            f32lePayload.CopyTo(payload.AsSpan(1 + sizeof(uint)));
+            if (!session.TryEnqueue(payload)) Interlocked.Increment(ref _dropsAudio);
+            else session.RecordProcessedTxFrameQueued();
+        }
+    }
+
     public void Broadcast(in CwEngineStatusFrame frame)
     {
         // Same length Serialize writes, reason tail included. A buffer that
@@ -1604,6 +1647,75 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             }
         }
 
+        private int _wantsProcessedTx;
+        private uint _processedTxGeneration;
+        private long _processedTxFramesQueued;
+        public bool WantsProcessedTx => Volatile.Read(ref _wantsProcessedTx) != 0;
+        public uint ProcessedTxGeneration => Volatile.Read(ref _processedTxGeneration);
+
+        public void SetWantsProcessedTx(bool want, uint generation = 0)
+        {
+            if (want && !IsNativeMicStreamAuthorized())
+            {
+                _log.LogWarning(
+                    "ws.processed-tx request denied id={Id} generation={Generation}",
+                    Id,
+                    generation);
+                want = false;
+                SendProcessedTxStreamDenied(generation);
+            }
+            if (want)
+            {
+                Volatile.Write(ref _processedTxGeneration, generation);
+                Interlocked.Exchange(ref _processedTxFramesQueued, 0);
+            }
+            int next = want ? 1 : 0;
+            int prev = Interlocked.Exchange(ref _wantsProcessedTx, next);
+            bool crossed = false;
+            if (prev != next)
+            {
+                int delta = next - prev;
+                int count = Interlocked.Add(ref _hub._processedTxStreamRequests, delta);
+                crossed = (delta > 0 && count == 1) || (delta < 0 && count == 0);
+                _log.LogInformation(
+                    "ws.processed-tx request enabled={Enabled} id={Id} generation={Generation} queuedBlocks={QueuedBlocks}",
+                    want,
+                    Id,
+                    ProcessedTxGeneration,
+                    Interlocked.Read(ref _processedTxFramesQueued));
+            }
+            if (!want) _queue.RemoveType(MsgType.ProcessedTxPcm);
+            if (crossed) _hub.ProcessedTxDemandChanged?.Invoke();
+        }
+
+        private void SendProcessedTxStreamDenied(uint generation)
+        {
+            var payload = new byte[1 + sizeof(uint)];
+            payload[0] = (byte)MsgType.ProcessedTxStreamDenied;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1, sizeof(uint)), generation);
+            TryEnqueue(payload);
+        }
+
+        public void LogProcessedTxAuthorizationRevoked() =>
+            _log.LogWarning(
+                "ws.processed-tx authorization revoked id={Id} generation={Generation} queuedBlocks={QueuedBlocks}",
+                Id,
+                ProcessedTxGeneration,
+                Interlocked.Read(ref _processedTxFramesQueued));
+
+        public void RecordProcessedTxFrameQueued()
+        {
+            var count = Interlocked.Increment(ref _processedTxFramesQueued);
+            if (count == 1)
+            {
+                _log.LogInformation(
+                    "ws.processed-tx first-frame id={Id} generation={Generation} samples={Samples}",
+                    Id,
+                    ProcessedTxGeneration,
+                    MicPcmFrameSamples);
+            }
+        }
+
         // Whether this client currently has any mounted display-frame consumer
         // (panadapter / waterfall / mini-pan). Broadcast reads this from the
         // DSP thread, so store it as an int and use Volatile/Interlocked.
@@ -1673,6 +1785,16 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
                 if (frame.Length == 2 + sizeof(uint))
                 {
                     SetWantsNativeMic(
+                        frame.Span[1] != 0,
+                        BinaryPrimitives.ReadUInt32LittleEndian(frame.Span.Slice(2, sizeof(uint))));
+                }
+                return;
+            }
+            if (frame.Length >= 1 && frame.Span[0] == MsgTypeProcessedTxStreamRequest)
+            {
+                if (frame.Length == 2 + sizeof(uint))
+                {
+                    SetWantsProcessedTx(
                         frame.Span[1] != 0,
                         BinaryPrimitives.ReadUInt32LittleEndian(frame.Span.Slice(2, sizeof(uint))));
                 }

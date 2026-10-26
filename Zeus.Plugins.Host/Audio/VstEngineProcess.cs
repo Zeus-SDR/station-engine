@@ -88,7 +88,7 @@ internal sealed class VstEngineProcess : IVstEngineProcess
     public static string? ManagedEnginePath()
     {
         if (!OperatingSystem.IsWindows()) return null;
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var local = global::Zeus.Server.EditionPaths.LocalApplicationData();
         if (string.IsNullOrEmpty(local)) return null;
         return Path.Combine(local, "Zeus", "vst-engine", "VSTHostEngine.exe");
     }

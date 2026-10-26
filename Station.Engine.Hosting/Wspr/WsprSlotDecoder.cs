@@ -261,7 +261,13 @@ internal static partial class WsprDataDirectory
     {
         string root = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
         if (string.IsNullOrEmpty(root)) return null;
-        string dir = Path.Combine(root, "ZeusSDR", "wspr");
+        // The native decoder needs an ASCII path even when the user profile
+        // and its edition directory contain non-ASCII characters. Keep this
+        // fallback separate from ordinary Zeus and from other edition roots.
+        string dir = EditionPaths.DataRoot is { } edition
+            ? Path.Combine(root, "ZeusEditions", Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(edition))), "wspr")
+            : Path.Combine(root, "ZeusSDR", "wspr");
         try
         {
             Directory.CreateDirectory(dir);
