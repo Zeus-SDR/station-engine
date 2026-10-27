@@ -177,9 +177,12 @@ public partial class Program
             tciEnabled,
             tciBindAddress,
             tciPort);
-        builder.Services.AddSingleton(tciListener);
-
         var persistedCat = LoadPersistedCat();
+        tciListener = StationControlPortConflict.YieldTciToCat(
+            tciListener,
+            StationControlPortConflict.EffectiveCat(
+                builder.Configuration.GetSection("Cat"), persistedCat, options.ReceiveOnly));
+        builder.Services.AddSingleton(tciListener);
         builder.Host.UseDefaultServiceProvider(options =>
         {
             options.ValidateOnBuild = true;

@@ -372,13 +372,17 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
         AsioBufferSizePolicy.Validate(settings.AsioBufferFrames, probe);
 
+        if (settings.AsioInputWidth is not (1 or 2))
+            throw new InvalidOperationException("ASIO input width must be 1 or 2.");
         int inputChannel = settings.AsioInputChannel;
         if (_mic is not null)
         {
             if (probe.Inputs.Count == 0)
                 throw new InvalidOperationException("The ASIO driver has no supported PCM input channels.");
-            if (!probe.Inputs.Any(channel => channel.Index == inputChannel))
+            if (settings.AsioInputWidth == 1 && !probe.Inputs.Any(channel => channel.Index == inputChannel))
                 inputChannel = probe.Inputs[0].Index;
+            if (settings.AsioInputWidth == 2 && (inputChannel % 2 != 0 || inputChannel == int.MaxValue || !probe.Inputs.Any(channel => channel.Index == inputChannel) || !probe.Inputs.Any(channel => channel.Index == inputChannel + 1)))
+                throw new InvalidOperationException("Select an even-indexed adjacent supported ASIO stereo input pair.");
         }
 
         int outputChannel = settings.AsioOutputChannel;
@@ -498,7 +502,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             settings.AsioOutputChannel,
             EnableInput: _mic is not null,
             EnableOutput: WantsAsioOutput(settings),
-            BufferFrames: checked((uint)settings.AsioBufferFrames));
+            BufferFrames: checked((uint)settings.AsioBufferFrames),
+            InputWidth: settings.AsioInputWidth);
         if (!config.EnableInput && !config.EnableOutput)
             throw new InvalidOperationException("No native ASIO input or output route is enabled in this host mode.");
         _sink?.SetRuntimeAsioOutputEnabled(settings.DirectAsioMonitoring);
@@ -685,6 +690,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 
     private static void Validate(AudioDeviceSettings settings)
     {
+        if (settings.AsioInputWidth is not (1 or 2))
+            throw new InvalidOperationException("ASIO input width must be 1 or 2.");
         if (settings.AsioBufferFrames < 0)
             throw new InvalidOperationException("ASIO buffer frames must be zero or greater.");
         if (!Enum.IsDefined(settings.Backend))

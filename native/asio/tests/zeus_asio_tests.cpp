@@ -104,6 +104,18 @@ bool test_packed_int24_last_sample()
 
 int main()
 {
+    using namespace zeus_asio::detail;
+    const float left[] = {0.0f, 0.8f, 1.0f};
+    const float right[] = {0.6f, -0.2f, 1.0f};
+    if (std::fabs(capture_mono(left, ASIOSTFloat32LSB, right, ASIOSTFloat32LSB, 0) - 0.3f) > 1e-6f) return 20;
+    if (std::fabs(capture_mono(left, ASIOSTFloat32LSB, right, ASIOSTFloat32LSB, 1) - 0.3f) > 1e-6f) return 21;
+    if (capture_mono(left, ASIOSTFloat32LSB, right, ASIOSTFloat32LSB, 2) != 1.0f) return 22;
+    if (capture_mono(left, ASIOSTFloat32LSB, nullptr, ASIOSTFloat32LSB, 1) != 0.8f) return 23;
+    if (!valid_input_pair(4, 2, 6) || !valid_input_pair(5, 1, 6) || valid_input_pair(5, 2, 6)
+        || valid_input_pair(1, 2, 6) || valid_input_pair(INT32_MAX, 2, 6) || valid_input_pair(0, 3, 6)) return 24;
+    if (zeus_asio_session_create_with_input_width("unused", INT32_MAX, 2, -1, 0, 64, 0) != nullptr) return 25;
+    if (zeus_asio_session_create_with_input_width("unused", 1, 2, -1, 0, 64, 0) != nullptr) return 26;
+
     if (!test_aligned_int32_formats()) return 8;
     if (!test_packed_int24_last_sample()) return 9;
 

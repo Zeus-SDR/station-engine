@@ -213,4 +213,19 @@ inline void float_to_sample(void* buffer, ASIOSampleType type, uint32_t frame, f
     }
 }
 
+// Capture stays mono for the TX microphone pipeline. Both stereo buffers are
+// decoded independently; averaging prevents a full-scale correlated pair clipping.
+inline float capture_mono(const void* left, ASIOSampleType left_type,
+    const void* right, ASIOSampleType right_type, uint32_t frame) noexcept
+{
+    const float l = sample_to_float(left, left_type, frame);
+    return right ? l * 0.5f + sample_to_float(right, right_type, frame) * 0.5f : l;
+}
+
+inline bool valid_input_pair(int32_t first, uint32_t width, int32_t count) noexcept
+{
+    return (width == 1 || width == 2) && first >= 0 && count > 0
+        && first < count && (width == 1 || (first % 2 == 0 && count - first >= 2));
+}
+
 } // namespace zeus_asio::detail

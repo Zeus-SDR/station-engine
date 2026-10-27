@@ -19,7 +19,8 @@ public sealed record AudioDeviceSettings(
     int AsioInputChannel = 0,
     int AsioOutputChannel = 0,
     int AsioBufferFrames = 0,
-    bool DirectAsioMonitoring = false);
+    bool DirectAsioMonitoring = false,
+    int AsioInputWidth = 1);
 
 public sealed class AudioDeviceSettingsStore : IDisposable
 {
@@ -67,7 +68,8 @@ public sealed class AudioDeviceSettingsStore : IDisposable
                     AsioInputChannel: Math.Max(0, e.AsioInputChannel),
                     AsioOutputChannel: Math.Max(0, e.AsioOutputChannel),
                     AsioBufferFrames: Math.Max(0, e.AsioBufferFrames),
-                    DirectAsioMonitoring: e.DirectAsioMonitoring);
+                    DirectAsioMonitoring: e.DirectAsioMonitoring,
+                    AsioInputWidth: e.AsioInputWidth == 2 ? 2 : 1);
         }
     }
 
@@ -142,6 +144,8 @@ public sealed class AudioDeviceSettingsStore : IDisposable
         ArgumentNullException.ThrowIfNull(settings);
         if (settings.InputChannel is < 0)
             throw new ArgumentOutOfRangeException(nameof(settings));
+        if (settings.AsioInputWidth is not (1 or 2))
+            throw new ArgumentOutOfRangeException(nameof(settings));
         if (settings.AsioInputChannel < 0 || settings.AsioOutputChannel < 0 || settings.AsioBufferFrames < 0)
             throw new ArgumentOutOfRangeException(nameof(settings));
 
@@ -154,6 +158,7 @@ public sealed class AudioDeviceSettingsStore : IDisposable
             e.Backend = settings.Backend;
             e.AsioDriverId = Normalize(settings.AsioDriverId);
             e.AsioInputChannel = settings.AsioInputChannel;
+            e.AsioInputWidth = settings.AsioInputWidth;
             e.AsioOutputChannel = settings.AsioOutputChannel;
             e.AsioBufferFrames = settings.AsioBufferFrames;
             e.DirectAsioMonitoring = settings.DirectAsioMonitoring;
@@ -189,6 +194,7 @@ public sealed class AudioDeviceSettingsEntry
     public AudioHostApi Backend { get; set; }
     public string? AsioDriverId { get; set; }
     public int AsioInputChannel { get; set; }
+    public int AsioInputWidth { get; set; } = 1;
     public int AsioOutputChannel { get; set; }
     public int AsioBufferFrames { get; set; }
     public bool DirectAsioMonitoring { get; set; }
