@@ -110,6 +110,14 @@ ZEUS_ASIO_API void* ZEUS_ASIO_CALL zeus_asio_session_create(
     uint32_t capture_ring_frames,
     uint32_t playback_ring_frames);
 
+/* Explicit capture width: 1 retains mono; 2 opens [input_channel, +1] and
+ * averages the distinct L/R samples into the mono TX consumer. Stereo starts
+ * must be even. Existing create callers retain mono behavior. */
+ZEUS_ASIO_API void* ZEUS_ASIO_CALL zeus_asio_session_create_with_input_width(
+    const char* driver_id_utf8, int32_t input_channel, uint32_t input_width,
+    int32_t output_first_channel, uint32_t buffer_frames,
+    uint32_t capture_ring_frames, uint32_t playback_ring_frames);
+
 ZEUS_ASIO_API int32_t ZEUS_ASIO_CALL zeus_asio_session_start(void* session);
 ZEUS_ASIO_API int32_t ZEUS_ASIO_CALL zeus_asio_session_stop(void* session);
 ZEUS_ASIO_API int32_t ZEUS_ASIO_CALL zeus_asio_session_control_panel(void* session);

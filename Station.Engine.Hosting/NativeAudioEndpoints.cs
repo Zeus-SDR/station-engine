@@ -183,6 +183,8 @@ public static class NativeAudioEndpoints
             return Results.BadRequest(new { error = "input channel must be -1 or greater" });
         if (body?.AsioBufferFrames is < 0)
             return Results.BadRequest(new { error = "ASIO buffer frames must be zero or greater" });
+        if (body?.AsioInputWidth is not null and not (1 or 2))
+            return Results.BadRequest(new { error = "ASIO input width must be 1 or 2" });
         if (body?.AsioInputChannel is < 0)
             return Results.BadRequest(new { error = "ASIO input channel must be zero or greater" });
         if (body?.AsioOutputChannel is < 0)
@@ -256,6 +258,7 @@ public static class NativeAudioEndpoints
                 },
                 AsioDriverId = asioDriverId,
                 AsioInputChannel = body?.AsioInputChannel ?? current.AsioInputChannel,
+                AsioInputWidth = body?.AsioInputWidth ?? current.AsioInputWidth,
                 AsioOutputChannel = body?.AsioOutputChannel ?? current.AsioOutputChannel,
                 DirectAsioMonitoring = requestedBackend == AudioHostApi.System
                     ? false : body?.DirectAsioMonitoring ?? current.DirectAsioMonitoring,
@@ -378,6 +381,7 @@ public static class NativeAudioEndpoints
             AsioInputs: asioInputs,
             AsioOutputs: asioOutputs,
             AsioInputChannel: effectiveInput,
+            AsioInputWidth: host?.Settings.AsioInputWidth ?? 1,
             AsioOutputChannel: effectiveOutput,
             AsioSampleRate: runtime?.SampleRate ?? (probe?.Supports48000 == true ? 48_000 : null),
             AsioBufferFrames: runtime?.BufferFrames
@@ -475,7 +479,8 @@ internal sealed record NativeAudioDevicesSetRequest(
     int? AsioInputChannel = null,
     int? AsioOutputChannel = null,
     int? AsioBufferFrames = null,
-    bool? DirectAsioMonitoring = null);
+    bool? DirectAsioMonitoring = null,
+    int? AsioInputWidth = null);
 internal sealed record NativeAudioDeviceDto(
     string Id,
     string Name,
@@ -516,6 +521,7 @@ internal sealed record NativeAudioDevicesResponse(
     string? AsioDriverId = null,
     IReadOnlyList<AsioChannelInfo>? AsioInputs = null,
     IReadOnlyList<AsioChannelInfo>? AsioOutputs = null,
+    int AsioInputWidth = 1,
     int AsioInputChannel = 0,
     int AsioOutputChannel = 0,
     int? AsioSampleRate = null,

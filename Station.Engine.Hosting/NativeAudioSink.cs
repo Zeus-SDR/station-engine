@@ -140,6 +140,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     // drains whatever is available immediately and pads only that callback's
     // short tail with silence.
     private readonly FloatSpscRing _txMonitorRing = new(TxMonitorRingCapacity);
+    private int _txMonitorMaxPublishSamples;
     private readonly FloatSpscRing _previewRing = new(PreviewRingCapacity);
     private readonly object _deviceSync = new();
 
@@ -640,6 +641,7 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
     {
         _ring.Clear();
         _txMonitorRing.Clear();
+        Volatile.Write(ref _txMonitorMaxPublishSamples, 0);
         _previewRing.Clear();
         _rebuffering = true;
     }
@@ -780,6 +782,10 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
             return;
 
         var src = frame.Samples.Span;
+        // Publish the producer's batch size before making its samples visible.
+        // ASIO replenishment reads can be much smaller than one DSP tick.
+        if (src.Length > Volatile.Read(ref _txMonitorMaxPublishSamples))
+            Volatile.Write(ref _txMonitorMaxPublishSamples, src.Length);
         _txMonitorRing.Write(src);
         RecordMonitorDiagnostics(src);
         // TX preview is an audible producer in its own right. In particular,
@@ -831,10 +837,14 @@ internal sealed class NativeAudioSink : IRxAudioSink, IPreviewAudioSink, IHosted
         // The operator should hear the current syllable after recovery, not an
         // increasingly delayed replay. Skip is consumer-owned and therefore
         // preserves the ring's SPSC contract.
+        // A complete DSP batch is normal queue depth even when ASIO asks for
+        // only 64/128 frames (or a smaller replenishment). Trimming against
+        // that read size discards most of each otherwise healthy batch.
         int txMonitorQueued = _txMonitorRing.Count;
-        if (txMonitorQueued > totalFrames * 2)
+        int monitorBatchSamples = Math.Max(totalFrames, Volatile.Read(ref _txMonitorMaxPublishSamples));
+        if (txMonitorQueued > monitorBatchSamples * 2)
             Interlocked.Add(ref _monitorTrimmedSamples,
-                _txMonitorRing.Skip(txMonitorQueued - totalFrames));
+                _txMonitorRing.Skip(txMonitorQueued - monitorBatchSamples));
         int txMonitorRead = _txMonitorRing.Read(mono);
         // Observe complete starvation only within 100 ms of a producer frame.
         // MON-off and a stopped producer are indistinguishable here; this bounded

@@ -22,7 +22,8 @@ internal sealed record AsioSessionConfig(
     int OutputFirstChannel,
     bool EnableInput,
     bool EnableOutput,
-    uint BufferFrames = 0);
+    uint BufferFrames = 0,
+    int InputWidth = 1);
 
 internal sealed record AsioSessionRuntime(
     string DriverId,
@@ -259,9 +260,10 @@ internal sealed class AsioAudioSession : IAsioSession
         _sink = sink;
         _mic = mic;
         _log = log;
-        _handle = AsioInterop.SessionCreate(
+        _handle = AsioInterop.SessionCreateWithInputWidth(
             config.DriverId,
             config.EnableInput ? config.InputChannel : -1,
+            checked((uint)config.InputWidth),
             config.EnableOutput ? config.OutputFirstChannel : -1,
             config.BufferFrames,
             RingFrames,

@@ -412,9 +412,9 @@ public:
 
 class Session final {
 public:
-    Session(std::string driver_id, int32_t input_channel, int32_t output_first,
+    Session(std::string driver_id, int32_t input_channel, uint32_t input_width, int32_t output_first,
         uint32_t requested_buffer, uint32_t capture_ring_frames, uint32_t playback_ring_frames)
-        : driver_id_(std::move(driver_id)), input_channel_(input_channel),
+        : driver_id_(std::move(driver_id)), input_channel_(input_channel), input_width_(input_width),
           output_first_(output_first), requested_buffer_(requested_buffer),
           capture_ring_(capture_ring_frames, input_channel >= 0 ? 1u : 0u),
           playback_ring_(playback_ring_frames, output_first >= 0 ? 2u : 0u)
@@ -531,7 +531,8 @@ public:
             void* input = buffer_infos_[0].buffers[index];
             uint32_t accepted = 0;
             for (uint32_t frame = 0; frame < buffer_frames_; ++frame) {
-                if (!capture_ring_.write_mono(sample_to_float(input, input_type_, frame))) break;
+                if (!capture_ring_.write_mono(zeus_asio::detail::capture_mono(input, input_types_[0],
+                    input_width_ == 2 ? buffer_infos_[1].buffers[index] : nullptr, input_types_[1], frame))) break;
                 ++accepted;
             }
             capture_frames_.fetch_add(accepted, std::memory_order_relaxed);
@@ -543,7 +544,7 @@ public:
         }
 
         if (output_first_ >= 0) {
-            const size_t offset = input_channel_ >= 0 ? 1u : 0u;
+            const size_t offset = input_channel_ >= 0 ? input_width_ : 0u;
             void* left_buffer = buffer_infos_[offset].buffers[index];
             void* right_buffer = buffer_infos_[offset + 1].buffers[index];
             uint32_t supplied = 0;
@@ -772,7 +773,8 @@ private:
         long input_count = 0, output_count = 0;
         ASIOError error = driver_->getChannels(&input_count, &output_count);
         if (!asio_ok(error)) { set_error("ASIO channel query failed.", error); return false; }
-        if (input_channel_ >= input_count || output_first_ >= 0 && output_first_ + 1 >= output_count) {
+        if ((input_channel_ >= 0 && !zeus_asio::detail::valid_input_pair(input_channel_, input_width_, input_count))
+            || (output_first_ >= 0 && (output_first_ >= output_count || output_count - output_first_ < 2))) {
             set_error("Selected ASIO channel is outside the driver's channel range.", ASE_InvalidParameter); return false;
         }
         if (input_channel_ < 0 && output_first_ < 0) {
@@ -810,12 +812,14 @@ private:
 
         buffer_infos_.clear();
         if (input_channel_ >= 0) {
-            ASIOChannelInfo info{}; info.channel = input_channel_; info.isInput = ASIOTrue;
-            error = driver_->getChannelInfo(&info);
-            if (!asio_ok(error) || !supported_pcm(info.type)) { set_error("Selected ASIO input sample format is unsupported.", error); return false; }
-            input_type_ = info.type;
-            ASIOBufferInfo buffer{}; buffer.isInput = ASIOTrue; buffer.channelNum = input_channel_;
-            buffer_infos_.push_back(buffer);
+            for (uint32_t side = 0; side < input_width_; ++side) {
+                ASIOChannelInfo info{}; info.channel = input_channel_ + side; info.isInput = ASIOTrue;
+                error = driver_->getChannelInfo(&info);
+                if (!asio_ok(error) || !supported_pcm(info.type)) { set_error("Selected ASIO input sample format is unsupported.", error); return false; }
+                input_types_[side] = info.type;
+                ASIOBufferInfo buffer{}; buffer.isInput = ASIOTrue; buffer.channelNum = input_channel_ + side;
+                buffer_infos_.push_back(buffer);
+            }
         }
         if (output_first_ >= 0) {
             for (long offset = 0; offset < 2; ++offset) {
@@ -850,7 +854,7 @@ private:
         }
         supports_output_ready_ = output_first_ >= 0 && asio_ok(driver_->outputReady());
         if (output_first_ >= 0) {
-            const size_t offset = input_channel_ >= 0 ? 1u : 0u;
+            const size_t offset = input_channel_ >= 0 ? input_width_ : 0u;
             for (uint32_t half = 0; half < 2; ++half) {
                 for (uint32_t frame = 0; frame < buffer_frames_; ++frame) {
                     float_to_sample(buffer_infos_[offset].buffers[half], output_types_[0], frame, 0.0f);
@@ -961,6 +965,7 @@ private:
 
     std::string driver_id_;
     int32_t input_channel_ = -1;
+    uint32_t input_width_ = 1;
     int32_t output_first_ = -1;
     uint32_t requested_buffer_ = 0;
     FloatRing capture_ring_;
@@ -973,7 +978,7 @@ private:
     IASIO* driver_ = nullptr;
     ASIOCallbacks callbacks_{};
     std::vector<ASIOBufferInfo> buffer_infos_;
-    ASIOSampleType input_type_ = ASIOSTFloat32LSB;
+    ASIOSampleType input_types_[2] = {ASIOSTFloat32LSB, ASIOSTFloat32LSB};
     ASIOSampleType output_types_[2] = {ASIOSTFloat32LSB, ASIOSTFloat32LSB};
     bool buffers_created_ = false;
     bool supports_output_ready_ = false;
@@ -1141,7 +1146,17 @@ void* ZEUS_ASIO_CALL zeus_asio_session_create(const char* driver_id_utf8,
     int32_t input_channel, int32_t output_first_channel, uint32_t buffer_frames,
     uint32_t capture_ring_frames, uint32_t playback_ring_frames)
 {
+    return zeus_asio_session_create_with_input_width(driver_id_utf8, input_channel, 1,
+        output_first_channel, buffer_frames, capture_ring_frames, playback_ring_frames);
+}
+
+void* ZEUS_ASIO_CALL zeus_asio_session_create_with_input_width(const char* driver_id_utf8,
+    int32_t input_channel, uint32_t input_width, int32_t output_first_channel, uint32_t buffer_frames,
+    uint32_t capture_ring_frames, uint32_t playback_ring_frames)
+{
     g_last_error.clear();
+    if (input_width != 1 && input_width != 2) { set_global_error("ASIO input width must be 1 or 2."); return nullptr; }
+    if (input_width == 2 && input_channel >= 0 && (input_channel % 2 != 0 || input_channel == INT32_MAX)) { set_global_error("ASIO stereo input must start at an even adjacent channel pair."); return nullptr; }
     if (driver_id_utf8 == nullptr || *driver_id_utf8 == '\0') { set_global_error("ASIO driver ID is required."); return nullptr; }
     if (input_channel < -1 || output_first_channel < -1) { set_global_error("ASIO channel indices must be -1 or non-negative."); return nullptr; }
     if (input_channel < 0 && output_first_channel < 0) { set_global_error("ASIO session must enable input, output, or both."); return nullptr; }
@@ -1153,7 +1168,7 @@ void* ZEUS_ASIO_CALL zeus_asio_session_create(const char* driver_id_utf8,
         }
         DriverClaim claim;
         if (!claim.acquired()) { set_global_error("Another ASIO session or driver probe is active."); return nullptr; }
-        auto session = std::make_unique<Session>(driver_id_utf8, input_channel, output_first_channel,
+        auto session = std::make_unique<Session>(driver_id_utf8, input_channel, input_width, output_first_channel,
             buffer_frames, capture_ring_frames, playback_ring_frames);
         session->accept_driver_claim();
         claim.retain();

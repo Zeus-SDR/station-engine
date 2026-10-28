@@ -81,10 +81,11 @@ internal static partial class AsioInterop
     [LibraryImport(LibraryName, EntryPoint = "zeus_asio_probe_buffer_granularity")]
     internal static partial int ProbeBufferGranularity(IntPtr probe);
 
-    [LibraryImport(LibraryName, EntryPoint = "zeus_asio_session_create", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial IntPtr SessionCreate(
+    [LibraryImport(LibraryName, EntryPoint = "zeus_asio_session_create_with_input_width", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr SessionCreateWithInputWidth(
         string driverId,
         int inputChannel,
+        uint inputWidth,
         int outputFirstChannel,
         uint bufferFrames,
         uint captureRingFrames,
