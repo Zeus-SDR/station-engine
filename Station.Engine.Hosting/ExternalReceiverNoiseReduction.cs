@@ -32,6 +32,13 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
     // audio and the restart re-warms the native channel (#3215).
     internal const int InputStallMs = 1_000;
     private readonly object _gate = new();
+    // Receive only holds this gate while copying at most 100 ms of mono audio.
+    // Native creation, configuration, feed and read stay on the processing side.
+    private readonly object _inputGate = new();
+    private readonly float[] _input = new float[ExternalReceiverPort.MaxSamplesPerBlock];
+    private readonly float[] _feeding = new float[ExternalReceiverPort.MaxSamplesPerBlock];
+    private int _inputCount;
+    private bool _acceptInput;
     private readonly Func<NrMode, string?> _unavailable;
     private readonly Func<NrConfig, RxMode, IExternalReceiverNoiseReductionChannel> _create;
     private readonly ILogger _log;
@@ -91,6 +98,10 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
         {
             var mode = WdspAudioNoiseReduction.ChannelMode(config, sourceMode);
             if (_wanted != config || _wantedMode != mode) _retryAt = 0;
+            lock (_inputGate)
+            {
+                _acceptInput = !_disposed && enabled && NeedsProcessing(config);
+            }
             _enabled = enabled;
             _wanted = config;
             _wantedMode = mode;
@@ -100,16 +111,26 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
 
     internal void Feed(ReadOnlySpan<float> mono)
     {
-        // Arrival is independent of native creation/configuration. Raw publication
-        // continues even when this optional processing copy cannot take the gate.
+        // Arrival and raw publication never wait for the native channel. Retain
+        // brief overlaps with processing instead of silently deleting a block.
         Interlocked.Exchange(ref _lastInput, _now());
-        if (!Monitor.TryEnter(_gate)) return;
-        try
+        lock (_inputGate)
         {
-            if (_disposed || !_enabled) return;
-            _channel?.Feed(mono);
+            if (!_acceptInput) return;
+            _inputCount = ExternalReceiverPort.Source.HoldReturn(_input, _inputCount, mono);
         }
-        finally { Monitor.Exit(_gate); }
+    }
+
+    private void FeedPending()
+    {
+        int count;
+        lock (_inputGate)
+        {
+            count = _inputCount;
+            _input.AsSpan(0, count).CopyTo(_feeding);
+            _inputCount = 0;
+        }
+        if (count > 0) _channel!.Feed(_feeding.AsSpan(0, count));
     }
 
     internal (bool Active, NrMode Mode, int? LatencyMs, int Samples) Read(Span<float> output)
@@ -157,6 +178,7 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
                     _applied = _wanted;
                     _appliedMode = _wantedMode;
                 }
+                FeedPending();
                 int samples = _channel.Read(output);
                 int warmup = Math.Min(samples, _warmupRemaining);
                 _warmupRemaining -= warmup;
@@ -184,6 +206,7 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
 
     private void Stop(string reason)
     {
+        lock (_inputGate) _inputCount = 0;
         if (_channel is null) return;
         _channel.Dispose();
         _channel = null;
@@ -206,6 +229,7 @@ internal sealed class ExternalReceiverNoiseReduction : IDisposable
         lock (_gate)
         {
             _disposed = true;
+            lock (_inputGate) _acceptInput = false;
             Stop("detached");
         }
     }

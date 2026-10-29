@@ -17,7 +17,11 @@ public readonly record struct ExternalReceiverContext(
     long VfoHz,
     RxMode Mode,
     bool Transmitting,
-    bool ProcessedAudio = false);
+    bool ProcessedAudio = false,
+    // Optional receive DSP for this receiver alone. Null keeps the engine's
+    // own receive DSP settings (RadioService state Nr), as every receiver
+    // before this field did.
+    NrConfig? Nr = null);
 
 /// <summary>
 /// Lets one local product process feed finished receive audio plus a small
@@ -31,11 +35,18 @@ public readonly record struct ExternalReceiverContext(
 /// any transition out of that state. It never writes radio state or a store.
 /// Audio reaches consumers only through
 /// <see cref="DspPipelineService.PublishExternalReceiverAudio"/>.
+/// <para>Receiver 0 is the consumer receiver: the only one whose audio and
+/// context reach the engine's consumers. Receivers 1 to
+/// <see cref="MaxReceivers"/> - 1 are processing-only: each runs its own
+/// receive DSP channel and returns processed audio to its own source, and
+/// nothing else in the engine ever sees it.</para>
 /// </remarks>
 public sealed class ExternalReceiverPort : IDisposable
 {
     public const int SampleRateHz = 48_000;
     public const int MaxSamplesPerBlock = 4_800;
+    /// <summary>Receiver 0 plus eight processing-only receivers.</summary>
+    public const int MaxReceivers = 9;
     internal const int MaxContextBytes = 4_096;
     internal const int MaxBinaryBytes = MaxSamplesPerBlock * sizeof(float);
     internal const string ReasonRadioConnected = "radio-connected";
@@ -52,8 +63,9 @@ public sealed class ExternalReceiverPort : IDisposable
     private readonly object _gate = new();
     private readonly RadioService _radio;
     private readonly ILogger<ExternalReceiverPort> _log;
-    private Source? _source;
-    private ContextBox? _context;
+    // Indexed by receiver. Index 0 is the consumer receiver.
+    private readonly Source?[] _sources = new Source?[MaxReceivers];
+    private readonly ContextBox?[] _contexts = new ContextBox?[MaxReceivers];
     private int _radioStatus;
     private bool _disposed;
     private NrConfig _nr;
@@ -80,11 +92,12 @@ public sealed class ExternalReceiverPort : IDisposable
     public event Action? ContextChanged;
 
     /// <summary>True while a source is attached and its context has been received.</summary>
-    public bool IsActive => Volatile.Read(ref _context) is not null;
+    public bool IsActive => Volatile.Read(ref _contexts[0]) is not null;
 
+    /// <summary>The consumer receiver's context; processing-only receivers never report one.</summary>
     public bool TryGetContext(int receiver, out ExternalReceiverContext context)
     {
-        if (Volatile.Read(ref _context) is { } box && box.Value.Receiver == receiver)
+        if (Volatile.Read(ref _contexts[0]) is { } box && box.Value.Receiver == receiver)
         {
             context = box.Value;
             return true;
@@ -100,8 +113,10 @@ public sealed class ExternalReceiverPort : IDisposable
         IsEngineRadioIdle(_radio.IsConnected, (ConnectionStatus)Volatile.Read(ref _radioStatus));
 
     /// <summary>Non-reserving admission check; <see cref="TryAttach"/> decides.</summary>
-    internal bool CanAttach(out string? refusal)
+    internal bool CanAttach(out string? refusal, int receiver = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(receiver);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(receiver, MaxReceivers);
         Volatile.Write(ref _radioStatus, (int)_radio.Snapshot().Status);
         if (!EngineRadioIdleNow())
         {
@@ -115,7 +130,7 @@ public sealed class ExternalReceiverPort : IDisposable
                 refusal = ReasonShutdown;
                 return false;
             }
-            if (_source is not null)
+            if (_sources[receiver] is not null)
             {
                 refusal = ReasonBusy;
                 return false;
@@ -125,11 +140,11 @@ public sealed class ExternalReceiverPort : IDisposable
         return true;
     }
 
-    internal bool TryAttach(DspPipelineService dsp, out Source? source, out string? refusal)
+    internal bool TryAttach(DspPipelineService dsp, out Source? source, out string? refusal, int receiver = 0)
     {
         ArgumentNullException.ThrowIfNull(dsp);
         source = null;
-        if (!CanAttach(out refusal)) return false;
+        if (!CanAttach(out refusal, receiver)) return false;
         lock (_gate)
         {
             if (_disposed)
@@ -137,13 +152,13 @@ public sealed class ExternalReceiverPort : IDisposable
                 refusal = ReasonShutdown;
                 return false;
             }
-            if (_source is not null)
+            if (_sources[receiver] is not null)
             {
                 refusal = ReasonBusy;
                 return false;
             }
-            source = new Source(this, dsp);
-            _source = source;
+            source = new Source(this, dsp, receiver);
+            _sources[receiver] = source;
         }
         AttachReservedForTest?.Invoke();
         // A connect that raced the admission check above still detaches here.
@@ -154,14 +169,31 @@ public sealed class ExternalReceiverPort : IDisposable
             refusal = ReasonRadioConnected;
             return false;
         }
-        _log.LogInformation("external_receiver.attached");
+        if (receiver == 0) _log.LogInformation("external_receiver.attached");
+        else _log.LogInformation("external_receiver.attached receiver={Receiver}", receiver);
         return true;
+    }
+
+    /// <summary>The <c>receiver</c> query value: absent is receiver 0. False when it is not a receiver index.</summary>
+    internal static bool TryParseReceiverQuery(IQueryCollection query, out int receiver)
+    {
+        receiver = 0;
+        if (!query.TryGetValue("receiver", out var values)) return true;
+        return values.Count == 1
+            && int.TryParse(values[0], System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out receiver)
+            && receiver < MaxReceivers;
     }
 
     /// <summary>Runs one WebSocket source for the lifetime of the request.</summary>
     internal async Task RunAsync(HttpContext context, DspPipelineService dsp)
     {
-        if (!CanAttach(out var refusal))
+        if (!TryParseReceiverQuery(context.Request.Query, out int receiver))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+        if (!CanAttach(out var refusal, receiver))
         {
             await RefuseAsync(context, refusal!).ConfigureAwait(false);
             return;
@@ -171,7 +203,7 @@ public sealed class ExternalReceiverPort : IDisposable
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
             return;
         }
-        if (!TryAttach(dsp, out var source, out refusal))
+        if (!TryAttach(dsp, out var source, out refusal, receiver))
         {
             await RefuseAsync(context, refusal!).ConfigureAwait(false);
             return;
@@ -208,6 +240,11 @@ public sealed class ExternalReceiverPort : IDisposable
             _log.LogInformation("external_receiver.protocol_error {Error}", error);
             return false;
         }
+        if (parsed.Receiver != source.Receiver)
+        {
+            _log.LogInformation("external_receiver.protocol_error {Error}", "receiver does not match the attached receiver");
+            return false;
+        }
         if (!EngineRadioIdleNow())
         {
             Detach(source, ReasonRadioConnected);
@@ -217,13 +254,14 @@ public sealed class ExternalReceiverPort : IDisposable
         lock (_publishGate)
         lock (_gate)
         {
-            if (_source != source) return true;
-            var current = _context;
+            int receiver = source.Receiver;
+            if (_sources[receiver] != source) return true;
+            var current = _contexts[receiver];
             changed = current is null || current.Value != parsed;
-            if (changed) Volatile.Write(ref _context, new ContextBox(parsed));
-            source.ConfigureProcessing(parsed, _nr);
+            if (changed) Volatile.Write(ref _contexts[receiver], new ContextBox(parsed));
+            source.ConfigureProcessing(parsed, parsed.Nr ?? _nr);
         }
-        if (changed) RaiseContextChanged();
+        if (changed && source.Receiver == 0) RaiseContextChanged();
         return true;
     }
 
@@ -236,8 +274,9 @@ public sealed class ExternalReceiverPort : IDisposable
         bool detach = false;
         lock (_publishGate)
         {
-            if (Volatile.Read(ref _source) != source) return true;
-            var box = Volatile.Read(ref _context);
+            int receiver = source.Receiver;
+            if (Volatile.Read(ref _sources[receiver]) != source) return true;
+            var box = Volatile.Read(ref _contexts[receiver]);
             if (box is null) return false;
             if (!EngineRadioIdleNow())
             {
@@ -247,7 +286,8 @@ public sealed class ExternalReceiverPort : IDisposable
             {
                 if (box.Value.Transmitting) source.SuppressedBlocks++;
                 else source.PublishedBlocks++;
-                dsp.PublishExternalReceiverAudio(box.Value.Receiver, samples);
+                // Processing-only receivers never reach the engine's consumers.
+                if (receiver == 0) dsp.PublishExternalReceiverAudio(box.Value.Receiver, samples);
                 if (!box.Value.Transmitting && box.Value.ProcessedAudio) source.FeedProcessing(samples);
             }
         }
@@ -262,25 +302,34 @@ public sealed class ExternalReceiverPort : IDisposable
         {
             lock (_gate)
             {
-                if (_source != source) return;
-                _source = null;
-                hadContext = Volatile.Read(ref _context) is not null;
-                Volatile.Write(ref _context, null);
+                int receiver = source.Receiver;
+                if (_sources[receiver] != source) return;
+                _sources[receiver] = null;
+                hadContext = Volatile.Read(ref _contexts[receiver]) is not null;
+                Volatile.Write(ref _contexts[receiver], null);
                 source.StopProcessing();
             }
         }
-        _log.LogInformation(
-            "external_receiver.detached reason={Reason} blocks={Blocks} suppressedTx={Suppressed}",
-            reason, source.PublishedBlocks, source.SuppressedBlocks);
+        if (source.Receiver == 0)
+            _log.LogInformation(
+                "external_receiver.detached reason={Reason} blocks={Blocks} suppressedTx={Suppressed}",
+                reason, source.PublishedBlocks, source.SuppressedBlocks);
+        else
+            _log.LogInformation(
+                "external_receiver.detached receiver={Receiver} reason={Reason} blocks={Blocks} suppressedTx={Suppressed}",
+                source.Receiver, reason, source.PublishedBlocks, source.SuppressedBlocks);
         source.SignalDetached(reason);
-        if (hadContext) RaiseContextChanged();
+        if (hadContext && source.Receiver == 0) RaiseContextChanged();
+    }
+
+    private Source[] AttachedSources()
+    {
+        lock (_gate) return _sources.OfType<Source>().ToArray();
     }
 
     private void DetachCurrent(string reason)
     {
-        Source? current;
-        lock (_gate) current = _source;
-        if (current is not null) Detach(current, reason);
+        foreach (var current in AttachedSources()) Detach(current, reason);
     }
 
     private void OnRadioStateChanged(StateDto state)
@@ -292,8 +341,9 @@ public sealed class ExternalReceiverPort : IDisposable
             lock (_publishGate)
             {
                 _nr = state.Nr ?? new NrConfig();
-                if (_source is { } source && _context is { } box)
-                    source.ConfigureProcessing(box.Value, _nr);
+                for (int receiver = 0; receiver < MaxReceivers; receiver++)
+                    if (_sources[receiver] is { } source && _contexts[receiver] is { } box)
+                        source.ConfigureProcessing(box.Value, box.Value.Nr ?? _nr);
             }
         }
     }
@@ -302,10 +352,9 @@ public sealed class ExternalReceiverPort : IDisposable
     {
         lock (_publishGate)
         {
-            Source? source;
-            lock (_gate) source = _source;
-            if (source is not null) source.ResetProcessingModel();
-            else Zeus.Dsp.Wdsp.WdspAudioNoiseReduction.InvalidateModelCache();
+            var sources = AttachedSources();
+            foreach (var source in sources) source.ResetProcessingModel();
+            if (sources.Length == 0) Zeus.Dsp.Wdsp.WdspAudioNoiseReduction.InvalidateModelCache();
         }
     }
 
@@ -354,9 +403,9 @@ public sealed class ExternalReceiverPort : IDisposable
             if (!root.TryGetProperty("receiver", out var receiverElement)
                 || receiverElement.ValueKind != JsonValueKind.Number
                 || !receiverElement.TryGetInt32(out int receiver)
-                || receiver != 0)
+                || receiver < 0 || receiver >= MaxReceivers)
             {
-                error = "receiver must be 0";
+                error = "receiver must be 0 to 8";
                 return false;
             }
             if (!root.TryGetProperty("vfoHz", out var vfoElement)
@@ -390,7 +439,16 @@ public sealed class ExternalReceiverPort : IDisposable
                 }
                 processed = processedElement.GetBoolean();
             }
-            context = new ExternalReceiverContext(receiver, vfoHz, mode, txElement.GetBoolean(), processed);
+            NrConfig? nr = null;
+            if (root.TryGetProperty("nr", out var nrElement) && nrElement.ValueKind != JsonValueKind.Null)
+            {
+                if (!TryParseNr(nrElement, out nr))
+                {
+                    error = "nr is not a receive DSP configuration";
+                    return false;
+                }
+            }
+            context = new ExternalReceiverContext(receiver, vfoHz, mode, txElement.GetBoolean(), processed, nr);
             error = null;
             return true;
         }
@@ -399,6 +457,25 @@ public sealed class ExternalReceiverPort : IDisposable
             error = "context is not valid JSON";
             return false;
         }
+    }
+
+    private static readonly JsonSerializerOptions NrJson = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
+    };
+
+    // The same shape and checks as POST /api/rx/nr: known enum names only, and
+    // a reducer this engine does not offer runs as Off (RadioService.SetNr).
+    internal static bool TryParseNr(JsonElement element, out NrConfig? nr)
+    {
+        nr = null;
+        if (element.ValueKind != JsonValueKind.Object) return false;
+        try { nr = element.Deserialize<NrConfig>(NrJson); }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException or ArgumentException) { return false; }
+        if (nr is null || !Enum.IsDefined(nr.NrMode) || !Enum.IsDefined(nr.NbMode)) { nr = null; return false; }
+        if (nr.NrMode is not (NrMode.Off or NrMode.Anr or NrMode.Emnr or NrMode.Sbnr or NrMode.Rnnr or NrMode.Nnr))
+            nr = nr with { NrMode = NrMode.Off };
+        return true;
     }
 
     // Names only: Enum.TryParse would also accept numeric strings.
@@ -494,12 +571,16 @@ public sealed class ExternalReceiverPort : IDisposable
         internal (bool Active, NrMode Mode, int? LatencyMs, int Samples) ReadProcessing(Span<float> output)
             => _processing.Read(output);
 
-        internal Source(ExternalReceiverPort port, DspPipelineService dsp)
+        internal Source(ExternalReceiverPort port, DspPipelineService dsp, int receiver = 0)
         {
             _port = port;
             _dsp = dsp;
+            Receiver = receiver;
             _processing = port.CreateNoiseReduction();
         }
+
+        /// <summary>The receiver index this source was attached for.</summary>
+        internal int Receiver { get; }
 
         // Written under the port's publish gate only.
         internal long PublishedBlocks;
@@ -688,7 +769,7 @@ public sealed class ExternalReceiverPort : IDisposable
         }
 
         /// <summary>
-        /// Appends fresh return audio to the held block, keeping the newest
+        /// Appends fresh audio to a bounded held block, keeping the newest
         /// <see cref="MaxSamplesPerBlock"/> samples when it would overflow.
         /// </summary>
         internal static int HoldReturn(float[] held, int count, ReadOnlySpan<float> fresh)
@@ -711,9 +792,9 @@ public sealed class ExternalReceiverPort : IDisposable
         {
             lock (_port._publishGate)
             {
-                if (_port._source != this || revision != Volatile.Read(ref _processingRevision)) return null;
+                if (_port._sources[Receiver] != this || revision != Volatile.Read(ref _processingRevision)) return null;
                 if (type == WebSocketMessageType.Binary
-                    && (_port._context is not { Value: { ProcessedAudio: true, Transmitting: false } }
+                    && (_port._contexts[Receiver] is not { Value: { ProcessedAudio: true, Transmitting: false } }
                         || !_lastProcessing.Active)) return null;
                 return socket.SendAsync(payload, type, true, stop);
             }
