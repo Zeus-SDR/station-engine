@@ -5,11 +5,12 @@ namespace Zeus.Server;
 
 public sealed partial class RadioService
 {
-    private static string ReceiverAgcProfile(int index) => $"receiver-{index}";
+    // One DspSettingsStore row per RX2+ receiver holds its AGC and noise block.
+    private static string ReceiverDspProfile(int index) => $"receiver-{index}";
     private AgcConfig LoadReceiverAgc(int index) => NormalizeAgcConfig(
-        _dspSettingsStore.GetAgc(ReceiverAgcProfile(index)) ?? _dspSettingsStore.GetAgc() ?? new AgcConfig());
+        _dspSettingsStore.GetAgc(ReceiverDspProfile(index)) ?? _dspSettingsStore.GetAgc() ?? new AgcConfig());
     private double LoadReceiverAgcTop(int index) => Math.Clamp(
-        _dspSettingsStore.GetAgcTopDb(ReceiverAgcProfile(index)) ?? _dspSettingsStore.GetAgcTopDb() ?? 90.0,
+        _dspSettingsStore.GetAgcTopDb(ReceiverDspProfile(index)) ?? _dspSettingsStore.GetAgcTopDb() ?? 90.0,
         MinAgcTopDb, MaxAgcTopDb);
 
     internal static StateDto ReceiverAgcState(StateDto state, int index)
@@ -75,7 +76,7 @@ public sealed partial class RadioService
             extra.AgcOffsetDb = next.AgcOffsetDb;
             return s;
         });
-        string profile = ReceiverAgcProfile(index);
+        string profile = ReceiverDspProfile(index);
         _dspSettingsStore.SetAgc(persisted!, profile);
         _dspSettingsStore.SetAgcTopDb(persistedTop, profile);
         _dspSettingsStore.SetReceiverAutoAgc(persistedAuto, profile);

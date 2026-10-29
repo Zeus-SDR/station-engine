@@ -1507,14 +1507,19 @@ public sealed record ReceiverDto(
     int ZoomLevel = 1,
     // Per-receiver noise-reduction mode. RX1 (index 0) mirrors StateDto.Nr.NrMode
     // (still settable via POST /api/rx/nr); RX2+ are independent and settable via
-    // ReceiverSetRequest.NrMode. Every other NrConfig field (NR tunables, NB, ANF,
-    // SNB, NBP) stays shared across receivers. Defaulted Off so pre-per-RX-NR
-    // wire frames deserialize unchanged.
+    // ReceiverSetRequest.NrMode. Defaulted Off so pre-per-RX-NR wire frames
+    // deserialize unchanged.
     NrMode NrMode = NrMode.Off,
     AgcConfig? Agc = null,
     double AgcTopDb = 90.0,
     bool AutoAgcEnabled = false,
-    double AgcOffsetDb = 0.0);
+    double AgcOffsetDb = 0.0,
+    // Per-receiver noise block: NB mode + threshold, ANF, SNB, NBP notches and
+    // every NR tunable. RX1 (index 0) mirrors StateDto.Nr; RX2+ are independent
+    // and settable via ReceiverSetRequest.Nr. NrMode inside this block always
+    // equals the NrMode field above. Null on pre-per-RX-noise wire frames, where
+    // the receiver used the shared StateDto.Nr.
+    NrConfig? Nr = null);
 
 public sealed record StateDto(
     ConnectionStatus Status,
@@ -2112,12 +2117,15 @@ public sealed record ReceiverSetRequest(
     // MaxZoomLevel by RadioService.SetReceiver.
     int? ZoomLevel = null,
     // Per-receiver noise-reduction mode. Index 0 updates StateDto.Nr.NrMode (the
-    // same value POST /api/rx/nr sets); RX2+ select their own mode. The rest of
-    // the NR/NB/ANF/SNB configuration stays shared.
+    // same value POST /api/rx/nr sets); RX2+ select their own mode.
     NrMode? NrMode = null,
     AgcConfig? Agc = null,
     double? AgcTopDb = null,
-    bool? AutoAgcEnabled = null);
+    bool? AutoAgcEnabled = null,
+    // Per-receiver noise block (NB, NB threshold, ANF, SNB, NBP, NR tunables).
+    // Replace-style like POST /api/rx/nr. Its NrMode is ignored: the mode is
+    // set only through NrMode above. Index 0 updates StateDto.Nr.
+    NrConfig? Nr = null);
 
 /// <summary>Body of <c>POST /api/kiwi</c> — configure the KiwiSDR slice
 /// receiver. Every field is optional; only supplied fields change.
@@ -2485,7 +2493,9 @@ public sealed record Nr2Post2ConfigSetRequest(
     double? Post2Factor = null,
     double? Post2Nlevel = null,
     double? Post2Rate = null,
-    int? Post2Taper = null);
+    int? Post2Taper = null,
+    // Receiver to edit (RX1=0, RX2=1, RX3+=2..). Null edits RX1.
+    int? ReceiverIndex = null);
 
 public sealed record Nr4ConfigSetRequest(
     double? ReductionAmount = null,
@@ -2494,7 +2504,9 @@ public sealed record Nr4ConfigSetRequest(
     double? NoiseRescale = null,
     double? PostFilterThreshold = null,
     int? NoiseScalingType = null,
-    int? Position = null);
+    int? Position = null,
+    // Receiver to edit (RX1=0, RX2=1, RX3+=2..). Null edits RX1.
+    int? ReceiverIndex = null);
 
 // NR2 (EMNR) core algorithm selectors + trained-method tuning. Mirrors
 // Nr2Post2ConfigSetRequest's nullable-merge pattern: each field absent
@@ -2507,7 +2519,9 @@ public sealed record Nr2CoreConfigSetRequest(
     int? NpeMethod = null,
     bool? AeRun = null,
     double? TrainT1 = null,
-    double? TrainT2 = null);
+    double? TrainT2 = null,
+    // Receiver to edit (RX1=0, RX2=1, RX3+=2..). Null edits RX1.
+    int? ReceiverIndex = null);
 
 // Panadapter/waterfall zoom levels. Level=1 means the analyzer covers the full
 // sample-rate span; level=2 means VFO-centered half-span (×2 bins/Hz), and so

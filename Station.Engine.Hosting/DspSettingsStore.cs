@@ -254,19 +254,43 @@ public sealed class DspSettingsStore : IDisposable
         }
     }
 
+    // A receiver row can exist only for its noise block (SetReceiverNr). Auto AGC
+    // counts as saved only once an AGC write has stamped the row's AGC mode, so
+    // an NR-only row keeps inheriting the shared Auto AGC.
     public bool? GetReceiverAutoAgc(string profileId) =>
-        _entries.FindOne(x => x.ProfileId == profileId)?.ReceiverAutoAgcEnabled;
+        _entries.FindOne(x => x.ProfileId == profileId) is { AgcMode: not null } entry
+            ? entry.ReceiverAutoAgcEnabled
+            : null;
 
     public void SetReceiverAutoAgc(bool enabled, string profileId)
     {
         var entry = _entries.FindOne(x => x.ProfileId == profileId);
-        if (entry is null)
+        if (entry?.AgcMode is null)
         {
-            SetAgc(new AgcConfig(), profileId);
+            // No AGC saved on this row yet (absent, or a noise-only row): stamp
+            // the AGC it inherits so GetReceiverAutoAgc counts this write.
+            SetAgc(GetAgc() ?? new AgcConfig(), profileId);
             entry = _entries.FindOne(x => x.ProfileId == profileId)!;
         }
         entry.ReceiverAutoAgcEnabled = enabled;
         entry.UpdatedUtc = DateTime.UtcNow;
+        _entries.Update(entry);
+    }
+
+    // Per-receiver noise block (RX2+). A receiver row may already exist for its
+    // AGC, so the NR fields on it only count once this flag is set; until then
+    // the receiver keeps the shared block it used before per-receiver noise.
+    public NrConfig? GetReceiverNr(string profileId) =>
+        _entries.FindOne(x => x.ProfileId == profileId)?.ReceiverNrStored == true
+            ? Get(profileId)
+            : null;
+
+    public void SetReceiverNr(NrConfig config, string profileId)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        Upsert(config, profileId);
+        var entry = _entries.FindOne(x => x.ProfileId == profileId)!;
+        entry.ReceiverNrStored = true;
         _entries.Update(entry);
     }
 
@@ -1034,6 +1058,7 @@ public sealed class DspSettingsEntry
     // RadioService can fall back to the baseline default for first-run.
     public double? AgcTopDb { get; set; }
     public bool ReceiverAutoAgcEnabled { get; set; }
+    public bool ReceiverNrStored { get; set; }
     // AGC threshold ("knee") in operator/displayed dBm (#741). Null = never set
     // → WDSP's per-mode default threshold stays in effect.
     public double? AgcThresholdDbm { get; set; }
