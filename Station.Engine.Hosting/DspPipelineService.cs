@@ -1251,6 +1251,7 @@ public partial class DspPipelineService : BackgroundService,
     private RxMode _appliedEngineMode = RxMode.USB;
     private RxMode _appliedTxMode = RxMode.USB;
     private RxMode _appliedTxEngineMode = RxMode.USB;
+    internal bool TxHasAmCarrier => _appliedTxEngineMode is RxMode.AM or RxMode.SAM;
     private int _appliedLowHz;
     private int _appliedHighHz;
     // WDSP RX filter shift currently applied (Hz). Equals

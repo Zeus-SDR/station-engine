@@ -753,6 +753,22 @@ private:
         return static_cast<uint32_t>(chosen);
     }
 
+    bool verify_sample_rate(const char* stage)
+    {
+        ASIOSampleRate rate = 0;
+        const ASIOError error = driver_->getSampleRate(&rate);
+        if (!asio_ok(error)) {
+            set_error(std::string("Could not verify ASIO 48 kHz sample rate ") + stage + ".", error);
+            return false;
+        }
+        if (!std::isfinite(rate) || std::fabs(rate - kSampleRate) > 0.5) {
+            set_error(std::string("ASIO driver reports ") + std::to_string(rate) + " Hz " + stage +
+                "; Zeus requires 48000 Hz. Check the driver's sample rate and clock source.", ASE_NoClock);
+            return false;
+        }
+        return true;
+    }
+
     bool initialize_driver()
     {
         const std::wstring wide_id = utf8_to_wide(driver_id_.c_str());
@@ -796,12 +812,14 @@ private:
 
         ASIOSampleRate current_rate = 0;
         error = driver_->getSampleRate(&current_rate);
-        if (!asio_ok(error) || std::fabs(current_rate - kSampleRate) > 0.5) {
+        if (!asio_ok(error) || !std::isfinite(current_rate) || std::fabs(current_rate - kSampleRate) > 0.5) {
             error = driver_->canSampleRate(static_cast<ASIOSampleRate>(kSampleRate));
             if (!asio_ok(error)) { set_error("Selected ASIO driver does not support 48 kHz.", error); return false; }
             error = driver_->setSampleRate(static_cast<ASIOSampleRate>(kSampleRate));
             if (!asio_ok(error)) { set_error("Could not set selected ASIO driver to 48 kHz.", error); return false; }
         }
+        // A successful set is not proof that the device clock actually changed.
+        if (!verify_sample_rate("after rate negotiation")) return false;
 
         long minimum = 0, maximum = 0, preferred = 0, granularity = 0;
         error = driver_->getBufferSize(&minimum, &maximum, &preferred, &granularity);
@@ -847,6 +865,8 @@ private:
             set_error("ASIO buffer creation failed.", error); return false;
         }
         buffers_created_ = true;
+        // Some drivers finalize their hardware format while allocating buffers.
+        if (!verify_sample_rate("after buffer creation")) return false;
         long input_latency = 0, output_latency = 0;
         if (asio_ok(driver_->getLatencies(&input_latency, &output_latency))) {
             input_latency_ = static_cast<uint32_t>(std::max(0L, input_latency));
