@@ -56,6 +56,8 @@ public static class ReceiverControlEndpoints
                 return Results.BadRequest(new { error = "invalid AGC configuration" });
             if (req.AgcTopDb is double top && !double.IsFinite(top))
                 return Results.BadRequest(new { error = "AGC gain must be finite" });
+            if (req.Nr is { } nr && (!Enum.IsDefined(nr.NbMode) || !double.IsFinite(nr.NbThreshold)))
+                return Results.BadRequest(new { error = "invalid noise configuration" });
 
             log.LogInformation(
                 "api.receivers index={Index} enabled={Enabled} vfoHz={VfoHz} adc={Adc} mode={Mode}",
@@ -76,7 +78,8 @@ public static class ReceiverControlEndpoints
                 filterPresetName: req.FilterPresetName,
                 zoomLevel: req.ZoomLevel,
                 nrMode: req.NrMode,
-                agc: req.Agc, agcTopDb: req.AgcTopDb, autoAgcEnabled: req.AutoAgcEnabled));
+                agc: req.Agc, agcTopDb: req.AgcTopDb, autoAgcEnabled: req.AutoAgcEnabled,
+                nr: req.Nr));
         });
 
         endpoints.MapPost("/api/receivers/{index:int}/mute", (

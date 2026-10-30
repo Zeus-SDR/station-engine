@@ -253,6 +253,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     internal delegate int DatagramSink(ReadOnlySpan<byte> packet, IPEndPoint endpoint, bool requireImmediate);
     internal DatagramSink? DatagramSinkForTesting { get; set; }
     internal Func<bool>? DatagramReadyForTesting { get; set; }
+    internal Func<ITxPacingWait> TxPacingWaitFactory { get; set; } = TxPacingWait.Create;
     private Action<byte[]>? _cmdHighPrioritySinkForTesting;
     private Action<int, byte[]>? _commandSinkForTesting;
     private Action<int, byte[]>? _speakerAudioSinkForTesting;
@@ -677,6 +678,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private int _txIqLastPacketsPerSecond;
     private long _txIqLastFifoModelSamples;
     private long _txIqLastRateUtcTicks;
+    private long _txIqPacingDegradedLastWarnTicks;
+    private volatile bool _txIqPacingHighResolution;
 
     // ---- PureSignal feedback (DDC0 + DDC1 paired on UDP 1035) ----
     // PS feedback decoder: when armed, packets on port 1035 carry interleaved
@@ -2773,6 +2776,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         // the loop never bounces to a ThreadPool
         // worker and loses the promotion mid-transmit. #559 desktop fix.
         RealtimeThreadPriority.PromoteCallingThreadToProAudio(_log, windowsCritical: true);
+        using var pacingWait = TxPacingWaitFactory();
+        _txIqPacingHighResolution = pacingWait.IsHighResolution;
         // Port of pihpsdr's new_protocol_txiq_thread (new_protocol.c:1909-1997).
         // Maintains a software model of the radio's TX FIFO fill level: each
         // packet adds 240 samples, wall-clock elapses drain at 192 kHz. When
@@ -2802,6 +2807,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             static state => ((Protocol2Client)state!).SignalTxIqQueue(), this);
         try
         {
+            _log.LogInformation("p2.tx.pacing timer={Timer}",
+                pacingWait.IsHighResolution ? "high-resolution" : "sleep");
             while (!ct.IsCancellationRequested)
             {
                 long phaseStarted = Stopwatch.GetTimestamp();
@@ -2863,10 +2870,13 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                         // Above the modeled FIFO target, request a 1 ms wait.
                         // Its nominal duration fits the 6.5 ms target headroom,
                         // but scheduler delays can exceed it and cause underruns.
+                        // Windows uses a high-resolution waitable timer so this
+                        // stays ~1 ms after Windows 11 withdraws timeBeginPeriod
+                        // (issue #3401); other platforms keep Thread.Sleep(1).
                         if (fifoSamples > TxFifoTargetSamples)
                         {
                             phaseStarted = Stopwatch.GetTimestamp();
-                            Thread.Sleep(1);
+                            pacingWait.WaitOneMillisecond();
                             sendTiming.RecordPhase(TxIqSendTiming.Phase.Pacing, Stopwatch.GetTimestamp() - phaseStarted, phaseEpoch);
                             if (ct.IsCancellationRequested) break;
                             now = Stopwatch.GetTimestamp();
@@ -3004,6 +3014,37 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     internal void DrainTxIqDiagnosticsForTesting() => _txIqDiagnostics.Drain();
 
+    internal void EmitTxIqRateDiagnosticForTesting(
+        int pps, int gapsOver10Ms, long pacingUsMax, long sendGapUsMax, long staleDrops, long epoch)
+    {
+        WriteTxIqDiagnostic(new(TxIqDiagnosticKind.Rate, Rate: new(
+            Pps: pps,
+            Fifo: 0,
+            Failures: 0,
+            Suppressed: 0,
+            GateBusy: 0,
+            NotWritable: 0,
+            SocketErrors: 0,
+            SafetyRejected: 0,
+            StaleDrops: staleDrops,
+            GapUs: sendGapUsMax,
+            Gaps: gapsOver10Ms,
+            InputUs: 0,
+            PacingUs: pacingUsMax,
+            SendGateUs: 0,
+            DatagramUs: 0,
+            SocketUs: 0,
+            UnaccountedUs: 0,
+            UnaccountedAtMaxGapUs: 0,
+            Epoch: epoch,
+            AgeMs: 0,
+            Underruns: 0,
+            EmptyMs: 0,
+            FirstAgeMs: 0,
+            GcPauseDeltaUs: 0,
+            SampleUtc: default)));
+    }
+
     private enum TxIqDiagnosticKind { Rate, Content, NullPacket, SendFailure, SenderError }
     private readonly record struct TxIqDiagnostic(TxIqDiagnosticKind Kind,
         TxIqRate Rate = default, TxIqSilenceRuns.Window Content = default,
@@ -3043,6 +3084,15 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                 var rate = diagnostic.Rate;
                 _log.LogInformation("p2.tx.rate pkts/s={Pps} fifoModel={Fifo:F0} totalFailures={Failures} suppressedWarnings={Suppressed} txGateBusy={GateBusy} txNotWritable={NotWritable} txSocketErrors={SocketErrors} safetyRejected={SafetyRejected} staleQueueDrops={StaleDrops} sendGapUsMax={GapUs} gapsGt10ms={Gaps} inputWaitUsMax={InputUs} pacingUsMax={PacingUs} sendGateUsMax={SendGateUs} datagramUsMax={DatagramUs} socketUsMax={SocketUs} unaccountedUsMax={UnaccountedUs} unaccountedAtMaxGapUs={UnaccountedAtMaxGapUs} epoch={Epoch} txAgeMs={AgeMs:F0} modeledUnderruns={Underruns} modeledEmptyMsMax={EmptyMs:F2} firstModeledUnderrunAgeMs={FirstAgeMs:F2} gcPauseCounterDeltaAtMaxGapUs={GcPauseDeltaUs} sampleUtc={SampleUtc:O}",
                     rate.Pps, rate.Fifo, rate.Failures, rate.Suppressed, rate.GateBusy, rate.NotWritable, rate.SocketErrors, rate.SafetyRejected, rate.StaleDrops, rate.GapUs, rate.Gaps, rate.InputUs, rate.PacingUs, rate.SendGateUs, rate.DatagramUs, rate.SocketUs, rate.UnaccountedUs, rate.UnaccountedAtMaxGapUs, rate.Epoch, rate.AgeMs, rate.Underruns, rate.EmptyMs, rate.FirstAgeMs, rate.GcPauseDeltaUs, rate.SampleUtc);
+                if (TxPacingHealth.IsDegraded(rate.Gaps, rate.PacingUs)
+                    && TxPacingHealth.ShouldWarn(Stopwatch.GetTimestamp(), _txIqPacingDegradedLastWarnTicks))
+                {
+                    _txIqPacingDegradedLastWarnTicks = Stopwatch.GetTimestamp();
+                    _log.LogWarning(
+                        "p2.tx.pacing.degraded pkts/s={Pps} gapsGt10ms={Gaps} pacingUsMax={PacingUs} sendGapUsMax={GapUs} staleQueueDrops={StaleDrops} epoch={Epoch} timer={Timer}",
+                        rate.Pps, rate.Gaps, rate.PacingUs, rate.GapUs, rate.StaleDrops, rate.Epoch,
+                        _txIqPacingHighResolution ? "high-resolution" : "sleep");
+                }
                 break;
             case TxIqDiagnosticKind.Content:
                 WriteTxIqContent(diagnostic.Content, diagnostic.End ? "end" : "window");

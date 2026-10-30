@@ -761,6 +761,7 @@ public sealed class TxAudioIngest : IDisposable
                setP2TimingExact: pipeline.SetTxIqTimingExact,
                isVoiceTxMode: () => tx.IsVoiceTxModeNow,
                voiceDspLatencyMs: pipeline.EstimateVoiceTxDspLatencyMs,
+               txHasAmCarrier: () => pipeline.TxHasAmCarrier,
                audioModem: audioModem,
                productAudio: productAudio,
                productPluginAudio: productPluginAudio,
@@ -794,7 +795,8 @@ public sealed class TxAudioIngest : IDisposable
         Func<int>? voiceDspLatencyMs = null,
         Func<int>? voiceRadioFifoGuardMs = null,
         Action<bool>? setP2TimingExact = null,
-        Action<int, Func<bool>?>? voiceTailWait = null)
+        Action<int, Func<bool>?>? voiceTailWait = null,
+        Func<bool>? txHasAmCarrier = null)
     {
         _ring = ring;
         _txTransportLevel = txTransportLevel ?? (static () => TxTransportLevel.Unknown);
@@ -816,6 +818,7 @@ public sealed class TxAudioIngest : IDisposable
         _preKeyOpenAtTicks = preKeyOpenAtTicks ?? (static () => 0L);
         _stopwatchTicks = stopwatchTicks ?? System.Diagnostics.Stopwatch.GetTimestamp;
         _voiceTailWait = voiceTailWait ?? SleepUnlessAborted;
+        _txHasAmCarrier = txHasAmCarrier ?? (static () => false);
         _hub = hub;
         _log = log;
         _handler = OnMicPcmBytesFromBrowserMic;
@@ -1036,10 +1039,11 @@ public sealed class TxAudioIngest : IDisposable
             long paceAt = _stopwatchTicks();
             Array.Clear(_tailMic, 0, blockSize);
             float iqPeak = 0f;
+            bool hasAmCarrier = _txHasAmCarrier();
             for (int b = 0; b < maxFlushBlocks; b++)
             {
                 if (shouldAbort?.Invoke() == true) return false;
-                ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak);
+                ClockTailBlock(engine, blockSize, iqOut, ref iqPeak, out float blockPeak, hasAmCarrier);
                 flushBlocks++;
                 quietBlocks = b >= minFlushBlocks && blockPeak <= RogerBeepFlushIqThreshold
                     ? quietBlocks + 1
@@ -1328,8 +1332,10 @@ public sealed class TxAudioIngest : IDisposable
 
     /// <summary>Run <see cref="_tailMic"/> through TXA and publish the IQ to
     /// both transports. Returns 1 when IQ was produced, else 0;
-    /// <paramref name="blockPeak"/> is this block's IQ peak.</summary>
-    private int ClockTailBlock(IDspEngine engine, int blockSize, int iqOut, ref float iqPeak, out float blockPeak)
+    /// <paramref name="blockPeak"/> is the IQ peak, or the component range
+    /// when checking for modulation on an AM carrier.</summary>
+    private int ClockTailBlock(IDspEngine engine, int blockSize, int iqOut, ref float iqPeak,
+        out float blockPeak, bool hasAmCarrier = false)
     {
         blockPeak = 0f;
         int produced = engine.ProcessTxBlock(
@@ -1344,9 +1350,32 @@ public sealed class TxAudioIngest : IDisposable
             if (sampleAbs > blockPeak) blockPeak = sampleAbs;
         }
         if (blockPeak > iqPeak) iqPeak = blockPeak;
+        if (hasAmCarrier) blockPeak = AmTailModulationRange(iqSpan);
         _ring.Write(iqSpan);
         _forwardP2?.Invoke(new ReadOnlyMemory<float>(_tailIq, 0, 2 * produced));
         return 1;
+    }
+
+    // AM/SAM silence still carries a steady complex carrier. Measure the
+    // remaining modulation without changing the IQ sent to the radio. The
+    // full component range is conservative relative to the peak threshold.
+    // This is only trusted after the existing TXA latency bound, so leading
+    // carrier-only output cannot hide speech still inside the filters.
+    internal static float AmTailModulationRange(ReadOnlySpan<float> iq)
+    {
+        if (iq.Length < 2 || (iq.Length & 1) != 0) return float.PositiveInfinity;
+        float minI = float.PositiveInfinity, maxI = float.NegativeInfinity;
+        float minQ = float.PositiveInfinity, maxQ = float.NegativeInfinity;
+        for (int i = 0; i < iq.Length; i += 2)
+        {
+            float inPhase = iq[i], quadrature = iq[i + 1];
+            if (!float.IsFinite(inPhase) || !float.IsFinite(quadrature)) return float.PositiveInfinity;
+            minI = Math.Min(minI, inPhase);
+            maxI = Math.Max(maxI, inPhase);
+            minQ = Math.Min(minQ, quadrature);
+            maxQ = Math.Max(maxQ, quadrature);
+        }
+        return Math.Max(maxI - minI, maxQ - minQ);
     }
 
     /// <summary>
@@ -1612,6 +1641,7 @@ public sealed class TxAudioIngest : IDisposable
     // start its cushion wider than a local sound card's.
     private const int BrowserMicMinCushionSamples = 30 * TxLatencyGovernor.SamplesPerMs;
     private readonly Func<bool> _isVoiceTxMode;
+    private readonly Func<bool> _txHasAmCarrier;
     // True while TUN or the two-tone test is active. TxTuneDriver is the sole TX
     // driver in those states; this mic-ingest path must NOT also run ProcessTxBlock
     // or push IQ, or two threads drive the same TXA (fexchange2) and BOTH feed the

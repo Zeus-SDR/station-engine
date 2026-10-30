@@ -65,4 +65,20 @@ if(BUILD_TESTING)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
     add_test(NAME zeus_asio_abi_smoke COMMAND zeus_asio_tests)
+
+    add_executable(zeus_asio_sample_rate_tests tests/sample_rate_tests.cpp)
+    target_compile_features(zeus_asio_sample_rate_tests PRIVATE cxx_std_17)
+    target_include_directories(zeus_asio_sample_rate_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/asiosdk-2.3.4/common)
+    target_compile_definitions(zeus_asio_sample_rate_tests PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_link_libraries(zeus_asio_sample_rate_tests PRIVATE ole32 advapi32 user32)
+    if(MSVC)
+        target_compile_options(zeus_asio_sample_rate_tests PRIVATE /W4 /wd4324 /permissive- /EHsc /utf-8)
+        set_property(TARGET zeus_asio_sample_rate_tests PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME zeus_asio_sample_rate COMMAND zeus_asio_sample_rate_tests)
 endif()

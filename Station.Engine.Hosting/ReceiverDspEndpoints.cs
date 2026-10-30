@@ -12,6 +12,20 @@ public static class ReceiverDspEndpoints
     {
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
+        // The settings popovers can name a receiver; an index outside the
+        // receiver range is the caller's error, not a server fault.
+        static IResult ReceiverNrPatch(Func<StateDto> apply)
+        {
+            try
+            {
+                return Results.Ok(apply());
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        }
+
         endpoints.MapPost("/api/rx/nr", (NrSetRequest req, RadioService r) =>
         {
             log.LogInformation(
@@ -34,7 +48,7 @@ public static class ReceiverDspEndpoints
             log.LogInformation(
                 "api.rx.nr2.post2 run={Run} factor={Factor} nlevel={Nlevel} rate={Rate} taper={Taper}",
                 req.Post2Run, req.Post2Factor, req.Post2Nlevel, req.Post2Rate, req.Post2Taper);
-            return Results.Ok(r.SetNr2Post2(req));
+            return ReceiverNrPatch(() => r.SetNr2Post2(req));
         });
 
         endpoints.MapPost("/api/rx/nr2/core", (Nr2CoreConfigSetRequest req, RadioService r) =>
@@ -42,14 +56,7 @@ public static class ReceiverDspEndpoints
             log.LogInformation(
                 "api.rx.nr2.core gainMethod={Gm} npeMethod={Npm} aeRun={Ae} trainT1={T1} trainT2={T2}",
                 req.GainMethod, req.NpeMethod, req.AeRun, req.TrainT1, req.TrainT2);
-            try
-            {
-                return Results.Ok(r.SetNr2Core(req));
-            }
-            catch (ArgumentException ex)
-            {
-                return Results.BadRequest(new { error = ex.Message });
-            }
+            return ReceiverNrPatch(() => r.SetNr2Core(req));
         });
 
         endpoints.MapPost("/api/rx/nr4", (Nr4ConfigSetRequest req, RadioService r) =>
@@ -58,7 +65,7 @@ public static class ReceiverDspEndpoints
                 "api.rx.nr4 reduction={Red} smoothing={Smo} whitening={Whi} noiseRescale={Nr} postThr={Pft} scaling={Sc} pos={Pos}",
                 req.ReductionAmount, req.SmoothingFactor, req.WhiteningFactor,
                 req.NoiseRescale, req.PostFilterThreshold, req.NoiseScalingType, req.Position);
-            return Results.Ok(r.SetNr4(req));
+            return ReceiverNrPatch(() => r.SetNr4(req));
         });
 
         // ---- NR3 (RNNoise) model management (issue #79 follow-up) ----

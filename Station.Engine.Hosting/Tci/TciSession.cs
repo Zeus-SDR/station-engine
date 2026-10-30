@@ -2191,18 +2191,19 @@ public sealed class TciSession : IDisposable
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (args.Length == 1)
         {
-            var snap = _radio.Snapshot().Nr ?? new NrConfig();
+            var snap = RadioService.ReceiverNrConfig(_radio.Snapshot(), rx is 0 or 1 ? rx : 0);
             Send(TciProtocol.Command("rx_nb_enable", rx, snap.NbMode == NbMode.Nb1));
             return;
         }
         if (!TciProtocol.TryParseBool(args[1], out bool enable)) return;
 
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
         // Setting NB1 off should leave NB2 alone if it was active. We only
         // touch the NB slot when the requested change concerns NB1.
-        NbMode next = enable ? NbMode.Nb1
-                             : (current.NbMode == NbMode.Nb1 ? NbMode.Off : current.NbMode);
-        _radio.SetNr(current with { NbMode = next });
+        SetReceiverNoise(rx, current => current with
+        {
+            NbMode = enable ? NbMode.Nb1
+                            : (current.NbMode == NbMode.Nb1 ? NbMode.Off : current.NbMode),
+        });
     }
 
     private void HandleNb2Enable(string[] args)
@@ -2213,16 +2214,17 @@ public sealed class TciSession : IDisposable
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (args.Length == 1)
         {
-            var snap = _radio.Snapshot().Nr ?? new NrConfig();
+            var snap = RadioService.ReceiverNrConfig(_radio.Snapshot(), rx is 0 or 1 ? rx : 0);
             Send(TciProtocol.Command("rx_nb2_enable", rx, snap.NbMode == NbMode.Nb2));
             return;
         }
         if (!TciProtocol.TryParseBool(args[1], out bool enable)) return;
 
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
-        NbMode next = enable ? NbMode.Nb2
-                             : (current.NbMode == NbMode.Nb2 ? NbMode.Off : current.NbMode);
-        _radio.SetNr(current with { NbMode = next });
+        SetReceiverNoise(rx, current => current with
+        {
+            NbMode = enable ? NbMode.Nb2
+                            : (current.NbMode == NbMode.Nb2 ? NbMode.Off : current.NbMode),
+        });
     }
 
     private void HandleAnfEnable(string[] args)
@@ -2232,8 +2234,7 @@ public sealed class TciSession : IDisposable
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (!TciProtocol.TryParseBool(args[1], out bool enable)) return;
 
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
-        _radio.SetNr(current with { AnfEnabled = enable });
+        SetReceiverNoise(rx, current => current with { AnfEnabled = enable });
     }
 
     private void HandleAncEnable(string[] args)
@@ -2244,8 +2245,18 @@ public sealed class TciSession : IDisposable
         if (!TciProtocol.TryParseInt(args[0], out int rx)) return;
         if (!TciProtocol.TryParseBool(args[1], out bool enable)) return;
 
-        var current = _radio.Snapshot().Nr ?? new NrConfig();
-        _radio.SetNr(current with { SnbEnabled = enable });
+        SetReceiverNoise(rx, current => current with { SnbEnabled = enable });
+    }
+
+    // The noise block is per receiver like the NR mode: rx 0 drives RX1, rx 1
+    // drives RX2. Other indices are ignored like rx_volume.
+    private void SetReceiverNoise(int rx, Func<NrConfig, NrConfig> patch) =>
+        SetReceiverNoise(_radio, rx, patch);
+
+    internal static void SetReceiverNoise(RadioService radio, int rx, Func<NrConfig, NrConfig> patch)
+    {
+        if (rx is not (0 or 1)) return;
+        radio.SetReceiver(rx, nr: patch(RadioService.ReceiverNrConfig(radio.Snapshot(), rx)));
     }
 
     private void HandlePreamp(string[] args)

@@ -1251,6 +1251,7 @@ public partial class DspPipelineService : BackgroundService,
     private RxMode _appliedEngineMode = RxMode.USB;
     private RxMode _appliedTxMode = RxMode.USB;
     private RxMode _appliedTxEngineMode = RxMode.USB;
+    internal bool TxHasAmCarrier => _appliedTxEngineMode is RxMode.AM or RxMode.SAM;
     private int _appliedLowHz;
     private int _appliedHighHz;
     // WDSP RX filter shift currently applied (Hz). Equals
@@ -7556,15 +7557,10 @@ public partial class DspPipelineService : BackgroundService,
             : (r.Mode, r.VfoHz, r.FilterLowHz, r.FilterHighHz, r.AfGainDb);
     }
 
-    // Per-receiver NR: the shared NrConfig (NR tunables, NB, ANF, SNB, NBP)
-    // with this receiver's own NR mode from its Receivers[] entry. RX1 keeps
-    // using StateDto.Nr directly.
-    internal static NrConfig SecondaryRxNrConfig(StateDto s, int rxIndex)
-    {
-        var shared = s.Nr ?? new NrConfig();
-        var r = s.Receivers is { } rs && rxIndex >= 0 && rxIndex < rs.Count ? rs[rxIndex] : null;
-        return NormalizeNrConfig(r is null ? shared : shared with { NrMode = r.NrMode });
-    }
+    // Per-receiver NR: this receiver's own noise block (NB, ANF, SNB, NBP, NR
+    // tunables) and NR mode. RX1 keeps using StateDto.Nr directly.
+    internal static NrConfig SecondaryRxNrConfig(StateDto s, int rxIndex) =>
+        RadioService.ReceiverNrConfig(s, rxIndex);
 
     // Convenience helper: open/sync/close the WDSP channel for one secondary
     // receiver, mirroring RX1's lifecycle. Returns the channel id (or -1 when the

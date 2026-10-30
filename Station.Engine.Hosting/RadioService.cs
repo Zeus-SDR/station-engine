@@ -293,7 +293,8 @@ public sealed partial class RadioService : IDisposable
         public bool SplitEnabled;
         public long TxVfoHz;
         public int ZoomLevel = 1; // independent DDC display zoom for this slice
-        public NrMode NrMode = NrMode.Off; // per-RX NR mode (NR tunables stay shared)
+        public NrMode NrMode = NrMode.Off; // per-RX NR mode
+        public NrConfig Nr = new(); // per-RX noise block (NB/ANF/SNB/NBP/NR tunables)
         public AgcConfig Agc = new();
         public double AgcTopDb = 90.0;
         public bool AutoAgcEnabled;
@@ -1073,7 +1074,7 @@ public sealed partial class RadioService : IDisposable
                     FilterLowHz: _state.FilterLowHz, FilterHighHz: _state.FilterHighHz,
                     FilterPresetName: _state.FilterPresetName, AfGainDb: _state.Rx1AfGainDb,
                     SampleRateHz: _state.SampleRate, Muted: _state.Rx1Muted,
-                    NrMode: persistedNr.NrMode),
+                    NrMode: persistedNr.NrMode, Nr: persistedNr),
                 new(Index: 1, Enabled: _state.Rx2Enabled, AdcSource: 0,
                     VfoHz: hydVfoB, Mode: hydModeB,
                     FilterLowHz: hydFilterLowB, FilterHighHz: hydFilterHighB,
@@ -1081,7 +1082,8 @@ public sealed partial class RadioService : IDisposable
                     SampleRateHz: _state.SampleRate, Muted: _state.Rx2Muted,
                     NrMode: hydNrModeB,
                     Agc: LoadReceiverAgc(1), AgcTopDb: LoadReceiverAgcTop(1),
-                    AutoAgcEnabled: _dspSettingsStore.GetReceiverAutoAgc(ReceiverAgcProfile(1)) ?? _state.AutoAgcEnabled),
+                    AutoAgcEnabled: _dspSettingsStore.GetReceiverAutoAgc(ReceiverDspProfile(1)) ?? _state.AutoAgcEnabled,
+                    Nr: LoadReceiverNr(1, persistedNr)),
             },
         };
 
@@ -1089,7 +1091,8 @@ public sealed partial class RadioService : IDisposable
         {
             _extraReceivers[i].Agc = LoadReceiverAgc(i);
             _extraReceivers[i].AgcTopDb = LoadReceiverAgcTop(i);
-            _extraReceivers[i].AutoAgcEnabled = _dspSettingsStore.GetReceiverAutoAgc(ReceiverAgcProfile(i)) ?? _state.AutoAgcEnabled;
+            _extraReceivers[i].AutoAgcEnabled = _dspSettingsStore.GetReceiverAutoAgc(ReceiverDspProfile(i)) ?? _state.AutoAgcEnabled;
+            _extraReceivers[i].Nr = LoadReceiverNr(i, persistedNr);
         }
 
         // Persist the fold immediately. A crash before the next natural flush
@@ -2372,10 +2375,13 @@ public sealed partial class RadioService : IDisposable
         string? filterPresetName = null,
         int? zoomLevel = null,
         NrMode? nrMode = null,
-        AgcConfig? agc = null, double? agcTopDb = null, bool? autoAgcEnabled = null)
+        AgcConfig? agc = null, double? agcTopDb = null, bool? autoAgcEnabled = null,
+        NrConfig? nr = null)
     {
         if (agc is not null || agcTopDb is not null || autoAgcEnabled is not null)
             SetReceiverAgc(index, agc, agcTopDb, autoAgcEnabled);
+        if (nr is not null)
+            SetReceiverNr(index, nr);
         // RX1 (0) and RX2 (1) live on the flat StateDto fields, but the uniform
         // numeric model means /api/receivers/{index} must drive every receiver.
         // Route each supplied field to its canonical RX1/RX2 setter so all their
@@ -6972,16 +6978,14 @@ public sealed partial class RadioService : IDisposable
     public StateDto SetNr2Post2(Nr2Post2ConfigSetRequest req)
     {
         ArgumentNullException.ThrowIfNull(req);
-        var current = Snapshot().Nr ?? new NrConfig();
-        var merged = current with
+        return SetReceiverNrPatch(req.ReceiverIndex, current => current with
         {
             EmnrPost2Run = req.Post2Run ?? current.EmnrPost2Run,
             EmnrPost2Factor = req.Post2Factor ?? current.EmnrPost2Factor,
             EmnrPost2Nlevel = req.Post2Nlevel ?? current.EmnrPost2Nlevel,
             EmnrPost2Rate = req.Post2Rate ?? current.EmnrPost2Rate,
             EmnrPost2Taper = req.Post2Taper ?? current.EmnrPost2Taper,
-        };
-        return SetNr(merged);
+        });
     }
 
     // NR2 (EMNR) core algorithm selectors + Trained-method T1/T2. Same
@@ -6996,16 +7000,14 @@ public sealed partial class RadioService : IDisposable
         if (req.NpeMethod is int npm && (npm < 0 || npm > 2))
             throw new ArgumentException($"NpeMethod must be 0..2, got {npm}", nameof(req));
 
-        var current = Snapshot().Nr ?? new NrConfig();
-        var merged = current with
+        return SetReceiverNrPatch(req.ReceiverIndex, current => current with
         {
             EmnrGainMethod = req.GainMethod ?? current.EmnrGainMethod,
             EmnrNpeMethod = req.NpeMethod ?? current.EmnrNpeMethod,
             EmnrAeRun = req.AeRun ?? current.EmnrAeRun,
             EmnrTrainT1 = req.TrainT1 ?? current.EmnrTrainT1,
             EmnrTrainT2 = req.TrainT2 ?? current.EmnrTrainT2,
-        };
-        return SetNr(merged);
+        });
     }
 
     // Right-click popover save for NR4 (SBNR) tunables — same merge-and-
@@ -7013,8 +7015,7 @@ public sealed partial class RadioService : IDisposable
     public StateDto SetNr4(Nr4ConfigSetRequest req)
     {
         ArgumentNullException.ThrowIfNull(req);
-        var current = Snapshot().Nr ?? new NrConfig();
-        var merged = current with
+        return SetReceiverNrPatch(req.ReceiverIndex, current => current with
         {
             Nr4ReductionAmount = req.ReductionAmount ?? current.Nr4ReductionAmount,
             Nr4SmoothingFactor = req.SmoothingFactor ?? current.Nr4SmoothingFactor,
@@ -7023,8 +7024,7 @@ public sealed partial class RadioService : IDisposable
             Nr4PostFilterThreshold = req.PostFilterThreshold ?? current.Nr4PostFilterThreshold,
             Nr4NoiseScalingType = req.NoiseScalingType ?? current.Nr4NoiseScalingType,
             Nr4Position = req.Position ?? current.Nr4Position,
-        };
-        return SetNr(merged);
+        });
     }
 
     // CFC (Continuous Frequency Compressor) — issue #123. The whole 10-band
@@ -7668,7 +7668,7 @@ public sealed partial class RadioService : IDisposable
         // StateDto.ZoomLevel / SetZoom, never through this projection.
         ZoomLevel: s.ZoomLevel,
         NrMode: Rx1NrMode(s), Agc: s.Agc, AgcTopDb: s.AgcTopDb,
-        AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb);
+        AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb, Nr: s.Nr);
 
     private static StateDto WithReceiverAdcSource(StateDto s, int index, byte adcSource)
     {
@@ -7764,7 +7764,7 @@ public sealed partial class RadioService : IDisposable
                 Muted: s.Rx1Muted, SplitEnabled: s.SplitEnabled,
                 TxVfoHz: s.SplitTxHz, ZoomLevel: s.ZoomLevel,
                 NrMode: Rx1NrMode(s), Agc: s.Agc, AgcTopDb: s.AgcTopDb,
-                AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb),
+                AutoAgcEnabled: s.AutoAgcEnabled, AgcOffsetDb: s.AgcOffsetDb, Nr: s.Nr),
             // index 1 = RX2: its VFO / mode / filter / AF gain are authoritative
             // in the array itself (the flat VFO-B fields are gone). Carry the
             // existing tuning forward and overlay the flat RX2 control fields
@@ -7778,6 +7778,7 @@ public sealed partial class RadioService : IDisposable
                 AdcSource = ReceiverAdcSource(s, 1),
                 SampleRateHz = s.SampleRate,
                 Muted = s.Rx2Muted,
+                Nr = ReceiverNrConfig(s, 1),
             },
         };
         // Extra DDC receivers (RX3+). Appended contiguously while enabled — the
@@ -7798,7 +7799,8 @@ public sealed partial class RadioService : IDisposable
                 AfGainDb: e.AfGainDb, SampleRateHz: s.SampleRate,
                 Muted: e.Muted, SplitEnabled: e.SplitEnabled,
                 TxVfoHz: e.TxVfoHz, ZoomLevel: e.ZoomLevel, NrMode: e.NrMode,
-                Agc: e.Agc, AgcTopDb: e.AgcTopDb, AutoAgcEnabled: e.AutoAgcEnabled, AgcOffsetDb: e.AgcOffsetDb));
+                Agc: e.Agc, AgcTopDb: e.AgcTopDb, AutoAgcEnabled: e.AutoAgcEnabled, AgcOffsetDb: e.AgcOffsetDb,
+                Nr: NormalizeNrConfig(e.Nr with { NrMode = e.NrMode })));
         }
         // Non-hardware KiwiSDR slice (reserved index KiwiReceiverIndex). Appended
         // out of the contiguous DDC run — it is a remote receiver, not a DDC, so

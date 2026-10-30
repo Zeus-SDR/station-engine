@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using Zeus.Contracts;
 using Zeus.Hosting;
+using Zeus.Protocol2;
 using Zeus.Server;
 using Zeus.Server.Cat;
 using Zeus.Server.Diagnostics;
@@ -29,7 +30,7 @@ public partial class Program
     public static async Task<int> Main(string[] args)
     {
         // Must run before any TX pacing starts — see RaiseTimerResolutionOnWindows.
-        RaiseTimerResolutionOnWindows();
+        var timerResolution = RaiseTimerResolutionOnWindows();
 
         // Eager self-diagnostics: stamp the startup banner into the rolling
         // on-disk log BEFORE anything else can throw. The banner is the only
@@ -66,6 +67,7 @@ public partial class Program
 
         try
         {
+            app.Logger.LogInformation("station-engine {Fragment}", timerResolution.ToLogFragment());
             await app.RunAsync().ConfigureAwait(false);
             return 0;
         }
@@ -87,22 +89,20 @@ public partial class Program
     // tail drain. At that granularity the sender can only feed the 192 kHz DUC
     // at ~380 packets/s instead of the required 800, starving the radio's TX
     // FIFO and delaying un-key. macOS and Linux already provide approximately
-    // 1 ms resolution. The OS guard also ensures winmm.dll is never resolved
-    // on those platforms. timeBeginPeriod(1) raises the Windows process-wide
+    // 1 ms resolution. timeBeginPeriod(1) raises the Windows process-wide
     // resolution for its lifetime; timeEndPeriod is deliberately omitted
     // because TX pacing needs the resolution until process exit, when Windows
     // restores the default.
-    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
-    private static extern uint TimeBeginPeriod(uint uMilliseconds);
-
-    internal static void RaiseTimerResolutionOnWindows()
-    {
-        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                System.Runtime.InteropServices.OSPlatform.Windows))
-        {
-            TimeBeginPeriod(1);
-        }
-    }
+    //
+    // Starting with Windows 11, that 1 ms request is withdrawn when a
+    // window-owning process is fully occluded, minimized, or otherwise
+    // invisible or inaudible (the Zeus Link engine with an ASIO hidden
+    // window qualifies — issue #3401). Raise() also opts out of that
+    // throttle via SetProcessInformation(ProcessPowerThrottling). The P2
+    // sender additionally uses a high-resolution waitable timer so pacing
+    // stays ~1 ms even if the process-wide request is withdrawn again.
+    internal static WindowsTimerResolutionResult RaiseTimerResolutionOnWindows() =>
+        WindowsTimerResolution.Raise();
 
     /// <summary>Builds the standalone engine application; the caller owns its lifecycle.</summary>
     public static WebApplication Build(string[] args) => Build(args, diagnosticLogFileSink: null);
