@@ -26,6 +26,7 @@ public partial class DspPipelineService
     // channel was configured. Reconcile before publishing it to audio readers.
     private void PublishPrimaryEngineLocked(IDspEngine engine, int channel)
     {
+        ReleaseExternalFeedbackOnEngineReplaceLocked(engine);
         engine.SetRxCwNoiseReductionBypass(channel,
             CwNoiseReductionBypassForReceiver(_radio.Snapshot(), 0));
         Volatile.Write(ref _engine, engine);

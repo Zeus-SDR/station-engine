@@ -19,6 +19,17 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine, ITxWaveformSour
     {
         if (_inner is ITxWaveformSource source) source.SetTxWaveformTap(handler, demandUntilTickMs);
     }
+
+    public IDisposable SubscribeTxWaveform(TxWaveformHandler handler) =>
+        _inner is ITxWaveformSource source
+            ? source.SubscribeTxWaveform(handler)
+            : EmptySubscription.Instance;
+
+    private sealed class EmptySubscription : IDisposable
+    {
+        internal static readonly EmptySubscription Instance = new();
+        public void Dispose() { }
+    }
     internal const int MaxTxBlockSamples = 1024;
     internal const int MaxTxOutputSamples = 2048;
 

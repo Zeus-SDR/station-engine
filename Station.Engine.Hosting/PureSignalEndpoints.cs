@@ -7,20 +7,33 @@ namespace Zeus.Server;
 /// <summary>Maps PureSignal control and correction-file routes.</summary>
 public static class PureSignalEndpoints
 {
+    /// <summary>
+    /// The master-arm decision for whichever radio this station operates. On a
+    /// product-operated radio, which reaches correction through the
+    /// external feedback port, the decision is session-only and the saved HPSDR
+    /// arm decision is left unchanged; an HPSDR decision persists exactly as before.
+    /// </summary>
+    internal static StateDto SetPsForStation(RadioService radio, DspPipelineService pipeline, PsControlSetRequest req)
+        => radio.SetPs(req, persistArmIntent: !pipeline.IsExternalFeedbackRadioSession);
+
     public static IEndpointRouteBuilder MapPureSignalEndpoints(
         this IEndpointRouteBuilder endpoints)
     {
+        endpoints.MapGet("/api/tx/ps/external-feedback", (HttpContext context) =>
+            context.RequestServices.GetService<ExternalFeedbackPort>() is { } port
+                ? Results.Ok(port.CaptureStatus()) : Results.NotFound());
+
         var log = endpoints.ServiceProvider.GetRequiredService<ILogger<object>>();
 
         // PureSignal master arm + cal-mode. RadioService.SetPs sets the
         // StateDto bit; DspPipelineService then sequences the active P1 or P2
         // feedback wire path before arming the WDSP engine.
-        endpoints.MapPost("/api/tx/ps", (PsControlSetRequest req, RadioService r) =>
+        endpoints.MapPost("/api/tx/ps", (PsControlSetRequest req, RadioService r, DspPipelineService pipe) =>
         {
             log.LogInformation(
                 "api.tx.ps enabled={On} auto={Auto} single={Single}",
                 req.Enabled, req.Auto, req.Single);
-            return Results.Ok(r.SetPs(req));
+            return Results.Ok(SetPsForStation(r, pipe, req));
         });
 
         endpoints.MapPost("/api/tx/ps/advanced", (PsAdvancedSetRequest req, RadioService r) =>

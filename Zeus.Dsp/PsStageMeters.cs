@@ -49,13 +49,18 @@ namespace Zeus.Dsp;
 /// calcc has finished a fit, otherwise the loop changes the envelope mid-
 /// calc and can trigger the WDSP 2.00 <c>info[6]</c> scheck mask, forcing
 /// rejected fits and repeated reset cycles.</param>
+/// <param name="CalibrationCalcAttempts">info[7] — cumulative count of calc()
+/// entries, including fits that fail before info[5] moves. The external
+/// feedback servo steps on this while feedback is above the hot threshold.
+/// info[5] semantics are unchanged.</param>
 public readonly record struct PsStageMeters(
     float FeedbackLevel,
     byte CalState,
     bool Correcting,
     float CorrectionDb,
     float MaxTxEnvelope,
-    int CalibrationAttempts)
+    int CalibrationAttempts,
+    int CalibrationCalcAttempts = 0)
 {
     public static readonly PsStageMeters Silent = new(
         FeedbackLevel: 0f,
@@ -63,5 +68,6 @@ public readonly record struct PsStageMeters(
         Correcting: false,
         CorrectionDb: 0f,
         MaxTxEnvelope: 0f,
-        CalibrationAttempts: 0);
+        CalibrationAttempts: 0,
+        CalibrationCalcAttempts: 0);
 }

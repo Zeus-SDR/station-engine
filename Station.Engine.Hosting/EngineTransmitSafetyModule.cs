@@ -56,7 +56,8 @@ internal sealed record TransmitSafetySnapshot(
     TransmitIntent? ActiveIntent,
     MoxSource? Source = null,
     bool TransverterProfileRequired = false,
-    TransverterBandDto? TransverterBand = null);
+    TransverterBandDto? TransverterBand = null,
+    bool ExternalRadio = false);
 
 internal readonly record struct TransmitSafetyDecision(
     bool Allowed,
@@ -181,6 +182,7 @@ internal sealed class EngineTransmitSafetyModule
 
     private TransmitSafetyDecision? Hl2IoBoardDecision(TransmitSafetySnapshot snapshot)
     {
+        if (snapshot.ExternalRadio) return null;
         lock (_sync)
         {
             if (snapshot.Board != HpsdrBoardKind.HermesLite2) return null;
@@ -205,12 +207,12 @@ internal sealed class EngineTransmitSafetyModule
 
         if (!snapshot.Connected)
             return TransmitSafetyDecision.Deny(TransmitSafetyReasonCode.NotConnected, "not connected", envelope);
-        if (snapshot.Board == HpsdrBoardKind.Unknown)
+        if (!snapshot.ExternalRadio && snapshot.Board == HpsdrBoardKind.Unknown)
             return TransmitSafetyDecision.Deny(
                 TransmitSafetyReasonCode.UnknownBoard,
                 "TX blocked: connected radio identity is unknown; receive remains available",
                 envelope);
-        if (snapshot.Board == HpsdrBoardKind.OrionMkII && !Enum.IsDefined(snapshot.Variant))
+        if (!snapshot.ExternalRadio && snapshot.Board == HpsdrBoardKind.OrionMkII && !Enum.IsDefined(snapshot.Variant))
             return TransmitSafetyDecision.Deny(
                 TransmitSafetyReasonCode.UnknownBoardVariant,
                 "TX blocked: Orion-MkII physical variant is unknown",

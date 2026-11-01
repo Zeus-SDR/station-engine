@@ -219,5 +219,10 @@ public sealed class PsSettingsEntry
     // cleared.
     // See PsSettingsStore.MigrateTxAttnPoison.
     public int TxAttnMigration { get; set; }
+    // Settled external-feedback attenuation per amateur band, keyed by
+    // the band's lower edge in kHz ("3500"). Restored when an external arm
+    // starts so the first fit after a launch or band change is learned at the
+    // right feedback level. Not tied to an HPSDR board key.
+    public Dictionary<string, int> ExternalFeedbackAttnByBand { get; set; } = new();
     public DateTime UpdatedUtc { get; set; }
 }

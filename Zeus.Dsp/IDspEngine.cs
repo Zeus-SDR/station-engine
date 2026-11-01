@@ -648,6 +648,21 @@ public interface IDspEngine : IDisposable
     bool IsTxMonitorOn { get; }
 }
 
+/// <summary>
+/// Engines that can report the two-tone pair currently armed. Read on the
+/// external-feedback path; engines without the generator do not implement it.
+/// </summary>
+public interface ITwoToneFrequencies
+{
+    bool TryGetTwoTone(out double freq1Hz, out double freq2Hz);
+
+    /// <summary>
+    /// Lock-free count of armed-state or frequency-tuple changes.
+    /// Equal-separation edits count. Readable without the engine's TX lock.
+    /// </summary>
+    long TwoToneRevision => 0;
+}
+
 /// <summary>Engine-side FM readouts; see <see cref="IDspEngine.GetFmDspStatus"/>.</summary>
 public sealed record FmDspStatus(
     bool ToneDecodeAvailable,

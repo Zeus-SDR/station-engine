@@ -1227,6 +1227,7 @@ public sealed partial class RadioService : IDisposable
             TwoToneMag = snap.TwoToneMag,
             HwPeakByBoard = hwPeakByBoard,
             TxAttnByBoard = txAttnByBoard,
+            ExternalFeedbackAttnByBand = ExternalBandAttnSnapshot(existing),
             // Carry the migration marker forward — this rebuild replaces the
             // whole entry, and dropping the marker back to 0 would re-run the
             // HermesC10 poison wipe on the next startup, deleting a freshly
@@ -1253,6 +1254,41 @@ public sealed partial class RadioService : IDisposable
         // Surface the live value so the PURESIGNAL panel's manual control and
         // the "differs" hint track what's actually applied.
         Mutate(s => s.PsTxFeedbackAttenuationDb == db ? s : s with { PsTxFeedbackAttenuationDb = db });
+    }
+
+    private readonly object _externalBandAttnLock = new();
+    private Dictionary<string, int>? _externalBandAttn;
+
+    private Dictionary<string, int> ExternalBandAttnSnapshot(PsSettingsEntry? existing)
+    {
+        lock (_externalBandAttnLock)
+            return _externalBandAttn is { } live
+                ? new Dictionary<string, int>(live)
+                : new Dictionary<string, int>(existing?.ExternalFeedbackAttnByBand ?? new());
+    }
+
+    private Dictionary<string, int> ExternalBandAttnLocked() =>
+        _externalBandAttn ??= new Dictionary<string, int>(_psStore?.Get()?.ExternalFeedbackAttnByBand ?? new());
+
+    /// <summary>The external-feedback attenuation last settled on the band starting at <paramref name="bandKhz"/>, if saved.</summary>
+    internal int? GetExternalFeedbackBandAttenuationDb(int bandKhz)
+    {
+        lock (_externalBandAttnLock)
+            return ExternalBandAttnLocked().TryGetValue(bandKhz.ToString(System.Globalization.CultureInfo.InvariantCulture), out int db)
+                ? db : null;
+    }
+
+    /// <summary>Saves the external-feedback attenuation settled on the band starting at <paramref name="bandKhz"/>.</summary>
+    internal void SetExternalFeedbackBandAttenuationDb(int bandKhz, int db)
+    {
+        string key = bandKhz.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        lock (_externalBandAttnLock)
+        {
+            var map = ExternalBandAttnLocked();
+            if (map.TryGetValue(key, out int current) && current == db) return;
+            map[key] = db;
+        }
+        PersistPsState();
     }
 
     /// <summary>
@@ -7081,7 +7117,16 @@ public sealed partial class RadioService : IDisposable
     // SetPs flips master arm and cal-mode in a single mutate so the engine
     // sees a consistent state when DspPipelineService.OnRadioStateChanged
     // fires.
-    public StateDto SetPs(PsControlSetRequest req)
+    public StateDto SetPs(PsControlSetRequest req) => SetPs(req, persistArmIntent: true);
+
+    /// <summary>
+    /// <paramref name="persistArmIntent"/> false is the arm decision for a
+    /// product-operated (external feedback) radio: it lasts for this
+    /// session only and leaves the saved HPSDR arm decision exactly as it was.
+    /// Everything else (cal mode, persistence of the other PS settings, the
+    /// disarm side effects) is the same as an HPSDR decision.
+    /// </summary>
+    internal StateDto SetPs(PsControlSetRequest req, bool persistArmIntent)
     {
         ArgumentNullException.ThrowIfNull(req);
         bool psDisarmed = false;
@@ -7091,8 +7136,9 @@ public sealed partial class RadioService : IDisposable
                 ThrowIfPaCalibrationInvariantMutation("PureSignal");
             // This is the sole writer of persisted arm intent. Runtime safety
             // disarms (watchdog, disconnect, sanitize) use Mutate directly and
-            // therefore cannot erase the operator's decision.
-            _psArmIntent = req.Enabled;
+            // therefore cannot erase the operator's decision; nor can a
+            // session-only external decision.
+            if (persistArmIntent) _psArmIntent = req.Enabled;
             psDisarmed = s.PsEnabled && !req.Enabled;
             return s with
             {
@@ -7224,11 +7270,16 @@ public sealed partial class RadioService : IDisposable
     // TxMetersService at 10 Hz while PS is armed.
     public void UpdatePsLiveReadout(double feedbackLevel, byte calState, bool correcting)
     {
-        Mutate(s => s with
+        Mutate(s =>
         {
-            PsFeedbackLevel = feedbackLevel,
-            PsCalState = calState,
-            PsCorrecting = correcting,
+            if (_externalFeedbackRuntime && s.Status == ConnectionStatus.Disconnected && !s.PsEnabled)
+                return s with { PsFeedbackLevel = 0, PsCalState = 0, PsCorrecting = false };
+            return s with
+            {
+                PsFeedbackLevel = feedbackLevel,
+                PsCalState = calState,
+                PsCorrecting = correcting,
+            };
         });
     }
 

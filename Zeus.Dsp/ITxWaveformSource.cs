@@ -7,4 +7,10 @@ public delegate void TxWaveformHandler(int sampleRateHz, ReadOnlySpan<float> int
 public interface ITxWaveformSource
 {
     void SetTxWaveformTap(TxWaveformHandler? handler, long demandUntilTickMs);
+
+    /// <summary>
+    /// Adds an independent completed-output observer. Disposing the returned
+    /// lease removes only this observer; the display/capture tap remains intact.
+    /// </summary>
+    IDisposable SubscribeTxWaveform(TxWaveformHandler handler);
 }

@@ -51,7 +51,7 @@ using Zeus.Contracts;
 
 namespace Zeus.Dsp.Wdsp;
 
-public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
+public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost, IExternalPureSignalMox, ITwoToneFrequencies, IPsCorrectionHold
 {
     // A 512-sample host exchange and DSP partition gives RXA a 10.67 ms
     // scheduling quantum at 48 kHz. Protocol clients already partial-frame IQ
@@ -516,6 +516,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     private double _twoToneF1Hz;
     private double _twoToneF2Hz;
     private bool _twoToneArmed;
+    // Bumped when the armed flag or the (f1, f2) tuple changes. Lock-free so
+    // the external-feedback waveform path can sample it without _txaLock.
+    private long _twoToneRevision;
     // Latest per-stage TX peak meters, published atomically at the end of each
     // ProcessTxBlock. The reader (TxMetersService, 10 Hz during MOX) sees a
     // consistent snapshot without blocking the DSP thread. null until first TX
@@ -615,6 +618,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // pinned once and reused on every GetPSInfo call.
     private readonly object _psLock = new();
     private volatile bool _psEnabled;
+    // Set only by a caller of SetPsHoldCorrection; the native call is never
+    // made otherwise, so radios that do not use it run exactly as before.
+    private bool _psHold;
     private bool _psAuto = true;
     private bool _psSingle;
     private double _psHwPeak = 0.4072;   // P1 default; RadioService overrides at connect
@@ -642,10 +648,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
 
     /// <summary>
     /// Override the PS feedback sample rate (Hz) BEFORE <see cref="OpenTxChannel"/>
-    /// runs. Hermes-family single-ADC P1 only — see the
-    /// <see cref="_psFeedbackRateHz"/> comment. No-op after TXA open (the
-    /// value is latched into WDSP at open; P1 rate changes tear down and
-    /// rebuild the whole engine, so the seam re-runs on every re-rate).
+    /// runs. Hermes-family single-ADC P1 and external-radio feedback paths use
+    /// this before opening TXA. No-op after TXA open (the value is latched into
+    /// WDSP at open; engine rebuilds reapply it before the next open).
     /// </summary>
     public void SetPsFeedbackRateHz(int rateHz)
     {
@@ -672,10 +677,17 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // Held (see PsObservedPeakHold) because feedback blocks keep arriving in
     // speech gaps and while unkeyed; a per-block value dropped to zero.
     private readonly PsObservedPeakHold _psObservedPeak = new();
+    // An externally keyed transmitter's PS MOX (IExternalPureSignalMox). The
+    // engine's own _moxOn never rises there, so without this the observed
+    // peak would only ever rise. Never set on the HPSDR path. Under _txaLock.
+    private bool _psExternalMox;
+    // Clock for the observed-peak hold; tests advance it.
+    internal Func<long> PsObservedPeakClockMs { get; set; } = static () => Environment.TickCount64;
     // Bring-up diagnostic — emit info[] every Nth GetPsStageMeters tick so the
     // calcc state machine is visible in the server log without flooding.
     // Drop alongside the wdsp.psSeed log once PS is confirmed stable.
     private int _psInfoLogCounter;
+    private int _lastPsFitAttempt = -1;
     private int _txOverdriveLogCounter;
 
     // TX Monitor — private RXA channel that demodulates the post-CFIR / post-
@@ -3443,6 +3455,18 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _log.LogInformation("wdsp.setPsMox on={Mox}", moxOn);
     }
 
+    /// <summary>
+    /// PS MOX from a radio the engine does not key. Also marks the PS feedback
+    /// as keyed for the observed-peak hold, which the engine's own MOX does on
+    /// HPSDR.
+    /// </summary>
+    public void SetExternalPsMox(bool moxOn)
+    {
+        if (_disposed != 0) return;
+        lock (_txaLock) _psExternalMox = moxOn;
+        SetPsMox(moxOn);
+    }
+
     public TxStageMeters GetTxStageMeters()
     {
         lock (_txMeterPublishLock)
@@ -4545,6 +4569,23 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _ => RxMode.USB,
     };
 
+    public long TwoToneRevision => Volatile.Read(ref _twoToneRevision);
+
+    public bool TryGetTwoTone(out double freq1Hz, out double freq2Hz)
+    {
+        lock (_txaLock)
+        {
+            if (!_twoToneArmed)
+            {
+                freq1Hz = freq2Hz = 0;
+                return false;
+            }
+            freq1Hz = _twoToneF1Hz;
+            freq2Hz = _twoToneF2Hz;
+            return true;
+        }
+    }
+
     public void SetTwoTone(bool on, double freq1, double freq2, double mag)
     {
         if (_disposed != 0) return;
@@ -4558,6 +4599,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             if (_txaChannelId is not int txa) return;
+            bool wasArmed = _twoToneArmed;
+            double previousF1 = _twoToneF1Hz;
+            double previousF2 = _twoToneF2Hz;
             if (on)
             {
                 // Sideband sign — matches Thetis (Setup.cs:11096, chkInvertTones
@@ -4603,6 +4647,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     "wdsp.setTwoTone on=false f1={F1} f2={F2} mag={Mag:F3} leveler={Leveler}",
                     freq1, freq2, mag, _txLevelerEnabled ? "on" : "off");
             }
+            bool tupleChanged = wasArmed != _twoToneArmed
+                || (on && (freq1 != previousF1 || freq2 != previousF2));
+            if (tupleChanged) Interlocked.Increment(ref _twoToneRevision);
         }
     }
 
@@ -4781,6 +4828,12 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                         NativeMethods.psccF(id, PsFeedbackBlockSize, zeros, zeros, zeros, zeros, 0, 0);
                     }
                 }
+                // A held correction must still end with the arm.
+                if (_psHold)
+                {
+                    NativeMethods.SetPSHoldCorrection(id, 0);
+                    _psHold = false;
+                }
                 NativeMethods.SetPSRunCal(id, 0);
                 NativeMethods.SetPSControl(id, 1, 0, 0, 0);
                 _psEnabled = false;
@@ -4924,7 +4977,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             txa = _txaChannelId;
-            keyed = _moxOn;
+            keyed = _moxOn || _psExternalMox;
         }
         if (txa is not int id) return;
 
@@ -4952,7 +5005,7 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                     (double)bufTxQ[i] * bufTxQ[i];
                 if (magnitudeSquared > maxTxSquared) maxTxSquared = magnitudeSquared;
             }
-            _psObservedPeak.Observe(Math.Sqrt(maxTxSquared), keyed, Environment.TickCount64);
+            _psObservedPeak.Observe(Math.Sqrt(maxTxSquared), keyed, PsObservedPeakClockMs());
             long n = Interlocked.Increment(ref _psFeedCount);
             if (n % 100 == 1)
             {
@@ -5021,6 +5074,9 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         bool correcting;
         double maxTx;
         int calibrationAttempts;
+        int calibrationCalcAttempts;
+        int fitB0, fitB1, fitB2, fitB3, fitB6;
+        bool logFit;
         lock (_psLock)
         {
             unsafe
@@ -5034,6 +5090,15 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             correcting = _psInfoBuf[14] != 0;
             calState = (byte)Math.Clamp(_psInfoBuf[15], 0, 255);
             calibrationAttempts = _psInfoBuf[5];
+            // info[7] increments on every calc() entry; info[5] only when the fit completes.
+            calibrationCalcAttempts = _psInfoBuf[7];
+            fitB0 = _psInfoBuf[0];
+            fitB1 = _psInfoBuf[1];
+            fitB2 = _psInfoBuf[2];
+            fitB3 = _psInfoBuf[3];
+            fitB6 = _psInfoBuf[6];
+            logFit = calibrationCalcAttempts != _lastPsFitAttempt;
+            if (logFit) _lastPsFitAttempt = calibrationCalcAttempts;
             // Report the live TX-reference peak captured in FeedPsFeedbackBlock
             // rather than GetPSMaxTX, which stays zero until calc() runs and so
             // is useless while collection is stalled (issue #2385).
@@ -5064,6 +5129,17 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 _lastLoggedPsState, calState,
                 _psInfoBuf[4], _psInfoBuf[6], _psInfoBuf[13], _psInfoBuf[14]);
             _lastLoggedPsState = calState;
+        }
+
+        // One line per calcc calc() attempt, including the ones that fail.
+        // info[7] increments on every attempt. The fields were copied under
+        // _psLock with _lastPsFitAttempt; this log uses only those locals.
+        if (logFit)
+        {
+            _log.LogInformation(
+                "wdsp.psFit attempt={Attempt} ok={Ok} binfo0=0x{B0:X} binfo1=0x{B1:X} binfo2=0x{B2:X} binfo3=0x{B3:X} binfo6=0x{B6:X} fb={Fb} correcting={Correcting} state={State}",
+                calibrationCalcAttempts, calibrationAttempts, fitB0, fitB1, fitB2, fitB3,
+                fitB6, feedbackRaw, correcting ? 1 : 0, calState);
         }
 
         // Bring-up diagnostic — log info[0..7] + correcting/state every Nth
@@ -5102,7 +5178,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             Correcting: correcting,
             CorrectionDb: depthDb,
             MaxTxEnvelope: (float)maxTx,
-            CalibrationAttempts: calibrationAttempts);
+            CalibrationAttempts: calibrationAttempts,
+            CalibrationCalcAttempts: calibrationCalcAttempts);
     }
 
     public void ResetPs()
@@ -5122,6 +5199,21 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             NativeMethods.SetPSControl(id, 1, mancal, automode, 0);
         }
         _log.LogInformation("wdsp.resetPs auto={Auto} single={Single}", _psAuto, _psSingle);
+    }
+
+    public void SetPsHoldCorrection(bool hold)
+    {
+        if (_disposed != 0) return;
+        lock (_psLock)
+        {
+            int? txa;
+            lock (_txaLock) txa = _txaChannelId;
+            // Setting always reaches the channel, which may have been rebuilt.
+            if (txa is not int id || (!hold && !_psHold)) return;
+            NativeMethods.SetPSHoldCorrection(id, hold ? 1 : 0);
+            _psHold = hold;
+        }
+        _log.LogInformation("wdsp.psHoldCorrection hold={Hold}", hold);
     }
 
     public void SavePsCorrection(string path)
@@ -5524,6 +5616,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             ? Volatile.Read(ref _waveformTap) : null;
         // Observe the exact completed digital output; observers cannot interrupt transmission.
         try { waveformTap?.Invoke(_txaOutputRateHz, iqInterleaved[..(2 * outSize)]); } catch { }
+        foreach (var subscriber in Volatile.Read(ref _waveformSubscribers))
+        {
+            try { subscriber(_txaOutputRateHz, iqInterleaved[..(2 * outSize)]); } catch { }
+        }
         return outSize;
     }
 

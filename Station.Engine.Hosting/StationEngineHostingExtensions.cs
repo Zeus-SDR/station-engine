@@ -97,6 +97,9 @@ public static class StationEngineHostingExtensions
         // Receive audio from a product-operated radio while the engine has no
         // radio of its own. Inert whenever RadioService owns a connection.
         services.AddSingleton<ExternalReceiverPort>();
+        // Independent complex feedback for a product-operated transmitter.
+        // This stays dormant until the explicit PureSignal arm transition.
+        services.AddSingleton<ExternalFeedbackPort>();
         services.AddSingleton<ITxAudioPreviewProcessor, NullTxAudioPreviewProcessor>();
         // KiwiSDR is an engine-owned remote receiver. Register the same concrete
         // external-receiver ports used by the monolithic host so attach-mode

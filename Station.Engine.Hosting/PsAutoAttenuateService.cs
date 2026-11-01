@@ -57,9 +57,9 @@ public sealed class PsAutoAttenuateService : BackgroundService
 {
     // Thetis ideal feedback target: 152.293 (PSForm.cs:745). Window 128..181
     // matches mi0bot's lblPSInfoFB green-LED thresholds (PSForm.cs:1123-1138).
-    private const double IdealFeedback = 152.293;
-    private const int FeedbackLowThreshold = 128;
-    private const int FeedbackHighThreshold = 181;
+    internal const double IdealFeedback = 152.293;
+    internal const int FeedbackLowThreshold = 128;
+    internal const int FeedbackHighThreshold = 181;
 
     // 10 Hz tick. Same cadence Thetis runs timer2code at when PS is armed and
     // the form has focus (PSForm.cs:204-209, m_bQuckAttenuate=false default).
@@ -149,6 +149,19 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private int _hl2DeltaDb;
     private bool _hl2SavedAuto;
     private bool _hl2SavedSingle;
+
+    // External-feedback path — the same plain walk; the attenuation is the
+    // feedback port's digital gain on a product-operated radio's sampler.
+    private P2AutoAttState _externalState = P2AutoAttState.Monitor;
+    private int _externalDeltaDb;
+    private bool _externalSavedAuto;
+    private bool _externalSavedSingle;
+    private bool _externalBaselined;
+    // External dance only. info[5] (completed fits) and info[7] (calc entries)
+    // are baselined separately so a hot attempt-gated step and a later
+    // success-gated step never count the same calculation twice.
+    private int _externalSuccessBaseline = -1;
+    private int _externalAttemptBaseline = -1;
 
     // HermesC10 / HermesII single-ADC P1 path — the same plain walk as the P2
     // dance (deliberately NOT the HL2 variant's -28 floor). A short, flow-
@@ -276,7 +289,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 // Snapshot is a struct copy on RadioService's cached state;
                 // ~free.
                 var s = _radio.Snapshot();
-                var wantActive = s.PsEnabled && (_tx.IsMoxOn || _tx.IsTwoToneOn);
+                var wantActive = s.PsEnabled && (_tx.IsMoxOn || _tx.IsTwoToneOn || _pipe.ExternalFeedbackTransmitting);
                 var wantPeriod = wantActive ? Tick : IdleTick;
                 if (wantPeriod != currentPeriod)
                 {
@@ -531,6 +544,10 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _psHeld = false;
             _convergeBaselineCal = -1;
             _convergeHealthyStartMs = 0;
+            _externalState = P2AutoAttState.Monitor;
+            _externalBaselined = false;
+            _externalSuccessBaseline = -1;
+            _externalAttemptBaseline = -1;
             _log.LogInformation("psAutoAttn.armed baseline attn={Db} (synced to radio)", _currentAttnDb);
         }
         _psWasEnabled = s.PsEnabled;
@@ -543,13 +560,16 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _hl2State = Hl2AutoAttState.Monitor;
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
+            _externalState = P2AutoAttState.Monitor;
             ResetC10CollectStall();
             ResetHermesIISingleCalRecovery();
             ClearStallFlag();
             LogGate("skip=PsEnabled-off");
             return;
         }
-        if (!_tx.IsMoxOn && !_tx.IsTwoToneOn)
+        // A product-operated transmitter reports its own keying; Zeus never
+        // keys it, so its TX activity is the radio's, not TxService's.
+        if (!_tx.IsMoxOn && !_tx.IsTwoToneOn && !_pipe.ExternalFeedbackTransmitting)
         {
             // If MOX dropped while the dance was mid-flight (state == SetNewValues
             // or RestoreOperation), Monitor-state has already issued
@@ -582,10 +602,18 @@ public sealed class PsAutoAttenuateService : BackgroundService
                         _c10State, _c10SavedAuto, _c10SavedSingle);
                     eng.SetPsControl(_c10SavedAuto, _c10SavedSingle);
                 }
+                if (_externalState != P2AutoAttState.Monitor)
+                {
+                    _log.LogInformation(
+                        "psAutoAttn.external.recover state={State} restore auto={Auto} single={Single}",
+                        _externalState, _externalSavedAuto, _externalSavedSingle);
+                    eng.SetPsControl(_externalSavedAuto, _externalSavedSingle);
+                }
             }
             _hl2State = Hl2AutoAttState.Monitor;
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
+            _externalState = P2AutoAttState.Monitor;
             ResetC10CollectStall();
             ResetHermesIISingleCalRecovery();
             ClearStallFlag();
@@ -599,6 +627,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _hl2State = Hl2AutoAttState.Monitor;
             _p2State = P2AutoAttState.Monitor;
             _c10State = P2AutoAttState.Monitor;
+            _externalState = P2AutoAttState.Monitor;
             ResetC10CollectStall();
             ClearStallFlag();
             LogGate("skip=engine-null");
@@ -680,6 +709,14 @@ public sealed class PsAutoAttenuateService : BackgroundService
         // and runs every keyed tick — same gates as the rest of the loop
         // (PsEnabled + TX active + engine present, all checked above).
         TickAutoCalHwPeak(s, engine);
+
+        // External feedback branch: a product-operated radio with no HPSDR
+        // client. Its attenuation is the feedback port's digital gain.
+        if (_pipe.ExternalFeedbackActive)
+        {
+            Tick1External(s, engine);
+            return;
+        }
 
         // HL2 P1 branch — mi0bot timer2code 3-state dance (PSForm.cs:728-815).
         // Run before the P2 path because HL2 has its own client + wire
@@ -1141,6 +1178,108 @@ public sealed class PsAutoAttenuateService : BackgroundService
                     "psAutoAttn.p2.restoreOperation auto={Auto} single={Single}",
                     _p2SavedAuto, _p2SavedSingle);
                 _p2State = P2AutoAttState.Monitor;
+                return;
+            }
+        }
+    }
+
+    // External-feedback dance: the plain Tick1P2 walk (Thetis PSForm.cs:728-815)
+    // with the write going to the feedback port's digital attenuation, 0..60 dB,
+    // through DspPipelineService so live state follows the manual control.
+    // No radio command is sent and no HPSDR client or saved board value is touched.
+    private void Tick1External(StateDto s, IDspEngine engine)
+    {
+        if (!_externalBaselined)
+        {
+            _externalBaselined = true;
+            _externalSuccessBaseline = -1;
+            _externalAttemptBaseline = -1;
+        }
+        // The port's attenuation is the truth: it also moves before the first
+        // fit (band memory, level preset), and a walk from a stale copy slams
+        // the wrong value (the G2 AutoAttenuate desync, 2026-05-27). Read it
+        // between walks; a walk in flight keeps the value it started from.
+        if (_externalState == P2AutoAttState.Monitor)
+            _currentAttnDb = Math.Clamp(_pipe.ExternalFeedbackAttenuationDb, TxAttnMinDb, ExternalFeedbackPort.MaximumAttenuationDb);
+        switch (_externalState)
+        {
+            case P2AutoAttState.Monitor:
+            {
+                if (!s.PsAutoAttenuate)
+                {
+                    LogGate("external.skip=AutoAttenuate-off");
+                    return;
+                }
+                var psm = engine.GetPsStageMeters();
+                int feedback = (int)Math.Round(psm.FeedbackLevel);
+                // An unkeyed first look must not consume the -1 baselines, or a
+                // later hot over whose fits all fail (info[5] stuck) never steps.
+                if (feedback <= 0 && (_externalSuccessBaseline < 0 || _externalAttemptBaseline < 0))
+                {
+                    LogGate($"external.skip=fb-zero-initial psm.fb={psm.FeedbackLevel:F2}");
+                    return;
+                }
+                bool tooHot = feedback > FeedbackHighThreshold;
+                bool attemptAdvanced = _externalAttemptBaseline < 0
+                    || psm.CalibrationCalcAttempts != _externalAttemptBaseline;
+                bool successAdvanced = _externalSuccessBaseline < 0
+                    || psm.CalibrationAttempts != _externalSuccessBaseline;
+                bool gateAdvanced = tooHot ? attemptAdvanced : successAdvanced;
+                if (feedback > 0 && !gateAdvanced)
+                {
+                    LogGate($"external.skip=no-new-calc info5={psm.CalibrationAttempts} info7={psm.CalibrationCalcAttempts} fb={feedback}");
+                    return;
+                }
+                // Seen together, so leaving the hot branch cannot step again on the same calc.
+                if (feedback > 0 || _externalSuccessBaseline >= 0)
+                {
+                    _externalSuccessBaseline = psm.CalibrationAttempts;
+                    _externalAttemptBaseline = psm.CalibrationCalcAttempts;
+                }
+                if (feedback <= 0)
+                {
+                    LogGate($"external.skip=fb-zero psm.fb={psm.FeedbackLevel:F2}");
+                    return;
+                }
+                bool tooQuiet = feedback < FeedbackLowThreshold && _currentAttnDb > TxAttnMinDb;
+                if (!tooHot && !tooQuiet)
+                {
+                    LogGate($"external.skip=in-window fb={feedback} attn={_currentAttnDb}");
+                    return;
+                }
+                _externalDeltaDb = ComputeAttnStepDb(feedback);
+                _externalSavedAuto = s.PsAuto;
+                _externalSavedSingle = s.PsSingle;
+                engine.SetPsControl(autoCal: false, singleCal: false);
+                _log.LogInformation(
+                    "psAutoAttn.external.monitor fb={Fb} info5={Cal} info7={Attempt} delta={Delta} attn={Db}",
+                    feedback, psm.CalibrationAttempts, psm.CalibrationCalcAttempts, _externalDeltaDb, _currentAttnDb);
+                _externalState = P2AutoAttState.SetNewValues;
+                return;
+            }
+
+            case P2AutoAttState.SetNewValues:
+            {
+                _externalState = P2AutoAttState.RestoreOperation;
+                int newAttn = Math.Clamp(_currentAttnDb + _externalDeltaDb, TxAttnMinDb, ExternalFeedbackPort.MaximumAttenuationDb);
+                if (newAttn != _currentAttnDb)
+                {
+                    _log.LogInformation(
+                        "psAutoAttn.external.setNewValues attn {Old}->{New} dB",
+                        _currentAttnDb, newAttn);
+                    _currentAttnDb = newAttn;
+                    _pipe.SetExternalFeedbackAttenuationFromServo(newAttn);
+                }
+                return;
+            }
+
+            case P2AutoAttState.RestoreOperation:
+            {
+                engine.SetPsControl(autoCal: _externalSavedAuto, singleCal: _externalSavedSingle);
+                _log.LogInformation(
+                    "psAutoAttn.external.restoreOperation auto={Auto} single={Single}",
+                    _externalSavedAuto, _externalSavedSingle);
+                _externalState = P2AutoAttState.Monitor;
                 return;
             }
         }

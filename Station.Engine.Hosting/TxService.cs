@@ -48,7 +48,7 @@ using Zeus.Server.Diagnostics;
 
 namespace Zeus.Server;
 
-public sealed class TxService
+public sealed class TxService : IDisposable
 {
     private readonly RadioService _radio;
     private readonly DspPipelineService _pipeline;
@@ -66,6 +66,33 @@ public sealed class TxService
     private long _transitionRevision;
     private bool _moxOn;
     private bool _tunOn;
+    // The Agent owns this wire key. Keep the fact independently of receiver
+    // context so rollback can still issue the exact release if preview detaches.
+    private bool _externalTwoToneKeyed;
+    // The external arm that key was requested on; its end proves the Agent
+    // dropped the key. Guarded by _transitionSync.
+    private long _externalTwoToneArmId;
+    // The external arm whose confirmed two-tone key the active TwoTone intent
+    // is (0 when it is not an external key). Every convergence clears it.
+    // Guarded by _transitionSync.
+    private long _externalTwoToneIntentArmId;
+    // An external two-tone key request awaiting the Agent's answer, which is
+    // never awaited under _transitionSync. Guarded by _transitionSync. While it
+    // exists no other key-on is admitted, release ownership treats it as
+    // TwoTone, and every convergence supersedes it before queuing the release.
+    private sealed class ExternalTwoToneKey(long revision, long preKeyDelayTicks,
+        Task<ExternalTwoToneOutcome> enable, string? remoteLeaseId)
+    {
+        internal long Revision { get; } = revision;
+        internal long PreKeyDelayTicks { get; } = preKeyDelayTicks;
+        internal Task<ExternalTwoToneOutcome> Enable { get; } = enable;
+        internal string? RemoteLeaseId { get; } = remoteLeaseId;
+    }
+    private ExternalTwoToneKey? _externalTwoTone;
+    // Mirrors _externalTwoTone for readers that only take _sync. Guarded by _sync.
+    private bool _externalTwoTonePending;
+    // The queued explicit release still awaiting its answer. Guarded by _transitionSync.
+    private Task<ExternalTwoToneOutcome>? _externalTwoToneRelease;
     // Session-only operator intent for Thetis-style MON during ordinary MOX.
     // TUN and two-tone clear it alongside Preview so their generators never
     // become audible through a stale voice-TX monitor choice.
@@ -227,7 +254,10 @@ public sealed class TxService
         _radio.SetTxSafetyAuthority(false);
         _radio.ApplyTxSafetyInhibit();
         _bandPlan.PlanChanged += OnBandPlanChanged;
+        _pipeline.ExternalFeedbackArmEnded += OnExternalFeedbackArmEnded;
     }
+
+    public void Dispose() => _pipeline.ExternalFeedbackArmEnded -= OnExternalFeedbackArmEnded;
 
     public bool IsMoxOn { get { lock (_sync) return _moxOn; } }
     public bool IsTunOn { get { lock (_sync) return _tunOn; } }
@@ -331,7 +361,7 @@ public sealed class TxService
                 activeIntent = _activeIntent;
                 moxOn = _moxOn;
                 tunOn = _tunOn;
-                twoToneOn = IsTwoToneOn;
+                twoToneOn = IsTwoToneOn || _externalTwoTonePending;
             }
 
             if (activeIntent is not null || moxOn || tunOn || twoToneOn || _radio.IsMox)
@@ -370,9 +400,9 @@ public sealed class TxService
                     error = "PA calibration is already running.";
                     return false;
                 }
-                if (_activeIntent is not null)
+                if (ActiveOrPendingIntentLocked() is { } held)
                 {
-                    error = $"TX held by {_activeIntent}; unkey before PA calibration.";
+                    error = $"TX held by {held}; unkey before PA calibration.";
                     return false;
                 }
                 _paCalibrationLeaseActive = true;
@@ -389,6 +419,11 @@ public sealed class TxService
             lock (_sync) _paCalibrationLeaseActive = false;
         }
     }
+    // Caller holds _sync. A two-tone key the Agent has not yet confirmed owns
+    // the transmitter for admission and release ownership exactly as TwoTone.
+    private TransmitIntent? ActiveOrPendingIntentLocked() =>
+        _activeIntent ?? (_externalTwoTonePending ? TransmitIntent.TwoTone : null);
+
     internal EngineTransmitSafetyModule Safety => _safety;
     internal long TransitionRevision { get { lock (_sync) return _transitionRevision; } }
     internal bool IsMicIqProducerAllowed
@@ -564,8 +599,21 @@ public sealed class TxService
     private TransmitSafetySnapshot CaptureSafetySnapshot(
         StateDto state,
         TransmitIntent? activeIntent,
-        MoxSource? source = null)
+        MoxSource? source = null,
+        ExternalReceiverContext? externalContext = null)
     {
+        if (externalContext is { } external)
+            state = state with
+            {
+                Status = ConnectionStatus.Connected,
+                VfoHz = external.VfoHz,
+                Mode = external.Mode,
+                TxReceiverIndex = 0,
+                SplitEnabled = false,
+                SplitTxHz = 0,
+                XitEnabled = false,
+                XitHz = 0,
+            };
         long txHz = RadioFrequencyResolver.TxFrequencyHz(state);
         TransverterBandDto? profile = _radio.TryResolveTransverterBand(txHz, out var resolved)
             ? resolved
@@ -574,7 +622,7 @@ public sealed class TxService
             || txHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz;
         return new TransmitSafetySnapshot(
             state,
-            _radio.IsConnected,
+            externalContext is not null || _radio.IsConnected,
             _radio.ConnectedBoardKind,
             _radio.EffectiveOrionMkIIVariant,
             _bandPlan.CurrentRegion,
@@ -583,7 +631,8 @@ public sealed class TxService
             activeIntent,
             source,
             profileRequired,
-            profile);
+            profile,
+            ExternalRadio: externalContext is not null);
     }
 
     private bool EvaluateAdmission(
@@ -606,8 +655,16 @@ public sealed class TxService
                 error = "PA calibration owns the transmitter.";
                 return false;
             }
+            // Exclusive ownership holds while the Agent answers an external key.
+            if (_externalTwoTonePending)
+            {
+                error = "A two-tone key is waiting for the external radio to confirm it.";
+                return false;
+            }
         }
         var state = _radio.Snapshot();
+        ExternalReceiverContext? external = intent == TransmitIntent.TwoTone &&
+            _pipeline.TryGetExternalTransmitContext(out var context) ? context : null;
         var channel = Volatile.Read(ref _productPluginTxChannelConstraint);
         if (source == MoxSource.ProductPlugin
             && channel is not null
@@ -618,7 +675,7 @@ public sealed class TxService
         }
         var decision = _safety.EvaluateKeyOn(
             intent,
-            CaptureSafetySnapshot(state, active, source));
+            CaptureSafetySnapshot(state, active, source, external));
         if (decision.Allowed)
         {
             error = null;
@@ -1128,8 +1185,23 @@ public sealed class TxService
         Safe("hardwareCw.disarm", () => _radio.SetHardwareCwSafetyBlocked(true));
         Safe("wire.mox.off", () =>
         {
+            string? externalReleaseError = null;
+            // A key request still awaiting the Agent is superseded: its answer can
+            // no longer commit, and the explicit release below is queued behind it
+            // (the Agent answers in order). Nothing in this step waits for the radio.
+            // Any convergence ends a committed external two-tone intent.
+            _externalTwoToneIntentArmId = 0;
+            if (_externalTwoTone is not null)
+            {
+                _externalTwoTone = null;
+                lock (_sync) _externalTwoTonePending = false;
+            }
+            if (_externalTwoToneKeyed)
+                externalReleaseError = RequestExternalTwoToneReleaseLocked();
             _radio.SetMox(false);
             wireDropped = true;
+            if (externalReleaseError is not null)
+                throw new InvalidOperationException(externalReleaseError);
         });
         var wireDroppedTs = _stopwatchTicks();
         Safe("authority.revoke", () => _radio.SetTxSafetyAuthority(false));
@@ -1272,7 +1344,7 @@ public sealed class TxService
             if (remoteLeaseId is not null && !ValidateRemoteLease(remoteLeaseId, out error)) return false;
             lock (_sync)
             {
-                if (_activeIntent is not null)
+                if (ActiveOrPendingIntentLocked() is not null)
                 {
                     error = "Stop the current transmission before sending an instant CW ID.";
                     return false;
@@ -1473,7 +1545,7 @@ public sealed class TxService
     {
         TransmitIntent? active;
         MoxSource? owner;
-        lock (_sync) { active = _activeIntent; owner = _moxOwner; }
+        lock (_sync) { active = ActiveOrPendingIntentLocked(); owner = _moxOwner; }
         if (active == TransmitIntent.Mox
             && source != MoxSource.UI
             && owner is not null
@@ -1524,7 +1596,7 @@ public sealed class TxService
             ClearReleaseTailAbort();
             TransmitIntent? active;
             MoxSource? owner;
-            lock (_sync) { active = _activeIntent; owner = _moxOwner; }
+            lock (_sync) { active = ActiveOrPendingIntentLocked(); owner = _moxOwner; }
             if (active is null)
             {
                 error = null;
@@ -1578,7 +1650,7 @@ public sealed class TxService
             {
                 if (!string.Equals(_remoteTxLeaseId, leaseId, StringComparison.Ordinal))
                     return false;
-                wasActive = _activeIntent is not null || _moxOn || _tunOn || IsTwoToneOn;
+                wasActive = _activeIntent is not null || _moxOn || _tunOn || IsTwoToneOn || _externalTwoTonePending;
             }
 
             PrepareTxMonitorForTransmitStart(clearTransmitIntent: true);
@@ -1671,18 +1743,11 @@ public sealed class TxService
         }
     }
 
+    // Not wrapped in the transition lock here: an external two-tone key releases
+    // it while the external radio answers. The lease is validated under the same
+    // lock as the mutation, and again before an external key commits.
     internal bool TrySetRemoteTwoTone(TwoToneSetRequest request, string leaseId, out string? error)
-    {
-        lock (_transitionSync)
-        {
-            if (!ValidateRemoteLease(leaseId, out error)) return false;
-            if (!CanRemoteLeaseMutateCurrentIntent(leaseId, request.Enabled, out error)) return false;
-            var success = TrySetTwoTone(request, out error);
-            if (success && request.Enabled)
-                lock (_sync) _remoteTxLeaseId = leaseId;
-            return success;
-        }
-    }
+        => TrySetTwoToneCore(request, leaseId, out error);
 
     internal bool IsRemoteLeaseOwner(string leaseId, MoxSource? source = null)
     {
@@ -1698,7 +1763,7 @@ public sealed class TxService
     {
         lock (_sync)
         {
-            if (_activeIntent is null)
+            if (ActiveOrPendingIntentLocked() is null)
             {
                 error = null;
                 return true;
@@ -1746,13 +1811,33 @@ public sealed class TxService
     /// before the engine drops the generator run flag.
     /// </summary>
     public bool TrySetTwoTone(TwoToneSetRequest req, out string? error)
+        => TrySetTwoToneCore(req, remoteLeaseId: null, out error);
+
+    /// <summary>
+    /// The two-tone transaction. On a product-operated radio the far side
+    /// owns the wire key, and its answer is a radio round trip: the request is
+    /// queued under the transition lock after admission and the pre-key steps,
+    /// the answer is awaited with the lock released (no other key-on is admitted
+    /// meanwhile), and the key commits under the lock only on a confirmed accept
+    /// that is still current and admissible. Anything else rolls back, and every
+    /// rollback, unkey, trip or disconnect queues the explicit release.
+    /// </summary>
+    private bool TrySetTwoToneCore(TwoToneSetRequest req, string? remoteLeaseId, out string? error)
     {
         ArgumentNullException.ThrowIfNull(req);
+        // A caller already inside a transition would keep the lock held across
+        // the radio round trip; such a caller is refused an external key below.
+        bool callerHoldsTransition = Monitor.IsEntered(_transitionSync);
         if (req.Enabled) TransmitRequested?.Invoke(MoxSource.UI);
+        ExternalTwoToneKey? pending = null;
         lock (_transitionSync)
         {
+            if (remoteLeaseId is not null &&
+                (!ValidateRemoteLease(remoteLeaseId, out error) ||
+                    !CanRemoteLeaseMutateCurrentIntent(remoteLeaseId, req.Enabled, out error)))
+                return false;
             TransmitIntent? active;
-            lock (_sync) active = _activeIntent;
+            lock (_sync) active = ActiveOrPendingIntentLocked();
             if (!req.Enabled)
             {
                 if (active is not null && active != TransmitIntent.TwoTone)
@@ -1777,6 +1862,7 @@ public sealed class TxService
                 try
                 {
                     _radio.SetTwoTone(req);
+                    if (remoteLeaseId is not null) lock (_sync) _remoteTxLeaseId = remoteLeaseId;
                     error = null;
                     return true;
                 }
@@ -1785,6 +1871,20 @@ public sealed class TxService
                     error = ex.Message;
                     return false;
                 }
+            }
+
+            bool external = _pipeline.TryGetExternalTransmitContext(out _);
+            if (external && callerHoldsTransition)
+            {
+                error = "An external two-tone key cannot start inside another transmit transition.";
+                return false;
+            }
+            // An earlier release the Agent has not confirmed may still hold its key.
+            if (_externalTwoToneKeyed)
+            {
+                if (_externalTwoToneRelease is null) _ = RequestExternalTwoToneReleaseLocked();
+                error = "The previous external two-tone release has not been confirmed yet.";
+                return false;
             }
 
             int preKeyMs = _radio.EffectiveTxMoxPreKeyDelayMs;
@@ -1807,17 +1907,25 @@ public sealed class TxService
                     throw new InvalidOperationException("Protocol 2 pre-key TX-IQ sanitization failed");
                 if (!EvaluateAdmission(TransmitIntent.TwoTone, MoxSource.UI, out error))
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
-                _radio.SetMox(true);
-                _pipeline.CommitTxEgress(revision);
-                _pipeline.SetPsMox(true);
-                CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, revision, preKeyDelayTicks > 0);
-                RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
-                _log.LogInformation(
-                    "tx.twoTone on=true f1={F1} f2={F2} mag={Mag} revision={Revision}",
-                    req.Freq1, req.Freq2, req.Mag, revision);
-                BroadcastMoxState(moxOn: true, tunOn: false);
-                error = null;
-                return true;
+                if (external)
+                {
+                    pending = BeginExternalTwoToneKeyLocked(revision, preKeyDelayTicks, remoteLeaseId);
+                }
+                else
+                {
+                    _radio.SetMox(true);
+                    _pipeline.CommitTxEgress(revision);
+                    _pipeline.SetPsMox(true);
+                    CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, revision, preKeyDelayTicks > 0);
+                    RebasePreKeyDeadlineIfStillActive(tune: false, preKeyDelayTicks);
+                    if (remoteLeaseId is not null) lock (_sync) _remoteTxLeaseId = remoteLeaseId;
+                    _log.LogInformation(
+                        "tx.twoTone on=true f1={F1} f2={F2} mag={Mag} revision={Revision}",
+                        req.Freq1, req.Freq2, req.Mag, revision);
+                    BroadcastMoxState(moxOn: true, tunOn: false);
+                    error = null;
+                    return true;
+                }
             }
             catch (Exception ex)
             {
@@ -1827,6 +1935,181 @@ public sealed class TxService
                 error = ex.Message;
                 return false;
             }
+        }
+
+        if (pending is null)
+        {
+            error = "The two-tone key request was not started.";
+            return false;
+        }
+        // The Agent's answer is awaited with the transition lock released, so an
+        // unkey, trip or disconnect is never held behind a radio round trip.
+        var outcome = AwaitExternalTwoToneAnswer(pending.Enable);
+        return CompleteExternalTwoToneKey(pending, outcome, out error);
+    }
+
+    // Caller holds _transitionSync, after admission, the generator, DSP MOX,
+    // sanitization and the second admission. Ownership is marked before the
+    // request: a lost or late answer may mean the Agent keyed, so every later
+    // rollback, unkey, trip or disconnect queues the explicit release.
+    private ExternalTwoToneKey BeginExternalTwoToneKeyLocked(long revision, long preKeyDelayTicks,
+        string? remoteLeaseId)
+    {
+        _externalTwoToneKeyed = true;
+        var enable = _pipeline.BeginExternalFeedbackTwoTone(true, out var externalError, out long armId);
+        _externalTwoToneArmId = armId;
+        if (enable is null)
+            throw new InvalidOperationException(externalError ?? "The external radio could not be asked to key two-tone.");
+        var pending = new ExternalTwoToneKey(revision, preKeyDelayTicks, enable, remoteLeaseId);
+        _externalTwoTone = pending;
+        lock (_sync)
+        {
+            _externalTwoTonePending = true;
+            // Lets the session's own disconnect converge this pending key.
+            if (remoteLeaseId is not null) _remoteTxLeaseId = remoteLeaseId;
+        }
+        _log.LogInformation("tx.twoTone.external.requested revision={Revision}", revision);
+        return pending;
+    }
+
+    private ExternalTwoToneOutcome AwaitExternalTwoToneAnswer(Task<ExternalTwoToneOutcome> answer)
+    {
+        try { return answer.GetAwaiter().GetResult(); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "tx.twoTone.external.answer.failed");
+            return ExternalTwoToneOutcome.TimedOut;
+        }
+    }
+
+    // Commits only a confirmed accept that is still the current request and
+    // still admissible; never on a timeout or an unknown answer.
+    private bool CompleteExternalTwoToneKey(ExternalTwoToneKey pending, ExternalTwoToneOutcome outcome,
+        out string? error)
+    {
+        lock (_transitionSync)
+        {
+            if (!ReferenceEquals(_externalTwoTone, pending))
+            {
+                // An unkey, trip or disconnect converged while the Agent answered;
+                // it already queued the explicit release behind this request.
+                _log.LogInformation("tx.twoTone.external.superseded revision={Revision} outcome={Outcome}",
+                    pending.Revision, outcome);
+                error = "Two-tone was released before the external radio confirmed the key.";
+                return false;
+            }
+            _externalTwoTone = null;
+            lock (_sync) _externalTwoTonePending = false;
+            error = outcome switch
+            {
+                ExternalTwoToneOutcome.Accepted => null,
+                ExternalTwoToneOutcome.Refused => "The external radio refused two-tone transmit.",
+                ExternalTwoToneOutcome.Ended => "External PureSignal ended before two-tone was confirmed.",
+                _ => "The external radio did not confirm two-tone transmit in time.",
+            };
+            if (error is null && pending.RemoteLeaseId is { } lease)
+                ValidateRemoteLease(lease, out error);
+            if (error is null && !EvaluateAdmission(TransmitIntent.TwoTone, MoxSource.UI, out error))
+                error ??= "TX safety revalidation failed";
+            if (error is not null)
+            {
+                // A refusal is rolled back the same way: a lost answer is
+                // indistinguishable from one that keyed, so the release is queued.
+                _log.LogWarning("tx.twoTone.keyOn.rollback revision={Revision} outcome={Outcome}",
+                    pending.Revision, outcome);
+                _safety.RecordTrip();
+                ConvergeToSafeIdle(faultLatched: true);
+                return false;
+            }
+            _pipeline.CommitTxEgress(pending.Revision);
+            _externalTwoToneIntentArmId = _externalTwoToneArmId;
+            _pipeline.SetPsMox(true);
+            CommitActiveIntent(TransmitIntent.TwoTone, MoxSource.UI, pending.Revision, pending.PreKeyDelayTicks > 0);
+            RebasePreKeyDeadlineIfStillActive(tune: false, pending.PreKeyDelayTicks);
+            _log.LogInformation("tx.twoTone on=true external=true revision={Revision}", pending.Revision);
+            BroadcastMoxState(moxOn: true, tunOn: false);
+            return true;
+        }
+    }
+
+    // Caller holds _transitionSync. Queues the explicit release behind any key
+    // request already sent and confirms it when the Agent answers; it never
+    // waits for the radio. Returns an error only when it could not be queued:
+    // the port then ended the arm instead, so the Agent drops its guarded key
+    // and that arm's end clears the ownership. Unconfirmed delivery is a trip.
+    private string? RequestExternalTwoToneReleaseLocked()
+    {
+        var release = _pipeline.BeginExternalFeedbackTwoTone(false, out var error, out _);
+        if (release is null)
+        {
+            _safety.RecordTrip();
+            _log.LogError("tx.twoTone.external.release.undeliverable arm={Arm} error={Error}",
+                _externalTwoToneArmId, error);
+            return error ?? "The external two-tone release could not be sent.";
+        }
+        _externalTwoToneRelease = release;
+        _ = release.ContinueWith(OnExternalTwoToneReleaseAnswered, CancellationToken.None,
+            TaskContinuationOptions.None, TaskScheduler.Default);
+        return null;
+    }
+
+    private void OnExternalTwoToneReleaseAnswered(Task<ExternalTwoToneOutcome> release)
+    {
+        var outcome = release.IsCompletedSuccessfully ? release.Result : ExternalTwoToneOutcome.TimedOut;
+        lock (_transitionSync)
+        {
+            if (!ReferenceEquals(_externalTwoToneRelease, release)) return;
+            _externalTwoToneRelease = null;
+            // Confirmed off, or the arm ended and the Agent dropped its own key.
+            if (outcome is ExternalTwoToneOutcome.Accepted or ExternalTwoToneOutcome.Ended)
+            {
+                _externalTwoToneKeyed = false;
+                return;
+            }
+            // Unconfirmed: the Agent may still hold the key. It stays owned until
+            // the next two-tone press retries the release or the arm ends, and
+            // the trip is recorded.
+            _safety.RecordTrip();
+        }
+        _log.LogError("tx.twoTone.external.release.unconfirmed outcome={Outcome}", outcome);
+    }
+
+    // The external arm a two-tone key was requested on has ended, for any
+    // reason (operator disarm, fail-close, engine replacement, a lost or
+    // undeliverable control channel). The Agent drops its guarded key with the
+    // feedback source, so the key is no longer owned, and a two-tone intent
+    // still held for that arm (keyed or awaiting its answer) converges to safe
+    // idle. That holds even when a release answered Ended has already cleared
+    // the key flag first: the arm ID, not the flag, decides ownership. Another
+    // arm's end, MOX, TUNE and a non-external two-tone are never touched, and a
+    // second notification for the same arm does nothing. The operator's own
+    // disarm is not a protection trip; any other end of the arm is. Raised on a
+    // pool thread outside the port's locks; nothing here waits for the radio,
+    // and it never keys anything.
+    internal void OnExternalFeedbackArmEnded(long armId, string reason)
+    {
+        lock (_transitionSync)
+        {
+            if (_externalTwoToneArmId != armId) return;
+            bool owned = _externalTwoToneKeyed || _externalTwoTone is not null ||
+                _externalTwoToneIntentArmId == armId;
+            if (!owned) return;
+            _externalTwoToneKeyed = false;
+            _externalTwoToneRelease = null;
+            TransmitIntent? active;
+            lock (_sync) active = ActiveOrPendingIntentLocked();
+            bool intentional = reason == ExternalFeedbackPort.OperatorDisarmReason;
+            _log.LogWarning("tx.twoTone.external.armEnded arm={Arm} reason={Reason} active={Active}",
+                armId, reason, active);
+            if (active != TransmitIntent.TwoTone)
+            {
+                _externalTwoToneIntentArmId = 0;
+                return;
+            }
+            if (!intentional) _safety.RecordTrip();
+            ConvergeToSafeIdle(faultLatched: !intentional,
+                reason: intentional ? "external-operator-disarm" : "external-arm-ended");
+            BroadcastMoxState(moxOn: false, tunOn: false);
         }
     }
 
@@ -1850,7 +2133,7 @@ public sealed class TxService
         {
             TransmitIntent? active;
             MoxSource? owner;
-            lock (_sync) { active = _activeIntent; owner = _tunOwner; }
+            lock (_sync) { active = ActiveOrPendingIntentLocked(); owner = _tunOwner; }
             if (!on)
             {
                 if (active is not null && active != TransmitIntent.Tun)

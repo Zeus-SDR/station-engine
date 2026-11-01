@@ -121,6 +121,25 @@ public static class StationProtocolEndpoints
             await port.RunAsync(context, dsp).ConfigureAwait(false);
         });
 
+        // Complex TX-reference / receive-feedback bridge for a product-owned
+        // radio. Originless loopback only; the port itself remains inert until
+        // an explicit operator PureSignal arm reaches the DSP pipeline.
+        endpoints.MapGet("/api/station/external-feedback", async (HttpContext context) =>
+        {
+            if (!IsLoopback(context) || context.Request.Headers.Origin.Count != 0)
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            var port = context.RequestServices.GetService<ExternalFeedbackPort>();
+            if (port is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+            await port.RunAsync(context).ConfigureAwait(false);
+        });
+
         endpoints.MapPost("/api/station/rx-audio/attach", async (HttpContext context) =>
         {
             if (!IsLoopback(context))

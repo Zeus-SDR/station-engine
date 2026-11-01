@@ -146,6 +146,8 @@ typedef struct _calcc
 		int automode;
 		int mancal;
 		int turnon;
+		// Zeus: keep the running correction through LRESET (SetPSHoldCorrection).
+		int hold;
 		int moxsamps;
 		int moxcount;
 		int count;
@@ -1815,6 +1817,13 @@ void __cdecl doPSCorrChange(void* arg)
 					a->util.m_spline_restore = NULL;
 					a->util.c_spline_restore = NULL;
 					a->util.s_spline_restore = NULL;
+					// Zeus: with hold no LTURNON follows to report it; the restored correction is running.
+					if (a->ctrl.hold)
+					{
+						EnterCriticalSection(&txa[a->channel].calcc.cs_update);
+						a->info[14] = 1;
+						LeaveCriticalSection(&txa[a->channel].calcc.cs_update);
+					}
 				}
 				else
 				{
@@ -1920,10 +1929,11 @@ void pscc (int channel, int size, double* tx, double* rx)
 				a->s_y_pin_valid = 0; a->s_y_pin_ema = 0.0; a->s_pin_cycle = 0;
 				a->scheck_valid = 0;
 				a->ctrl.reset = 0;
-				if (!a->ctrl.turnon)
+				if (!a->ctrl.turnon && !a->ctrl.hold)
 					if (InterlockedBitTestAndReset(&a->ctrl.running, 0))
 						ReleaseSemaphore(a->SemsPSCorr[0], 1, 0);
-				a->info[14] = 0;
+				// Zeus: info[14] mirrors running (as after a fit); a held correction is still running.
+				a->info[14] = a->ctrl.hold ? (int)(a->ctrl.running & 1) : 0;
 				a->ctrl.env_maxtx = 0.0;
 				a->ctrl.bs_count = 0;
 				if (a->ctrl.turnon)
@@ -2136,7 +2146,9 @@ void PSRestoreCorr (int channel, char* filename)
 	EnterCriticalSection (&txa[channel].calcc.cs_update);
 	a = txa[channel].calcc.p;
 	memcpy(a->util.restore_file, filename, i + 1);
-	a->ctrl.turnon = 1;
+	// Zeus: with hold the restored correction runs while calibration continues;
+	// turnon would park calcc in LSTAYON with automode cleared.
+	if (!a->ctrl.hold) a->ctrl.turnon = 1;
 	ReleaseSemaphore(a->SemsPSCorr[2], 1, 0);
 	LeaveCriticalSection (&txa[channel].calcc.cs_update);
 }
@@ -2194,6 +2206,18 @@ void SetPSAutomode (int channel, int automode)
 {
 	EnterCriticalSection (&txa[channel].calcc.cs_update);
 	txa[channel].calcc.p->ctrl.automode = automode;
+	LeaveCriticalSection (&txa[channel].calcc.cs_update);
+}
+
+PORT
+void SetPSHoldCorrection (int channel, int hold)
+{
+	// Zeus: off by default. With hold set, a reset (re-arm, attenuation step)
+	// restarts the fit but leaves the last correction running until the next
+	// fit replaces it, and PSRestoreCorr applies a saved correction without
+	// stopping calibration.
+	EnterCriticalSection (&txa[channel].calcc.cs_update);
+	txa[channel].calcc.p->ctrl.hold = hold;
 	LeaveCriticalSection (&txa[channel].calcc.cs_update);
 }
 

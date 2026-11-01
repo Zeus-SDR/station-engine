@@ -9,10 +9,14 @@ namespace Zeus.Dsp.Wdsp;
 /// Disconnected-mode DSP engine: no radio RX/audio is published, but the TXA
 /// chain is a real WDSP path so Audio Suite Preview can run while off-air.
 /// </summary>
-public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, ITxWaveformSource
+public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, ITxWaveformSource,
+    IExternalPureSignalMox, ITwoToneFrequencies, IPsCorrectionHold
 {
     public void SetTxWaveformTap(TxWaveformHandler? handler, long demandUntilTickMs) =>
         _tx.SetTxWaveformTap(handler, demandUntilTickMs);
+    public IDisposable SubscribeTxWaveform(TxWaveformHandler handler) =>
+        _tx.SubscribeTxWaveform(handler);
+    public void SetPsFeedbackRateHz(int rateHz) => _tx.SetPsFeedbackRateHz(rateHz);
     private readonly SyntheticDspEngine _control = new();
     private readonly WdspDspEngine _tx;
     private readonly object _channelLock = new();
@@ -285,9 +289,18 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, IT
     public void SetTwoTone(bool on, double freq1, double freq2, double mag) =>
         _tx.SetTwoTone(on, freq1, freq2, mag);
 
+    public bool TryGetTwoTone(out double freq1Hz, out double freq2Hz) =>
+        _tx.TryGetTwoTone(out freq1Hz, out freq2Hz);
+
+    public long TwoToneRevision => _tx.TwoToneRevision;
+
     public void SetPsEnabled(bool enabled) => _tx.SetPsEnabled(enabled);
 
     public void SetPsMox(bool moxOn) => _tx.SetPsMox(moxOn);
+
+    public void SetExternalPsMox(bool moxOn) => _tx.SetExternalPsMox(moxOn);
+
+    public void SetPsHoldCorrection(bool hold) => _tx.SetPsHoldCorrection(hold);
 
     public void SetPsControl(bool autoCal, bool singleCal) => _tx.SetPsControl(autoCal, singleCal);
 
@@ -309,7 +322,7 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, IT
         ReadOnlySpan<float> rxQ) =>
         _tx.FeedPsFeedbackBlock(txI, txQ, rxI, rxQ);
 
-    public PsStageMeters GetPsStageMeters() => PsStageMeters.Silent;
+    public PsStageMeters GetPsStageMeters() => _tx.GetPsStageMeters();
 
     public void ResetPs() => _tx.ResetPs();
 

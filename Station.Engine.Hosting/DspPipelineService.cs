@@ -2144,10 +2144,12 @@ public partial class DspPipelineService : BackgroundService,
         ProductPluginAudioPort? productPluginAudio = null,
         SMeterCalibrationStore? sMeterCalibrationStore = null,
         TxMonitorSettingsStore? txMonitorSettingsStore = null,
-        ExternalReceiverPort? externalReceiverPort = null)
+        ExternalReceiverPort? externalReceiverPort = null,
+        ExternalFeedbackPort? externalFeedbackPort = null)
     {
         _radio = radio;
         _externalReceiverPort = externalReceiverPort;
+        _externalFeedbackPort = externalFeedbackPort;
         _vrxPool = new(maximumFrequencyHz: radio.ReceiveOnly
             ? StationReceiveOnlyPolicy.MaximumFrequencyHz
             : Zeus.Server.PublicListen.GuestReceiverSettings.MaxHz);
@@ -6177,6 +6179,9 @@ public partial class DspPipelineService : BackgroundService,
     /// </summary>
     public void SetPsFeedbackAttenuationDb(int db)
     {
+        // A product-operated radio has no HPSDR step attenuator; its feedback
+        // attenuation is applied digitally by the external feedback port.
+        if (TrySetExternalFeedbackAttenuationDb(db)) return;
         if (_radio.ConnectedBoardKind == HpsdrBoardKind.HermesLite2)
         {
             int clamped = Math.Clamp(db, -28, 31);
@@ -6220,7 +6225,8 @@ public partial class DspPipelineService : BackgroundService,
         RaiseEngineChanged(engine);
     }
 
-    private IDspEngine CreateDisconnectedEngine(out int channelId)
+    private IDspEngine CreateDisconnectedEngine(out int channelId,
+        int txOutputRateHz = OfflinePreviewTxOutputRateHz, double? psHwPeak = null)
     {
         OfflinePreviewDspEngine? preview = null;
         try
@@ -6228,7 +6234,11 @@ public partial class DspPipelineService : BackgroundService,
             preview = new OfflinePreviewDspEngine(_loggerFactory.CreateLogger<WdspDspEngine>(), Volatile.Read(ref _rxAnalyzerFftSize));
             channelId = preview.OpenChannel(SyntheticSampleRateHz, _panadapterWidth);
             SeedTxDisplayConfig(preview);
-            preview.OpenTxChannel(outputRateHz: OfflinePreviewTxOutputRateHz);
+            preview.SetPsFeedbackRateHz(txOutputRateHz);
+            // Only the external-feedback rebuild passes a peak. Every other
+            // caller leaves the neutral 0.4072 seed for the per-board apply.
+            if (psHwPeak is double peak) preview.SetPsHwPeak(peak);
+            preview.OpenTxChannel(outputRateHz: txOutputRateHz);
             try
             {
                 ApplyStateToNewChannel(preview, channelId);
@@ -6820,15 +6830,16 @@ public partial class DspPipelineService : BackgroundService,
         // ---- TwoTone (protocol-agnostic; PostGen mode=1 inside TXA) ----
         // TwoTone is safe on P1 even though PS itself is P2-only in v1
         // because it touches only the TXA stage, not the wire format.
+        double twoToneFreq2 = EffectiveTwoToneFreq2(s.TwoToneFreq1, s.TwoToneFreq2);
         if (s.TwoToneEnabled != _appliedTwoToneEnabled
             || s.TwoToneFreq1 != _appliedTwoToneFreq1
-            || s.TwoToneFreq2 != _appliedTwoToneFreq2
+            || twoToneFreq2 != _appliedTwoToneFreq2
             || s.TwoToneMag != _appliedTwoToneMag)
         {
-            engine.SetTwoTone(s.TwoToneEnabled, s.TwoToneFreq1, s.TwoToneFreq2, s.TwoToneMag);
+            engine.SetTwoTone(s.TwoToneEnabled, s.TwoToneFreq1, twoToneFreq2, s.TwoToneMag);
             _appliedTwoToneEnabled = s.TwoToneEnabled;
             _appliedTwoToneFreq1 = s.TwoToneFreq1;
-            _appliedTwoToneFreq2 = s.TwoToneFreq2;
+            _appliedTwoToneFreq2 = twoToneFreq2;
             _appliedTwoToneMag = s.TwoToneMag;
         }
 
@@ -7250,6 +7261,11 @@ public partial class DspPipelineService : BackgroundService,
     private async Task<bool> RunPsArmTransitionAsync(
         bool enable, IProtocol1Client? p1, IDspEngine engine, bool engineArmSupported)
     {
+        bool externalRadio = IsExternalFeedbackRadioSessionCore;
+        if ((enable && externalRadio) ||
+            (!enable && Volatile.Read(ref _externalFeedbackActive) != 0))
+            return await RunExternalFeedbackArmTransitionAsync(enable, CancellationToken.None).ConfigureAwait(false);
+
         // A capability-gated external P3 engine owns its matching p3app route
         // transaction. Zeus still owns operator intent and serialization;
         // startup remains disarmed and P1/P2 retain their wire-first ordering.
@@ -7322,6 +7338,14 @@ public partial class DspPipelineService : BackgroundService,
         static bool externalPsStateMatches(IDspEngine engine, bool enabled) =>
             engine is ExternalProtocol3TxDspEngine externalPs &&
             externalPs.PureSignalArmed == enabled;
+    }
+
+    internal bool TryGetExternalTransmitContext(out ExternalReceiverContext context)
+    {
+        if (_externalFeedbackPort is not null && _externalFeedbackPort.TryGetTransmitContext(out context))
+            return true;
+        context = default;
+        return false;
     }
 
     private async Task<bool> SetAndReconcileP1PsEnabledAsync(
@@ -9985,10 +10009,13 @@ public partial class DspPipelineService : BackgroundService,
             // (issue #3060) and the UI hides it on HermesLite2, so a value
             // saved while another radio was connected is ignored there: HL2
             // keeps the exact monitor-off path it has always had.
+            bool externalFeedbackDisplay = ExternalFeedbackTransmitting;
+            bool feedbackDisplayTransmit = _keyed || externalFeedbackDisplay;
             bool g2eP2PsDisplay = _keyed && _appliedPsEnabled
                 && _p2DisplayDuplexForCurrentTx
                 && _radio.ConnectedBoardKind == HpsdrBoardKind.HermesC10;
-            if (_keyed && _appliedPsEnabled && (!_p2DisplayDuplexForCurrentTx || g2eP2PsDisplay))
+            if (feedbackDisplayTransmit && _appliedPsEnabled &&
+                (externalFeedbackDisplay || !_p2DisplayDuplexForCurrentTx || g2eP2PsDisplay))
             {
                 if (_appliedPsEnabled && _psMonitorEnabled
                     && _radio.ConnectedBoardKind != HpsdrBoardKind.HermesLite2
@@ -10222,6 +10249,11 @@ public partial class DspPipelineService : BackgroundService,
                 : _loHistory.LookupAt(
                     Stopwatch.GetTimestamp() - stampLagTicks,
                     fallbackLoHz: state.RadioLoHz);
+
+            // Two-tone IMD on an externally fed PureSignal transmitter reads the
+            // amplifier feedback, not this panadapter (DspPipelineService.PsFeedbackImd).
+            CapturePsFeedbackImdSpectrum(engine, panBuf, pan && panSource == "ps-feedback",
+                txCal, centerHz, hzPerPixel, holdNowMs);
 
             // Cache for the frequency-calibration service (issue #325). The
             // cal reads from this cache to avoid racing for WDSP's "fresh

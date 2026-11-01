@@ -270,6 +270,7 @@ extern void SetPSReset (int channel, int reset);
 extern void SetPSMancal (int channel, int mancal);
 extern void SetPSAutomode (int channel, int automode);
 extern void SetPSTurnon (int channel, int turnon);
+extern void SetPSHoldCorrection (int channel, int hold);
 extern void SetPSControl (int channel, int reset, int mancal, int automode, int turnon);
 extern void SetPSLoopDelay (int channel, double delay);
 extern void SetPSMoxDelay (int channel, double delay);
