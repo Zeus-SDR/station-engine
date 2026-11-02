@@ -63,7 +63,8 @@ internal readonly record struct TciStreamHeader(
 ///   [16]: crc32 of payload, or 0 to skip
 ///   [20]: length — count of float values in payload (total floats, not pairs)
 ///   [24]: stream type — see <see cref="TciStreamType"/>
-///   [28..63]: reserved zeros (9 × uint32)
+///   [28]: channels — written on TX_CHRONO; other streams leave it 0
+///   [32..63]: reserved zeros (8 × uint32)
 ///   [64..]: sample payload bytes
 /// </summary>
 internal static class TciStreamPayload
@@ -76,15 +77,17 @@ internal static class TciStreamPayload
         TciSampleType sampleType,
         int length,
         TciStreamType streamType,
-        ReadOnlySpan<byte> samplePayload)
+        ReadOnlySpan<byte> samplePayload,
+        int channels = 0)
     {
         var payload = new byte[HeaderSize + samplePayload.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0), (uint)receiver);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)sampleRate);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), (uint)sampleType);
-        // [12] codec, [16] crc, [28..63] reserved — all zero (cleared by `new byte[]`)
+        // [12] codec, [16] crc, [32..63] reserved — all zero (cleared by `new byte[]`)
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(20), (uint)length);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(24), (uint)streamType);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(28), (uint)channels);
         if (samplePayload.Length > 0)
             samplePayload.CopyTo(payload.AsSpan(HeaderSize));
         return payload;
@@ -117,17 +120,22 @@ internal static class TciStreamPayload
     /// Build a TX_CHRONO sync frame (StreamType=3). Carries no audio payload —
     /// the client uses this as a "send another TX audio block now" signal per
     /// spec §3.4. Sent periodically by the server while MOX is on AND the
-    /// session has TRX source = TCI.
+    /// session has TRX source = TCI. Length counts samples across all channels
+    /// (spec §3.4 and Thetis SendTxChrono), so one request covers one pacing
+    /// interval of audio at the session's negotiated rate and channel count.
     /// </summary>
-    public static byte[] BuildTxChrono(int receiver, int sampleRate)
+    public static byte[] BuildTxChrono(int receiver, int sampleRate, int channels)
     {
+        int frames = (int)Math.Round(
+            TciServer.TciTxBlockSamples * (double)sampleRate / TciServer.TciTxBlockRate);
         return Build(
             receiver,
             sampleRate,
             TciSampleType.Float32,
-            length: 4096,
+            length: frames * channels,
             streamType: TciStreamType.TxChrono,
-            samplePayload: ReadOnlySpan<byte>.Empty);
+            samplePayload: ReadOnlySpan<byte>.Empty,
+            channels: channels);
     }
 
     public static byte[] BuildIqFromDoubles(int receiver, int sampleRate, ReadOnlySpan<double> interleavedIQ)

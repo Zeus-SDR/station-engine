@@ -88,13 +88,11 @@ public sealed class TciServer : IHostedService, IDisposable
     // TX_CHRONO demand-driven pacing — mirrors Thetis cmaster.serviceTCITxProtocol.
     // WSJT-X generates all FT8 audio as fast as TX_CHRONO arrives, so we MUST
     // pace at exactly real-time (1 chrono per 2048 samples @ 48 kHz = 42.6667 ms).
-    // Integer-millisecond pacing leaves a 1.6% rate error that — combined with
-    // any timer drift — overflows TxAudioIngest._accumulator (2048 cap) every
-    // ~1.8 s, dropping a full 42 ms block and breaking FT8 phase continuity.
-    // Compute the spacing in stopwatch ticks (sub-ms) and pace off a monotonic
-    // Stopwatch so DateTime jumps can't disturb TX timing.
-    private const int TciTxBlockSamples = 2048;
-    private const int TciTxBlockRate = 48000;
+    // Integer-millisecond pacing would leave a 1.6% rate error, so compute the
+    // spacing in stopwatch ticks (sub-ms) and pace off a monotonic Stopwatch so
+    // DateTime jumps can't disturb TX timing.
+    internal const int TciTxBlockSamples = 2048;
+    internal const int TciTxBlockRate = 48000;
     internal const int TciTxBurstCount = 3;
     internal static readonly long TciTxChronoSpacingSwTicks =
         (long)Math.Round((double)TciTxBlockSamples * Stopwatch.Frequency / TciTxBlockRate);
@@ -104,7 +102,6 @@ public sealed class TciServer : IHostedService, IDisposable
     private readonly Stopwatch _txChronoClock = new();
     private readonly object _tciTxStateLock = new();
     private Timer? _txChronoTimer;
-    private byte[]? _txChronoFrame;
 
     internal void NotifyTxAudioQueued(int monoSamplesQueued)
     {
@@ -580,8 +577,9 @@ public sealed class TciServer : IHostedService, IDisposable
     //
     // The timer fires only while MOX is on AND there's at least one session
     // with TX source = TCI; otherwise the timer is parked. Frame body is
-    // empty (length=0); the receiver field carries 0 since Zeus is single-
-    // transceiver.
+    // empty; each session's header asks for one block in its negotiated format
+    // (TciSession.SendTxChronoIfTxSource). The receiver field carries 0 since
+    // Zeus is single-transceiver.
 
     private void OnMoxChanged(bool moxOn)
     {
@@ -602,7 +600,6 @@ public sealed class TciServer : IHostedService, IDisposable
             // is fully up.
             _tciTxLastChronoSwTicks = _txChronoClock.ElapsedTicks - TciTxChronoSpacingSwTicks;
         }
-        _txChronoFrame ??= TciStreamPayload.BuildTxChrono(receiver: 0, sampleRate: 48000);
         // Service the queue at ~half the spacing so a single late OS tick can
         // still be caught up by the next one without burning the burst budget.
         // The actual chrono cadence is enforced by the stopwatch math inside
@@ -630,9 +627,6 @@ public sealed class TciServer : IHostedService, IDisposable
     {
         if (!_tx.IsMoxOn || _clients.IsEmpty) return;
 
-        var frame = _txChronoFrame;
-        if (frame is null) return;
-
         int sent = 0;
         while (sent < TciTxBurstCount)
         {
@@ -647,7 +641,7 @@ public sealed class TciServer : IHostedService, IDisposable
 
             foreach (var session in _clients.Values)
             {
-                if (session.TxSourceIsTci) session.SendBinary(frame);
+                session.SendTxChronoIfTxSource();
             }
             sent++;
         }
