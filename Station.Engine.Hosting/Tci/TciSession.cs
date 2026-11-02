@@ -93,6 +93,9 @@ public sealed class TciSession : IDisposable
     // the handshake-advertised values (stereo, 48 kHz). Per spec §5.8 the
     // client may set audio_stream_channels=1 for mono binary audio.
     private int _audioStreamChannels = 2;
+    // TX_CHRONO for the negotiated format; cleared when rate or channels change.
+    // Guarded by _streamLock.
+    private byte[]? _txChronoFrame;
     // Per-session digital-mode pitch offsets (DIGL_OFFSET / DIGU_OFFSET).
     // Stored only — Zeus has no backend for these yet, but we acknowledge
     // and echo so digital-mode clients (WSJT-X / JTDX) don't see "unknown
@@ -219,6 +222,20 @@ public sealed class TciSession : IDisposable
     /// audio source via <c>TRX:0,true,tci;</c>. Used by <see cref="TciServer"/>
     /// to gate TX_CHRONO frame emission to this session.</summary>
     public bool TxSourceIsTci { get { lock (_streamLock) return _txSourceIsTci; } }
+
+    /// <summary>Asks this session for its next TX audio block, in its own
+    /// negotiated format, when it is the TCI TX audio source.</summary>
+    internal void SendTxChronoIfTxSource()
+    {
+        byte[] frame;
+        lock (_streamLock)
+        {
+            if (!_txSourceIsTci) return;
+            frame = _txChronoFrame ??= TciStreamPayload.BuildTxChrono(
+                receiver: 0, _audioSampleRate, _audioStreamChannels);
+        }
+        SendBinary(frame);
+    }
 
     internal bool TryBuildRxAudioFrame(int receiver, int sampleRateHz, ReadOnlySpan<float> samples, out byte[]? frame)
     {
@@ -1775,6 +1792,7 @@ public sealed class TciSession : IDisposable
                 if (_audioSampleRate != rate)
                 {
                     _audioSampleRate = rate;
+                    _txChronoFrame = null;
                     _rxAudioResampler.Reset();
                 }
             }
@@ -1824,7 +1842,11 @@ public sealed class TciSession : IDisposable
             && TciProtocol.TryParseInt(args[0], out int ch)
             && (ch == 1 || ch == 2))
         {
-            lock (_streamLock) _audioStreamChannels = ch;
+            lock (_streamLock)
+            {
+                _audioStreamChannels = ch;
+                _txChronoFrame = null;
+            }
         }
         Send($"{command}:{args[0]};");
     }
