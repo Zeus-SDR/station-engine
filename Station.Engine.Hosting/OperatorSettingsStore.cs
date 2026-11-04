@@ -35,6 +35,7 @@ public sealed class OperatorSettingsStore : IDisposable
             ["tuner-companion"] = "tuner_companion",
             ["notepad"] = "notepad_content",
             ["rx-wf-windows"] = "display_aux_settings",
+            ["rx-pan-band-windows"] = "display_aux_settings",
             ["spectrum-view-scope"] = "display_aux_settings",
             ["surface-opacity"] = "display_aux_settings",
             ["ui-text-size"] = "display_aux_settings",

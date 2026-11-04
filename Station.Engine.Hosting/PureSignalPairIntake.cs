@@ -320,6 +320,14 @@ internal sealed class PureSignalPairIntake
     // the control gate alone; read under the feed gate.
     private bool _twoToneRunning;
     private int? _completedAtStart;
+    // A two-tone was keyed since the correction last came from voice. Its curve
+    // reads badly on voice and can starve calcc's top bucket, so it is neither
+    // saved nor left running for the next voice over.
+    private bool _twoToneInCurve;
+    // Hold is off so a reset can drop a two-tone curve no saved voice curve can
+    // replace; back on at the next completed fit.
+    private bool _holdReleased;
+    private int? _completedAtVoiceReturn;
     private double? _lastFeedbackLevel;
 
     /// <param name="sendControl">
@@ -453,7 +461,9 @@ internal sealed class PureSignalPairIntake
                 Volatile.Write(ref _keyEpoch, epoch);
             }
             _transmitting = transmitting;
-            Volatile.Write(ref _twoToneRunning, transmitting && IsTwoTone(twoToneLowHz, twoToneHighHz));
+            bool twoTone = transmitting && IsTwoTone(twoToneLowHz, twoToneHighHz);
+            Volatile.Write(ref _twoToneRunning, twoTone);
+            if (twoTone) _twoToneInCurve = true;
             if (transmitting) BeginOverLocked();
             _target.SetPsMox(transmitting);
         }
@@ -650,7 +660,11 @@ internal sealed class PureSignalPairIntake
         var fallback = Pairs(4, complex);
         if (hwPeak > 0)
         {
-            if (Volatile.Read(ref _twoToneRunning)) _lastTwoToneFedMs = now;
+            if (Volatile.Read(ref _twoToneRunning))
+            {
+                _lastTwoToneFedMs = now;
+                _twoToneInCurve = true;
+            }
             var fed = PreferPrimary && !_fallback ? primary : fallback;
             _target.FeedPsFeedbackBlock(fed.TxI, fed.TxQ, fed.RxI, fed.RxQ);
             CheckFitsLocked(now);
@@ -695,6 +709,11 @@ internal sealed class PureSignalPairIntake
             return;
         }
         int attempts = counts.Attempts - previous.Attempts, completed = counts.Completed - previous.Completed;
+        if (completed > 0 && _holdReleased)
+        {
+            _holdReleased = false;
+            _target.HoldPsCorrection(true);
+        }
         if (completed > 0) DiscardFitAtWrongLevelLocked();
         bool testSignal = attempts > completed && _lastTwoToneFedMs != long.MinValue &&
             now - _lastTwoToneFedMs <= CalccCollectionMs;
@@ -801,20 +820,41 @@ internal sealed class PureSignalPairIntake
     /// <summary>
     /// On the arm's first key-down, resumes the last validated correction for
     /// the same geometry, if any. Not at arm time: WDSP installs a restored
-    /// correction only once the TX channel runs.
+    /// correction only once the TX channel runs. A voice key-down after a
+    /// two-tone does the same, and first resets calcc so its next fit does not
+    /// average into the two-tone's; with no saved correction the two-tone's is
+    /// dropped and voice starts cold, as on a new arm.
     /// </summary>
     private void ResumeHeldCorrection()
     {
         PureSignalHeldCorrectionKey key;
+        bool returningToVoice;
         lock (_gate)
         {
-            if (!_resumePending || _stopped) return;
+            returningToVoice = _twoToneInCurve && !Volatile.Read(ref _twoToneRunning);
+            if (_stopped || !(_resumePending || returningToVoice)) return;
             _resumePending = false;
             key = HeldKeyLocked();
+            if (returningToVoice)
+            {
+                _twoToneInCurve = false;
+                _completedAtVoiceReturn = _target.PsFitCounts().Completed;
+            }
         }
-        if (key.BandKhz <= 0) return;
         string path = Path.Combine(_host.HeldCorrectionDirectory, key.FileName);
-        if (!File.Exists(path)) return;
+        bool saved = key.BandKhz > 0 && File.Exists(path);
+        if (returningToVoice)
+        {
+            lock (_gate)
+            {
+                if (_stopped) return;
+                _holdReleased = !saved;
+                _target.HoldPsCorrection(saved);
+                _target.ResetPsCalibration();
+            }
+            _log.LogInformation("ps_pair_intake.two_tone_curve_dropped resumed={Resumed}", saved);
+        }
+        if (!saved) return;
         _target.RestorePsCorrection(path);
         _log.LogInformation(
             "ps_pair_intake.correction_resumed band={Band}kHz mode={Mode} geometry={Geometry} attn={Attn}dB",
@@ -824,7 +864,8 @@ internal sealed class PureSignalPairIntake
     /// <summary>
     /// After an over in which calcc completed a fit at a feedback level inside
     /// the auto-attenuate window, saves the running correction under the arm's
-    /// geometry, so a later arm on the same geometry resumes it.
+    /// geometry, so a later arm on the same geometry resumes it. A curve with a
+    /// two-tone in it is not saved, and after one only a later fit counts.
     /// </summary>
     private void SaveValidatedCorrection()
     {
@@ -832,9 +873,9 @@ internal sealed class PureSignalPairIntake
         int? start;
         lock (_gate)
         {
-            if (_stopped) return;
+            if (_stopped || _twoToneInCurve) return;
             key = HeldKeyLocked();
-            start = _completedAtStart;
+            start = _completedAtVoiceReturn ?? _completedAtStart;
         }
         if (key.BandKhz <= 0 || start is not int completedAtStart) return;
         if (_target.PsFitCounts().Completed <= completedAtStart) return;

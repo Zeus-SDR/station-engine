@@ -3063,6 +3063,13 @@ public partial class DspPipelineService : BackgroundService,
             DdcZoomLevel(globalZoomLevel) /
             Math.Max(1, pixelWidth));
 
+    // Each secondary analyzer owns its own zoom. Its frame geometry must use
+    // the same receiver-specific level that configured that analyzer.
+    internal static float SecondaryDisplayHzPerPixel(StateDto state, int receiverIndex,
+        int sampleRateHz, int pixelWidth, int decimation) =>
+        VisibleDdcHzPerPixel(sampleRateHz, RadioService.ReceiverZoomLevel(state, receiverIndex), pixelWidth)
+        * decimation;
+
     public StateDto ApplyWidebandZoomRequest(int requestedLevel, long? centerHz)
     {
         lock (_widebandZoomRequestLock)
@@ -10397,10 +10404,8 @@ public partial class DspPipelineService : BackgroundService,
                         BodyFlags: secFlags,
                         Width: secFrameWidth,
                         CenterHz: rx.LoHz,
-                        HzPerPixel: VisibleDdcHzPerPixel(
-                            sampleRate,
-                            state.ZoomLevel,
-                            _panadapterWidth) * displayPlan.Decimation,
+                        HzPerPixel: SecondaryDisplayHzPerPixel(
+                            state, ri, sampleRate, _panadapterWidth, displayPlan.Decimation),
                         PanDb: secPanBins,
                         WfDb: secWfBins);
                     if (secFlags != DisplayBodyFlags.None)
