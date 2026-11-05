@@ -126,14 +126,12 @@ public sealed record BoardCapabilities(
     bool SupportsAnvelinaDxOc = false,
     // ---- External antenna ports (external-ports plan — antenna slice, #804) --
     /// <summary>True when the board has switchable TX antenna relays (ANT1/2/3).
-    /// Two wire paths: the 0x0A / Saturn OrionMkII family (G2 / G2-1K / 7000DLE /
-    /// 8000DLE / Apache OrionMkII original / ANVELINA-PRO3 / Red Pitaya) emit the
-    /// alex0[26:24] TX-antenna bits over Protocol 2; the full-Alex dual-ADC ANAN
-    /// boards (ANAN-100D / ANAN-200D) emit them over Protocol 1 on Config-frame
-    /// C4[1:0] (Thetis networkproto1.c:463-468; external-port parity audit,
-    /// GAP-P1-1). Every other board is ANT1-hardwired on transmit (Hermes / Metis
-    /// / ANAN-10 / ANAN-10E — no full Alex; ANAN-G2E — hardwired; Hermes-Lite 2 —
-    /// single jack). The frontend gates the TX-antenna selector on this flag; the
+    /// Alex-equipped Hermes / Metis / ANAN-10 / ANAN-10E, ANAN-100D / ANAN-200D,
+    /// ANAN-G2E (HermesC10), and the 0x0A / Saturn OrionMkII family have these
+    /// relays. Protocol 1 carries the selection on Config-frame C4[1:0]
+    /// (Thetis networkproto1.c:463-468); Protocol 2 uses Alex bits [26:24].
+    /// Hermes-Lite 2 has a single jack and stays ANT1-only on transmit.
+    /// The frontend gates the TX-antenna selector on this flag; the
     /// server returns 409 to a non-ANT1 TX request when it is false. The P1 wire
     /// encode + clamp live in ControlFrame.EncodeTxAntennaC4Bits /
     /// P1BoardHasTxAntennaRelays, which MUST stay in step with the per-board

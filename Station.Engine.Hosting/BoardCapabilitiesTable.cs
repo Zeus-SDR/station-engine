@@ -312,9 +312,10 @@ internal static class BoardCapabilitiesTable
         HasSteppedAttenuationRx2: false, // single-RX: RX2 doesn't exist
         SupportsPathIllustrator: false,
         MaxPowerWatts: 120,
-        // ANAN-G2E (HermesC10) runs Protocol 1 with the MkII BPF board: RX-antenna
-        // relays + full aux set, but ANT1-hardwired on transmit (no P2 Alex word)
-        // and single-RX (no RX2 antenna path) — antenna slice (#804).
+        // ANAN-G2E (HermesC10) has MkII BPF TX/RX antenna relays + full aux
+        // set on both protocols: P1 Config C4[1:0], P2 Alex TX bits [26:24].
+        // Single-RX: no RX2 antenna path — antenna slice (#804).
+        HasTxAntennaRelays: true,
         HasRxAntennaRelays: true,
         RxAuxInputs: RxAuxInputs.All,
         // ANAN-G2E: codec board (radio mic). No line-in / XLR (Thetis hard-gates
