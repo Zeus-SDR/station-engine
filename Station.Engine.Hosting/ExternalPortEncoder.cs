@@ -59,9 +59,9 @@ namespace Zeus.Server;
 /// </summary>
 public readonly record struct ExternalPortState(
     /// <summary>TX antenna relay select. Honoured only on boards with
-    /// <see cref="BoardCapabilities.HasTxAntennaRelays"/> (0x0A / Saturn family);
-    /// every other board is ANT1-hardwired on transmit — the encoder gates the
-    /// emission so a non-relay board never advertises ANT2/3.</summary>
+    /// <see cref="BoardCapabilities.HasTxAntennaRelays"/> (Alex-equipped
+    /// Hermes-class / ANAN boards, including G2E, and the 0x0A / Saturn family).
+    /// The encoder clamps non-relay boards such as Hermes-Lite 2 to ANT1.</summary>
     HpsdrAntenna TxAnt = HpsdrAntenna.Ant1,
     /// <summary>RX antenna relay select (C3[7:5] on P1). Clamped to ANT1 at the
     /// wire layer on boards without
@@ -163,9 +163,9 @@ public interface IExternalPortEncoder
 /// <summary>
 /// Protocol-1 encoder for codec / Alex boards (Hermes-class, ANAN-100D/200D,
 /// ANAN-G2E). Emits RX-antenna C3[7:5] from the desired RX antenna (the shared
-/// helper applies the relay-presence clamp) and carries mic_boost / mic_linein
-/// on the 0x12 codec frame. These boards are ANT1-hardwired on transmit (no P2
-/// Alex word) and have no P2 TxSpecific bytes.
+/// helper applies the relay-presence clamp), TX-antenna C4[1:0], and mic_boost /
+/// mic_linein on the 0x12 codec frame. This encoder emits no P2 Alex word or
+/// P2 TxSpecific bytes.
 /// </summary>
 public sealed class Protocol1PortEncoder : IExternalPortEncoder
 {
@@ -192,12 +192,12 @@ public sealed class Protocol1PortEncoder : IExternalPortEncoder
     }
 
     public byte EncodeP1TxAntennaC4Bits(in ExternalPortState state)
-        // Full-Alex P1 boards (ANAN-100D/200D) emit the TX antenna on Config-frame
-        // C4[1:0]; the shared helper clamps every other P1 board to ANT1 (GAP-P1-1).
+        // Alex-equipped P1 boards, including Hermes-class and G2E, emit the TX
+        // antenna on C4[1:0]; the shared helper clamps relay-less boards to ANT1.
         => ControlFrame.EncodeTxAntennaC4Bits(state.TxAnt, _board);
 
     public uint EncodeP2TxAntennaBits(in ExternalPortState state)
-        // P1 boards do not emit a P2 Alex word; ANT1-hardwired on transmit.
+        // Unused on P1: TX selection rides C4[1:0], not a P2 Alex word.
         => Protocol2Client.EncodeTxAntennaBits(txAnt: 1);
 
     public byte EncodeP2MicControlByte(in ExternalPortState state)

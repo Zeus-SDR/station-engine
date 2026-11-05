@@ -1070,9 +1070,9 @@ internal static class ControlFrame
     /// Whether a Protocol-1 board has switchable full-Alex TX-antenna relays
     /// (ANT1/2/3 on Config-frame C4[1:0]). Mirrors the P1 subset of
     /// <c>BoardCapabilities.HasTxAntennaRelays</c>: the Hermes / Metis / ANAN-10 /
-    /// ANAN-10E and dual-ADC ANAN-100D / ANAN-200D families. ANAN-G2E
-    /// (ANT1-hardwired on TX) and Hermes-Lite 2 (single jack) are ANT1-only on
-    /// transmit. Kept local to the protocol assembly so the wire-layer clamp
+    /// ANAN-10E, ANAN-G2E (HermesC10), and dual-ADC ANAN-100D / ANAN-200D
+    /// families. Hermes-Lite 2 (single jack) remains ANT1-only on transmit.
+    /// Kept local to the protocol assembly so the wire-layer clamp
     /// needs no reference to Station.Engine.Hosting; it MUST stay in step with
     /// the BoardCapabilitiesTable HasTxAntennaRelays entries for P1.
     /// </summary>
@@ -1081,7 +1081,8 @@ internal static class ControlFrame
             or HpsdrBoardKind.Hermes
             or HpsdrBoardKind.HermesII
             or HpsdrBoardKind.Angelia
-            or HpsdrBoardKind.Orion;
+            or HpsdrBoardKind.Orion
+            or HpsdrBoardKind.HermesC10;
 
     /// <summary>
     /// Build a complete 1032-byte Metis data frame with two USB frames carrying

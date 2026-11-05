@@ -6442,9 +6442,9 @@ public sealed partial class RadioService : IDisposable
         ActiveClient?.SetRxAuxInput(rxAuxWire);
         // P1: TX-antenna relay (Config-frame C4[1:0]) — external-port parity audit
         // (GAP-P1-1). Clamped to ANT1 at the wire for boards without full Alex TX
-        // relays (ControlFrame.EncodeTxAntennaC4Bits → only ANAN-100D/200D emit
-        // it), and deferred to the unkey edge while keyed. P2 TX antenna rides the
-        // alex0[26:24] path in the SetAntennas snapshot below.
+        // relays (ControlFrame.EncodeTxAntennaC4Bits includes Hermes-class,
+        // ANAN-100D/200D and G2E), and deferred to the unkey edge while keyed.
+        // P2 TX antenna rides alex0[26:24] in the SetAntennas snapshot below.
         ActiveClient?.SetAntennaTx(antSel.TxAnt);
 
         PaSnapshotChanged?.Invoke(new PaRuntimeSnapshot(
