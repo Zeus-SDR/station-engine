@@ -2066,7 +2066,8 @@ public partial class DspPipelineService : BackgroundService,
         IProductTxAudioPort? productAudio = null,
         ProductPluginAudioPort? productPluginAudio = null,
         SMeterCalibrationStore? sMeterCalibrationStore = null,
-        TxMonitorSettingsStore? txMonitorSettingsStore = null)
+        TxMonitorSettingsStore? txMonitorSettingsStore = null,
+        DisplaySettingsStore? displaySettingsStore = null)
     {
         _radio = radio;
         _vrxPool = new(maximumFrequencyHz: radio.ReceiveOnly
@@ -2118,7 +2119,19 @@ public partial class DspPipelineService : BackgroundService,
         // auto-AGC servo the REAL analyzer size, not the WDSP channel block
         // size (the old 1024 hardcode seated auto AGC-T ~12 dB too hot).
         _radio.SetAutoAgcAnalyzerFftSize(_rxAnalyzerFftSize);
-        _panadapterWidth = displayPerformance.PanadapterWidth;
+        // Waterfall detail saved in Settings wins over the profile/config
+        // width (low-power hosts ignore it). Every display buffer is sized
+        // from this once, which is why a change applies at the next start.
+        _panadapterWidth = DisplayPerformanceOptions.ResolveOperatorPanadapterWidth(
+            displaySettingsStore?.Get().PanadapterRowPoints,
+            displayPerformance);
+        if (_panadapterWidth != displayPerformance.PanadapterWidth)
+        {
+            _log.LogInformation(
+                "display.performance waterfallDetail panadapterWidth={Width} profileWidth={ProfileWidth}",
+                _panadapterWidth,
+                displayPerformance.PanadapterWidth);
+        }
         _panBuf = new float[_panadapterWidth];
         _wfBuf = new float[_panadapterWidth];
         _panDecimatedBuf = new float[_panadapterWidth];
@@ -2141,7 +2154,7 @@ public partial class DspPipelineService : BackgroundService,
                 displayHardware.DeviceTreeModel ?? "unreadable",
                 displayPerformance.MaxFrameRateHz,
                 displayPerformance.RxAnalyzerFftSize,
-                displayPerformance.PanadapterWidth);
+                _panadapterWidth);
         }
         else if (loggedDisplayPerformanceProfile)
         {
@@ -2153,7 +2166,7 @@ public partial class DspPipelineService : BackgroundService,
                 profile,
                 displayPerformance.MaxFrameRateHz,
                 displayPerformance.RxAnalyzerFftSize,
-                displayPerformance.PanadapterWidth);
+                _panadapterWidth);
         }
         _displayMaxFrameRateHz = displayPerformance.MaxFrameRateHz;
         _displayDecimation = DisplayPerformanceOptions.DefaultDisplayDecimation;

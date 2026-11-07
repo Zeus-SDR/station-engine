@@ -30,7 +30,8 @@ public static class OperatorUiSettingsEndpoints
         // Panadapter background + dB windows + display performance. The PUT
         // pushes the validated, merged config into the running DSP pipeline so
         // the change is live without a reconnect — same as the product host.
-        endpoints.MapGet("/api/display-settings", (DisplaySettingsStore store) => Results.Ok(store.Get()));
+        endpoints.MapGet("/api/display-settings", (DisplaySettingsStore store, DspPipelineService dsp) =>
+            Results.Ok(store.Get() with { ActivePanadapterWidth = dsp.ConfiguredPanadapterWidth }));
 
         endpoints.MapPut("/api/display-settings", (DisplaySettingsSetRequest req, DisplaySettingsStore store, DspPipelineService dsp) =>
         {
@@ -66,7 +67,8 @@ public static class OperatorUiSettingsEndpoints
                     req.WaterfallHighColor,
                     req.BandwidthFilter,
                     req.CwTuningSpanHz,
-                    req.CwSidebandByBand);
+                    req.CwSidebandByBand,
+                    req.PanadapterRowPoints);
             }
             catch (System.Text.Json.JsonException ex)
             {
@@ -74,7 +76,7 @@ public static class OperatorUiSettingsEndpoints
             }
             var saved = store.Get();
             dsp.ApplyDisplaySettings(saved);
-            return Results.Ok(saved);
+            return Results.Ok(saved with { ActivePanadapterWidth = dsp.ConfiguredPanadapterWidth });
         });
 
         // Wideband signal markers snapshot (display-only, additive wire

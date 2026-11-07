@@ -3331,7 +3331,15 @@ public sealed record DisplaySettingsDto(
     string? FilterPanelImageMime = null,
     BandwidthFilterSettingsDto? BandwidthFilter = null,
     int? CwTuningSpanHz = null,
-    IReadOnlyDictionary<string, string>? CwSidebandByBand = null);
+    IReadOnlyDictionary<string, string>? CwSidebandByBand = null,
+    // Waterfall detail chosen in Settings: points per panadapter/waterfall
+    // line, 4096 (High) or 2048 (Standard). Null = never chosen: the engine
+    // keeps its profile/config width. Read once at engine start, so a change
+    // applies the next time the engine starts. Low-power hosts ignore it.
+    int? PanadapterRowPoints = null,
+    // Points per line the running engine actually produces. Filled in by the
+    // display-settings endpoints from the live pipeline; null elsewhere.
+    int? ActivePanadapterWidth = null);
 
 public sealed record DisplaySettingsSetRequest(
     string? Mode = null,
@@ -3373,7 +3381,10 @@ public sealed record DisplaySettingsSetRequest(
     int? FilterPanelBgBrightness = null,
     BandwidthFilterSettingsDto? BandwidthFilter = null,
     int? CwTuningSpanHz = null,
-    IReadOnlyDictionary<string, string>? CwSidebandByBand = null);
+    IReadOnlyDictionary<string, string>? CwSidebandByBand = null,
+    // 4096 (High) or 2048 (Standard); anything else is ignored. Null leaves
+    // the stored choice unchanged.
+    int? PanadapterRowPoints = null);
 
 // One detected wideband signal, as reported by the engine's deterministic
 // wideband signal detector. Frequencies are absolute Hz in the wideband ADC
