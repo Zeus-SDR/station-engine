@@ -161,7 +161,7 @@ public static class DisplayPerformanceOptions
                 LowPower: envFps < DefaultFrameRateHz,
                 PreferWebglWaterfall: forceWebgl || envFps < DefaultFrameRateHz,
                 RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, envFps < DefaultFrameRateHz, configuration, environment),
-                PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
+                PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, envFps < DefaultFrameRateHz, configuration, environment),
                 DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
                 NativeG2: hw.IsNativeG2);
         }
@@ -190,7 +190,7 @@ public static class DisplayPerformanceOptions
                 LowPower: true,
                 PreferWebglWaterfall: true,
                 RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(LowPowerRxAnalyzerFftSize, lowPower: true, configuration, environment),
-                PanadapterWidth: ResolvePanadapterWidth(LowPowerPanadapterWidth, configuration, environment),
+                PanadapterWidth: ResolvePanadapterWidth(LowPowerPanadapterWidth, lowPower: true, configuration, environment),
                 DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
                 NativeG2: hw.IsNativeG2);
         }
@@ -201,7 +201,7 @@ public static class DisplayPerformanceOptions
             LowPower: false,
             PreferWebglWaterfall: forceWebgl,
             RxAnalyzerFftSize: ResolveRxAnalyzerFftSize(DefaultRxAnalyzerFftSize, lowPower: false, configuration, environment),
-            PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, configuration, environment),
+            PanadapterWidth: ResolvePanadapterWidth(DefaultPanadapterWidth, lowPower: false, configuration, environment),
             DefaultConnectSampleRateHz: ResolveDefaultConnectSampleRateHz(configuration),
             NativeG2: hw.IsNativeG2);
     }
@@ -287,11 +287,50 @@ public static class DisplayPerformanceOptions
     public static int ClampRxAnalyzerFftSizeForProfile(int fftSize, bool lowPower) =>
         lowPower ? Math.Min(fftSize, MaxLowPowerRxAnalyzerFftSize) : fftSize;
 
+    // Points per panadapter / waterfall row. 4096 is opt-in (Settings →
+    // Display Performance → Waterfall detail, or env/config; read once at
+    // engine start) for displays wider than 2048 device pixels, where 2048
+    // points get stretched and narrow signals merge. WDSP's analyzer allows
+    // far more (dMAX_PIXELS 16384) and Protocol 3 and the P2 wideband view
+    // already send 4096-point rows, but each step doubles display bandwidth
+    // to every client, so the default stays 2048.
+    public const int MaxPanadapterWidth = 4_096;
+    // Low-power hosts keep the pre-existing ceiling: a Pi-class board must
+    // never be able to select itself into a display load it could not reach
+    // before (same rule as MaxLowPowerRxAnalyzerFftSize).
+    public const int MaxLowPowerPanadapterWidth = DefaultPanadapterWidth;
+
     public static int NormalizePanadapterWidth(int? raw) => raw switch
     {
-        512 or 1024 or 2048 => raw.Value,
+        512 or 1024 or 2048 or MaxPanadapterWidth => raw.Value,
         _ => DefaultPanadapterWidth,
     };
+
+    public static int ClampPanadapterWidthForProfile(int width, bool lowPower) =>
+        lowPower ? Math.Min(width, MaxLowPowerPanadapterWidth) : width;
+
+    /// <summary>
+    /// The two Waterfall detail choices an operator can save from Settings:
+    /// Standard (2048 points per line) and High (4096).
+    /// </summary>
+    public static bool IsValidOperatorPanadapterWidth(int? raw) =>
+        raw is DefaultPanadapterWidth or MaxPanadapterWidth;
+
+    /// <summary>
+    /// The width the engine runs at. A saved Waterfall detail choice wins over
+    /// the profile/config value in <paramref name="snapshot"/>, the same rule
+    /// as the RX FFT size. No choice (or a malformed one) leaves the snapshot
+    /// untouched, so an install that never opens the setting is byte-identical
+    /// to before. Low-power hosts ignore the choice entirely: their profile
+    /// width (1024 on a Pi) is never raised from Settings.
+    /// </summary>
+    public static int ResolveOperatorPanadapterWidth(int? operatorChoice, DisplayPerformanceSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return !snapshot.LowPower && IsValidOperatorPanadapterWidth(operatorChoice)
+            ? operatorChoice!.Value
+            : snapshot.PanadapterWidth;
+    }
 
     public static bool IsStock(DisplayPerformanceSnapshot snapshot) =>
         string.Equals(snapshot.Profile, "normal", StringComparison.Ordinal) &&
@@ -354,14 +393,15 @@ public static class DisplayPerformanceOptions
 
     private static int ResolvePanadapterWidth(
         int profileDefault,
+        bool lowPower,
         IConfiguration? configuration,
         Func<string, string?> environment)
     {
         if (TryParseInt(environment("ZEUS_PANADAPTER_WIDTH"), out var envValue))
-            return NormalizePanadapterWidth(envValue);
+            return ClampPanadapterWidthForProfile(NormalizePanadapterWidth(envValue), lowPower);
 
         if (TryParseInt(configuration?["Zeus:Display:PanadapterWidth"], out var configValue))
-            return NormalizePanadapterWidth(configValue);
+            return ClampPanadapterWidthForProfile(NormalizePanadapterWidth(configValue), lowPower);
 
         return profileDefault;
     }

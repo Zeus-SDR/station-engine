@@ -265,7 +265,11 @@ public sealed class DisplaySettingsStore : IDisposable
                     : e.FilterPanelImageMime,
                 BandwidthFilter: e.BandwidthFilter is null ? null : NormalizeBandwidthFilter(e.BandwidthFilter),
                 CwTuningSpanHz: IsValidCwSpan(e.CwTuningSpanHz) ? e.CwTuningSpanHz : null,
-                CwSidebandByBand: NormalizeCwSidebands(e.CwSidebandByBand));
+                CwSidebandByBand: NormalizeCwSidebands(e.CwSidebandByBand),
+                // Re-validated on read, like RxDisplayFftSize.
+                PanadapterRowPoints: DisplayPerformanceOptions.IsValidOperatorPanadapterWidth(e.PanadapterRowPoints)
+                    ? e.PanadapterRowPoints
+                    : null);
         }
     }
 
@@ -356,7 +360,8 @@ public sealed class DisplaySettingsStore : IDisposable
         string? waterfallHighColor = null,
         BandwidthFilterSettingsDto? bandwidthFilter = null,
         int? cwTuningSpanHz = null,
-        IReadOnlyDictionary<string, string>? cwSidebandByBand = null)
+        IReadOnlyDictionary<string, string>? cwSidebandByBand = null,
+        int? panadapterRowPoints = null)
     {
         lock (_sync)
         {
@@ -401,6 +406,10 @@ public sealed class DisplaySettingsStore : IDisposable
                 e.RxDisplayFftSize = DisplayPerformanceOptions.ClampRxAnalyzerFftSizeForProfile(
                     rxDisplayFftSize!.Value, _lowPowerDisplay);
             }
+            // Stored as chosen even on a low-power host: the engine resolves
+            // it against its profile at start and ignores it there.
+            if (DisplayPerformanceOptions.IsValidOperatorPanadapterWidth(panadapterRowPoints))
+                e.PanadapterRowPoints = panadapterRowPoints;
             if (widebandDisplayEnabled.HasValue) e.WidebandDisplayEnabled = widebandDisplayEnabled.Value;
             if (widebandSignalMarkersEnabled.HasValue) e.WidebandSignalMarkersEnabled = widebandSignalMarkersEnabled.Value;
             if (displayMaxFrameRateHz.HasValue && double.IsFinite(displayMaxFrameRateHz.Value))
@@ -650,6 +659,10 @@ public sealed class DisplaySettingsEntry
     // RX display analyzer FFT size. Null = never chosen: the engine keeps its
     // profile/config size (16384 stock / 8192 low-power).
     public int? RxDisplayFftSize { get; set; }
+    // Waterfall detail: points per panadapter/waterfall line (2048 or 4096).
+    // Null = never chosen: the engine keeps its profile/config width. Read
+    // once at engine start.
+    public int? PanadapterRowPoints { get; set; }
     public int? CwTuningSpanHz { get; set; }
     public Dictionary<string, string>? CwSidebandByBand { get; set; }
     public int? TxDisplayWindow { get; set; }
