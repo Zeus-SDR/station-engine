@@ -3585,7 +3585,7 @@ public sealed partial class RadioService : IDisposable
 
         RxMode departingMode = default;
         string? departingPreset = null;
-        long newVfoAHz = 0;
+        long newRadioLoHz = 0;
         bool targetBAtSet = false;
         Mutate(s =>
         {
@@ -3640,7 +3640,16 @@ public sealed partial class RadioService : IDisposable
             long bump = CwOffset.DialBumpForModeTransition(currentMode, mode);
             long nextVfoA = targetB ? s.VfoHz : ClampTuningFrequency(s.VfoHz + bump);
             long nextVfoB = targetB ? ClampTuningFrequency(rx2.VfoHz + bump) : rx2.VfoHz;
-            newVfoAHz = nextVfoA;
+
+            // 6) A mode change never moves a parked NCO (CTUN freeze, or a
+            //    pure-pan / keep-in-view offset): the WDSP shift stage is
+            //    derived from RadioLoHz and already places the dial, so the
+            //    hardware has to stay on it. Only an NCO that is following
+            //    the dial tracks the new effective LO. Issue #3615.
+            bool ncoParked = s.CtunEnabled
+                || s.RadioLoHz != CwOffset.EffectiveLoHz(currentMode, s.VfoHz);
+            long nextRadioLo = ncoParked ? s.RadioLoHz : CwOffset.EffectiveLoHz(mode, nextVfoA);
+            newRadioLoHz = nextRadioLo;
 
             if (targetB)
             {
@@ -3674,6 +3683,7 @@ public sealed partial class RadioService : IDisposable
             {
                 Mode = mode,
                 VfoHz = nextVfoA,
+                RadioLoHz = nextRadioLo,
                 FilterLowHz = lo, FilterHighHz = hi,
                 TxFilterLowHz = txLo, TxFilterHighHz = txHi,
                 FilterPresetName = restoredPreset,
@@ -3686,13 +3696,14 @@ public sealed partial class RadioService : IDisposable
         if (departingPreset != null && !targetBAtSet)
             _filterPresetStore?.UpsertLastSelectedPreset(departingMode, departingPreset);
 
-        // Push the new effective LO. Even with no dial bump, switching
-        // into/out of CW changes EffectiveLoHz by ±cw_pitch and the radio
-        // needs the new tuning before the next IQ block arrives. P2 is
-        // pushed via DspPipelineService.OnRadioStateChanged.
+        // Push the NCO the state now records, never a value derived from the
+        // dial alone: a Protocol 1 radio that disagrees with RadioLoHz shows a
+        // mislabelled panadapter and demodulates dial + shift (#3615). CWU↔CWL
+        // still moves a following NCO by 2× pitch here. P2 is pushed from the
+        // same RadioLoHz via DspPipelineService.OnRadioStateChanged.
         if (!targetBAtSet)
         {
-            PushPrimaryRadioFrequency(CwOffset.EffectiveLoHz(mode, newVfoAHz));
+            PushPrimaryRadioFrequency(newRadioLoHz);
             // Entering/leaving CW toggles the P2 internal keyer (TxSpecific
             // byte-5 CW-select). Re-push so a paddle keys the radio the moment
             // the operator is in CW, and the bit clears on the way back to
