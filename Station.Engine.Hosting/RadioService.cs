@@ -6048,7 +6048,35 @@ public sealed partial class RadioService : IDisposable
         var options = ResolveG2AdcOptionsForWire(connectedBoard);
         client.SetAdcDitherRandom(options.DitherEnabled, options.RandomEnabled);
         ApplyPhysicalAttenuatorsToP2Client(client);
+        // Front-panel CAT port (bytes 1398-1399); the client composes it only
+        // for the 0x0A family, so other boards are unaffected.
+        client.SetCatPort(GetG2FrontPanelCatPort());
     }
+
+    /// <summary>
+    /// TCP CAT port announced to the radio so an ANAN-G2 / Saturn front
+    /// panel can connect back (Protocol-2 high-priority bytes 1398-1399).
+    /// 0 = off. Saturn p2app connects to this port on the engine host's
+    /// address, so whatever listens there must accept connections from the
+    /// radio's LAN and should be listening before the port is set: p2app
+    /// does not retry a failed connect until the port is set back to 0.
+    /// </summary>
+    public int GetG2FrontPanelCatPort() =>
+        _preferredRadioStore?.GetG2FrontPanelCatPort() ?? 0;
+
+    public int SetG2FrontPanelCatPort(int port)
+    {
+        int clamped = Math.Clamp(port, 0, ushort.MaxValue);
+        _preferredRadioStore?.SetG2FrontPanelCatPort(clamped);
+        _p2Client?.SetCatPort(clamped);
+        return clamped;
+    }
+
+    /// <summary>True when the effective board is the 0x0A (OrionMkII /
+    /// Saturn) family, the only one whose high-priority packet carries
+    /// the CAT port.</summary>
+    public bool G2FrontPanelCatPortSupported =>
+        EffectiveBoardKind == HpsdrBoardKind.OrionMkII;
 
     /// <summary>
     /// True when a non-HL2 Protocol-1 board is the live connection. Protocol 1

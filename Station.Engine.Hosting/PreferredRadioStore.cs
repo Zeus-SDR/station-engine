@@ -281,6 +281,46 @@ public sealed class PreferredRadioStore : IDisposable
     }
 
     /// <summary>
+    /// TCP CAT port for the ANAN-G2 / Saturn front panel. 0 (the default)
+    /// means no port is announced.
+    /// </summary>
+    public int GetG2FrontPanelCatPort()
+    {
+        lock (_sync)
+        {
+            var e = _entries.FindAll().FirstOrDefault();
+            return Math.Clamp(e?.G2FrontPanelCatPort ?? 0, 0, ushort.MaxValue);
+        }
+    }
+
+    public void SetG2FrontPanelCatPort(int port)
+    {
+        int clamped = Math.Clamp(port, 0, ushort.MaxValue);
+        lock (_sync)
+        {
+            var existing = _entries.FindAll().FirstOrDefault();
+            if (existing is null)
+            {
+                _entries.Insert(new PreferredRadioEntry
+                {
+                    Board = HpsdrBoardKind.Unknown,
+                    OverrideDetection = false,
+                    OrionMkIIVariantChosen = false,
+                    G2FrontPanelCatPort = clamped,
+                    UpdatedUtc = DateTime.UtcNow,
+                });
+            }
+            else
+            {
+                existing.G2FrontPanelCatPort = clamped;
+                existing.UpdatedUtc = DateTime.UtcNow;
+                _entries.Update(existing);
+            }
+        }
+        Changed?.Invoke();
+    }
+
+    /// <summary>
     /// ANAN-G2/Saturn ADC dither enable. Defaults to <c>true</c>, matching
     /// the Thetis G2 option block. Nullable storage lets older LiteDB rows
     /// that pre-date the field inherit the default-on behaviour.
@@ -511,6 +551,10 @@ public sealed class PreferredRadioEntry
     /// <c>false</c> for older rows that pre-date this field, which matches
     /// the shipping default.</summary>
     public bool EnableHl2BandVolts { get; set; }
+    /// <summary>TCP CAT port announced to an ANAN-G2 / Saturn radio in the
+    /// Protocol-2 high-priority packet (bytes 1398-1399) so its front panel
+    /// can connect back. LiteDB hydrates as 0 (off) for older rows.</summary>
+    public int G2FrontPanelCatPort { get; set; }
     /// <summary>ANAN-G2/Saturn ADC dither enable. Nullable so upgraded rows
     /// can inherit the default-on value instead of silently disabling a radio
     /// option Thetis leaves enabled.</summary>
