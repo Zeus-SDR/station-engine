@@ -109,8 +109,9 @@ internal static class BoardCapabilitiesTable
             // Red Pitaya — Saturn-class hardware but Thetis DISABLES the Orion
             // mic-bias panel there (HasMicBias=false) and it has no balanced XLR.
             OrionMkIIVariant.RedPitaya    => SaturnRedPitaya,
-            // 7000DLE and the default 0x0A fall to the Saturn baseline: analog
-            // line-in + Orion mic bias, NO balanced XLR (G2 / G2-1K only).
+            OrionMkIIVariant.Anan7000DLE  => Saturn7000DLE,
+            // The default 0x0A falls to the Saturn baseline: analog line-in +
+            // Orion mic bias, NO balanced XLR (G2 / G2-1K only).
             _                             => Saturn,
         },
         // --- ANAN-G2E (HermesC10, N1GP) ---
@@ -266,11 +267,25 @@ internal static class BoardCapabilitiesTable
         HasBalancedXlr = true,
     };
 
-    // ANAN-8000DLE — 250 W per Apache spec; axis snaps to that. Saturn-class
-    // audio (line-in + mic bias), NO balanced XLR (G2 / G2-1K only).
+    // ANAN-7000DLE — Saturn baseline plus the Protocol-2 ADC dither /
+    // randomizer bits (CmdRx bytes 5/6) and the RX2 (ADC1) stepped attenuator
+    // control. Thetis composes CmdRx bytes 5/6 from the per-ADC dither /
+    // random settings for every Protocol-2 board (ChannelMaster network.c,
+    // CmdRx), and Zeus already sends ADC1's attenuator in CmdHighPriority
+    // byte 1442 for dual-ADC boards. Saturn-class audio (line-in + mic bias),
+    // NO balanced XLR (G2 / G2-1K only).
+    private static readonly BoardCapabilities Saturn7000DLE = Saturn with
+    {
+        SupportsG2AdcOptions = true,
+    };
+
+    // ANAN-8000DLE — 250 W per Apache spec; axis snaps to that. Same ADC
+    // options as the 7000DLE. Saturn-class audio (line-in + mic bias), NO
+    // balanced XLR (G2 / G2-1K only).
     private static readonly BoardCapabilities Saturn8000DLE = Saturn with
     {
         MaxPowerWatts = 250,
+        SupportsG2AdcOptions = true,
     };
 
     // Red Pitaya (DH1KLM) — Saturn-class hardware but Thetis disables the MkII
