@@ -53,7 +53,8 @@ public sealed record AudioRingEndpoint(
     string InputSignalName,
     string OutputSignalName,
     int SampleRate,
-    int MaxSamplesPerBlock);
+    int MaxSamplesPerBlock,
+    bool SupportsSampleDelay = false);
 
 public sealed record ProductAudioAttachRequest(
     string Name,
@@ -68,8 +69,9 @@ public sealed record ProductAudioAttachResponse(
 public delegate void AudioBlockProcessor(Span<float> block);
 
 /// <summary>
-/// Processes one block and reports how many input blocks the returned audio is
-/// delayed. The transport uses the delay only to select the matching retained
-/// dry block when a later response is unavailable; it never changes pacing.
+/// Processes one block and reports its source delay. The consuming pump
+/// determines whether the result is measured in blocks or samples. The delay
+/// aligns retained dry audio when a later response is unavailable; it does not
+/// change pacing.
 /// </summary>
 public delegate int DelayAwareAudioBlockProcessor(Span<float> block);

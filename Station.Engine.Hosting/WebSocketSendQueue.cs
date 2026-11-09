@@ -221,6 +221,7 @@ internal sealed class WebSocketSendQueue
         MsgType.RxMetersV2 or
         MsgType.RxMetersV2Secondary or
         MsgType.RxSignalQuality or
+        MsgType.ChatSignalSample or
         MsgType.PaTemp or
         MsgType.MicPeak or
         MsgType.DiagnosticsHealth;

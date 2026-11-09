@@ -154,6 +154,14 @@ public sealed class TxAudioIngest : IDisposable
     private MicBlockValidity? _voiceIqValidity;
     private long _voiceIqSourceEpoch;
     private MicBlockSource _voiceIqSource;
+    // Product can hold speech even when no pre-key IQ buffer was needed.
+    private bool _productVoicePending;
+    private int _voiceTailIngressBlocked;
+    private long _voiceIngressGeneration;
+    private int _productVoiceTailSamples;
+    private MicBlockValidity? _productVoiceValidity;
+    private long _productVoiceSourceEpoch;
+    private MicBlockSource _productVoiceSource;
     private readonly float[] _productTailSilence = new float[MicBlockSamples];
     // While a tail replays held speech, a concurrent live mic callback must
     // yield without erasing the replay's partial WDSP input block.
@@ -435,32 +443,67 @@ public sealed class TxAudioIngest : IDisposable
 
     private bool DrainProcessedVoiceOnset(long frequency, Func<bool>? shouldAbort)
     {
-        lock (_sync) if (!_voicePreKeyIqActive) return true;
+        lock (_sync) if (!_voicePreKeyIqActive && !_productVoicePending) return true;
         long paceAt = _stopwatchTicks();
+        long productStart = paceAt;
         // A short utterance can still be inside the external insert after its
         // final input. Clock that history before draining retained IQ or TXA.
         int flushed = 0;
-        while (_voicePreKeyIqActive && _productAudio.Active
-            && flushed < Math.Clamp(_productAudio.VoiceTailSamples48k, 0, 31 * MicBlockSamples))
+        var acceptedSamples = new int[1];
+        int requestedSamples = 0;
+        int partialBlocksKept = 0;
+        while (_voicePreKeyIqActive || _productVoicePending)
         {
             if (shouldAbort?.Invoke() == true || !_isMoxOn()) return false;
+            int availableSamples = Math.Clamp(_productAudio.VoiceTailSamples48k, 0, 31 * MicBlockSamples);
+            int tailSamples = Math.Max(availableSamples, _productVoiceTailSamples);
+            if (_productVoicePending && flushed < tailSamples
+                && (!_productAudio.Active || !_productAudio.RequiresTxProcessing || availableSamples == 0))
+            {
+                _log.LogWarning("tx.voice.tail Product insert unavailable with {Samples} pending samples; draining retained TX audio", tailSamples - flushed);
+                break;
+            }
+            requestedSamples = tailSamples;
+            int outputSamples = Math.Min(MicBlockSamples, tailSamples - flushed);
+            if (outputSamples <= 0) break;
+            acceptedSamples[0] = MicBlockSamples;
             lock (_sync)
             {
-                if (_voiceIqSourceEpoch != _activeSourceEpoch || !IsBufferedCurrent(_voiceIqValidity))
+                var source = _productVoicePending ? _productVoiceSource : _voiceIqSource;
+                var validity = _productVoicePending ? _productVoiceValidity : _voiceIqValidity;
+                long sourceEpoch = _productVoicePending ? _productVoiceSourceEpoch : _voiceIqSourceEpoch;
+                if (sourceEpoch != _activeSourceEpoch || !IsBufferedCurrent(validity))
                 {
                     ResetVoicePreKeyIq();
+                    _productVoicePending = false;
                     return false;
                 }
-                ProcessMicPcm(_productTailSilence, _voiceIqSource, _voiceIqValidity,
-                    bypassOnset: true, tailReplay: true);
+                ProcessMicPcm(_productTailSilence, source, validity,
+                    bypassOnset: true, tailReplay: true, tailProductOutputSamples: outputSamples,
+                    tailProductDelaySnapshot: tailSamples, tailProductAcceptedSamples: acceptedSamples);
+                // A newly rendered response may report a different processing
+                // delay. Preserve the entire block in that case and re-plan.
+                outputSamples = acceptedSamples[0];
+                if (outputSamples == MicBlockSamples && tailSamples - flushed < MicBlockSamples)
+                    partialBlocksKept++;
             }
-            flushed += MicBlockSamples;
-            paceAt += frequency / 50;
+            flushed += outputSamples;
+            paceAt += (long)(frequency * (double)outputSamples / TxRateHz);
             long waitTicks = paceAt - _stopwatchTicks();
             if (waitTicks > 0)
                 _voiceTailWait((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
         }
 
+        lock (_sync)
+        {
+            _productVoicePending = false;
+            _productVoiceTailSamples = 0;
+        }
+
+        long productEnd = _stopwatchTicks();
+        long retainedPairs = 0;
+        long trailingZeroPairs = 0;
+        int retainedRate = 0;
         while (true)
         {
             if (shouldAbort?.Invoke() == true || !_isMoxOn()) return false;
@@ -476,12 +519,17 @@ public sealed class TxAudioIngest : IDisposable
                 int iqOut = engine?.TxOutputSamples ?? 0;
                 if (blockSize <= 0 || iqOut <= 0) return false;
                 outputRate = TxRateHz * iqOut / blockSize;
+                retainedRate = outputRate;
                 components = _voicePreKeyIq.Read(_tailIq.AsSpan(0, Math.Min(2 * iqOut, _tailIq.Length)));
                 if (components == 0)
                 {
                     ResetVoicePreKeyIq();
-                    return true;
+                    break;
                 }
+                for (int i = 0; i + 1 < components; i += 2)
+                    trailingZeroPairs = _tailIq[i] == 0f && _tailIq[i + 1] == 0f
+                        ? trailingZeroPairs + 1 : 0;
+                retainedPairs += components / 2;
                 _ring.Write(_tailIq.AsSpan(0, components));
                 _forwardP2?.Invoke(_tailIq.AsMemory(0, components));
             }
@@ -490,6 +538,13 @@ public sealed class TxAudioIngest : IDisposable
             if (waitTicks > 0)
                 _voiceTailWait((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
         }
+        long retainedEnd = _stopwatchTicks();
+        _log.LogInformation(
+            "tx.voice.tail.processed productInputSamples48k={ProductSamples} productRequestedSamples48k={RequestedSamples} partialBlocksKept={PartialBlocksKept} productFlushMs={ProductMs:F1} retainedIqPairs={RetainedPairs} retainedIqRateHz={Rate} retainedIqTrailingZeroPairs={TrailingZeroPairs} retainedIqDrainMs={RetainedMs:F1}",
+            flushed, requestedSamples, partialBlocksKept, (productEnd - productStart) * 1000.0 / frequency,
+            retainedPairs, retainedRate, trailingZeroPairs,
+            (retainedEnd - productEnd) * 1000.0 / frequency);
+        return true;
     }
 
     private int DrainVoiceOnsetPaced(long frequency, Func<bool>? shouldAbort, Action<int, Func<bool>?>? wait = null)
@@ -497,33 +552,52 @@ public sealed class TxAudioIngest : IDisposable
         lock (_sync) _voiceOnsetArmed = false;
         long paceAt = _stopwatchTicks();
         int drained = 0;
+        int staleBlocks = 0;
+        int staleSamples = 0;
         while (true)
         {
             if (shouldAbort?.Invoke() == true) break;
             (float[] Samples, MicBlockSource Source, MicBlockValidity? Validity) block;
+            bool current;
             lock (_sync)
             {
                 if (!_voiceOnset.TryDequeue(out block)) break;
                 _voiceOnsetSamples -= block.Samples.Length;
-                if (IsBufferedCurrent(block.Validity))
+                current = IsBufferedCurrent(block.Validity);
+                if (current)
                     ProcessMicPcm(block.Samples, block.Source, block.Validity,
                         bypassOnset: true, tailReplay: true);
             }
             drained++;
+            // A stale frame was discarded, so there is no transmitted audio
+            // whose duration needs to be paced before the next frame.
+            if (!current)
+            {
+                staleBlocks++;
+                staleSamples += block.Samples.Length;
+                continue;
+            }
             paceAt += (long)(frequency * (double)block.Samples.Length / TxRateHz);
             long waitTicks = paceAt - _stopwatchTicks();
             if (waitTicks > 0)
                 (wait ?? SleepUnlessAborted)((int)Math.Ceiling(waitTicks * 1000.0 / frequency), shouldAbort);
         }
+        if (staleBlocks > 0)
+            _log.LogInformation("tx.voice.onset.stale blocks={Blocks} samples={Samples}", staleBlocks, staleSamples);
         return drained;
     }
 
     private bool HoldOrReplayVoiceOnset(
         ReadOnlySpan<float> samples, MicBlockSource source, MicBlockValidity? validity,
-        bool moxNow)
+        bool moxNow, long ingressGeneration)
     {
         lock (_sync)
         {
+            // A callback can cross a complete tail/off/rekey while waiting for
+            // this lock. Never let its old input mutate a newer onset queue.
+            if (Volatile.Read(ref _voiceTailIngressBlocked) != 0
+                || Interlocked.Read(ref _voiceIngressGeneration) != ingressGeneration)
+                return true;
             if (source is not (MicBlockSource.Host or MicBlockSource.BrowserMic or MicBlockSource.RadioMic))
                 return false;
             if ((source == MicBlockSource.BrowserMic && _activeSource == MicBlockSource.VirtualCable)
@@ -978,25 +1052,37 @@ public sealed class TxAudioIngest : IDisposable
         int settleMs = plan.SettleMs;
         _voiceTailWait(settleMs, shouldAbort);
         if (shouldAbort?.Invoke() == true) return false;
+        long settleEndTs = _stopwatchTicks();
 
-        lock (_sync)
-        {
-            if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
-            _preserveOnsetAccumulatorDuringTail = true;
-        }
-
+        bool tailOwned = false;
         int residualSamples = 0;
         int produced = 0;
         int onsetDrained = 0;
         bool transportDrained = true;
         try
         {
+            // Capture and tail use the same lock order. Snapshot the partial
+            // Product frame before capture can start a new fanout-only frame.
+            lock (_hostFanoutSync)
+            lock (_sync)
+            {
+                if (Interlocked.CompareExchange(ref _tailDraining, 1, 0) != 0) return false;
+                tailOwned = true;
+                _voiceTailCaptureLatched = true;
+                Interlocked.Increment(ref _voiceIngressGeneration);
+                Volatile.Write(ref _voiceTailIngressBlocked, 1);
+                _preserveOnsetAccumulatorDuringTail = true;
+                QueuePendingHostProductFrameForTail();
+            }
             // Releasing during relay settling must not replay held speech
             // into the still-muted IQ path. Keep the original deadline.
             if (!WaitForVoiceOnsetPreKey(freq, shouldAbort)) return false;
+            long preKeyEndTs = _stopwatchTicks();
             onsetDrained = DrainVoiceOnsetPaced(freq, shouldAbort, _voiceTailWait);
             if (shouldAbort?.Invoke() == true) return false;
+            long onsetEndTs = _stopwatchTicks();
             if (!DrainProcessedVoiceOnset(freq, shouldAbort)) return false;
+            long processedOnsetEndTs = _stopwatchTicks();
 
             lock (_sync)
             {
@@ -1056,6 +1142,7 @@ public sealed class TxAudioIngest : IDisposable
             }
 
             if (shouldAbort?.Invoke() == true) return false;
+            long flushEndTs = _stopwatchTicks();
             int backlogSamples = _txTransportLevel().BacklogSamples;
             int transportBudgetMs = Math.Clamp(
                 backlogSamples < 0 ? 5000
@@ -1070,6 +1157,7 @@ public sealed class TxAudioIngest : IDisposable
             } while (!transportDrained && _stopwatchTicks() < transportStop);
             if (!transportDrained)
                 _log.LogWarning("tx.voice.tail transport did not drain before bounded timeout budgetMs={Budget}", transportBudgetMs);
+            long transportEndTs = _stopwatchTicks();
             // The radio FIFO can still hold the last emitted IQ after the
             // host queue goes idle: hold for its depth, then honor the
             // operator's requested hold as a minimum before unkey.
@@ -1084,9 +1172,15 @@ public sealed class TxAudioIngest : IDisposable
             double elapsedMs = (_stopwatchTicks() - startTs)
                 * 1000.0 / freq;
             _log.LogInformation(
-                "tx.voice.tail dropping PTT: delayMs={Delay} settleMs={Settle} onsetBlocks={OnsetBlocks} residualSamples={Residual} produced={Produced} dspLatencyMs={DspLatency} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} transportDrained={TransportDrained} guardMs={Guard} elapsedMs={Elapsed:F1}",
+                "tx.voice.tail dropping PTT: delayMs={Delay} settleMs={Settle} onsetBlocks={OnsetBlocks} residualSamples={Residual} produced={Produced} dspLatencyMs={DspLatency} flushBlocks={FlushBlocks} dspFlushed={DspFlushed} transportDrained={TransportDrained} guardMs={Guard} elapsedMs={Elapsed:F1} settleElapsedMs={SettleElapsed:F1} preKeyWaitMs={PreKeyWait:F1} onsetDrainMs={OnsetDrain:F1} processedOnsetDrainMs={ProcessedOnsetDrain:F1} dspFlushElapsedMs={DspFlushElapsed:F1} transportDrainMs={TransportDrain:F1} backlogSamples48k={Backlog}",
                 tailDelayMs, settleMs, onsetDrained, residualSamples, produced, dspLatencyMs, flushBlocks,
-                quietBlocks >= VoiceTailQuietBlocks, transportDrained, guardMs, elapsedMs);
+                quietBlocks >= VoiceTailQuietBlocks, transportDrained, guardMs, elapsedMs,
+                (settleEndTs - startTs) * 1000.0 / freq,
+                (preKeyEndTs - settleEndTs) * 1000.0 / freq,
+                (onsetEndTs - preKeyEndTs) * 1000.0 / freq,
+                (processedOnsetEndTs - onsetEndTs) * 1000.0 / freq,
+                (flushEndTs - processedOnsetEndTs) * 1000.0 / freq,
+                (transportEndTs - flushEndTs) * 1000.0 / freq, backlogSamples);
             return true;
         }
         catch (Exception ex)
@@ -1096,19 +1190,29 @@ public sealed class TxAudioIngest : IDisposable
         }
         finally
         {
-            lock (_sync)
+            if (tailOwned)
             {
-                _voiceOnsetArmed = false;
-                ResetVoicePreKeyIq();
-                _voiceOnset.Clear();
-                _voiceOnsetSamples = 0;
-                _preserveOnsetAccumulatorDuringTail = false;
-                _ring.Clear();
-                _accumulatorFill = 0;
-                SetRecordingBypassLocked(null, false);
-                _lastSeenMox = false;
+                lock (_hostFanoutSync)
+                lock (_sync)
+                {
+                    _voiceOnsetArmed = false;
+                    _productVoicePending = false;
+                    _productVoiceTailSamples = 0;
+                    ResetVoicePreKeyIq();
+                    _voiceOnset.Clear();
+                    _voiceOnsetSamples = 0;
+                    _preserveOnsetAccumulatorDuringTail = false;
+                    _ring.Clear();
+                    _accumulatorFill = 0;
+                    SetRecordingBypassLocked(null, false);
+                    _lastSeenMox = false;
+                    // Post-release fanout-only audio must not become the
+                    // beginning of a later on-air Product frame on rapid rekey.
+                    _hostFanoutFill = 0;
+                    _hostFanoutValidity = null;
+                    Volatile.Write(ref _tailDraining, 0);
+                }
             }
-            Volatile.Write(ref _tailDraining, 0);
         }
     }
 
@@ -1517,6 +1621,7 @@ public sealed class TxAudioIngest : IDisposable
     /// </summary>
     public bool PrimeTxDspForKeyDown()
     {
+        ReleaseVoiceTailIngress();
         // Every key-down starts the latency governor from scratch, even when
         // the prime itself is skipped (FreeDV, TUN).
         lock (_sync)
@@ -1547,6 +1652,11 @@ public sealed class TxAudioIngest : IDisposable
             // Product's two-block response runway survives idle. Start this
             // voice epoch before WDSP priming so old wet speech cannot reappear.
             _productAudio.BeginVoiceTxEpoch();
+            lock (_sync)
+            {
+                _productVoicePending = false;
+                _productVoiceTailSamples = 0;
+            }
             Array.Clear(_tailMic, 0, blockSize);
             // Whatever the last over left inside TXA leaves only after its full
             // latency (about 210 ms with CFC at a 96 kHz DSP rate), and its
@@ -1737,19 +1847,69 @@ public sealed class TxAudioIngest : IDisposable
         ReadOnlyMemory<byte> f32lePayload,
         MicBlockValidity validity)
     {
-        _hostFanoutFill = 0; // never splice a partial ASIO block into the fan-out
-        long now = Environment.TickCount64;
-        if (ShouldSuppressHostSource(now, f32lePayload.Length / sizeof(float))) return;
-        OnMicPcmBytes(f32lePayload, MicBlockSource.Host, validity);
+        lock (_hostFanoutSync)
+        {
+            _hostFanoutFill = 0; // never splice a partial ASIO block into the fan-out
+            long now = Environment.TickCount64;
+            if (ShouldSuppressHostSource(now, f32lePayload.Length / sizeof(float))) return;
+            OnMicPcmBytes(f32lePayload, MicBlockSource.Host, validity,
+                processAir: !_voiceTailCaptureLatched);
+        }
     }
 
-    // ASIO fast-path state. Touched only by the single native-capture worker
-    // thread (the same thread that calls OnMicPcmBytesFromMic).
+    // Capture normally owns this state; a voice-tail snapshot also takes this
+    // lock. If both locks are needed, take _hostFanoutSync before _sync.
+    private readonly object _hostFanoutSync = new();
+    private bool _voiceTailCaptureLatched;
     private readonly float[] _hostFanout = new float[MicBlockSamples];
     private readonly byte[] _hostFanoutPayload = new byte[MicBlockBytes];
     private int _hostFanoutFill;
     private bool _hostFanoutAirPerChunk;
     private long _hostFanoutGeneration = -1;
+    private MicBlockValidity? _hostFanoutValidity;
+    private long _hostFanoutSourceEpoch;
+
+    /// <summary>Release the post-tail ingress barrier only after wire MOX has
+    /// fallen, or when a new explicit key transaction starts.</summary>
+    internal void ReleaseVoiceTailIngress()
+    {
+        lock (_hostFanoutSync)
+        lock (_sync)
+        {
+            _hostFanoutFill = 0;
+            _hostFanoutValidity = null;
+            _voiceTailCaptureLatched = false;
+            Volatile.Write(ref _voiceTailIngressBlocked, 0);
+        }
+    }
+
+    // Called while holding _hostFanoutSync and _sync after the tail takes
+    // ownership. The padded Product block follows earlier onset frames.
+    private void QueuePendingHostProductFrameForTail()
+    {
+        lock (_hostFanoutSync)
+        {
+            int count = _hostFanoutFill;
+            if (count > 0 && !_hostFanoutAirPerChunk && IsBufferedCurrent(_hostFanoutValidity))
+            {
+                lock (_sync)
+                {
+                    if (_activeSource == MicBlockSource.Host
+                        && _hostFanoutSourceEpoch == _activeSourceEpoch
+                        && Volatile.Read(ref _productPluginInjectionActive) == 0
+                        && !ShouldSuppressHostSource(Environment.TickCount64, 0))
+                    {
+                        var padded = new float[MicBlockSamples];
+                        _hostFanout.AsSpan(0, count).CopyTo(padded);
+                        _voiceOnsetCapacitySamples = Math.Max(_voiceOnsetCapacitySamples,
+                            _voiceOnsetSamples + MicBlockSamples);
+                        EnqueueVoiceOnset(padded, MicBlockSource.Host, _hostFanoutValidity);
+                    }
+                }
+            }
+            _hostFanoutFill = 0;
+        }
+    }
 
     /// <summary>
     /// Host mic at the ASIO driver's buffer cadence. Each chunk goes to the air
@@ -1766,7 +1926,7 @@ public sealed class TxAudioIngest : IDisposable
     // Called only by the native capture worker at a radio-clock discontinuity.
     internal void ResetNativeHostContinuity()
     {
-        _hostFanoutFill = 0;
+        lock (_hostFanoutSync) _hostFanoutFill = 0;
         lock (_sync)
         {
             if (_accumulatorSource == MicBlockSource.Host) _accumulatorFill = 0;
@@ -1783,52 +1943,60 @@ public sealed class TxAudioIngest : IDisposable
     internal void OnHostMicSamplesFromMic(ReadOnlySpan<float> samples, MicBlockValidity validity)
     {
         if (samples.IsEmpty) return;
-        // A capture route change / ASIO restart bumps the generation: never
-        // splice the old partial 20 ms block onto the new stream.
-        if (!IsCurrent(validity) || validity.Generation != _hostFanoutGeneration)
+        lock (_hostFanoutSync)
         {
-            _hostFanoutFill = 0;
-            _hostFanoutGeneration = validity.Generation;
-            if (!IsCurrent(validity)) return;
-        }
-        long now = Environment.TickCount64;
-        if (ShouldSuppressHostSource(now, samples.Length))
-        {
-            _hostFanoutFill = 0;
-            return;
-        }
-
-        int offset = 0;
-        while (offset < samples.Length)
-        {
-            if (_hostFanoutFill == 0) _hostFanoutAirPerChunk = !_productAudio.RequiresTxProcessing;
-            int take = Math.Min(MicBlockSamples - _hostFanoutFill, samples.Length - offset);
-            var chunk = samples.Slice(offset, take);
-            chunk.CopyTo(_hostFanout.AsSpan(_hostFanoutFill));
-            _hostFanoutFill += take;
-            offset += take;
-
-            // Cheap pre-check mirroring OnMicPcmBytes' early gate so an inactive
-            // host mic never touches the shared monitor-preview gate or the
-            // drop counters; ProcessMicPcm's in-lock gate stays authoritative.
-            if (_hostFanoutAirPerChunk
-                && Volatile.Read(ref _productPluginInjectionActive) == 0
-                && ActiveSource == MicBlockSource.Host)
-            {
-                ProcessMicPcm(chunk, MicBlockSource.Host, validity, observeTransparentProduct: false);
-            }
-
-            if (_hostFanoutFill == MicBlockSamples)
+            // A capture route change / ASIO restart bumps the generation: never
+            // splice the old partial 20 ms block onto the new stream.
+            if (!IsCurrent(validity) || validity.Generation != _hostFanoutGeneration)
             {
                 _hostFanoutFill = 0;
-                MemoryMarshal.AsBytes(_hostFanout.AsSpan()).CopyTo(_hostFanoutPayload);
-                if (_hostFanoutAirPerChunk && _productAudio.Active
-                    && ActiveSource == MicBlockSource.Host
+                _hostFanoutGeneration = validity.Generation;
+                if (!IsCurrent(validity)) return;
+            }
+            long now = Environment.TickCount64;
+            if (ShouldSuppressHostSource(now, samples.Length))
+            {
+                _hostFanoutFill = 0;
+                return;
+            }
+
+            int offset = 0;
+            while (offset < samples.Length)
+            {
+                if (_hostFanoutFill == 0)
+                {
+                    _hostFanoutAirPerChunk = !_productAudio.RequiresTxProcessing;
+                    _hostFanoutValidity = validity;
+                    _hostFanoutSourceEpoch = Volatile.Read(ref _activeSourceEpoch);
+                }
+                int take = Math.Min(MicBlockSamples - _hostFanoutFill, samples.Length - offset);
+                var chunk = samples.Slice(offset, take);
+                chunk.CopyTo(_hostFanout.AsSpan(_hostFanoutFill));
+                _hostFanoutFill += take;
+                offset += take;
+
+                // Cheap pre-check mirroring OnMicPcmBytes' early gate so an inactive
+                // host mic never touches the shared monitor-preview gate or the
+                // drop counters; ProcessMicPcm's in-lock gate stays authoritative.
+                if (!_voiceTailCaptureLatched && _hostFanoutAirPerChunk
                     && Volatile.Read(ref _productPluginInjectionActive) == 0
-                    && (_isMoxOn() || _engineProvider()?.IsTxMonitorOn == true))
-                    _productAudio.ObserveTx(_hostFanout);
-                OnMicPcmBytes(_hostFanoutPayload, MicBlockSource.Host, validity,
-                    processAir: !_hostFanoutAirPerChunk);
+                    && ActiveSource == MicBlockSource.Host)
+                {
+                    ProcessMicPcm(chunk, MicBlockSource.Host, validity, observeTransparentProduct: false);
+                }
+
+                if (_hostFanoutFill == MicBlockSamples)
+                {
+                    _hostFanoutFill = 0;
+                    MemoryMarshal.AsBytes(_hostFanout.AsSpan()).CopyTo(_hostFanoutPayload);
+                    if (!_voiceTailCaptureLatched && _hostFanoutAirPerChunk && _productAudio.Active
+                        && ActiveSource == MicBlockSource.Host
+                        && Volatile.Read(ref _productPluginInjectionActive) == 0
+                        && (_isMoxOn() || _engineProvider()?.IsTxMonitorOn == true))
+                        _productAudio.ObserveTx(_hostFanout);
+                    OnMicPcmBytes(_hostFanoutPayload, MicBlockSource.Host, validity,
+                        processAir: !_voiceTailCaptureLatched && !_hostFanoutAirPerChunk);
+                }
             }
         }
     }
@@ -2062,9 +2230,15 @@ public sealed class TxAudioIngest : IDisposable
         MicBlockValidity? validity = null,
         bool bypassOnset = false,
         bool tailReplay = false,
-        bool observeTransparentProduct = true)
+        bool observeTransparentProduct = true,
+        int tailProductOutputSamples = MicBlockSamples,
+        int tailProductDelaySnapshot = 0,
+        int[]? tailProductAcceptedSamples = null)
     {
-        if (!bypassOnset && HoldOrReplayVoiceOnset(samples, source, validity, _isMoxOn()))
+        long ingressGeneration = Interlocked.Read(ref _voiceIngressGeneration);
+        if (!tailReplay && Volatile.Read(ref _voiceTailIngressBlocked) != 0)
+            return;
+        if (!bypassOnset && HoldOrReplayVoiceOnset(samples, source, validity, _isMoxOn(), ingressGeneration))
             return;
 
         // Gate: process mic samples when MOX is on (normal TX) OR when the TX
@@ -2210,7 +2384,10 @@ public sealed class TxAudioIngest : IDisposable
             // sets _tailDraining then takes _sync as a barrier, so any frame that
             // reaches here after that point bails. Drop the accumulator so no
             // pre-tail remainder stitches onto the next over.
-            if (_instantCwIdReserved || (!tailReplay && Volatile.Read(ref _tailDraining) != 0))
+            if (!tailReplay && Interlocked.Read(ref _voiceIngressGeneration) != ingressGeneration)
+                return; // do not clear a later epoch's accumulator
+            if (_instantCwIdReserved || (!tailReplay && (Volatile.Read(ref _tailDraining) != 0
+                || Volatile.Read(ref _voiceTailIngressBlocked) != 0)))
             {
                 if (!_preserveOnsetAccumulatorDuringTail) _accumulatorFill = 0;
                 return;
@@ -2291,7 +2468,18 @@ public sealed class TxAudioIngest : IDisposable
             {
                 long productStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (_productAudio.RequiresTxProcessing)
+                {
                     _productAudio.ProcessTx(incoming);
+                    if (moxNow)
+                    {
+                        _productVoicePending = true;
+                        _productVoiceTailSamples = Math.Max(_productVoiceTailSamples,
+                            Math.Clamp(_productAudio.VoiceTailSamples48k, 0, 31 * MicBlockSamples));
+                        _productVoiceSource = source;
+                        _productVoiceValidity = validity;
+                        _productVoiceSourceEpoch = _activeSourceEpoch;
+                    }
+                }
                 else if (observeTransparentProduct)
                     _productAudio.ObserveTx(incoming);
                 _diagnosticProductMs = Math.Max(_diagnosticProductMs,
@@ -2303,6 +2491,22 @@ public sealed class TxAudioIngest : IDisposable
                 _accumulatorFill = 0;
                 return;
             }
+            // Preserve nonzero effect decay beyond the final input speech. A
+            // partial tail may omit only an exactly silent output suffix.
+            if (tailReplay && tailProductOutputSamples < need
+                && _productAudio.VoiceTailSamples48k == tailProductDelaySnapshot)
+            {
+                int prefix = Math.Max(0, tailProductOutputSamples);
+                bool silent = true;
+                for (int i = prefix; i < need; i++)
+                    if (incoming[i] != 0f) { silent = false; break; }
+                if (silent)
+                {
+                    need = prefix;
+                    incoming = incoming[..need];
+                }
+            }
+            if (tailProductAcceptedSamples is not null) tailProductAcceptedSamples[0] = need;
             // Keep live voice near real time: trim transport backlog by
             // dropping silent 1 ms chunks between words. Operator speech only —
             // digital, FreeDV, TCI/WAV/cable and plugin audio are timing-exact

@@ -352,6 +352,8 @@ public static class StationEngineEndpoints
             context.RequestAborted,
             displayRxId: displayRxId,
             suppressAudio: suppressAudio,
+            stationObserver: context.Request.Query.TryGetValue("stationObserver", out var observer)
+                && observer.Count == 1 && observer[0] == "1",
             nativeMicStreamAuthorization: CreateNativeMicStreamAuthorization(context)).ConfigureAwait(false);
     }
 

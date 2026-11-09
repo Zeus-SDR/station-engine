@@ -521,6 +521,10 @@ public sealed partial class RadioService : IDisposable
     // needs to forward the same bit into a live Protocol2Client, which owns
     // its own CmdHighPriority byte 4.
     public event Action<bool>? MoxChanged;
+    public event Action<ChatMoxEdgeFrame>? ChatMoxEdgeObserved;
+    private readonly ulong _chatMoxStreamId = BitConverter.ToUInt64(Guid.NewGuid().ToByteArray());
+    private long _chatMoxSequence;
+    private long _signalContextGeneration = 1;
     public event Action<bool>? TunActiveChanged;
     // Fires when the operator toggles the Mercury preamp. P1 path is pushed
     // directly via ActiveClient?.SetPreamp inside SetPreamp; this event lets
@@ -1397,6 +1401,22 @@ public sealed partial class RadioService : IDisposable
         lock (_sync) return ProjectedStateUnderLock();
     }
 
+    internal (StateDto State, long Generation) SignalContextSnapshot()
+    {
+        lock (_sync) return (ProjectedStateUnderLock(), _signalContextGeneration);
+    }
+
+    internal bool SignalContextIsCurrent(long generation)
+    {
+        lock (_sync) return _signalContextGeneration == generation;
+    }
+
+    private static bool SignalContextChanged(StateDto a, StateDto b) =>
+        a.Status != b.Status || a.VfoHz != b.VfoHz || a.RadioLoHz != b.RadioLoHz
+        || a.Mode != b.Mode || a.FilterLowHz != b.FilterLowHz || a.FilterHighHz != b.FilterHighHz
+        || a.RitEnabled != b.RitEnabled || a.RitHz != b.RitHz || a.SampleRate != b.SampleRate
+        || ReceiverAdcSource(a, 0) != ReceiverAdcSource(b, 0);
+
     /// <summary>Current RX1 mode without taking the radio-state lock or
     /// projecting a StateDto. Intended for protocol RX edge handlers.</summary>
     internal RxMode CurrentMode => (RxMode)_currentMode;
@@ -1710,6 +1730,7 @@ public sealed partial class RadioService : IDisposable
                 // hook, after calibration and attenuation restoration.
                 PsEnabled = false,
             };
+            _signalContextGeneration++;
             // Fresh connection — reset per-session auto-ATT state so a sticky
             // offset from a previous session doesn't leak onto new hardware.
             ResetPhysicalProtectionNoLock();
@@ -1767,7 +1788,10 @@ public sealed partial class RadioService : IDisposable
             {
                 hpsdrRate = MapSampleRate(restoredHz);
                 lock (_sync)
+                {
                     _state = _state with { SampleRate = hpsdrRate.SampleRateHz() };
+                    _signalContextGeneration++;
+                }
             }
             if (!_bypassP1SocketIoForTests)
                 await client.StartAsync(new StreamConfig(hpsdrRate, _preampOn, _atten), ct).ConfigureAwait(false);
@@ -5067,11 +5091,13 @@ public sealed partial class RadioService : IDisposable
         // Latch _mox before AlignLoForTx so a concurrent guarded SetRadioLo
         // (the frontend LO heartbeat) cannot slip between the snap and guard.
         bool moxFell = false;
+        long chatMoxSequence = 0;
         lock (_sync)
         {
             if (_mox != on)
             {
                 moxFell = _mox && !on;
+                chatMoxSequence = ++_chatMoxSequence;
                 _mox = on;
                 // Telemetry arriving around a TX/RX transition can describe
                 // the old signal path. Start a fresh sample window on both
@@ -5089,8 +5115,25 @@ public sealed partial class RadioService : IDisposable
         if (on) AlignLoForTx();
         if (on && Interlocked.Read(ref _productPluginNativeFrequencyHz) > 0)
             PushPrimaryRadioFrequency(Interlocked.Read(ref _productPluginNativeFrequencyHz));
+        // Alignment may intentionally move the RX LO. Capture context after it
+        // settles, immediately before bracketing propagation of the MOX edge.
+        long chatMoxContext, chatMoxVfo;
+        int chatMoxMode;
+        lock (_sync)
+        {
+            chatMoxContext = _signalContextGeneration;
+            chatMoxVfo = _state.VfoHz;
+            chatMoxMode = (int)_state.Mode;
+        }
+        long chatMoxBegin = Environment.TickCount64;
         ActiveClient?.SetMox(on);
         MoxChanged?.Invoke(on);
+        long chatMoxEnd = Environment.TickCount64;
+        if (chatMoxSequence != 0)
+            ChatMoxEdgeObserved?.Invoke(new(_chatMoxStreamId, (ulong)chatMoxSequence,
+                chatMoxBegin, chatMoxEnd, on,
+                SignalContextIsCurrent(chatMoxContext) ? chatMoxVfo : 0,
+                chatMoxMode, chatMoxContext));
         if (!on) RestoreLoAfterTx();
         if (moxFell) ApplyBoardKindToActiveClientIfSafe();
     }
@@ -7606,6 +7649,7 @@ public sealed partial class RadioService : IDisposable
                 next = ApplyAutoRepeaterShiftLocked(next, out arsChanged);
                 TransmitSafetyStateChanging?.Invoke(_state, next);
                 bool ritXitChanged = RitXitMemory(_state) != RitXitMemory(next);
+                if (SignalContextChanged(_state, next)) _signalContextGeneration++;
                 _state = next;
                 _ritXitBandKey = squelchBand;
                 if (squelchBand is not null && (ritXitBandChanged || ritXitChanged))
@@ -7967,6 +8011,7 @@ public sealed partial class RadioService : IDisposable
         lock (_sync)
         {
             previous = _p2Client;
+            _signalContextGeneration++;
             _p2Client = client;
             _p2Active = true;
             _p2BoardKind = boardKind;
@@ -8052,6 +8097,7 @@ public sealed partial class RadioService : IDisposable
         lock (_sync)
         {
             previous = _p2Client;
+            _signalContextGeneration++;
             _p2Client = null;
             _p2Active = false;
             _p2BoardKind = HpsdrBoardKind.Unknown;
@@ -8107,6 +8153,7 @@ public sealed partial class RadioService : IDisposable
         lock (_sync)
         {
             previous = _p2Client;
+            _signalContextGeneration++;
             _p2Client = null;
             _p2Active = false;
             _p2BoardKind = HpsdrBoardKind.Unknown;
@@ -8152,6 +8199,7 @@ public sealed partial class RadioService : IDisposable
     {
         lock (_sync)
         {
+            _signalContextGeneration++;
             _p3Active = false;
             _p3MaxReceivers = Zeus.Contracts.WireContract.MaxReceivers;
             _connectedFirmware = null;
