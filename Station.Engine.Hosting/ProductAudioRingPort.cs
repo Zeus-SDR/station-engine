@@ -192,7 +192,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                 return false;
             }
 
-            var owner = AudioRingOwner.Create();
+            var owner = AudioRingOwner.Create(supportsSampleDelay: true);
             AudioRingOwner? rxOwner = null;
             try
             {
@@ -425,14 +425,14 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
                        _txProcessed,
                        out var completedSequence,
                        out var completedCount,
-                       out var processingDelayBlocks))
+                       out var delayMetadata))
             {
-                if (resetEpoch || completedCount <= 0 || completedCount > _txProcessed.Length)
+                if (resetEpoch || completedCount <= 0 || completedCount > _txProcessed.Length || delayMetadata == -1)
                     continue;
-                session.TxPipeline.RememberProcessed(
+                session.TxPipeline.RememberResponseMetadata(
                     completedSequence,
                     _txProcessed.AsSpan(0, completedCount),
-                    processingDelayBlocks);
+                    delayMetadata);
             }
 
             var published = session.Owner.TryPublish(block48k, out var submittedSequence);
@@ -737,7 +737,7 @@ public sealed class ProductAudioRingPort : IProductTxAudioPort, IDisposable
         public int? HttpPort { get; } = httpPort;
         public AudioRingOwner Owner { get; } = owner;
         public AudioRingOwner RxOwner { get; } = rxOwner;
-        public ProductAudioTransportPipeline TxPipeline { get; } = new();
+        public ProductAudioTransportPipeline TxPipeline { get; } = new(adaptiveDelayMetadata: true);
         public long LastTxProcessingAt;
         public Timer? PendingTimer { get; set; }
         public bool IsLeased => Volatile.Read(ref _leased) != 0;
@@ -820,6 +820,10 @@ internal sealed class ProductAudioTransportPipeline
     // voice TX latency while a product is attached.
     internal const int TxRenderDelayBlocks = 2;
     private readonly int _renderDelayBlocks;
+    private bool _sampleAccurate;
+    private readonly bool _adaptiveDelayMetadata;
+    private bool _metadataModeSelected;
+    private int _sampleBlockSize = AudioRingProtocol.NominalSamplesPerBlock;
     private readonly float[][] _dry = CreateBuffers();
     private readonly float[][] _processed = CreateBuffers();
     private readonly long[] _drySequences = new long[SlotCount];
@@ -833,19 +837,27 @@ internal sealed class ProductAudioTransportPipeline
     private bool _processingDelayKnown;
     private bool _zeroSourceDelayPinned;
     private long _lastRenderedSource;
+    private long _lastRenderedSourceSample;
+    private readonly float[] _alignedDry = new float[AudioRingProtocol.MaxSamplesPerBlock];
+    private readonly bool[] _alignedValid = new bool[AudioRingProtocol.MaxSamplesPerBlock];
     private bool _hasRenderedTarget;
     private ProductAudioTransportStatus _lastTargetStatus;
     private float _lastRenderedSample;
 
-    internal ProductAudioTransportPipeline(int renderDelayBlocks = TxRenderDelayBlocks)
+    internal ProductAudioTransportPipeline(int renderDelayBlocks = TxRenderDelayBlocks, bool sampleAccurate = false,
+        bool adaptiveDelayMetadata = false)
     {
         if (renderDelayBlocks < 1 || renderDelayBlocks > SlotCount / 2)
             throw new ArgumentOutOfRangeException(nameof(renderDelayBlocks));
         _renderDelayBlocks = renderDelayBlocks;
+        _sampleAccurate = sampleAccurate;
+        _adaptiveDelayMetadata = adaptiveDelayMetadata;
     }
 
     internal int RenderDelayBlocks => _renderDelayBlocks;
-    internal int VoiceTailSamples48k => (_renderDelayBlocks + _lastProcessingDelay) * 960;
+    internal int VoiceTailSamples48k => _sampleAccurate
+        ? _renderDelayBlocks * _sampleBlockSize + _lastProcessingDelay
+        : (_renderDelayBlocks + _lastProcessingDelay) * AudioRingProtocol.NominalSamplesPerBlock;
     internal long LastRenderedResponse => _lastRenderedResponse;
 
     internal void Reset()
@@ -858,6 +870,8 @@ internal sealed class ProductAudioTransportPipeline
         _processingDelayKnown = false;
         _zeroSourceDelayPinned = false;
         _lastRenderedSource = 0;
+        _lastRenderedSourceSample = -1;
+        if (_adaptiveDelayMetadata) { _sampleAccurate = false; _metadataModeSelected = false; }
         _hasRenderedTarget = false;
         _lastTargetStatus = ProductAudioTransportStatus.Priming;
         _lastRenderedSample = 0f;
@@ -866,6 +880,7 @@ internal sealed class ProductAudioTransportPipeline
     internal void RememberDry(long sequence, ReadOnlySpan<float> block)
     {
         if (_firstSequence == 0) _firstSequence = sequence;
+        if (_sampleAccurate) _sampleBlockSize = block.Length;
         var index = Index(sequence);
         block.CopyTo(_dry[index]);
         _dryCounts[index] = block.Length;
@@ -889,6 +904,39 @@ internal sealed class ProductAudioTransportPipeline
         Volatile.Write(ref _processedSequences[index], responseSequence);
     }
 
+    internal void RememberProcessedSamples(long responseSequence, ReadOnlySpan<float> block, int processingDelaySamples)
+    {
+        if (!_sampleAccurate) throw new InvalidOperationException("Sample delay requires sample-accurate mode.");
+        if (_firstSequence != 0 && responseSequence < _firstSequence) return;
+        var index = Index(responseSequence);
+        block.CopyTo(_processed[index]);
+        _processedCounts[index] = block.Length;
+        _processedDelays[index] = Math.Clamp(processingDelaySamples, 0,
+            (SlotCount - 1 - _renderDelayBlocks) * block.Length);
+        Volatile.Write(ref _processedSequences[index], responseSequence);
+    }
+
+    internal void RememberResponseMetadata(long responseSequence, ReadOnlySpan<float> block, int delayMetadata)
+    {
+        if (!_adaptiveDelayMetadata) throw new InvalidOperationException("Adaptive metadata mode is not enabled.");
+        if (_firstSequence != 0 && responseSequence < _firstSequence) return;
+        bool sampleDelay = delayMetadata < -1;
+        if (delayMetadata == -1) return;
+        long delay = sampleDelay ? -2L - delayMetadata : delayMetadata;
+        long max = sampleDelay ? (long)(SlotCount - 1 - _renderDelayBlocks) * block.Length : SlotCount - 1 - _renderDelayBlocks;
+        if (delay < 0 || delay > max) return;
+        if (!_metadataModeSelected)
+        {
+            _metadataModeSelected = true;
+            _sampleAccurate = sampleDelay;
+            if (sampleDelay && _lastRenderedSource > 0)
+                _lastRenderedSourceSample = (_lastRenderedSource + 1) * block.Length - 1;
+        }
+        else if (_sampleAccurate != sampleDelay) return;
+        if (sampleDelay) RememberProcessedSamples(responseSequence, block, (int)delay);
+        else RememberProcessed(responseSequence, block, (int)delay);
+    }
+
     internal ProductAudioTransportStatus Render(
         long submittedSequence,
         ReadOnlySpan<float> currentDry,
@@ -909,6 +957,13 @@ internal sealed class ProductAudioTransportPipeline
         bool hasResponse = Volatile.Read(ref _processedSequences[responseIndex]) == targetResponse
             && _processedCounts[responseIndex] == currentDry.Length
             && (!_zeroSourceDelayPinned || _processedDelays[responseIndex] == 0);
+        // A shorter plugin delay would jump the wet source position forward,
+        // skipping the speech between the old and new positions. Keep the
+        // established source timeline for this TX epoch and use aligned dry
+        // fallback until the original delay returns or the next TX epoch.
+        if (_sampleAccurate && hasResponse && _processingDelayKnown
+            && _processedDelays[responseIndex] < _lastProcessingDelay)
+            hasResponse = false;
         if (hasResponse)
         {
             _lastProcessingDelay = _processedDelays[responseIndex];
@@ -926,6 +981,8 @@ internal sealed class ProductAudioTransportPipeline
 
         var status = hasResponse ? ProductAudioTransportStatus.Processed
             : ProductAudioTransportStatus.DryFallback;
+        if (_sampleAccurate)
+            return RenderSampleAccurate(targetResponse, currentDry.Length, output, responseIndex, hasResponse, status);
         var sourceSequence = targetResponse - _lastProcessingDelay;
         // A current response sequence does not prove the vendor delay line
         // contains this epoch's audio. Keep pre-epoch and replayed sources silent.
@@ -957,6 +1014,43 @@ internal sealed class ProductAudioTransportPipeline
             alignedDry.CopyTo(output);
         ApplyTransitionRamp(alignedDry, output, status);
         _lastRenderedSource = sourceSequence;
+        return status;
+    }
+
+    private ProductAudioTransportStatus RenderSampleAccurate(long targetResponse, int count, Span<float> output,
+        int responseIndex, bool hasResponse, ProductAudioTransportStatus status)
+    {
+        // The negotiated Product TX path uses fixed-size 960-sample frames
+        // for an epoch (TxAudioIngest reblocks before calling ProcessTx).
+        // Legacy peers retain the sequence-based path above.
+        long sourceStart = targetResponse * count - _lastProcessingDelay;
+        int firstValid = count;
+        long lastValid = _lastRenderedSourceSample;
+        for (int i = 0; i < count; i++)
+        {
+            long source = sourceStart + i;
+            long sequence = Math.DivRem(source, count, out long offset);
+            if (offset < 0) { sequence--; offset += count; }
+            int index = Index(sequence);
+            bool valid = source >= _firstSequence * count && source > _lastRenderedSourceSample
+                && Volatile.Read(ref _drySequences[index]) == sequence && _dryCounts[index] == count;
+            _alignedValid[i] = valid;
+            _alignedDry[i] = valid ? _dry[index][(int)offset] : 0f;
+            if (valid) { firstValid = Math.Min(firstValid, i); lastValid = source; }
+        }
+        if (firstValid == count)
+        {
+            output.Clear();
+            _hasRenderedTarget = false;
+            _lastRenderedSample = 0f;
+            return status;
+        }
+        if (hasResponse) _processed[responseIndex].AsSpan(0, count).CopyTo(output);
+        else _alignedDry.AsSpan(0, count).CopyTo(output);
+        ApplyTransitionRamp(_alignedDry.AsSpan(0, count), output, status);
+        for (int i = 0; i < count; i++) if (!_alignedValid[i]) output[i] = 0f;
+        _lastRenderedSample = output[count - 1];
+        _lastRenderedSourceSample = lastValid;
         return status;
     }
 

@@ -532,6 +532,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             case MsgType.RxMetersV2:
             case MsgType.RxMetersV2Secondary:
             case MsgType.RxSignalQuality:
+            case MsgType.ChatSignalSample:
             case MsgType.PaTemp:
             case MsgType.MicPeak:
                 Interlocked.Increment(ref _dropsMeter);
@@ -631,7 +632,8 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         int? displayRxId = null,
         bool suppressAudio = false,
         bool allowNativeMicStream = false,
-        Func<bool>? nativeMicStreamAuthorization = null)
+        Func<bool>? nativeMicStreamAuthorization = null,
+        bool stationObserver = false)
     {
         if (displayRxId is < 1 or >= WireContract.MaxReceiverSlots)
             throw new ArgumentOutOfRangeException(nameof(displayRxId));
@@ -646,6 +648,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             identity,
             displayRxId,
             suppressAudio,
+            stationObserver,
             nativeMicStreamAuthorization
                 ?? (allowNativeMicStream ? static () => true : null));
         var (cwSequence, cwSnapshot) = PublishClient(() =>
@@ -1150,6 +1153,24 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         }
     }
 
+    public void BroadcastChatSignalSample(in ChatSignalSampleFrame frame)
+    {
+        if (_clients.IsEmpty) return;
+        var payload = new byte[ChatSignalSampleFrame.ByteLength];
+        frame.Serialize(new FixedBufferWriter(payload, payload.Length));
+        foreach (var client in _clients.Values)
+            if (client is ClientSession { StationObserver: true }) client.TryEnqueue(payload);
+    }
+
+    public void BroadcastChatMoxEdge(in ChatMoxEdgeFrame frame)
+    {
+        if (_clients.IsEmpty) return;
+        var payload = new byte[ChatMoxEdgeFrame.ByteLength];
+        frame.Serialize(new FixedBufferWriter(payload, payload.Length));
+        foreach (var client in _clients.Values)
+            if (client is ClientSession { StationObserver: true }) client.TryEnqueue(payload);
+    }
+
     public void Broadcast(in PaTempFrame frame)
     {
         if (_clients.IsEmpty) return;
@@ -1439,6 +1460,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
         private readonly string? _identity;
         public int? DisplayRxId { get; }
         public bool SuppressAudio { get; }
+        public bool StationObserver { get; }
         private readonly Func<bool>? _nativeMicStreamAuthorization;
 
         public ClientSession(
@@ -1450,6 +1472,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             string? identity,
             int? displayRxId,
             bool suppressAudio,
+            bool stationObserver,
             Func<bool>? nativeMicStreamAuthorization)
         {
             Id = id; _ws = ws; _log = log; _hub = hub;
@@ -1457,6 +1480,7 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
             _identity = identity;
             DisplayRxId = displayRxId;
             SuppressAudio = suppressAudio;
+            StationObserver = stationObserver;
             _nativeMicStreamAuthorization = nativeMicStreamAuthorization;
         }
 
@@ -1484,6 +1508,13 @@ public sealed class StreamingHub : IDisposable, IAsyncDisposable
 
         public bool TryEnqueue(byte[] payload)
         {
+            // The product's station observer consumes only these frames. Avoid
+            // filling its queue with unrelated UI telemetry, which can evict the
+            // signal samples used for friend reports. This is an opt-in filter,
+            // not a delivery guarantee if the observer itself stalls.
+            if (StationObserver && (payload.Length == 0 || (MsgType)payload[0] is not
+                (MsgType.MoxState or MsgType.RxMetersV2 or MsgType.RxSignalQuality or MsgType.ChatSignalSample or MsgType.ChatMoxEdge)))
+                return true;
             var result = _queue.Enqueue(payload);
             _hub.RecordQueueResult(result);
 

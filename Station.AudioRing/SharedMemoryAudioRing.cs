@@ -87,7 +87,7 @@ public sealed class AudioRingOwner : IDisposable
         }
     }
 
-    public static AudioRingOwner Create()
+    public static AudioRingOwner Create(bool supportsSampleDelay = false)
     {
         var token = Guid.NewGuid().ToString("N")[..12];
         var session = $"zar-{Environment.ProcessId}-{token}";
@@ -105,7 +105,8 @@ public sealed class AudioRingOwner : IDisposable
             inputSignalName,
             outputSignalName,
             AudioRingProtocol.SampleRate,
-            AudioRingProtocol.MaxSamplesPerBlock);
+            AudioRingProtocol.MaxSamplesPerBlock,
+            supportsSampleDelay);
 
         FileStream? stream = null;
         MemoryMappedFile? map = null;
@@ -278,8 +279,9 @@ public sealed class AudioRingOwner : IDisposable
 
     /// <summary>
     /// Reads one bundle-produced block and its source delay without waiting.
-    /// A delay of one means the returned samples correspond to the input block
-    /// immediately before the response sequence.
+    /// Nonnegative metadata gives the number of input blocks of delay; -1
+    /// denotes an invalid delay. When sample delay was negotiated on the
+    /// endpoint, values at or below -2 encode -(sample delay + 2).
     /// </summary>
     public bool TryReadOutput(
         Span<float> output,
@@ -591,6 +593,7 @@ public sealed class AudioRingOwner : IDisposable
 /// <summary>Bundle-owned side of an engine-created audio-ring session.</summary>
 public sealed class AudioRingConsumer : IDisposable
 {
+    private readonly bool _supportsSampleDelay;
     private readonly MemoryMappedFile _map;
     private readonly MemoryMappedViewAccessor _view;
     private readonly CrossProcessSignal _inputSignal;
@@ -608,6 +611,7 @@ public sealed class AudioRingConsumer : IDisposable
 
     public AudioRingConsumer(AudioRingEndpoint endpoint)
     {
+        _supportsSampleDelay = endpoint.SupportsSampleDelay;
         var opened = AudioRingOwner.OpenConsumer(endpoint);
         _map = opened.Map;
         _view = opened.View;
@@ -665,6 +669,25 @@ public sealed class AudioRingConsumer : IDisposable
         DelayAwareAudioBlockProcessor processor,
         CancellationToken cancellationToken,
         Func<bool>? transparentPassthrough = null)
+        => RunWithDelayCore(processor, cancellationToken, transparentPassthrough, sampleDelay: false);
+
+    /// <summary>Runs the pump using sample-accurate delay metadata. The owner
+    /// must explicitly advertise support on the endpoint.</summary>
+    public void RunWithSampleDelay(
+        DelayAwareAudioBlockProcessor processor,
+        CancellationToken cancellationToken,
+        Func<bool>? transparentPassthrough = null)
+    {
+        if (!_supportsSampleDelay)
+            throw new InvalidOperationException("The audio-ring owner did not negotiate sample delay metadata.");
+        RunWithDelayCore(processor, cancellationToken, transparentPassthrough, sampleDelay: true);
+    }
+
+    private void RunWithDelayCore(
+        DelayAwareAudioBlockProcessor processor,
+        CancellationToken cancellationToken,
+        Func<bool>? transparentPassthrough,
+        bool sampleDelay)
     {
         ArgumentNullException.ThrowIfNull(processor);
         void AdvertiseTransparency()
@@ -687,11 +710,11 @@ public sealed class AudioRingConsumer : IDisposable
                 {
                     int revision = Volatile.Read(ref _transparencyRevision);
                     AdvertiseTransparency();
-                    var delayBlocks = Math.Clamp(
-                        processor(_block.AsSpan(0, sampleCount)),
-                        -1,
-                        AudioRingProtocol.SlotCount - 2);
-                    if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), delayBlocks))
+                    int delay = processor(_block.AsSpan(0, sampleCount));
+                    int encodedDelay = sampleDelay
+                        ? delay < 0 || delay > (AudioRingProtocol.SlotCount - 2) * AudioRingProtocol.NominalSamplesPerBlock ? -1 : -2 - delay
+                        : Math.Clamp(delay, -1, AudioRingProtocol.SlotCount - 2);
+                    if (_output.TryWrite(sequence, _block.AsSpan(0, sampleCount), encodedDelay))
                         _outputSignal.TrySet();
                     _processedTransparencyRevision = revision;
                     AdvertiseTransparency();

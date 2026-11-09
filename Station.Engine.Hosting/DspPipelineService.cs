@@ -2008,6 +2008,12 @@ public partial class DspPipelineService : BackgroundService,
     // is drained at the meter cadence even when no spectrum panel is mounted.
     private readonly float[] _snrPowerBuf;
     private readonly InPassbandSnrEstimator _snrEstimator = new();
+    private readonly ulong _chatSampleStreamId = BitConverter.ToUInt64(Guid.NewGuid().ToByteArray());
+    private ulong _chatSampleSequence;
+    private readonly Channel<ChatMoxEdgeFrame> _chatMoxEdges = Channel.CreateBounded<ChatMoxEdgeFrame>(
+        new BoundedChannelOptions(64) { SingleReader = true, FullMode = BoundedChannelFullMode.DropWrite });
+
+    private void QueueChatMoxEdge(ChatMoxEdgeFrame edge) => _chatMoxEdges.Writer.TryWrite(edge);
     // RX0 passband evidence sampled at the analyzer/meter cadence. The audio
     // hot path only reads these scalar fields; no allocation, lock or I/O.
     private int _rxLevelerRfSignalResolved;
@@ -3997,6 +4003,7 @@ public partial class DspPipelineService : BackgroundService,
         // radio-mic STREAM (1026) gate.
         _radio.AudioFrontEndChanged += OnAudioFrontEndChanged;
         _radio.MoxChanged += OnRadioMoxChanged;
+        _radio.ChatMoxEdgeObserved += QueueChatMoxEdge;
         _radio.TunActiveChanged += OnRadioTunActiveChanged;
         _radio.PreampChanged += OnRadioPreampChanged;
         _radio.SampleRateChanged += OnRadioSampleRateChanged;
@@ -4055,6 +4062,7 @@ public partial class DspPipelineService : BackgroundService,
             _radio.PaSnapshotChanged -= OnPaSnapshotChanged;
             _radio.AudioFrontEndChanged -= OnAudioFrontEndChanged;
             _radio.MoxChanged -= OnRadioMoxChanged;
+            _radio.ChatMoxEdgeObserved -= QueueChatMoxEdge;
             _radio.TunActiveChanged -= OnRadioTunActiveChanged;
             _radio.PreampChanged -= OnRadioPreampChanged;
             _radio.SampleRateChanged -= OnRadioSampleRateChanged;
@@ -8009,7 +8017,8 @@ public partial class DspPipelineService : BackgroundService,
         CancellationToken ct,
         HpsdrBoardKind boardKind = HpsdrBoardKind.Unknown,
         string? firmware = null,
-        bool sampleRateExplicit = true)
+        bool sampleRateExplicit = true,
+        bool takeoverHold = false)
     {
         try
         {
@@ -8021,7 +8030,8 @@ public partial class DspPipelineService : BackgroundService,
                 ct,
                 boardKind,
                 firmware,
-                sampleRateExplicit).ConfigureAwait(false);
+                sampleRateExplicit,
+                takeoverHold).ConfigureAwait(false);
         }
         catch
         {
@@ -8048,7 +8058,8 @@ public partial class DspPipelineService : BackgroundService,
         CancellationToken ct,
         HpsdrBoardKind boardKind,
         string? firmware,
-        bool sampleRateExplicit)
+        bool sampleRateExplicit,
+        bool takeoverHold)
     {
         if (_p2Client is not null)
         {
@@ -8068,6 +8079,7 @@ public partial class DspPipelineService : BackgroundService,
         var client = new Zeus.Protocol2.Protocol2Client(
             _loggerFactory.CreateLogger<Zeus.Protocol2.Protocol2Client>());
         _p2ConnectingClient = client;
+        if (takeoverHold) client.BeginTakeoverHold();
         client.SetNumAdc(numAdc);
         // Tell the P2 client which board it's talking to so RX-decode quirks
         // (Hermes-on-P2 48 kHz IQ gain correction; future per-board branches)
@@ -8456,6 +8468,8 @@ public partial class DspPipelineService : BackgroundService,
                 ref _rxPostTxDisplayFramesRemaining,
                 PostTxMuteBlocksForDelayMs(_radio.TxPostTxRxMuteDelayMs));
         _keyed = on;
+        if (!on)
+            Volatile.Read(ref _txIngest)?.ReleaseVoiceTailIngress();
         // Do not reuse a pre-TX diagnostic sample after key-up. A new receive
         // meter capture restores eligibility without changing meter broadcasts.
         lock (_rxMeterDiagLock)
@@ -9879,6 +9893,8 @@ public partial class DspPipelineService : BackgroundService,
         if (!_tickGate.TryEnter()) { Interlocked.Increment(ref _tickReentrySkips); return false; }
         try
         {
+        while (_chatMoxEdges.Reader.TryRead(out var chatMoxEdge))
+            _hub.BroadcastChatMoxEdge(chatMoxEdge);
         // iter5 pass-2: lock-free hot path. Tick runs inline on the RX OS
         // thread when a sink is attached (paced via Stopwatch elapsed in
         // OnIqFrame), and on the PeriodicTimer thread otherwise. Volatile
@@ -9889,7 +9905,7 @@ public partial class DspPipelineService : BackgroundService,
         int sampleRate = Volatile.Read(ref _sampleRateHz);
         if (engine is null) return true;
 
-        var state = _radio.Snapshot();
+        var (state, chatSignalGeneration) = _radio.SignalContextSnapshot();
         ReconcileCaptureMonitor(engine, state);
         ReconcileExternalPureSignalStatusForTick(engine, state);
         CaptureBandwidthSpectra(engine, state);
@@ -11218,6 +11234,7 @@ public partial class DspPipelineService : BackgroundService,
             // Panel can render any of them; older clients that only know
             // 0x14 ignore this frame. Same 5 Hz cadence as 0x14 above.
             //
+            long chatSampleBegin = Environment.TickCount64;
             var rx = engine.GetRxStageMeters(channel);
             var v2 = BuildRxMetersV2(rx, rxCalOffsetDb);
             // Feed Auto-AGC the Thetis-faithful tracked noise floor (#806):
@@ -11363,6 +11380,14 @@ public partial class DspPipelineService : BackgroundService,
             var quality = BuildRxSignalQualityFrame(0, snrResult, rxCalOffsetDb);
             _hub.Broadcast(quality);
             RxSignalQualityUpdated?.Invoke(quality);
+            var chatSample = new ChatSignalSampleFrame(_chatSampleStreamId, ++_chatSampleSequence,
+                chatSampleBegin, Environment.TickCount64, v2.SignalAv,
+                !_radio.IsProtocol3Active && engine is WdspDspEngine && _radio.SignalContextIsCurrent(chatSignalGeneration)
+                    ? quality.SnrDb : float.NaN,
+                chatSignalGeneration, state.VfoHz, (int)state.Mode, state.FilterLowHz, state.FilterHighHz,
+                state.RitEnabled, state.RitHz);
+            _hub.BroadcastChatSignalSample(chatSample);
+            ChatSignalSampleUpdated?.Invoke(chatSample);
         }
         return true;
         }
@@ -11380,6 +11405,7 @@ public partial class DspPipelineService : BackgroundService,
 
     /// <summary>Test/diagnostic seam for the measured passband-quality frame.</summary>
     public event Action<RxSignalQualityFrame>? RxSignalQualityUpdated;
+    public event Action<ChatSignalSampleFrame>? ChatSignalSampleUpdated;
 
     /// <summary>
     /// Protocol-3 RX meter ingress (S-meter fix): the sidecar frame forwarder

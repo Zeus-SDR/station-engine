@@ -223,6 +223,11 @@ public sealed class TxService : IDisposable
     internal static bool IsVoiceTxMode(RxMode mode) =>
         mode is RxMode.LSB or RxMode.USB or RxMode.AM or RxMode.SAM or RxMode.DSB or RxMode.FM;
 
+    // FM has a continuous IQ carrier, so the existing amplitude-based tail
+    // quiet detector cannot distinguish idle carrier from speech modulation.
+    private static bool SupportsZeroHoldVoiceDrain(RxMode mode) =>
+        IsVoiceTxMode(mode) && mode != RxMode.FM;
+
     /// <summary>Lock-free voice-mode check for the per-block mic hot path.</summary>
     internal bool IsVoiceTxModeNow => IsVoiceTxMode(_radio.CurrentMode);
 
@@ -538,7 +543,8 @@ public sealed class TxService : IDisposable
             if (!moxOn || owner != MoxSource.UI) return;
             _log.LogWarning(
                 "tx.ui.gone releasing UI-owned MOX — last websocket client disconnected while keyed");
-            if (!TrySetMox(false, MoxSource.UI, out var error) && error is not null)
+            if (!TrySetMoxOffUnderTransitionLock(MoxSource.UI, onPostWireIdle: null,
+                out var error, drainZeroHoldVoice: false) && error is not null)
                 _log.LogWarning("tx.ui.gone MOX release failed: {Error}", error);
         }
     }
@@ -1058,7 +1064,7 @@ public sealed class TxService : IDisposable
         return _pipeline.ArmFmToneBurst(fm.ToneBurstHz, fm.ToneBurstMs, micGainDb);
     }
 
-    private void DrainMoxTailBestEffort()
+    private void DrainMoxTailBestEffort(bool drainZeroHoldVoice = false)
     {
         // An unfinished access burst never runs into the release tail.
         try { _pipeline.CancelFmToneBurst(); }
@@ -1095,7 +1101,11 @@ public sealed class TxService : IDisposable
         }
 
         int tailMs = _radio.TxMoxTailDelayMs;
-        if (!cwIdHeld && tailMs > 0 && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
+        var txMode = RadioFrequencyResolver.TxReceiver(state).Mode;
+        bool automaticZeroHold = drainZeroHoldVoice && SupportsZeroHoldVoiceDrain(state.Mode)
+            && SupportsZeroHoldVoiceDrain(txMode);
+        if (!cwIdHeld && (tailMs > 0 || automaticZeroHold)
+            && !IsCwMode(state.Mode) && !_pipeline.IsFreeDvActive)
         {
             try
             {
@@ -1425,7 +1435,9 @@ public sealed class TxService : IDisposable
                 if (_activeIntent == TransmitIntent.Mox) { error = null; return true; }
             }
             int preKeyMs = SourceArmsPreKey(source) ? _radio.EffectiveTxMoxPreKeyDelayMs : 0;
-            bool armPreKey = preKeyMs > 0 && IsPreKeyVoiceMode(_radio.Snapshot().Mode);
+            var txState = _radio.Snapshot();
+            var txMode = RadioFrequencyResolver.TxReceiver(txState).Mode;
+            bool armPreKey = preKeyMs > 0 && IsPreKeyVoiceMode(txState.Mode);
             long preKeyDelayTicks = armPreKey ? DelayMsToStopwatchTicks(preKeyMs) : 0;
             long revision = NextTransitionRevision();
             _safety.AdmitExplicitRequest();
@@ -1438,8 +1450,9 @@ public sealed class TxService : IDisposable
                 _radio.SetHardwareCwSafetyBlocked(true);
             try
             {
-                if (source == MoxSource.UI && IsPreKeyVoiceMode(_radio.Snapshot().Mode)
-                    && _radio.TxMoxTailDelayMs > 0)
+                if (source == MoxSource.UI && IsPreKeyVoiceMode(txState.Mode)
+                    && (_radio.TxMoxTailDelayMs > 0 || (preKeyMs > 0
+                        && SupportsZeroHoldVoiceDrain(txState.Mode) && SupportsZeroHoldVoiceDrain(txMode))))
                     _pipeline.BeginVoiceOnsetBuffer(preKeyMs);
                 PrepareTxMonitorForTransmitStart();
                 _pipeline.RevokeTxEgress();
@@ -1541,7 +1554,8 @@ public sealed class TxService : IDisposable
     private bool TrySetMoxOffUnderTransitionLock(
         MoxSource source,
         Action? onPostWireIdle,
-        out string? error)
+        out string? error,
+        bool drainZeroHoldVoice = true)
     {
         TransmitIntent? active;
         MoxSource? owner;
@@ -1567,7 +1581,7 @@ public sealed class TxService : IDisposable
             // the measured hold.
             int tailConfiguredMs = _radio.TxMoxTailDelayMs;
             long tailStartTs = _stopwatchTicks();
-            DrainMoxTailBestEffort();
+            DrainMoxTailBestEffort(drainZeroHoldVoice && source == MoxSource.UI && owner == MoxSource.UI);
             tail = new TxReleaseTail(tailStartTs, _stopwatchTicks(), tailConfiguredMs);
         }
         ConvergeToSafeIdle(

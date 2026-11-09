@@ -373,6 +373,12 @@ public enum MsgType : byte
     // See CwSettingsFrame.cs.
     CwSettings = 0x40,
 
+    // Engine to local station observer; paired RX AVG and SNR with stream
+    // sequence and host-monotonic read bounds. Unknown to legacy clients.
+    // 0x44 and 0x45 are taken on flex-integration; do not assign them here.
+    ChatSignalSample = 0x46,
+    ChatMoxEdge = 0x47,
+
     // ---- Public Listening (ADR-0010, docs/designs/public-listening.md) ----
     // These frames flow ONLY on the listener feed (engine → host) and the
     // listener WebRTC session (host → anonymous listener). They are never

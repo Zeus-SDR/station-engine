@@ -139,6 +139,10 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private const int RxSilenceBeforeRecoveryMs = 3000;
     private const int RxRecoveryAttemptSpacingMs = 2000;
     private const int RxRecoveryMaxAttempts = 2;
+    // Long enough for a displaced Zeus to run out its own recovery (under 30 s
+    // in the worst simulated case), short enough to bound relay chatter if the
+    // other controller never lets go.
+    private const int TakeoverHoldMs = 30_000;
     // Upper bound on how long KeepaliveLoop may skip sends while a recovery
     // restart is in flight. The burst itself lasts ~200 ms; if the queued
     // restart task is delayed past this window (thread-pool saturation), the
@@ -265,6 +269,14 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private int _rxRecoveryRestartActive;
     private long _rxRecoveryRestartSetMs;
     private int _disconnectSignaled;
+    // Set when a live controller has taken this radio from us. From then on we
+    // send nothing, not even the run=0 stop in StopAsync: the radio is theirs,
+    // and a stop would interrupt the new owner's stream (issue 3607).
+    private int _streamYielded;
+    // TickCount64 deadline set when the operator pressed Take over. Until it
+    // passes, this session asserts itself as the radio's stream destination and
+    // does not give the radio up. 0 for every ordinary connect.
+    private long _takeoverHoldUntilMs;
     private int _sampleRateKhz = 48;
     private uint _rxFreqHz = 14_200_000;
     // RX2 owns its independently tuned DDC. Diversity requests the separate
@@ -1169,6 +1181,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
         _sampleRateKhz = sampleRateKhz;
         Interlocked.Exchange(ref _disconnectSignaled, 0);
+        Interlocked.Exchange(ref _streamYielded, 0);
 
         // macOS-only: pre-prime the kernel ARP table for the radio's IP
         // before we fire off any real packets. The Brick2 firmware answers
@@ -1223,6 +1236,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         // refreshes run_destination_ip/mac/port. Clear run before configuration
         // so a new session re-latches this socket instead of the previous one.
         ct.ThrowIfCancellationRequested();
+        if (IsTakeoverHoldActive()) SendCmdGeneral();
         SendCmdHighPriority(run: false);
         long preclearTicks = _stopwatch.ElapsedTicks;
         Thread.Sleep(settleDelayMs);
@@ -3218,6 +3232,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     private void SendCommandPacket(byte[] packet, int destinationPort)
     {
+        if (Volatile.Read(ref _streamYielded) != 0) return;
         var testSink = _commandSinkForTesting;
         if (testSink is not null)
             testSink(destinationPort, packet);
@@ -5446,21 +5461,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                     continue;
                 try
                 {
-                    cycle = (cycle % 8) + 1;
-                    SendCmdHighPriority(run: true);
-                    switch (cycle)
-                    {
-                        case 2: case 4: case 6:
-                            SendCmdRx();
-                            break;
-                        case 1: case 3: case 5: case 7:
-                            SendCmdTx();
-                            break;
-                        case 8:
-                            SendCmdRx();
-                            SendCmdGeneral();
-                            break;
-                    }
+                    cycle = SendKeepaliveCycle(cycle);
                 }
                 catch (SocketException ex)
                 {
@@ -5479,6 +5480,45 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             SignalDisconnected("keepalive-fault", ex);
         }
     }
+
+    private int SendKeepaliveCycle(int cycle)
+    {
+        cycle = (cycle % 8) + 1;
+        // General names this host as the destination. Saturn latches that on any
+        // run edge, so the old controller's own restart cannot pull the stream
+        // back while the takeover hold is active.
+        if (IsTakeoverHoldActive()) SendCmdGeneral();
+        SendCmdHighPriority(run: true);
+        switch (cycle)
+        {
+            case 2: case 4: case 6:
+                SendCmdRx();
+                break;
+            case 1: case 3: case 5: case 7:
+                SendCmdTx();
+                break;
+            case 8:
+                SendCmdRx();
+                SendCmdGeneral();
+                break;
+        }
+        return cycle;
+    }
+
+    internal int SendKeepaliveCycleForTest(int cycle) => SendKeepaliveCycle(cycle);
+
+    /// <summary>
+    /// Marks this session as an operator takeover of a radio another controller
+    /// may still be driving. Call before <see cref="StartAsync"/>.
+    /// </summary>
+    public void BeginTakeoverHold() =>
+        Volatile.Write(ref _takeoverHoldUntilMs, Environment.TickCount64 + TakeoverHoldMs);
+
+    internal void BeginTakeoverHoldForTest(long untilMs) =>
+        Volatile.Write(ref _takeoverHoldUntilMs, untilMs);
+
+    private bool IsTakeoverHoldActive() =>
+        Environment.TickCount64 < Volatile.Read(ref _takeoverHoldUntilMs);
 
     /// <summary><paramref name="reason"/> describes observed state and is only a blocking log reason when this returns true.</summary>
     internal bool IsRxRecoveryBlocked(out string reason)
@@ -5517,12 +5557,19 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                     Interlocked.Exchange(ref _psBlockResetPending, 1);
 
                 if (ShouldAbort()) return;
+                bool takeover = IsTakeoverHoldActive();
+                if (takeover) SendCmdGeneral();
                 SendCmdHighPriority(run: false);
                 await Task.Delay(50, ct).ConfigureAwait(false);
                 // Aborting after run=false is safe: a key-down push or the 100 ms
                 // keepalive re-latches run=true, so no stopped state can persist.
                 if (ShouldAbort()) return;
                 SendCmdGeneral();
+                // FPGA gateware takes the destination from the last packet seen
+                // while stopped, so run=1 has to beat the old controller's next
+                // 100 ms keepalive. Rx/Tx were already sent when this session
+                // started and the keepalive keeps refreshing them.
+                if (takeover) SendCmdHighPriority(run: true);
                 await Task.Delay(50, ct).ConfigureAwait(false);
                 if (ShouldAbort()) return;
                 SendCmdRx();
@@ -5599,7 +5646,10 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             Environment.TickCount64,
             RxSilenceBeforeRecoveryMs,
             RxRecoveryAttemptSpacingMs,
-            RxRecoveryMaxAttempts);
+            RxRecoveryMaxAttempts,
+            RxSilenceRecoveryPolicy.DefaultDisplacedMinRunMs,
+            RxSilenceRecoveryPolicy.DefaultDisplacedMaxRunMs,
+            Volatile.Read(ref _takeoverHoldUntilMs));
         int toleratedConnectionResets = 0;
         long lastConnectionResetLogMs = 0;
         long lastNonIqErrorLogMs = 0;
@@ -5843,44 +5893,64 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                 nowMs,
                 streamingExpected: !ct.IsCancellationRequested,
                 recoveryBlocked: blocked);
-            switch (decision.Action)
-            {
-                case RxSilenceRecoveryAction.None:
-                    return;
-                case RxSilenceRecoveryAction.Blocked:
+            ApplyRxSilenceDecision(decision, reason, ct);
+        }
+    }
+
+    private void ApplyRxSilenceDecision(
+        RxSilenceRecoveryDecision decision,
+        string reason,
+        CancellationToken ct)
+    {
+        switch (decision.Action)
+        {
+            case RxSilenceRecoveryAction.None:
+                return;
+            case RxSilenceRecoveryAction.Blocked:
+                _log.LogWarning(
+                    "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while TX is active",
+                    reason,
+                    decision.SilenceMs);
+                return;
+            case RxSilenceRecoveryAction.AttemptRestart:
+                if (IsRxRecoveryBlocked(out reason))
+                {
                     _log.LogWarning(
                         "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while TX is active",
                         reason,
                         decision.SilenceMs);
                     return;
-                case RxSilenceRecoveryAction.AttemptRestart:
-                    if (IsRxRecoveryBlocked(out reason))
-                    {
-                        _log.LogWarning(
-                            "p2.rx.recover skip reason={Reason} silenceMs={Silence} - no DDC IQ packets; automatic restart is disabled while TX is active",
-                            reason,
-                            decision.SilenceMs);
-                        return;
-                    }
-                    _log.LogWarning(
-                        "p2.rx.recover attempt={Attempt}/{Max} silenceMs={Silence} - no DDC IQ packets; restarting stream",
-                        decision.Attempt,
-                        decision.MaxAttempts,
-                        decision.SilenceMs);
-                    _ = RequestStreamRestartForRecovery(ct);
-                    return;
-                case RxSilenceRecoveryAction.Exhausted:
-                    _log.LogWarning(
-                        "p2.rx.recover failed attempts={Max} silenceMs={Silence} - the radio may still be sending to a previous session because its stream destination stayed locked while the radio was running; secondary network causes include direct-connect/link-local addressing, an isolated switch, DHCP renewal, NIC power management, firewall filtering, or WiFi/Ethernet route selection; boundNic={BoundNic} rejectedNics={RejectedNics}",
-                        decision.MaxAttempts,
-                        decision.SilenceMs,
-                        _boundNicDisplay,
-                        _rejectedBindNicDisplays);
-                    SignalDisconnected("rx-silence");
-                    return;
-            }
+                }
+                _log.LogWarning(
+                    "p2.rx.recover attempt={Attempt}/{Max} silenceMs={Silence} - no DDC IQ packets; restarting stream",
+                    decision.Attempt,
+                    decision.MaxAttempts,
+                    decision.SilenceMs);
+                _ = RequestStreamRestartForRecovery(ct);
+                return;
+            case RxSilenceRecoveryAction.Exhausted:
+                _log.LogWarning(
+                    "p2.rx.recover failed attempts={Max} silenceMs={Silence} - the radio may still be sending to a previous session because its stream destination stayed locked while the radio was running; secondary network causes include direct-connect/link-local addressing, an isolated switch, DHCP renewal, NIC power management, firewall filtering, or WiFi/Ethernet route selection; boundNic={BoundNic} rejectedNics={RejectedNics}",
+                    decision.MaxAttempts,
+                    decision.SilenceMs,
+                    _boundNicDisplay,
+                    _rejectedBindNicDisplays);
+                SignalDisconnected("rx-silence");
+                return;
+            case RxSilenceRecoveryAction.Displaced:
+                Volatile.Write(ref _streamYielded, 1);
+                _log.LogWarning(
+                    "p2.rx.displaced silenceMs={Silence} - IQ returned after a stream restart and was lost again, so another live controller is taking this radio; releasing it without a stop so the new owner keeps its stream",
+                    decision.SilenceMs);
+                SignalDisconnected("displaced");
+                return;
         }
     }
+
+    internal void ApplyRxSilenceDecisionForTest(
+        RxSilenceRecoveryDecision decision,
+        CancellationToken ct) =>
+        ApplyRxSilenceDecision(decision, "none", ct);
 
     private void SignalDisconnected(string reason, Exception? error = null)
     {

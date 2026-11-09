@@ -172,7 +172,8 @@ public static class RadioConnectionEndpoints
                     ct: ctx.RequestAborted,
                     boardKind: boardKind,
                     firmware: finalProbe?.Firmware,
-                    sampleRateExplicit: true).ConfigureAwait(false);
+                    sampleRateExplicit: true,
+                    takeoverHold: true).ConfigureAwait(false);
                 return Results.Ok(new
                 {
                     freed = true,
