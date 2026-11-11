@@ -3863,6 +3863,47 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     internal static bool Hermes10ePsTimeMuxOnAir = true;
 
     /// <summary>
+    /// Kill-switch for the plain Hermes (<see cref="HpsdrBoardKind.Hermes"/>,
+    /// P2 board id 0x01: Hermes / ANAN-10 / ANAN-100 / Brick 2) single-ADC
+    /// time-multiplexed PS feedback path, the sibling of
+    /// <see cref="Hermes10ePsTimeMuxOnAir"/> (issue #3655, enabled by KB2UKA).
+    ///
+    /// Firmware ground truth (hermes/P2-gateware/Hermes_Protocol_2_v10.7, same
+    /// contract in v10.3):
+    ///   - <c>Rx_specific_C&amp;C.v:171</c> maps command byte 1363 to
+    ///     <c>SyncRx[0]</c>; <c>Hermes.v:667-670</c> hands it to the Rx0 FIFO
+    ///     controller, which emits <c>rx_I[0]</c> (Sync data, the ADC coupler)
+    ///     first and <c>rx_I[1]</c> second. That is the coupler-first /
+    ///     reference-second pair the existing decoder consumes.
+    ///   - Unlike the 10E, nothing slaves Rx1 to the TX DAC. <c>Hermes.v:1149</c>
+    ///     <c>select_input_RX[c] = C122_RxADC[c] == 8'd1 ? temp_DACD : temp_ADC</c>
+    ///     and <c>receiver_inst1</c> (<c>:1180-1193</c>) keeps its own sample rate
+    ///     and phase word. The host must therefore send DDC1 ADC select = 1,
+    ///     DDC1 rate = DDC0 rate and DDC1 phase = TX phase for the burst
+    ///     (<see cref="FeedsPsReferenceThroughDdc1"/>). Thetis does exactly this
+    ///     for HERMES / ANAN10 / ANAN100: console.cs UpdateDDCs
+    ///     <c>DDCEnable = DDC0; SyncEnable = DDC1; Rate[0] = Rate[1] = ps_rate;
+    ///     cntrl1 = 4</c>, and network.c:936-945 points RX0 and RX1 at the TX
+    ///     frequency while <c>ptt_out &amp;&amp; puresignal_run</c>.
+    ///   - <c>Hermes.v:1620</c> <c>atten0 = FPGA_PTT ? atten0_on_Tx : Attenuator0</c>,
+    ///     the same byte-59 TX-time ADC attenuator the 10E seeds.
+    ///
+    /// Validated against the virtual-radio wire tests only; Zeus has no plain
+    /// Hermes or Brick 2 on a bench. Set false to disable; no operator toggle.
+    /// </summary>
+    internal static bool HermesPsTimeMuxOnAir = true;
+
+    /// <summary>
+    /// True iff this board's time-mux PS burst needs the host to point DDC1 at
+    /// the TX DAC: ADC select 1, the feedback sample rate, and the TX phase word.
+    /// Plain Hermes only (<see cref="HermesPsTimeMuxOnAir"/>). The 10E slaves Rx1
+    /// in gateware through <c>Mux[1]</c> and the G2E uses a hardwired reference
+    /// receiver, so both stay byte-identical.
+    /// </summary>
+    internal static bool FeedsPsReferenceThroughDdc1(HpsdrBoardKind board)
+        => board == HpsdrBoardKind.Hermes && HermesPsTimeMuxOnAir;
+
+    /// <summary>
     /// TX-time ADC-overload protection floor for the single-ADC time-mux PS
     /// path (the byte-59 / <c>Angelia_atten_Tx0</c> seed). On a single-ADC board
     /// the TX-DAC reference and PA coupler land on the one RX ADC during a TX
@@ -3887,13 +3928,17 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     /// under <see cref="G2ePsTimeMuxOnAir"/>. The G2E presents the identical
     /// single-shared-ADC hazard (Hermes.v:1483 `atten0 = FPGA_PTT ? atten0_on_Tx
     /// : Attenuator0`, Tx_specific_C&amp;C.v:182-183), so it seeds byte 59 to the
-    /// same protective floor on key-down. Any other board — and either board with
-    /// its kill-switch forced false — returns false and is byte-identical to the
-    /// historical path.
+    /// same protective floor on key-down. Plain Hermes
+    /// (<see cref="HpsdrBoardKind.Hermes"/>, #3655) has the same mux
+    /// (Hermes_Protocol_2_v10.7/Hermes.v:1620) and joins under
+    /// <see cref="HermesPsTimeMuxOnAir"/>. Any other board — and any of these
+    /// boards with its kill-switch forced false — returns false and is
+    /// byte-identical to the historical path.
     /// </summary>
     internal static bool SeedsTxAdcProtection(HpsdrBoardKind board)
         => (board == HpsdrBoardKind.HermesII && Hermes10ePsTimeMuxOnAir)
-            || (board == HpsdrBoardKind.HermesC10 && G2ePsTimeMuxOnAir);
+            || (board == HpsdrBoardKind.HermesC10 && G2ePsTimeMuxOnAir)
+            || (board == HpsdrBoardKind.Hermes && HermesPsTimeMuxOnAir);
 
     internal static bool HonorsExplicitTxAdcProtection(HpsdrBoardKind board) =>
         TimeMuxesPsFeedbackOnDdc0(board);
@@ -3923,15 +3968,17 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     ///     Rx1's input to <c>temp_DACD</c> (the TX-DAC reference) — so the same
     ///     compose/decode machinery applies (anan-10e_100b/P2-gateware/
     ///     Hermes_v10.3/Hermes.v:684-687, :1080-1093, Rx_specific_C&amp;C.v:181).
-    /// Plain <see cref="HpsdrBoardKind.Hermes"/> is deliberately excluded — its
-    /// single-ADC mux is not gateware-verified here and has no bench. Both flags
-    /// default false, so this is dark for every board in production.
+    ///   - <see cref="HpsdrBoardKind.Hermes"/> (Hermes / ANAN-10 / ANAN-100 /
+    ///     Brick 2) → <see cref="HermesPsTimeMuxOnAir"/> (#3655). Same Rx0 FIFO
+    ///     interleave, but the host must also steer DDC1 to the TX DAC — see
+    ///     <see cref="FeedsPsReferenceThroughDdc1"/>.
     /// </summary>
     public static bool TimeMuxesPsFeedbackOnDdc0(HpsdrBoardKind board)
         => board switch
         {
             HpsdrBoardKind.HermesC10 => G2ePsTimeMuxOnAir,
             HpsdrBoardKind.HermesII  => Hermes10ePsTimeMuxOnAir,
+            HpsdrBoardKind.Hermes    => HermesPsTimeMuxOnAir,
             _                        => false,
         };
 
@@ -4091,6 +4138,17 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             WriteBeU16(p, 18, 192); // DDC0 sample rate = 192 kHz (0x00C0 BE)
             p[22] = 24;             // DDC0 = 24-bit IQ
             p[1363] = 0x02;         // SyncRx[0][1] coupler/reference interleave
+            if (FeedsPsReferenceThroughDdc1(boardKind))
+            {
+                // Plain Hermes (#3655): Rx1 is not slaved in gateware, so the
+                // host selects the TX DAC as its input and matches its rate to
+                // DDC0 (Hermes_Protocol_2_v10.7/Hermes.v:1149, :1180-1193;
+                // Thetis UpdateDDCs cntrl1 = 4, Rate[1] = ps_rate). DDC1 stays
+                // un-enabled: it reaches the wire only through the DDC0 sync.
+                p[23] = 0x01;           // DDC1 source = TX DAC (temp_DACD)
+                WriteBeU16(p, 24, 192); // DDC1 sample rate = DDC0's
+                p[28] = 24;             // DDC1 = 24-bit IQ
+            }
             return p;
         }
 
@@ -4686,8 +4744,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         {
             uint txPhase = (uint)(_txDucFreqHz * HzToPhase);
             WriteBeU32(p, 9, txPhase);     // DDC0 = TX freq
-            if (psWire)
-                WriteBeU32(p, 13, txPhase); // dual-ADC DDC1 = TX freq
+            // DDC1 = TX freq on the dual-ADC pair, and on plain Hermes where
+            // DDC1 is the host-steered TX-DAC reference (#3655; Thetis
+            // network.c:942-945). It overrides the RX2 phase for the burst only.
+            if (psWire || (timeMuxPsBurst && FeedsPsReferenceThroughDdc1(_boardKind)))
+                WriteBeU32(p, 13, txPhase);
         }
 
         if (diversityPair)

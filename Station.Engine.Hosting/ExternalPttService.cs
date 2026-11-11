@@ -74,6 +74,20 @@ public sealed class ExternalPttService : IHostedService, IDisposable
     /// switch level. False when no source is asserted.</summary>
     public bool IsKeyed => _hwHigh || _serialHigh;
 
+    /// <summary>True while the radio's own CW keyer reports key-down, on
+    /// either protocol: the Protocol 1 client's key-down level, or the last
+    /// Protocol 2 key-down level seen in the hi-priority status. The status
+    /// snapshot's CwKeyDown is Protocol 1 only and cannot answer this.</summary>
+    public bool IsCwKeyDown
+    {
+        get
+        {
+            IProtocol1Client? client;
+            lock (_sync) client = _client;
+            return client?.CwKeyDown == true || Volatile.Read(ref _p2PrevSidetone);
+        }
+    }
+
     private readonly RadioService _radio;
     private readonly TxService _tx;
     private readonly StreamingHub _hub;

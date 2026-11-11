@@ -40,13 +40,22 @@ public static class StationFavoriteEndpoints
                     : radio?.CaptureFmMemory(request.FrequencyHz)
                 : null;
 
-            return Results.Ok(store.Upsert(
-                slot,
-                request.FrequencyHz,
-                request.Mode,
-                request.FilterLowHz,
-                request.FilterHighHz,
-                fm));
+            try
+            {
+                return Results.Ok(store.Upsert(
+                    slot,
+                    request.FrequencyHz,
+                    request.Mode,
+                    request.FilterLowHz,
+                    request.FilterHighHz,
+                    fm));
+            }
+            catch (Exception ex) when (ex is StationMemoryValidationException or StationMemoryConflictException)
+            {
+                // The slot is a memory of the unified library; a write its
+                // rules refuse keeps this route's own error shape.
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         // Restore a favorite's FM repeater memory into the live FmConfig

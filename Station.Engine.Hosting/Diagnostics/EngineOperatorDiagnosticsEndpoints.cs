@@ -28,7 +28,8 @@ public static class EngineOperatorDiagnosticsEndpoints
                 services.GetService<DisplaySettingsStore>(),
                 services.GetService<AudioDeviceSettingsStore>(),
                 services.GetService<ExternalPttService>(),
-                services.GetService<NativeHostAudioCoordinator>())));
+                services.GetService<NativeHostAudioCoordinator>(),
+                services.GetService<MemoryOperationHistory>())));
         return endpoints;
     }
 }
@@ -41,7 +42,8 @@ internal sealed record EngineOperatorDiagnosticsSnapshot(
     bool Available,
     string? Reason,
     IReadOnlyList<EngineOperatorSetting> Settings,
-    IReadOnlyList<TransmitHistoryEntry> TransmitHistory)
+    IReadOnlyList<TransmitHistoryEntry> TransmitHistory,
+    IReadOnlyList<MemoryOperationEntry> MemoryOperations)
 {
     internal static EngineOperatorDiagnosticsSnapshot Capture(
         RadioService? radio,
@@ -50,16 +52,19 @@ internal sealed record EngineOperatorDiagnosticsSnapshot(
         DisplaySettingsStore? display,
         AudioDeviceSettingsStore? audioDevices,
         ExternalPttService? externalPtt,
-        NativeHostAudioCoordinator? hostAudio = null)
+        NativeHostAudioCoordinator? hostAudio = null,
+        MemoryOperationHistory? memoryOperations = null)
     {
         var history = tx?.History.Snapshot() ?? [];
+        var memoryHistory = memoryOperations?.Snapshot() ?? [];
         if (radio is null)
         {
             return new EngineOperatorDiagnosticsSnapshot(
                 Available: false,
                 Reason: "RadioService is not registered in this engine host.",
                 Settings: [],
-                TransmitHistory: history);
+                TransmitHistory: history,
+                MemoryOperations: memoryHistory);
         }
 
         var settings = new List<EngineOperatorSetting>(40);
@@ -155,7 +160,8 @@ internal sealed record EngineOperatorDiagnosticsSnapshot(
             Available: true,
             Reason: null,
             Settings: settings,
-            TransmitHistory: history);
+            TransmitHistory: history,
+            MemoryOperations: memoryHistory);
     }
 
     /// <summary>Tap count plus, for linear phase, the exact single-FIR group

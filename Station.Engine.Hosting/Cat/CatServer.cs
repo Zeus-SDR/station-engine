@@ -37,6 +37,7 @@ public sealed class CatServer : IHostedService, IDisposable
     private readonly DspPipelineService _pipeline;
     private readonly ILoggerFactory _loggerFactory;
     private readonly CatIfStateReporter _moxIfReporter;
+    private readonly CatMemoryChannels? _memories;
 
     private readonly ConcurrentDictionary<Guid, CatSession> _clients = new();
     private TcpListener? _listener;
@@ -53,9 +54,11 @@ public sealed class CatServer : IHostedService, IDisposable
         RadioService radio,
         TxService tx,
         DspPipelineService pipeline,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        CatMemoryChannels? memories = null)
     {
         _log = loggerFactory.CreateLogger<CatServer>();
+        _memories = memories;
         _options = options.Value;
         _radio = radio;
         _tx = tx;
@@ -69,6 +72,11 @@ public sealed class CatServer : IHostedService, IDisposable
     }
 
     public int ClientCount => _clients.Count;
+
+    /// <summary>True when sessions answer the memory channel commands
+    /// (MC / MR / MW). Unit hosts may leave the library out; the production
+    /// registration never does.</summary>
+    internal bool HasMemoryChannels => _memories is not null;
 
     public double LatestRxDbm => BitConverter.Int64BitsToDouble(Interlocked.Read(ref _latestRxDbmBits));
 
@@ -169,7 +177,7 @@ public sealed class CatServer : IHostedService, IDisposable
     {
         var id = Guid.NewGuid();
         var sessionLog = _loggerFactory.CreateLogger<CatSession>();
-        var session = new CatSession(id, client, sessionLog, _radio, _tx, _options, () => LatestRxDbm);
+        var session = new CatSession(id, client, sessionLog, _radio, _tx, _options, () => LatestRxDbm, _memories);
         RegisterAcceptedSession(id, session);
         _log.LogInformation("cat.client.connected id={Id} total={Count}", id, _clients.Count);
         try

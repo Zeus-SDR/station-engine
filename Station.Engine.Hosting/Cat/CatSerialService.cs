@@ -50,6 +50,7 @@ public sealed class CatSerialService : BackgroundService, ISerialPttPinSource
     private readonly TxService _tx;
     private readonly DspPipelineService _pipeline;
     private readonly CatIfStateReporter _moxIfReporter;
+    private readonly CatMemoryChannels? _memories;
 
     private readonly Slot[] _slots;
 
@@ -69,9 +70,11 @@ public sealed class CatSerialService : BackgroundService, ISerialPttPinSource
         CatSerialConfigStore store,
         RadioService radio,
         TxService tx,
-        DspPipelineService pipeline)
+        DspPipelineService pipeline,
+        CatMemoryChannels? memories = null)
     {
         _log = log;
+        _memories = memories;
         _loggerFactory = loggerFactory;
         _options = options.Value;
         _store = store;
@@ -89,6 +92,10 @@ public sealed class CatSerialService : BackgroundService, ISerialPttPinSource
     }
 
     public double LatestRxDbm => BitConverter.Int64BitsToDouble(Interlocked.Read(ref _latestRxDbmBits));
+
+    /// <summary>True when the ports answer the memory channel commands
+    /// (MC / MR / MW). Mirrors CatServer.</summary>
+    internal bool HasMemoryChannels => _memories is not null;
 
     /// <summary>Borrow the live CAT handle's modem-pin view for serial PTT.
     /// Ownership remains with this service; callers must never close or dispose
@@ -207,7 +214,7 @@ public sealed class CatSerialService : BackgroundService, ISerialPttPinSource
             {
                 port = new CatSerialPort(
                     cfg.PortName, cfg.BaudRate, ParseParity(cfg.Parity), cfg.DataBits, ParseStopBits(cfg.StopBits),
-                    _radio, _tx, _options, () => LatestRxDbm, portLog);
+                    _radio, _tx, _options, () => LatestRxDbm, portLog, _memories);
                 port.Open();
                 // Per-port "Auto Report" (piHPSDR AutoRprt parity): pre-enable
                 // AI1 so devices that never send AI1; still get unsolicited

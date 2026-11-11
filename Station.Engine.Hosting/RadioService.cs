@@ -256,6 +256,9 @@ public sealed partial class RadioService : IDisposable
     // tick to evaluate the FR-6 protection trip; the StateDto mirror is for
     // the frontend + persistence. Issue #1270.
     private int _txTimeoutSec = DefaultTxTimeoutSec;
+    private int _swrTripBypass;
+    private long _swrTripBypassGeneration;
+    private readonly object _swrTripBypassSync = new();
     // Which drive % the next frame uses. Latched via NotifyTunActive from
     // TxService whenever the MOX/TUN keying state changes so a drag on either
     // slider during a live TX picks the right source without polling.
@@ -501,6 +504,13 @@ public sealed partial class RadioService : IDisposable
         }
         error = null;
         return true;
+    }
+
+    /// <summary>True while PA calibration owns the radio state, between its
+    /// TUN pulses too. A memory recall must not move the radio under it.</summary>
+    internal bool IsPaCalibrationInvariantLeaseActive
+    {
+        get { lock (_sync) return _paCalibrationInvariantLeaseActive; }
     }
 
     internal void EndPaCalibrationInvariantLease()
@@ -833,6 +843,7 @@ public sealed partial class RadioService : IDisposable
                 0,
                 MaxPostTxRxMuteDelayMs);
             _txTimeoutSec = ClampTxTimeoutSec(rsSnap.TxTimeoutSec);
+            _swrTripBypass = rsSnap.SwrTripBypass ? 1 : 0;
         }
 
         // Missing on legacy RadioState rows -> 100, preserving the historical
@@ -967,6 +978,7 @@ public sealed partial class RadioService : IDisposable
             TxMoxTailDelayMs: Volatile.Read(ref _txMoxTailDelayMs),
             TxPostTxRxMuteDelayMs: Volatile.Read(ref _txPostTxRxMuteDelayMs),
             TxTimeoutSec: Volatile.Read(ref _txTimeoutSec),
+            SwrTripBypass: Volatile.Read(ref _swrTripBypass) != 0,
             // Preserve a persisted frozen NCO only when CTUN is enabled.
             // CTUN-off always starts with the radio following the dial, even
             // when an earlier ruler pan persisted an offset RadioLoHz.
@@ -2000,6 +2012,10 @@ public sealed partial class RadioService : IDisposable
     }
 
     internal bool IsTransverterActive => ActiveTransverterSettings().Enabled;
+
+    /// <summary>The transverter profiles of the connected radio, for the
+    /// frequency range a memory may be recalled onto.</summary>
+    internal TransverterSettingsDto ActiveTransverterSettingsForMemory => ActiveTransverterSettings();
 
     private long _productPluginNativeFrequencyHz;
     private readonly object _productPluginFrequencyConfigSync = new();
@@ -3847,6 +3863,13 @@ public sealed partial class RadioService : IDisposable
             moveDialForReverse: false);
     }
 
+    /// <summary>Put a whole FM configuration back after a failed memory
+    /// recall. Like <see cref="RecallFmMemory"/> the dial is NOT moved: the
+    /// public setter would move the TX receiver's dial for a reverse or shift
+    /// difference and bypass the VFO lock.</summary>
+    internal StateDto RestoreFmConfigForMemory(FmConfig config) =>
+        SetFmConfigCore(config, moveDialForReverse: false);
+
     /// <summary>Snapshot the live FM repeater settings for a favorite at
     /// <paramref name="frequencyHz"/>.</summary>
     public FmMemory CaptureFmMemory(long frequencyHz) =>
@@ -5390,6 +5413,20 @@ public sealed partial class RadioService : IDisposable
     /// every meter tick to evaluate the protection trip. 0 = disabled (no
     /// trip). Issue #1270.</summary>
     public int TxTimeoutSec => Volatile.Read(ref _txTimeoutSec);
+
+    public bool SwrTripBypass => Volatile.Read(ref _swrTripBypass) != 0;
+    public long SwrTripBypassGeneration => Interlocked.Read(ref _swrTripBypassGeneration);
+
+    public StateDto SetSwrTripBypass(bool bypass)
+    {
+        lock (_swrTripBypassSync)
+        {
+            Interlocked.Exchange(ref _swrTripBypass, bypass ? 1 : 0);
+            Interlocked.Increment(ref _swrTripBypassGeneration);
+            Mutate(s => s with { SwrTripBypass = bypass });
+            return Snapshot();
+        }
+    }
 
     /// <summary>
     /// Forward the on-board CW keyer config to the connected radio and
@@ -7950,6 +7987,7 @@ public sealed partial class RadioService : IDisposable
                 TxPostTxRxMuteDelayMs = snap.TxPostTxRxMuteDelayMs,
                 RogerBeepEnabled = snap.RogerBeepEnabled,
                 TxTimeoutSec = snap.TxTimeoutSec,
+                SwrTripBypass = snap.SwrTripBypass,
                 RadioLoHz = snap.RadioLoHz,
                 // RX2 tuning persists from the canonical Receivers[1] entry (the
                 // flat VFO-B StateDto fields are gone); the RadioStateEntry schema

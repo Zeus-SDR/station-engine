@@ -132,6 +132,13 @@ public static class TxTimingAndTestEndpoints
             }
         });
 
+        endpoints.MapPost("/api/tx/swr-trip-bypass", (SwrTripBypassSetRequest req, RadioService r) =>
+        {
+            log.LogWarning("api.tx.swr-trip-bypass bypass={Bypass}", req.Bypass);
+            var state = r.SetSwrTripBypass(req.Bypass);
+            return Results.Ok(new { swrTripBypass = state.SwrTripBypass });
+        });
+
         // TUN drive %. Symmetric with /api/tx/drive; the same PA-gain math applies,
         // so equal slider positions emit equal watts. Backend selects between the
         // two sources based on whether TUN is keyed (TxService.TrySetTun →

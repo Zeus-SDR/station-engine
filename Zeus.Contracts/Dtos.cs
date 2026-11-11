@@ -1783,6 +1783,9 @@ public sealed record StateDto(
     // un-key or reset the timer instead of being surprised.
     int TxTimeoutSec = 120,
 
+    // Operator bypass of the software SWR hard trip; false preserves protection.
+    bool SwrTripBypass = false,
+
     // Hardware NCO frequency in Hz. Independent of VfoHz: the dial roams over
     // the sampled spectrum while the radio's hardware centre stays put.
     // Updated only by explicit calls to <c>POST /api/radio/lo</c> (or by the
@@ -4005,3 +4008,5 @@ public sealed record AntennaSettingsDto(
 // connected board lacks (non-ANT1 on a relay-less board, an aux the board does
 // not expose), 400 on a malformed body / unknown band / unparseable value.
 public sealed record AntennaSetRequest(string Band, string TxAnt, string RxAnt, string RxAux = "None");
+
+public sealed record SwrTripBypassSetRequest(bool Bypass);

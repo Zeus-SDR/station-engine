@@ -37,21 +37,26 @@ internal sealed class CatCommandHandler
     private readonly CatOptions _options;
     private readonly Func<double> _latestRxDbm;
     private readonly Action<string> _send;
+    private readonly CatMemoryChannels? _memories;
 
     private int _autoInfo;
+    // Last channel this connection recalled with MC, -1 until one succeeds.
+    private int _lastMemoryChannel = -1;
 
     public CatCommandHandler(
         RadioService radio,
         TxService tx,
         CatOptions options,
         Func<double> latestRxDbm,
-        Action<string> send)
+        Action<string> send,
+        CatMemoryChannels? memories = null)
     {
         _radio = radio;
         _tx = tx;
         _options = options;
         _latestRxDbm = latestRxDbm;
         _send = send;
+        _memories = memories;
     }
 
     /// <summary>True once the client issued AI1/AI2 — gates unsolicited pushes.</summary>
@@ -92,6 +97,9 @@ internal sealed class CatCommandHandler
             case "FT": HandleFt(args, "FT", zzStrict: false); break;
             case "SM": HandleSmeter(); break;
             case "PC": HandlePc(args, "PC", zzStrict: false); break;
+            case "MC": HandleMemoryChannel(args); break;
+            case "MR": HandleMemoryRead(args); break;
+            case "MW": HandleMemoryWrite(args); break;
             case "ZZ":
                 // Thetis/PowerSDR extended dialect (issue #2939): every "ZZxx"
                 // token arrives here via the 2-letter id; the 4-letter id
@@ -247,6 +255,59 @@ internal sealed class CatCommandHandler
         if (parsed is null) return; // 08/11: no Zeus equivalent → no state change
         if (!rx2) _radio.SetMode(parsed.Value);
         else if (_radio.Snapshot().Rx2Enabled) _radio.SetMode(parsed.Value, TxVfo.B);
+    }
+
+    /// <summary>
+    /// MC: recall a memory channel through the one recall service, so the VFO
+    /// lock, every key source and the capability check apply and nothing is
+    /// ever keyed. Unlike the older Kenwood commands the three memory commands
+    /// are strict: a malformed argument, an unassigned channel and a refused
+    /// recall all answer "?;" and change nothing. A bare <c>MC;</c> reports the
+    /// last channel this connection recalled successfully.
+    /// </summary>
+    private void HandleMemoryChannel(string args)
+    {
+        if (_memories is null)
+        {
+            _send(CatProtocol.Error);
+            return;
+        }
+        if (args.Length == 0)
+        {
+            _send(_lastMemoryChannel < 0
+                ? CatProtocol.Error
+                : CatProtocol.Response("MC", CatProtocol.FormatMemoryChannel(_lastMemoryChannel)));
+            return;
+        }
+        if (!CatProtocol.TryParseMemoryChannel(args, out int channel) || !_memories.TryRecall(channel))
+        {
+            _send(CatProtocol.Error);
+            return;
+        }
+        _lastMemoryChannel = channel;
+    }
+
+    /// <summary>MR: the receive (selector 0) or transmit (selector 1) record of
+    /// a channel, 24 bytes with the space before the terminator.</summary>
+    private void HandleMemoryRead(string args)
+    {
+        if (_memories is not null
+            && CatProtocol.TryParseMemoryQuery(args, out int selector, out int channel)
+            && _memories.ReadRecord(selector, channel) is { } record)
+            _send(CatProtocol.Response("MR", record + " "));
+        else
+            _send(CatProtocol.Error);
+    }
+
+    /// <summary>MW: write a channel record. The session framer trims each
+    /// token, so the record arrives without its trailing space whether or not
+    /// the client sent it. A successful set has no reply.</summary>
+    private void HandleMemoryWrite(string args)
+    {
+        if (_memories is null
+            || !CatProtocol.TryParseMemoryRecord(args, out var record)
+            || !_memories.WriteRecord(record))
+            _send(CatProtocol.Error);
     }
 
     private void HandleIf()

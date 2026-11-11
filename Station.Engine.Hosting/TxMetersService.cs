@@ -812,13 +812,14 @@ public sealed class TxMetersService : BackgroundService
         int tuneDrivePercent = 100)
     {
         var decision = _tx.Safety.ObserveProtection(new ProtectionSample(
-            ProtectionEvidenceState.Available,
+            _radio.SwrTripBypass ? ProtectionEvidenceState.Unavailable : ProtectionEvidenceState.Available,
             swr,
             now,
             isTun ? TransmitIntent.Tun : TransmitIntent.Mox,
             keyedAt,
             TimeoutSeconds: 0,
-            FwdWatts: fwdWatts));
+            FwdWatts: fwdWatts,
+            SwrBypassGeneration: _radio.SwrTripBypassGeneration));
         return decision.Trip ? decision.OperatorText : null;
     }
 

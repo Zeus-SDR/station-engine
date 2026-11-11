@@ -230,6 +230,7 @@ public static class StationEngineEndpoints
         endpoints.MapContestLogEndpoints();
         endpoints.MapBandPlanEndpoints();
         endpoints.MapStationFavoriteEndpoints();
+        endpoints.MapStationMemoryEndpoints();
         endpoints.MapPaSettingsEndpoints();
         endpoints.MapRadioSelectionEndpoints();
         endpoints.MapRadioCapabilitiesEndpoint();
