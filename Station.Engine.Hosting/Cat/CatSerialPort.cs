@@ -94,8 +94,8 @@ internal sealed class CatSerialPort : ISerialPttPins, IDisposable
     public CatSerialPort(
         string path, int baud, Parity parity, int dataBits, StopBits stopBits,
         RadioService radio, TxService tx, CatOptions options,
-        Func<double> latestRxDbm, ILogger log)
-        : this(path, baud, parity, dataBits, stopBits, radio, tx, options, latestRxDbm, log, rawWrite: null)
+        Func<double> latestRxDbm, ILogger log, CatMemoryChannels? memories = null)
+        : this(path, baud, parity, dataBits, stopBits, radio, tx, options, latestRxDbm, log, rawWrite: null, memories)
     {
     }
 
@@ -106,15 +106,15 @@ internal sealed class CatSerialPort : ISerialPttPins, IDisposable
     /// drain in order — with no serial I/O in CI.</summary>
     internal CatSerialPort(
         RadioService radio, TxService tx, CatOptions options,
-        Func<double> latestRxDbm, Action<string> rawWrite, ILogger log)
-        : this("test:injected", 0, Parity.None, 8, StopBits.One, radio, tx, options, latestRxDbm, log, rawWrite)
+        Func<double> latestRxDbm, Action<string> rawWrite, ILogger log, CatMemoryChannels? memories = null)
+        : this("test:injected", 0, Parity.None, 8, StopBits.One, radio, tx, options, latestRxDbm, log, rawWrite, memories)
     {
     }
 
     private CatSerialPort(
         string path, int baud, Parity parity, int dataBits, StopBits stopBits,
         RadioService radio, TxService tx, CatOptions options,
-        Func<double> latestRxDbm, ILogger log, Action<string>? rawWrite)
+        Func<double> latestRxDbm, ILogger log, Action<string>? rawWrite, CatMemoryChannels? memories)
     {
         _path = path;
         _baud = baud;
@@ -125,7 +125,7 @@ internal sealed class CatSerialPort : ISerialPttPins, IDisposable
         _wireLog = new CatWireLogger(log, $"serial:{path}", options.WireLogAtInformation);
         _rawWrite = rawWrite ?? WriteLineToPort;
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
-        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
+        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send, memories);
     }
 
     /// <summary>True once the connected client issued AI1/AI2 — gates the

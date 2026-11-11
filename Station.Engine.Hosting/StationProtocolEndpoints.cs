@@ -203,6 +203,21 @@ public static class StationProtocolEndpoints
 
         endpoints.MapGet("/api/station/mode-modem/lease/{leaseId}", HoldModeModemLeaseAsync);
 
+        endpoints.MapPost("/api/freedv/finish-tx", async (HttpContext context) =>
+        {
+            if (!StationEngineEndpoints.CreateNativeMicStreamAuthorization(
+                context.Connection.RemoteIpAddress, context.Request.Headers.Origin,
+                context.RequestServices.GetService<ProductAudioRingPort>())())
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            var port = context.RequestServices.GetService<ExternalReceiverPort>();
+            var dsp = context.RequestServices.GetService<DspPipelineService>();
+            if (port?.TryGetContext(0, out var external) != true || !external.Transmitting
+                || external.Mode != Zeus.Contracts.RxMode.FreeDv || dsp is null)
+                return Results.Conflict(new { error = "No external FreeDV transmission is active." });
+            await Task.Run(dsp.DrainFreeDvTxTail).ConfigureAwait(false);
+            return Results.Ok();
+        });
+
         endpoints.MapPost("/api/station/mode-modem/event", async (HttpContext context) =>
         {
             if (!IsLoopback(context))

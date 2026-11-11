@@ -47,8 +47,17 @@ public static class BandPlanEndpoints
                 return Results.BadRequest(new { error = "hz must be positive" });
             var label = string.IsNullOrWhiteSpace(req.Label) ? band : req.Label.Trim();
             if (label.Length > 64) label = label.Substring(0, 64);
-            var entry = store.Add(band, label, req.Hz, req.Mode, req.FilterLowHz, req.FilterHighHz);
-            return Results.Ok(entry);
+            try
+            {
+                var entry = store.Add(band, label, req.Hz, req.Mode, req.FilterLowHz, req.FilterHighHz);
+                return Results.Ok(entry);
+            }
+            catch (Exception ex) when (ex is StationMemoryValidationException or StationMemoryConflictException)
+            {
+                // The entry is a memory of the unified library; a write its
+                // rules refuse keeps this route's own error shape.
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         endpoints.MapDelete("/api/bands/stack/{band}/{id:int}", (string band, int id, BandStackStore store) =>

@@ -1,61 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using LiteDB;
 using Zeus.Contracts;
 
 namespace Zeus.Server;
 
 /// <summary>
-/// Persists the five station-wide tuning favorites in the engine preferences
-/// database. Empty slots are synthesized on read rather than stored.
+/// The five station-wide tuning favorites, kept in the unified memory library
+/// of the engine preferences database. Empty slots are synthesized on read
+/// rather than stored.
 /// </summary>
 public sealed class StationFavoriteStore : IDisposable
 {
     public const int SlotCount = 5;
     internal const string CollectionName = "station_favorites";
 
-    private readonly object _gate = new();
-    private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
-    private readonly ILiteCollection<StationFavoriteEntry> _entries;
+    // The slots are memories of the unified library that carry a favorite
+    // slot. The legacy collection above is read once by the memory migration
+    // and never written again.
+    private readonly StationMemoryStore _memories;
+    private readonly ILogger _log;
 
     public StationFavoriteStore(
         ILogger<StationFavoriteStore> log,
         string? dbPathOverride = null)
     {
-        var dbPath = dbPathOverride ?? PrefsDbPath.EngineGet();
-        var directory = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            Directory.CreateDirectory(directory);
+        _log = log;
+        _memories = new StationMemoryStore(log, dbPathOverride, clock: null);
 
-        _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
-        _entries = _dbLease.Database.GetCollection<StationFavoriteEntry>(CollectionName);
-        RemoveOutOfRangeAndDuplicateRows(log);
-        _entries.EnsureIndex(entry => entry.Slot, unique: true);
-
-        log.LogInformation("StationFavoriteStore initialized at {Path}", dbPath);
+        log.LogInformation("StationFavoriteStore initialized at {Path}", _memories.DatabasePath);
     }
 
-    public IReadOnlyList<StationFavoriteDto> GetAll()
-    {
-        lock (_gate)
-        {
-            var bySlot = _entries.FindAll().ToDictionary(entry => entry.Slot);
-            return Enumerable.Range(1, SlotCount)
-                .Select(slot => bySlot.TryGetValue(slot, out var entry)
-                    ? ToDto(entry)
-                    : Empty(slot))
-                .ToArray();
-        }
-    }
+    public IReadOnlyList<StationFavoriteDto> GetAll() =>
+        Enumerable.Range(1, SlotCount)
+            .Select(slot => ToDto(slot, _memories.GetByFavoriteSlot(slot)) ?? Empty(slot))
+            .ToArray();
 
     public StationFavoriteDto? Get(int slot)
     {
         ValidateSlot(slot);
-        lock (_gate)
-        {
-            var entry = _entries.FindOne(candidate => candidate.Slot == slot);
-            return entry is null ? null : ToDto(entry);
-        }
+        return ToDto(slot, _memories.GetByFavoriteSlot(slot));
     }
 
     public StationFavoriteDto Upsert(
@@ -67,36 +50,14 @@ public sealed class StationFavoriteStore : IDisposable
         FmMemory? fm = null)
     {
         ValidateSlot(slot);
-
-        lock (_gate)
-        {
-            var entry = _entries.FindOne(candidate => candidate.Slot == slot)
-                ?? new StationFavoriteEntry { Slot = slot };
-            entry.FrequencyHz = frequencyHz;
-            entry.Mode = mode;
-            entry.FilterLowHz = filterLowHz;
-            entry.FilterHighHz = filterHighHz;
-            // FM repeater memory as a JSON string column (same pattern as
-            // DspSettingsEntry.FmConfigJson): no new POCO for LiteDB's
-            // BsonMapper (parallel-construction race, commit b57c12d). Null
-            // for non-FM slots.
-            entry.FmJson = fm is null ? null : System.Text.Json.JsonSerializer.Serialize(fm);
-            entry.UpdatedUtc = DateTime.UtcNow;
-
-            if (entry.Id == 0)
-                _entries.Insert(entry);
-            else
-                _entries.Update(entry);
-
-            return ToDto(entry);
-        }
+        var memory = _memories.UpsertFavorite(slot, frequencyHz, mode, filterLowHz, filterHighHz, fm);
+        return ToDto(slot, memory) ?? Empty(slot);
     }
 
     public void Clear(int slot)
     {
         ValidateSlot(slot);
-        lock (_gate)
-            _entries.DeleteMany(entry => entry.Slot == slot);
+        _memories.DeleteFavorite(slot);
     }
 
     public static bool IsValidSlot(int slot) => slot is >= 1 and <= SlotCount;
@@ -107,48 +68,37 @@ public sealed class StationFavoriteStore : IDisposable
             throw new ArgumentOutOfRangeException(nameof(slot), slot, "Favorite slot must be from 1 through 5.");
     }
 
-    private void RemoveOutOfRangeAndDuplicateRows(ILogger log)
-    {
-        var rows = _entries.FindAll().ToArray();
-        foreach (var row in rows.Where(row => !IsValidSlot(row.Slot)))
-        {
-            _entries.Delete(row.Id);
-            log.LogWarning("Removed invalid station favorite row {Id} for slot {Slot}", row.Id, row.Slot);
-        }
-
-        foreach (var group in rows
-            .Where(row => IsValidSlot(row.Slot))
-            .GroupBy(row => row.Slot)
-            .Where(group => group.Count() > 1))
-        {
-            var keep = group.OrderByDescending(row => row.UpdatedUtc).ThenByDescending(row => row.Id).First();
-            foreach (var duplicate in group.Where(row => row.Id != keep.Id))
-                _entries.Delete(duplicate.Id);
-            log.LogWarning("Collapsed duplicate station favorite rows for slot {Slot}", group.Key);
-        }
-    }
-
     private static StationFavoriteDto Empty(int slot) =>
         new(slot, null, null, null, null, null);
 
-    private static StationFavoriteDto ToDto(StationFavoriteEntry entry) => new(
-        entry.Slot,
-        entry.FrequencyHz,
-        entry.Mode,
-        entry.FilterLowHz,
-        entry.FilterHighHz,
-        new DateTimeOffset(DateTime.SpecifyKind(entry.UpdatedUtc, DateTimeKind.Utc))
-            .ToUnixTimeMilliseconds(),
-        entry.Mode == RxMode.FM ? ReadFm(entry.FmJson) : null);
-
-    private static FmMemory? ReadFm(string? json)
+    // A favorite needs a mode and both filter edges. The memory rules keep
+    // them on a slot-mapped memory; a row that lacks one anyway reads as an
+    // empty slot so the favorites route cannot fail on stored data.
+    private StationFavoriteDto? ToDto(int slot, StationMemoryDto? memory)
     {
-        if (string.IsNullOrWhiteSpace(json)) return null;
-        try { return System.Text.Json.JsonSerializer.Deserialize<FmMemory>(json); }
-        catch (System.Text.Json.JsonException) { return null; }
+        if (memory is null) return null;
+        if (!StationMemoryValidator.TryParseMode(memory.Mode, out var mode)
+            || memory.FilterLowHz is not { } filterLowHz
+            || memory.FilterHighHz is not { } filterHighHz)
+        {
+            _log.LogWarning(
+                "Memory {Id} holds favorite slot {Slot} without a mode or filter; the slot reads as empty",
+                memory.Id,
+                slot);
+            return null;
+        }
+
+        return new StationFavoriteDto(
+            slot,
+            memory.FrequencyHz,
+            mode,
+            filterLowHz,
+            filterHighHz,
+            memory.UpdatedUtcMs,
+            mode == RxMode.FM ? memory.Fm : null);
     }
 
-    public void Dispose() => _dbLease.Dispose();
+    public void Dispose() => _memories.Dispose();
 }
 
 public sealed class StationFavoriteEntry

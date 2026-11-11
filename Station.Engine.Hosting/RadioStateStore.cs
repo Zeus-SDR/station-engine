@@ -221,6 +221,7 @@ public sealed class RadioStateEntry
     // 120 = the historical FR-6 limit, so legacy rows missing this field
     // hydrate with the same guard that has always been in force. Issue #1270.
     public int TxTimeoutSec { get; set; } = 120;
+    public bool SwrTripBypass { get; set; }
     // Hardware NCO at last flush. Persisted so a restart retunes the radio
     // to the same physical centre the operator was last looking at. Zero on
     // legacy rows (pre-CTUN, or rows written by the old CTUN-off branch);

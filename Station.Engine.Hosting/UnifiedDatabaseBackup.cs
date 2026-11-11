@@ -744,12 +744,21 @@ internal static class UnifiedDatabaseBackup
                         .Where(EnginePrefsDbMigration.IsPluginSettingsCollection)
                         .Order(StringComparer.Ordinal))
                     .Distinct(StringComparer.Ordinal);
+                // A file written by a build that has the memory library carries
+                // that library's migration marker. An export leaves an empty
+                // collection out of the file, so in such a file a missing
+                // memory or link collection means "none", not "older build".
+                var sourceHasMemoryLibrary = sourceNames.Contains(StationMemoryStore.MigrationCollectionName)
+                    && source.GetCollection<BsonDocument>(StationMemoryStore.MigrationCollectionName)
+                        .FindById(StationMemoryStore.MigrationMarkerId) is not null;
                 foreach (var name in engineOwned)
                 {
                     // Older backups contain only the engine families known to the
                     // version that created them. Preserve newer local families
                     // instead of replacing them with empty collections.
-                    if (!sourceNames.Contains(name))
+                    if (!sourceNames.Contains(name)
+                        && !(sourceHasMemoryLibrary
+                            && name is StationMemoryStore.CollectionName or StationMemoryStore.LinksCollectionName))
                         continue;
                     if (EnginePrefsDbMigration.IsPluginSettingsCollection(name)
                         && destination.CollectionExists(name)
@@ -775,6 +784,28 @@ internal static class UnifiedDatabaseBackup
                         destination.Rollback();
                         throw;
                     }
+                }
+                // A file older than the unified memory library carries its
+                // favorites and band stack only in the legacy collections just
+                // replaced above. Mark each imported one so the memory store
+                // makes it the truth for that surface on its next open: the
+                // mapped memories follow the imported rows, and slots or
+                // entries the file no longer has stay gone. The collection the
+                // file did not carry keeps its current memories.
+                if (!sourceHasMemoryLibrary && !sourceNames.Contains(StationMemoryStore.CollectionName))
+                {
+                    var pendingMemoryMigration = destination.GetCollection<BsonDocument>(
+                        StationMemoryStore.MigrationCollectionName);
+                    if (sourceNames.Contains(StationFavoriteStore.CollectionName))
+                        pendingMemoryMigration.Upsert(new BsonDocument
+                        {
+                            ["_id"] = StationMemoryMigration.PendingFavoritesMarkerId,
+                        });
+                    if (sourceNames.Contains(StationMemoryMigration.BandStackCollectionName))
+                        pendingMemoryMigration.Upsert(new BsonDocument
+                        {
+                            ["_id"] = StationMemoryMigration.PendingBandStackMarkerId,
+                        });
                 }
                 destination.DropCollection(PureSignalCollection);
                 destination.Checkpoint();

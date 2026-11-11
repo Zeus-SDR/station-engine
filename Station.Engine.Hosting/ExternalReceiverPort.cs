@@ -21,7 +21,8 @@ public readonly record struct ExternalReceiverContext(
     // Optional receive DSP for this receiver alone. Null keeps the engine's
     // own receive DSP settings (RadioService state Nr), as every receiver
     // before this field did.
-    NrConfig? Nr = null);
+    NrConfig? Nr = null,
+    bool ModemTransmit = true);
 
 /// <summary>
 /// Lets one local product process feed finished receive audio plus a small
@@ -288,7 +289,8 @@ public sealed class ExternalReceiverPort : IDisposable
                 else source.PublishedBlocks++;
                 // Processing-only receivers never reach the engine's consumers.
                 if (receiver == 0) dsp.PublishExternalReceiverAudio(box.Value.Receiver, samples);
-                if (!box.Value.Transmitting && box.Value.ProcessedAudio) source.FeedProcessing(samples);
+                if (!box.Value.Transmitting && (box.Value.ProcessedAudio || receiver == 0 && box.Value.Mode == RxMode.FreeDv))
+                    source.FeedProcessing(samples);
             }
         }
         if (detach) Detach(source, ReasonRadioConnected);
@@ -448,7 +450,17 @@ public sealed class ExternalReceiverPort : IDisposable
                     return false;
                 }
             }
-            context = new ExternalReceiverContext(receiver, vfoHz, mode, txElement.GetBoolean(), processed, nr);
+            bool modemTransmit = true;
+            if (root.TryGetProperty("modemTransmit", out var modemTx))
+            {
+                if (modemTx.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    error = "modemTransmit must be a boolean";
+                    return false;
+                }
+                modemTransmit = modemTx.GetBoolean();
+            }
+            context = new ExternalReceiverContext(receiver, vfoHz, mode, txElement.GetBoolean(), processed, nr, modemTransmit);
             error = null;
             return true;
         }
@@ -543,6 +555,7 @@ public sealed class ExternalReceiverPort : IDisposable
         private long _statsPublished;
         private long _statsSuppressed;
         private readonly ExternalReceiverNoiseReduction _processing;
+        private readonly ExternalReceiverModem? _modem;
         private volatile bool _optedIn;
         private int _processingRevision;
         private bool _announced;
@@ -551,13 +564,17 @@ public sealed class ExternalReceiverPort : IDisposable
         internal void ConfigureProcessing(ExternalReceiverContext context, NrConfig nr)
         {
             _optedIn = context.ProcessedAudio;
-            _processing.Configure(context.ProcessedAudio && !context.Transmitting, nr,
+            _modem?.Configure(context);
+            _processing.Configure(context.Mode != RxMode.FreeDv && context.ProcessedAudio && !context.Transmitting, nr,
                 context.Transmitting ? "transmitting" : !ExternalReceiverNoiseReduction.NeedsProcessing(nr) ? "off" : "opt-out",
                 context.Mode);
             Interlocked.Increment(ref _processingRevision);
         }
 
-        internal void FeedProcessing(ReadOnlySpan<float> samples) => _processing.Feed(samples);
+        internal void FeedProcessing(ReadOnlySpan<float> samples)
+        {
+            if (_modem?.Feed(samples) != true) _processing.Feed(samples);
+        }
         internal void ResetProcessingModel()
         {
             _processing.ResetModel();
@@ -565,11 +582,12 @@ public sealed class ExternalReceiverPort : IDisposable
         }
         internal void StopProcessing()
         {
+            _modem?.Dispose();
             _processing.Dispose();
             Interlocked.Increment(ref _processingRevision);
         }
         internal (bool Active, NrMode Mode, int? LatencyMs, int Samples) ReadProcessing(Span<float> output)
-            => _processing.Read(output);
+            => _modem?.Read(output) ?? _processing.Read(output);
 
         internal Source(ExternalReceiverPort port, DspPipelineService dsp, int receiver = 0)
         {
@@ -577,6 +595,7 @@ public sealed class ExternalReceiverPort : IDisposable
             _dsp = dsp;
             Receiver = receiver;
             _processing = port.CreateNoiseReduction();
+            if (receiver == 0) _modem = new ExternalReceiverModem(dsp.ExternalAudioModem);
         }
 
         /// <summary>The receiver index this source was attached for.</summary>

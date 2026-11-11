@@ -86,7 +86,8 @@ internal readonly record struct ProtectionSample(
     // Measured forward power (W) gates the low-power TUN SWR hard-drop bypass.
     // The default is deliberately fail-safe, so a sample built without
     // measured power reads as "high power" and never bypasses protection.
-    double FwdWatts = double.MaxValue);
+    double FwdWatts = double.MaxValue,
+    long SwrBypassGeneration = 0);
 
 internal readonly record struct ProtectionDecision(
     bool Trip,
@@ -359,8 +360,18 @@ internal sealed class EngineTransmitSafetyModule
         }
     }
 
+    private long _swrBypassGeneration;
+
     public ProtectionDecision ObserveProtection(ProtectionSample sample)
     {
+        lock (_sync)
+        {
+            if (_swrBypassGeneration != sample.SwrBypassGeneration)
+            {
+                _swrBypassGeneration = sample.SwrBypassGeneration;
+                _swrAboveThresholdSince = null;
+            }
+        }
         var timeout = ObserveTimeout(sample.Now, sample.Intent, sample.KeyedAt, sample.TimeoutSeconds);
         if (timeout.Trip) return timeout;
 

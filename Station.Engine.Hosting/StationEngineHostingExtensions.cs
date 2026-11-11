@@ -3,6 +3,7 @@
 
 using Zeus.Dsp.Wdsp;
 using Zeus.Protocol1;
+using Zeus.Server.Diagnostics;
 using Zeus.Server.Tdoa;
 
 namespace Zeus.Server;
@@ -153,6 +154,11 @@ public static class StationEngineHostingExtensions
         services.AddSingleton<BandMemoryStore>();
         services.AddSingleton<BandStackStore>();
         services.AddSingleton<StationFavoriteStore>();
+        services.AddSingleton<StationMemoryStore>();
+        services.AddSingleton<MemoryOperationHistory>();
+        services.AddSingleton<StationMemoryRecallService>();
+        services.AddSingleton<StationMemoryImportExport>();
+        services.AddSingleton<Cat.CatMemoryChannels>();
         services.AddSingleton<RfFilterSettingsStore>();
         services.AddSingleton<PttSettingsStore>();
         services.AddSingleton<SerialPttSettingsStore>();

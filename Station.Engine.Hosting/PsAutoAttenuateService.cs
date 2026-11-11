@@ -242,8 +242,14 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private const long AutoCalMinIntervalMs = 1000;        // ≤ 1 push per second
     private long _lastAutoCalTickMs;
 
-    private static bool UsesHardenedSingleAdcPsPolicy(HpsdrBoardKind board) =>
-        board is HpsdrBoardKind.HermesC10 or HpsdrBoardKind.HermesII;
+    // Plain Hermes (Hermes / ANAN-10 / ANAN-100 / Brick 2) joins the policy on
+    // Protocol 2 only, where its single-ADC time-mux feedback path exists
+    // (#3655). On Protocol 1 it has no PureSignal path and keeps the old gates.
+    internal static bool UsesHardenedSingleAdcPsPolicy(HpsdrBoardKind board, bool protocol2 = false) =>
+        board is HpsdrBoardKind.HermesC10 or HpsdrBoardKind.HermesII
+        || (protocol2
+            && board == HpsdrBoardKind.Hermes
+            && Zeus.Protocol2.Protocol2Client.TimeMuxesPsFeedbackOnDdc0(board));
 
     public PsAutoAttenuateService(
         RadioService radio,
@@ -371,7 +377,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
         // where the 4-DDC feedback counters live. Any other board (and a
         // P2-connected HL2, where ActiveClient is null) keeps the generic line.
         bool isHl2P1 = board == HpsdrBoardKind.HermesLite2 && p1 is not null;
-        if (!isHl2P1 && !UsesHardenedSingleAdcPsPolicy(board))
+        if (!isHl2P1 && !UsesHardenedSingleAdcPsPolicy(board, protocol2: p1 is null))
         {
             _log.LogWarning(
                 "psAutoAttn.stall info5=0 for {ElapsedMs}ms — hw_peak likely too high for current drive (calcc bin 15 never fills). Lower HW peak in PURESIGNAL panel.",
@@ -1018,7 +1024,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 // runs on voice with the calibrated value; only attenuator
                 // WRITES are two-tone-scoped. Dual-ADC boards keep their
                 // shipped behaviour.
-                bool hardenedSingleAdc = UsesHardenedSingleAdcPsPolicy(_radio.ConnectedBoardKind);
+                bool hardenedSingleAdc = UsesHardenedSingleAdcPsPolicy(_radio.ConnectedBoardKind, protocol2: true);
                 if (hardenedSingleAdc && !_tx.IsTwoToneOn)
                 {
                     LogGate("p2.skip=single-adc-not-twotone (servo is two-tone-only)");
@@ -1155,7 +1161,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                     // fresh fit lands feedback in-window at this value (a
                     // completed calibration); mid-walk it surfaces the live
                     // value to the UI without touching the store.
-                    if (!UsesHardenedSingleAdcPsPolicy(_radio.ConnectedBoardKind))
+                    if (!UsesHardenedSingleAdcPsPolicy(_radio.ConnectedBoardKind, protocol2: true))
                         _radio.SetPsTxAttenuationDb(newAttn);
                     else
                         _radio.SetPsTxAttenuationDbStateOnly(newAttn);

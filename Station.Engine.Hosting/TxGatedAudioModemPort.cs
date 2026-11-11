@@ -6,8 +6,8 @@ namespace Zeus.Server;
 /// <summary>
 /// TX-only view of the one shared audio modem. Receive <see cref="SyncMode"/>,
 /// <see cref="ProcessRx"/>, and <see cref="FlushRx"/> stay on the inner port.
-/// <see cref="Active"/> is true only when that modem is engaged and the TX
-/// receiver's mode is FreeDV, so an SSB transmitter does not encode while
+/// <see cref="Active"/> requires a FreeDV TX receiver. An external receiver
+/// can also require silence while the modem is unavailable. SSB does not encode while
 /// another receiver holds the modem.
 /// </summary>
 /// <remarks>
@@ -27,13 +27,15 @@ public sealed class TxGatedAudioModemPort : IAudioModemPort
 {
     private readonly IAudioModemPort _inner;
     private readonly Func<bool> _txReceiverIsFreeDv;
+    private readonly Func<bool> _requireEncodedAudio;
     // 1 after this wrapper has forwarded ProcessTx or FinishTx and the
     // matching FlushTx has not yet reached the inner port. The unkey thread
     // and the mic thread both call in; the flag is the only shared state.
     private int _txResetPending;
 
-    public TxGatedAudioModemPort(IAudioModemPort inner, Func<bool> txReceiverIsFreeDv)
+    public TxGatedAudioModemPort(IAudioModemPort inner, Func<bool> txReceiverIsFreeDv, Func<bool>? requireEncodedAudio = null)
     {
+        _requireEncodedAudio = requireEncodedAudio ?? (() => false);
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _txReceiverIsFreeDv = txReceiverIsFreeDv ?? throw new ArgumentNullException(nameof(txReceiverIsFreeDv));
     }
@@ -42,7 +44,7 @@ public sealed class TxGatedAudioModemPort : IAudioModemPort
 
     public bool Available => _inner.Available;
 
-    public bool Active => _inner.Active && _txReceiverIsFreeDv();
+    public bool Active => (_inner.Active || _requireEncodedAudio()) && _txReceiverIsFreeDv();
 
     public void SyncMode(byte rxModeByte) { }
 
@@ -52,7 +54,7 @@ public sealed class TxGatedAudioModemPort : IAudioModemPort
 
     public void ProcessTx(Span<float> block48k)
     {
-        if (!Active)
+        if (!Active || !_inner.Active)
         {
             block48k.Clear();
             return;

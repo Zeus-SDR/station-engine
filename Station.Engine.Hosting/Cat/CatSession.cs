@@ -49,7 +49,8 @@ public sealed class CatSession : IDisposable
         RadioService radio,
         TxService tx,
         CatOptions options,
-        Func<double> latestRxDbm)
+        Func<double> latestRxDbm,
+        CatMemoryChannels? memories = null)
     {
         _id = id;
         _client = client;
@@ -57,7 +58,7 @@ public sealed class CatSession : IDisposable
         _log = log;
         _wireLog = new CatWireLogger(log, id.ToString("N"), options.WireLogAtInformation);
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
-        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
+        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send, memories);
     }
 
     internal CatSession(
@@ -67,14 +68,15 @@ public sealed class CatSession : IDisposable
         TxService tx,
         CatOptions options,
         Func<double> latestRxDbm,
-        Action<string> sendForTest)
+        Action<string> sendForTest,
+        CatMemoryChannels? memories = null)
     {
         _id = id;
         _log = log;
         _directSend = sendForTest;
         _wireLog = new CatWireLogger(log, id.ToString("N"), options.WireLogAtInformation);
         _rateLimiter = new TciRateLimiter(options.RateLimitMs, Send);
-        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send);
+        _handler = new CatCommandHandler(radio, tx, options, latestRxDbm, Send, memories);
     }
 
     /// <summary>True once the client has issued AI1/AI2 — gates unsolicited

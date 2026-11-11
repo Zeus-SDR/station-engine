@@ -417,6 +417,13 @@ public sealed class TxService : IDisposable
         return true;
     }
 
+    /// <summary>True while PA calibration owns the transmitter, between its
+    /// TUN pulses too.</summary>
+    internal bool IsPaCalibrationLeaseActive
+    {
+        get { lock (_sync) return _paCalibrationLeaseActive; }
+    }
+
     internal void EndPaCalibrationLease()
     {
         lock (_transitionSync)

@@ -130,6 +130,118 @@ public static class CatProtocol
         _ => null,
     };
 
+    /// <summary>Longest frequency the 11-digit Kenwood field can carry.
+    /// <see cref="FormatFreq"/> keeps the low 11 digits of anything wider, so a
+    /// memory record of a higher frequency would report a wrong one.</summary>
+    public const long MaxMemoryFrequencyHz = 99_999_999_999;
+
+    /// <summary>The Kenwood CTCSS tone table of the memory channel records
+    /// (MR/MW): the 2-digit tone field is the position in this list plus one,
+    /// 01..50.</summary>
+    public static IReadOnlyList<double> CtcssTones { get; } = new[]
+    {
+        67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5,
+        94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3,
+        131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9,
+        171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5,
+        203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
+    };
+
+    /// <summary>A stored tone matches a table entry within this distance.</summary>
+    public const double CtcssToleranceHz = 0.05;
+
+    /// <summary>1-based index of <paramref name="toneHz"/> in
+    /// <see cref="CtcssTones"/>, or 0 when the tone is not a table entry.</summary>
+    public static int CtcssIndex(double toneHz)
+    {
+        for (int i = 0; i < CtcssTones.Count; i++)
+        {
+            if (Math.Abs(CtcssTones[i] - toneHz) <= CtcssToleranceHz) return i + 1;
+        }
+        return 0;
+    }
+
+    private const int MemoryRecordLength = 20;
+
+    /// <summary>MC set argument: the bank (a space) + a 2-digit channel.</summary>
+    public static bool TryParseMemoryChannel(string args, out int channel)
+    {
+        channel = 0;
+        return args.Length == 3 && args[0] == ' ' && TryParseDigits(args.AsSpan(1, 2), out channel);
+    }
+
+    /// <summary>MR argument: selector (0 or 1) + the bank (a space) + a
+    /// 2-digit channel.</summary>
+    public static bool TryParseMemoryQuery(string args, out int selector, out int channel)
+    {
+        selector = 0;
+        channel = 0;
+        if (args.Length != 4 || args[0] is not ('0' or '1') || args[1] != ' ') return false;
+        selector = args[0] - '0';
+        return TryParseDigits(args.AsSpan(2, 2), out channel);
+    }
+
+    /// <summary>MW argument: exactly the 20-byte record. Every field is range
+    /// checked here: mode digits 0 and 8 have no Zeus mode, an enabled tone
+    /// carries index 01..50 and a disabled one exactly 00.</summary>
+    public static bool TryParseMemoryRecord(string args, out CatMemoryRecord record)
+    {
+        record = default;
+        if (args.Length != MemoryRecordLength
+            || !TryParseMemoryQuery(args[..4], out int selector, out int channel)
+            || !TryParseDigits(args.AsSpan(4, 11), out long hz)
+            || ParseMode(args.Substring(15, 1)) is null
+            || args[16] is not ('0' or '1')
+            || args[17] is not ('0' or '1')
+            || !TryParseDigits(args.AsSpan(18, 2), out int tone))
+            return false;
+
+        bool ctcss = args[17] == '1';
+        if (ctcss ? tone is < 1 or > 50 : tone != 0) return false;
+        record = new CatMemoryRecord(selector, channel, hz, args[15], args[16] == '1', ctcss, tone);
+        return true;
+    }
+
+    /// <summary>The 20-byte record body (no "MR" prefix, no trailing space,
+    /// no ';').</summary>
+    public static string FormatMemoryRecord(CatMemoryRecord record)
+    {
+        var sb = new StringBuilder(MemoryRecordLength);
+        sb.Append(record.Selector == 0 ? '0' : '1');
+        sb.Append(FormatMemoryChannel(record.Channel));
+        sb.Append(FormatFreq(record.FrequencyHz));
+        sb.Append(record.ModeDigit);
+        sb.Append(record.Skip ? '1' : '0');
+        sb.Append(record.CtcssEnabled ? '1' : '0');
+        sb.Append(TwoDigits(record.CtcssEnabled ? record.CtcssIndex : 0));
+        return sb.ToString();
+    }
+
+    /// <summary>The bank (a space) + the 2-digit channel, e.g. 1 → " 01".</summary>
+    public static string FormatMemoryChannel(int channel) => " " + TwoDigits(channel);
+
+    private static string TwoDigits(int value) =>
+        value.ToString(System.Globalization.CultureInfo.InvariantCulture).PadLeft(2, '0');
+
+    // Fixed-width record fields: every character must be an ASCII digit.
+    private static bool TryParseDigits(ReadOnlySpan<char> field, out long value)
+    {
+        value = 0;
+        foreach (char c in field)
+        {
+            if (!char.IsAsciiDigit(c)) return false;
+            value = value * 10 + (c - '0');
+        }
+        return field.Length > 0;
+    }
+
+    private static bool TryParseDigits(ReadOnlySpan<char> field, out int value)
+    {
+        bool ok = TryParseDigits(field, out long wide);
+        value = (int)wide;
+        return ok;
+    }
+
     /// <summary>Zeus mode → 2-digit Thetis ZZ mode code (ZZMD/ZZME/ZZIF), per
     /// Thetis <c>CATCommands.Mode2String</c>: 00 LSB, 01 USB, 02 DSB, 03 CWL,
     /// 04 CWU, 05 FM, 06 AM, 07 DIGU, 08 SPEC, 09 DIGL, 10 SAM, 11 DRM. Zeus has
@@ -255,3 +367,20 @@ public static class CatProtocol
         return sb.ToString();          // total              35 (IF) / 36 (ZZIF)
     }
 }
+
+/// <summary>
+/// One memory channel record (MR reply / MW set). Wire layout, 20 bytes:
+/// selector(1, 0 = receive, 1 = transmit) + bank(1, a space) + channel(2) +
+/// frequency(11) + mode(1) + skip(1) + CTCSS on(1) + CTCSS index(2). The
+/// wire form ends with one more space before the ';', which
+/// <see cref="CatProtocol.ExtractCommands"/> has already trimmed from a
+/// received token.
+/// </summary>
+public readonly record struct CatMemoryRecord(
+    int Selector,
+    int Channel,
+    long FrequencyHz,
+    char ModeDigit,
+    bool Skip,
+    bool CtcssEnabled,
+    int CtcssIndex);

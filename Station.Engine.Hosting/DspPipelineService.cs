@@ -1374,6 +1374,7 @@ public partial class DspPipelineService : BackgroundService,
     /// </summary>
     private void PushCarrierlessTx(IDspEngine engine, StateDto s, bool force)
     {
+        s = ExternalModemTxState(s);
         var receiver = RadioFrequencyResolver.TxReceiver(s);
         var plan = ResolveCarrierlessTxPlan(s, _hub.ProcessedTxStreamRequested);
         var txLeveling = ProcessedTxPublish.LevelingFor(
@@ -1577,6 +1578,12 @@ public partial class DspPipelineService : BackgroundService,
     // resets the epoch, and leave-mode disengages. Idle ticks stay silent.
     private void EngageFreeDvOwner(StateDto state)
     {
+        // External receive has its own clock and owns the modem while attached.
+        if (_externalReceiverPort?.IsActive == true)
+        {
+            _freeDvOwnerIndex = -1;
+            return;
+        }
         int owner = SelectFreeDvOwner(state);
         int previous = _freeDvOwnerIndex;
         if (owner >= 0)
@@ -2172,7 +2179,9 @@ public partial class DspPipelineService : BackgroundService,
         _hub = hub;
         _txIqRing = txIqRing;
         _audioModem = audioModem ?? new NullAudioModemPort();
-        _txAudioModem = new TxGatedAudioModemPort(_audioModem, () => _txReceiverIsFreeDv);
+        _txAudioModem = new TxGatedAudioModemPort(_audioModem, () => _externalReceiverPort?.TryGetContext(0, out var external) == true
+            ? external.Mode == RxMode.FreeDv && external.ModemTransmit : _txReceiverIsFreeDv,
+            () => _externalReceiverPort?.TryGetContext(0, out var external) == true && external.Mode == RxMode.FreeDv);
         _productAudio = productAudio ?? new NullProductTxAudioPort();
         _productPluginAudio = productPluginAudio;
         _productPluginAudio?.ConfigureLocalMonitorSink(EnqueueMonitorAudio);
@@ -2278,6 +2287,7 @@ public partial class DspPipelineService : BackgroundService,
 
         _hub.CwDecodeRequestChanged += OnCwNoiseReductionDemandChanged;
         _hub.ProcessedTxDemandChanged += OnProcessedTxDemandChanged;
+        if (_externalReceiverPort is not null) _externalReceiverPort.ContextChanged += OnExternalModemContextChanged;
 
         _nr3ModelStore = nr3ModelStore;
         if (_nr3ModelStore is not null)
@@ -2331,6 +2341,7 @@ public partial class DspPipelineService : BackgroundService,
         if (_micCaptureIngest is not null) _micCaptureIngest.MicPcmTapped -= CaptureMicWaveform;
         _hub.CwDecodeRequestChanged -= OnCwNoiseReductionDemandChanged;
         _hub.ProcessedTxDemandChanged -= OnProcessedTxDemandChanged;
+        if (_externalReceiverPort is not null) _externalReceiverPort.ContextChanged -= OnExternalModemContextChanged;
         ClearCwNoiseReductionBypass();
         if (_sMeterCalibrationStore is not null)
             _sMeterCalibrationStore.Changed -= OnSMeterCalibrationChanged;
@@ -6442,7 +6453,7 @@ public partial class DspPipelineService : BackgroundService,
         {
         // A queued pre-key snapshot must not retune the TX DUC or restore an
         // older sideband while a fixed-channel audio lease owns transmission.
-        s = _radio.ReconcileProductPluginTxState(s);
+        s = ExternalModemTxState(_radio.ReconcileProductPluginTxState(s));
         _fullDuplexRxConfigured = s.FullDuplexMultiRxEnabled;
         // FreeDV spec-profile override (see the AGC/TX-leveling pushes below):
         // gates those engine pushes to linear-friendly values while the operator's

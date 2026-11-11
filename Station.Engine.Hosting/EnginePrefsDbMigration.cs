@@ -100,6 +100,9 @@ internal static class EnginePrefsDbMigration
             "ui_saved_layouts",
             "vna_calibrations",
             "vna_sweeps",
+            StationMemoryStore.CollectionName,
+            StationMemoryStore.LinksCollectionName,
+            StationMemoryStore.MigrationCollectionName,
         ]);
 
     /// <summary>

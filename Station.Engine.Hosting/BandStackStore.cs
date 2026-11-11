@@ -10,7 +10,6 @@
 // option) any later version. See the LICENSE file at the root of this
 // repository for the full text, or https://www.gnu.org/licenses/.
 
-using LiteDB;
 using Zeus.Contracts;
 
 namespace Zeus.Server;
@@ -22,85 +21,62 @@ namespace Zeus.Server;
 // here have a stable Id + Label and are managed only by explicit push/delete.
 public sealed class BandStackStore : IDisposable
 {
-    private readonly Zeus.Data.SharedLiteDatabase.Lease _dbLease;
-    private readonly LiteDatabase _db;
-    private readonly ILiteCollection<BandStackEntry> _entries;
+    // Entries are memories of the unified library that carry a band-stack id.
+    // The legacy band_stack collection is read once by the memory migration
+    // and never written again.
+    private readonly StationMemoryStore _memories;
     private readonly ILogger<BandStackStore> _log;
 
     public BandStackStore(ILogger<BandStackStore> log, string? dbPathOverride = null)
     {
         _log = log;
-        var dbPath = dbPathOverride ?? PrefsDbPath.EngineGet();
+        _memories = new StationMemoryStore(log, dbPathOverride, clock: null);
 
-        var dir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-        {
-            Directory.CreateDirectory(dir);
-        }
-
-        _dbLease = Zeus.Data.SharedLiteDatabase.Acquire(dbPath);
-        _db = _dbLease.Database;
-        _entries = _db.GetCollection<BandStackEntry>("band_stack");
-        _entries.EnsureIndex(x => x.Band);
-
-        _log.LogInformation("BandStackStore initialized at {Path}", dbPath);
+        _log.LogInformation("BandStackStore initialized at {Path}", _memories.DatabasePath);
     }
 
-    public IReadOnlyList<BandStackEntryDto> GetAll()
-    {
-        return _entries
-            .FindAll()
-            .OrderBy(e => e.Band, StringComparer.Ordinal)
-            .ThenBy(e => e.UpdatedUtc)
-            .ThenBy(e => e.Id)
-            .Select(ToDto)
-            .ToArray();
-    }
+    public IReadOnlyList<BandStackEntryDto> GetAll() => ToDtos(_memories.GetBandStack());
 
-    public IReadOnlyList<BandStackEntryDto> GetForBand(string band)
-    {
-        return _entries
-            .Find(x => x.Band == band)
-            .OrderBy(e => e.UpdatedUtc)
-            .ThenBy(e => e.Id)
-            .Select(ToDto)
-            .ToArray();
-    }
+    public IReadOnlyList<BandStackEntryDto> GetForBand(string band) => ToDtos(_memories.GetBandStack(band));
 
     public BandStackEntryDto Add(string band, string label, long hz, RxMode mode, int? filterLowHz, int? filterHighHz)
     {
-        var entry = new BandStackEntry
-        {
-            Band = band,
-            Label = label,
-            Hz = hz,
-            Mode = mode,
-            FilterLowHz = filterLowHz,
-            FilterHighHz = filterHighHz,
-            UpdatedUtc = DateTime.UtcNow,
-        };
-        _entries.Insert(entry);
-        return ToDto(entry);
+        // The returned entry shows what was stored, which for a label with
+        // control characters or an unusable filter pair is the cleaned form.
+        return ToDtos([_memories.AddBandStack(band, label, hz, mode, filterLowHz, filterHighHz)])[0];
     }
 
-    public bool Delete(string band, int id)
+    public bool Delete(string band, int id) => _memories.DeleteBandStack(band, id);
+
+    // BandStackEntryDto.Mode is not nullable. The memory rules keep a mode on
+    // a band-stack memory; a row that lacks one anyway is left out so the
+    // band-stack route cannot fail on stored data.
+    private BandStackEntryDto[] ToDtos(IReadOnlyList<StationMemoryDto> memories)
     {
-        var e = _entries.FindOne(x => x.Band == band && x.Id == id);
-        if (e is null) return false;
-        return _entries.Delete(e.Id);
+        var entries = new List<BandStackEntryDto>(memories.Count);
+        foreach (var memory in memories)
+        {
+            if (memory.Legacy is not { BandStackId: { } id }
+                || !StationMemoryValidator.TryParseMode(memory.Mode, out var mode))
+            {
+                _log.LogWarning("Memory {Id} is a band stack entry without a mode; it is left out", memory.Id);
+                continue;
+            }
+
+            entries.Add(new BandStackEntryDto(
+                id,
+                memory.Legacy.Band ?? string.Empty,
+                memory.Name,
+                memory.FrequencyHz,
+                mode,
+                memory.FilterLowHz,
+                memory.FilterHighHz,
+                memory.CreatedUtcMs));
+        }
+        return entries.ToArray();
     }
 
-    private static BandStackEntryDto ToDto(BandStackEntry e) => new(
-        e.Id,
-        e.Band,
-        e.Label,
-        e.Hz,
-        e.Mode,
-        e.FilterLowHz,
-        e.FilterHighHz,
-        new DateTimeOffset(DateTime.SpecifyKind(e.UpdatedUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds());
-
-    public void Dispose() => _dbLease.Dispose();
+    public void Dispose() => _memories.Dispose();
 }
 
 public sealed class BandStackEntry

@@ -85,7 +85,7 @@ public partial class DspPipelineService
         if (!_hub.ProcessedTxStreamRequested) return;
         block.CopyTo(_processedTxScratch);
         var publishMode = ResolveCarrierlessTxPlan(
-            _radio.Snapshot(), _hub.ProcessedTxStreamRequested).Mode;
+            ExternalModemTxState(_radio.Snapshot()), _hub.ProcessedTxStreamRequested).Mode;
         ProcessedTxPublish.Apply(_processedTxScratch, publishMode);
         for (int i = 0; i < _processedTxScratch.Length; i++)
             BinaryPrimitives.WriteSingleLittleEndian(
