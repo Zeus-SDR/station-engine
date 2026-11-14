@@ -3151,6 +3151,14 @@ public sealed record G2OptionsSetRequest(
     bool? RandomEnabled = null,
     int? Rx1AttenuatorDb = null);
 
+// ANAN-G2 / Saturn front-panel CAT port (Protocol-2 high-priority bytes
+// 1398-1399). Port 0 = off. Supported is true when the effective board is the
+// 0x0A family, the only one that carries the port on the wire.
+public sealed record G2CatPortDto(bool Supported, int Port);
+
+// PUT body for /api/radio/g2-cat-port. Port must be 0..65535 (0 = off).
+public sealed record G2CatPortSetRequest(int Port);
+
 // ---- RF filter matrix ----------------------------------------------------
 //
 // Manual Alex RF filter windows, modeled after Thetis Setup -> Ant/Filters:

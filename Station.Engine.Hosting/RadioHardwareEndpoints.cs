@@ -223,6 +223,32 @@ public static class RadioHardwareEndpoints
             return Results.Ok(radio.SetG2Options(req));
         });
 
+        // ANAN-G2 / Saturn front-panel CAT port. Written to Protocol-2
+        // CmdHighPriority bytes 1398-1399 (big-endian) on the 0x0A family;
+        // Saturn p2app then opens a TCP connection to this port on the
+        // engine host and sends the panel's Andromeda CAT messages. 0 = off.
+        // The preference persists on any board; Supported reports whether the
+        // effective board carries it on the wire.
+        endpoints.MapGet("/api/radio/g2-cat-port", (RadioService radio) =>
+        {
+            return Results.Ok(new G2CatPortDto(
+                Supported: radio.G2FrontPanelCatPortSupported,
+                Port: radio.GetG2FrontPanelCatPort()));
+        });
+
+        endpoints.MapPut("/api/radio/g2-cat-port", (G2CatPortSetRequest req, RadioService radio) =>
+        {
+            if (req is null)
+                return Results.BadRequest(new { error = "body required" });
+            if (req.Port is < 0 or > 65535)
+                return Results.BadRequest(new { error = "port must be in 0..65535 (0 = off)." });
+
+            int effective = radio.SetG2FrontPanelCatPort(req.Port);
+            return Results.Ok(new G2CatPortDto(
+                Supported: radio.G2FrontPanelCatPortSupported,
+                Port: effective));
+        });
+
         return endpoints;
     }
 

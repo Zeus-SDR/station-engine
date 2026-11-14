@@ -411,6 +411,12 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     // replays the persisted G2 options for a verified G2-class board.
     private bool _adcDitherEnabled;
     private bool _adcRandomEnabled;
+    // TCP CAT port announced to the radio in CmdHighPriority bytes 1398-1399
+    // (big-endian). Saturn p2app (ANAN-G2 / G2-1K) connects back to this port
+    // on the host that sent the packet and streams the G2 front panel's
+    // Andromeda CAT messages (ZZZU/ZZZD/ZZZE/ZZZP). 0 = no CAT port, which is
+    // what Zeus has always sent; p2app shuts its CAT handler down on 0.
+    private int _catPort;
     // TX step attenuator (0..31 dB) — Thetis network.c:1238-1242 writes the
     // same value to bytes 57/58/59 of CmdTx (one per ADC tap). The PS
     // auto-attenuate loop adjusts this when info[4] feedback level lands
@@ -2131,6 +2137,40 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         _adcDitherEnabled = ditherEnabled;
         _adcRandomEnabled = randomEnabled;
         if (_rxTask is not null) SendCmdRx();
+    }
+
+    /// <summary>
+    /// Set the TCP CAT port written to CmdHighPriority bytes 1398-1399
+    /// (Thetis <c>SetCATPort</c>; Saturn p2app <c>InHighPriority.c</c> →
+    /// <c>SetupCATPort</c>). 0 disables. p2app only adopts a port while its
+    /// own port is 0, so a change from one non-zero port to another first
+    /// sends a packet with 0 to close the old connection. Only composed for
+    /// the 0x0A family; every other board keeps the bytes at 0.
+    /// </summary>
+    public void SetCatPort(int port)
+    {
+        int next = Math.Clamp(port, 0, ushort.MaxValue);
+        int previous = Interlocked.Exchange(ref _catPort, next);
+        if (previous == next || !CanSendCmdHighPriority) return;
+        if (previous != 0 && next != 0)
+        {
+            Volatile.Write(ref _catPort, 0);
+            SendCmdHighPriority(run: true);
+            Volatile.Write(ref _catPort, next);
+        }
+        SendCmdHighPriority(run: true);
+    }
+
+    /// <summary>Test accessor: the CAT port composed into bytes 1398-1399.</summary>
+    internal int CatPortForTesting => Volatile.Read(ref _catPort);
+
+    // CmdHighPriority bytes 1398-1399: TCP CAT port, big-endian (Thetis
+    // ChannelMaster network.c; Saturn p2app reads rd_be_u16(buf + 1398)).
+    internal static void WriteCatPortBytes(Span<byte> p, int port)
+    {
+        ushort value = (ushort)Math.Clamp(port, 0, ushort.MaxValue);
+        p[1398] = (byte)(value >> 8);
+        p[1399] = (byte)(value & 0xFF);
     }
 
     public void SetDriveByte(byte value)
@@ -4791,6 +4831,12 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             byte dxBits = (moxOn || tuneActive) ? _ocDxTxMask : _ocDxRxMask;
             p[1397] = (byte)((dxBits & 0x0F) << 1);
         }
+
+        // CAT-over-TCP port for the Saturn front panel (bytes 1398-1399). Only
+        // the 0x0A family runs p2app; other boards keep the bytes at 0, and
+        // the default port of 0 leaves the packet byte-identical everywhere.
+        if (_boardKind == HpsdrBoardKind.OrionMkII)
+            WriteCatPortBytes(p, Volatile.Read(ref _catPort));
 
         // OrionMkII DLE gateware and Saturn/G2 p2_app both honor byte 1400;
         // the explicit bit-0 state is resolved by the caller because the former
