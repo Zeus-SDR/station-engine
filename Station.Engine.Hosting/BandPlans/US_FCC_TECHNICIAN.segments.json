@@ -22,6 +22,8 @@
     { "lowHz": 28300000, "highHz": 28500000, "label": "10M Phone (Technician)",         "allocation": "Amateur",  "modeRestriction": "PhoneOnly",    "maxPowerW": 200,  "notes": "Tech/Novice SSB phone (CW also permitted), 200 W PEP" },
     { "lowHz": 28500000, "highHz": 29700000, "label": "10M >28.5 — no Technician privilege", "allocation": "Reserved", "modeRestriction": "Any",     "maxPowerW": null, "notes": null },
     { "lowHz": 50000000, "highHz": 50100000, "label": "6M CW",                          "allocation": "Amateur",  "modeRestriction": "CwOnly",       "maxPowerW": null, "notes": "Technician: full 6 m privileges" },
-    { "lowHz": 50100000, "highHz": 54000000, "label": "6M",                             "allocation": "Amateur",  "modeRestriction": "Any",          "maxPowerW": null, "notes": "Technician: full 6 m privileges" }
+    { "lowHz": 50100000, "highHz": 54000000, "label": "6M",                             "allocation": "Amateur",  "modeRestriction": "Any",          "maxPowerW": null, "notes": "Technician: full 6 m privileges" },
+    { "lowHz": 144000000, "highHz": 148000000, "label": "2M", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "47 CFR 97.301: 144-148 MHz, all license classes. Reachable only through a source that declares native VHF transmit (FT-991A)." },
+    { "lowHz": 420000000, "highHz": 450000000, "label": "70CM", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "47 CFR 97.301: 420-450 MHz (secondary allocation; 97.303 geographic limits apply). Reachable only through a source that declares native UHF transmit." }
   ]
 }

@@ -30,6 +30,8 @@ warren@pratt.one
 #include "nurbs_spline.h"
 #include "nurbs_fit.h"
 #include "delay.h"
+#include "ps_memcorr.h"
+#include "ps_scheck.h"
 
 typedef struct _psCollection* PSCOLLECTION;
 typedef struct _eqdensity* EQDENSITY;
@@ -40,6 +42,7 @@ typedef struct _calcc
 {
 	int channel;
 	int runcal;
+	int fast_tracking; // protected by calcc.cs_update
 	int size;
 	volatile long mox;
 	int rate;
@@ -203,6 +206,22 @@ typedef struct _calcc
 	HANDLE hCorrChangeExited;
 	double* temptx;
 	double* temprx;
+	// Zeus: opt-in memory correction (ps_memcorr.h). Off at create. Every
+	// field is protected by calcc.cs_update; while run == 0 all but hold are
+	// zero.
+	struct _mem
+	{
+		int    run;
+		double beta_re, beta_im;	// learned coefficient
+		double pub_re, pub_im;		// coefficient last handed to iqc
+		double rx_scale;			// rx_scale of the last accepted fit, 0 = none since reset
+		ps_memcorr_acc acc;
+		// Set while iqc may be running curves calcc did not fit: from a
+		// restore (PSRestoreCorr) or turn-on (LTURNON) until the next LRESET.
+		// The estimator never runs while it is set, so no fit that lands late
+		// (the worker can run a queued fit after the restore) can re-arm it.
+		int    hold;
+	} mem;
 } calcc, * CALCC;
 
 void __cdecl doPSCorrChange(void* arg);
@@ -291,6 +310,9 @@ void print_EQ_Samples(CALCC a);
 #define PS_NS_EXTEND_LEFT_MODE    0
 #define PS_NS_EXTEND_BOUND_FRAC   0.05
 #define PS_NS_EXTEND_X_TARGET     0.00
+#define PS_CTRL_EMA_ALPHA         0.10
+#define PS_CTRL_EMA_ALPHA_FAST    0.50
+#define PS_NS_EMA_ALPHA_FAST      0.60
 #define PS_NS_EMA_ALPHA           0.30
 #define PS_NS_EMA_ALPHA_LO        0.30
 #define PS_NS_EMA_X_BND           0.20
@@ -300,8 +322,7 @@ void print_EQ_Samples(CALCC a);
 #define EXTREMA_X_LO              0.05
 #define EXTREMA_X_HI              0.85
 
-#define SCHECK_PTS                40
-#define SCHECK_TOL                0.10
+// SCHECK_PTS / SCHECK_TOL and the magnitude weighting live in ps_scheck.h.
 #define TOP_BUCKET_PTS            100
 #define DEADLOCK_MIN_FRAC         0.06
 #define SC_IDENTITY_PTS           20
@@ -777,27 +798,27 @@ static double detect_clean_boundary(DCBY a, const double* x, const double* y,
 
 static int scheck(CALCC a)
 {
+	// Zeus: the tolerance (magnitude output-referred below x = 0.20) is in
+	// ps_scheck.c; see ps_scheck.h for why.
 	int scheck_fail = 0;
+	double m_new[SCHECK_PTS], c_new[SCHECK_PTS], s_new[SCHECK_PTS];
 	double m_py = a->m_calavg.ys[0];
 	double c_py = a->c_calavg.ys[0];
 	double s_py = a->s_calavg.ys[0];
 	for (int k = 0; k < SCHECK_PTS; k++)
 	{
-		double xk = (double)k / (double)(SCHECK_PTS - 1);
-		double m_y = ns_eval_near_clamped(a->m_spline, xk, m_py);
-		double c_y = ns_eval_near_clamped(a->c_spline, xk, c_py);
-		double s_y = ns_eval_near_clamped(a->s_spline, xk, s_py);
-		m_py = m_y; c_py = c_y; s_py = s_y;
-		if (a->scheck_valid)
-		{
-			if (fabs(m_y - a->m_prev_sol[k]) > SCHECK_TOL) scheck_fail = 1;
-			if (fabs(c_y - a->c_prev_sol[k]) > SCHECK_TOL) scheck_fail = 1;
-			if (fabs(s_y - a->s_prev_sol[k]) > SCHECK_TOL) scheck_fail = 1;
-		}
-		a->m_prev_sol[k] = m_y;
-		a->c_prev_sol[k] = c_y;
-		a->s_prev_sol[k] = s_y;
+		double xk = ps_scheck_x(k);
+		m_new[k] = ns_eval_near_clamped(a->m_spline, xk, m_py);
+		c_new[k] = ns_eval_near_clamped(a->c_spline, xk, c_py);
+		s_new[k] = ns_eval_near_clamped(a->s_spline, xk, s_py);
+		m_py = m_new[k]; c_py = c_new[k]; s_py = s_new[k];
 	}
+	if (a->scheck_valid)
+		scheck_fail = ps_scheck_deviates(a->m_prev_sol, m_new, a->c_prev_sol, c_new,
+			a->s_prev_sol, s_new);
+	memcpy(a->m_prev_sol, m_new, sizeof(m_new));
+	memcpy(a->c_prev_sol, c_new, sizeof(c_new));
+	memcpy(a->s_prev_sol, s_new, sizeof(s_new));
 	a->scheck_valid = 1;
 	if (scheck_fail)
 		dprintf("***** PS: Solution Deviation\n");
@@ -914,9 +935,12 @@ static void size_calcc (CALCC a)
 	a->c_anchor_valid = 0;
 	a->s_anchor_valid = 0;
 
-	curve_ema_init2(&a->m_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND,  0.1, 2.0);
-	curve_ema_init2(&a->c_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
-	curve_ema_init2(&a->s_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
+	curve_ema_init2(&a->m_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+		a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND,  0.1, 2.0);
+	curve_ema_init2(&a->c_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+		a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
+	curve_ema_init2(&a->s_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+		a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
 
 	a->m_fold_prev      = 0;
 	a->m_ctrl_n         = 0;
@@ -1030,6 +1054,9 @@ CALCC create_calcc (int channel, int runcal, int size, int rate, double hw_scale
 	CALCC a = (CALCC) malloc0 (sizeof (calcc));
 	a->channel = channel;
 	a->runcal = runcal;
+	a->fast_tracking = 0;
+	a->mem.run = 0;		// Zeus: memory correction off; coefficient zero (malloc0)
+	ps_memcorr_reset (&a->mem.acc);
 	a->size = size;
 	a->rate = rate;
 	a->hw_scale = hw_scale;
@@ -1093,19 +1120,29 @@ void destroy_calcc (CALCC a)
 {
 	IQC b = txa[a->channel].iqc.p;
 
+	for (int i = 0; i < 4; i++)
+		while (WaitForSingleObject(a->SemsPSCorr[i], 0) == WAIT_OBJECT_0);
+	ReleaseSemaphore(a->SemsPSCorr[4], 1, 0);
+	// Zeus: the corr-change worker may still be fitting, or waiting in
+	// SetTXAiqcStart/Swap/End for the TX DSP thread to clear iqc.busy, which a
+	// stopped channel never does. A single clear before the worker sets busy,
+	// and then a 500 ms timeout, let teardown free memory the worker was still
+	// using (and a fitted curve it had already handed to iqc). Keep clearing
+	// busy until the worker has really exited; it always finishes the case it
+	// is in and then takes the exit semaphore.
+	InterlockedBitTestAndReset(&b->busy, 0);
+	while (WaitForSingleObject(a->hCorrChangeExited, 10) != WAIT_OBJECT_0)
+		InterlockedBitTestAndReset(&b->busy, 0);
+	CloseHandle(a->hCorrChangeExited);
+
+	// Freed only once the worker is gone: it writes these while restoring
+	// and saving.
 	ns_free(a->util.m_spline_restore); a->util.m_spline_restore = NULL;
 	ns_free(a->util.c_spline_restore); a->util.c_spline_restore = NULL;
 	ns_free(a->util.s_spline_restore); a->util.s_spline_restore = NULL;
 	ns_free(a->util.m_spline_save);    a->util.m_spline_save = NULL;
 	ns_free(a->util.c_spline_save);    a->util.c_spline_save = NULL;
 	ns_free(a->util.s_spline_save);    a->util.s_spline_save = NULL;
-
-	for (int i = 0; i < 4; i++)
-		while (WaitForSingleObject(a->SemsPSCorr[i], 0) == WAIT_OBJECT_0);
-	InterlockedBitTestAndReset(&b->busy, 0);
-	ReleaseSemaphore(a->SemsPSCorr[4], 1, 0);
-	WaitForSingleObject(a->hCorrChangeExited, 500);
-	CloseHandle(a->hCorrChangeExited);
 
 	ns_free(a->m_spline); a->m_spline = NULL;
 	ns_free(a->c_spline); a->c_spline = NULL;
@@ -1132,8 +1169,18 @@ void flush_calcc (CALCC a)
 	flush_delay (a->txdelay);
 }
 
+static double control_point_alpha (CALCC a)
+{
+	return a->fast_tracking ? PS_CTRL_EMA_ALPHA_FAST : PS_CTRL_EMA_ALPHA;
+}
+
 static void calc (CALCC a)
 {
+	// The fitter runs on doPSCorrChange, not the feedback/update thread.
+	// Snapshot once per fit; never hold cs_update through the expensive fit.
+	EnterCriticalSection(&txa[a->channel].calcc.cs_update);
+	const double ctrl_alpha = control_point_alpha(a);
+	LeaveCriticalSection(&txa[a->channel].calcc.cs_update);
 	PSCOLLECTION b = a->ps_colct;
 
 	a->binfo[0] = 0b0000;
@@ -1467,7 +1514,7 @@ static void calc (CALCC a)
 	}
 
 	{
-		const double alpha = 0.10;
+		const double alpha = ctrl_alpha;
 		int nc = a->m_nurb->n_ctrl;
 		if (!a->m_ctrl_ema_valid)
 		{
@@ -1505,7 +1552,7 @@ static void calc (CALCC a)
 	}
 
 	{
-		const double alpha = 0.10;
+		const double alpha = ctrl_alpha;
 		int nc = a->c_nurb->n_ctrl;
 		if (!a->c_ctrl_ema_valid)
 		{
@@ -1543,7 +1590,7 @@ static void calc (CALCC a)
 	}
 
 	{
-		const double alpha = 0.10;
+		const double alpha = ctrl_alpha;
 		int nc = a->s_nurb->n_ctrl;
 		if (!a->s_ctrl_ema_valid)
 		{
@@ -1668,12 +1715,18 @@ static void calc (CALCC a)
 		goto cleanup;
 	}
 
+	EnterCriticalSection(&txa[a->channel].calcc.cs_update);
 	curve_ema_update(&a->m_calavg, a->m_spline);
 	a->m_prev_y = a->m_calavg.ys[0];
 	curve_ema_update(&a->c_calavg, a->c_spline);
 	a->c_prev_y = a->c_calavg.ys[0];
 	curve_ema_update(&a->s_calavg, a->s_spline);
 	a->s_prev_y = a->s_calavg.ys[0];
+	// Zeus: the memory estimator normalises feedback with the scale of the
+	// curves it compares against, not that of a fit scheck rejected.
+	if (a->mem.run)
+		a->mem.rx_scale = a->rx_scale;
+	LeaveCriticalSection(&txa[a->channel].calcc.cs_update);
 
 	EnterCriticalSection (&a->disp.cs_disp);
 	a->disp.nsamps = a->nsamps;
@@ -1800,23 +1853,29 @@ void __cdecl doPSCorrChange(void* arg)
 					&a->util.s_calavg_restore);
 				if (!error)
 				{
+					// Zeus: iqc owns the curves from the moment it stores them,
+					// so clear calcc's pointers before the hand-off; teardown
+					// during its busy-wait must not free them a second time.
+					NS_Spline* m_sp = a->util.m_spline_restore;
+					NS_Spline* c_sp = a->util.c_spline_restore;
+					NS_Spline* s_sp = a->util.s_spline_restore;
+					a->util.m_spline_restore = NULL;
+					a->util.c_spline_restore = NULL;
+					a->util.s_spline_restore = NULL;
 					if (!InterlockedBitTestAndSet(&a->ctrl.running, 0))
 					{
 						SetTXAiqcStart(a->channel,
-							a->util.m_spline_restore, &a->util.m_calavg_restore, a->util.m_prev_y_restore,
-							a->util.c_spline_restore, &a->util.c_calavg_restore, a->util.c_prev_y_restore,
-							a->util.s_spline_restore, &a->util.s_calavg_restore, a->util.s_prev_y_restore);
+							m_sp, &a->util.m_calavg_restore, a->util.m_prev_y_restore,
+							c_sp, &a->util.c_calavg_restore, a->util.c_prev_y_restore,
+							s_sp, &a->util.s_calavg_restore, a->util.s_prev_y_restore);
 					}
 					else
 					{
 						SetTXAiqcSwap(a->channel,
-							a->util.m_spline_restore, &a->util.m_calavg_restore, a->util.m_prev_y_restore,
-							a->util.c_spline_restore, &a->util.c_calavg_restore, a->util.c_prev_y_restore,
-							a->util.s_spline_restore, &a->util.s_calavg_restore, a->util.s_prev_y_restore);
+							m_sp, &a->util.m_calavg_restore, a->util.m_prev_y_restore,
+							c_sp, &a->util.c_calavg_restore, a->util.c_prev_y_restore,
+							s_sp, &a->util.s_calavg_restore, a->util.s_prev_y_restore);
 					}
-					a->util.m_spline_restore = NULL;
-					a->util.c_spline_restore = NULL;
-					a->util.s_spline_restore = NULL;
 					// Zeus: with hold no LTURNON follows to report it; the restored correction is running.
 					if (a->ctrl.hold)
 					{
@@ -1835,27 +1894,37 @@ void __cdecl doPSCorrChange(void* arg)
 				break;
 
 			case 3:
+			{
+				CurveEMA m_avg, c_avg, s_avg;
 				calc(a);
 				if (a->scOK)
 				{
-					if (!InterlockedBitTestAndSet(&a->ctrl.running, 0))
-					{
-						SetTXAiqcStart(a->channel, a->m_spline, &a->m_calavg, a->m_prev_y,
-							a->c_spline, &a->c_calavg, a->c_prev_y,
-							a->s_spline, &a->s_calavg, a->s_prev_y);
-					}
-					else
-					{
-						SetTXAiqcSwap(a->channel, a->m_spline, &a->m_calavg, a->m_prev_y,
-							a->c_spline, &a->c_calavg, a->c_prev_y,
-							a->s_spline, &a->s_calavg, a->s_prev_y);
-					}
+					EnterCriticalSection(&txa[a->channel].calcc.cs_update);
+					m_avg = a->m_calavg; c_avg = a->c_calavg; s_avg = a->s_calavg;
+					LeaveCriticalSection(&txa[a->channel].calcc.cs_update);
+					// Zeus: same ownership rule as the restore above.
+					NS_Spline* m_sp = a->m_spline;
+					NS_Spline* c_sp = a->c_spline;
+					NS_Spline* s_sp = a->s_spline;
 					a->m_spline = NULL;
 					a->c_spline = NULL;
 					a->s_spline = NULL;
+					if (!InterlockedBitTestAndSet(&a->ctrl.running, 0))
+					{
+						SetTXAiqcStart(a->channel, m_sp, &m_avg, a->m_prev_y,
+							c_sp, &c_avg, a->c_prev_y,
+							s_sp, &s_avg, a->s_prev_y);
+					}
+					else
+					{
+						SetTXAiqcSwap(a->channel, m_sp, &m_avg, a->m_prev_y,
+							c_sp, &c_avg, a->c_prev_y,
+							s_sp, &s_avg, a->s_prev_y);
+					}
 				}
 				InterlockedBitTestAndSet(&a->ctrl.calcdone, 0);
 				break;
+			}
 
 			case 4:
 				b = txa[a->channel].iqc.p;
@@ -1885,6 +1954,71 @@ enum _calcc_state
 	LTURNON
 };
 
+// Zeus: memory correction (ps_memcorr.h). All three helpers run with
+// calcc.cs_update held.
+
+// Hands the coefficient to iqc only when it changes, so with the feature off
+// nothing here ever touches the TX DSP lock.
+static void mem_publish (CALCC a)
+{
+	if (a->mem.beta_re == a->mem.pub_re && a->mem.beta_im == a->mem.pub_im)
+		return;
+	SetTXAiqcMemoryBeta (a->channel, a->mem.beta_re, a->mem.beta_im);
+	a->mem.pub_re = a->mem.beta_re;
+	a->mem.pub_im = a->mem.beta_im;
+}
+
+// Forgets everything learned: calibration reset, enable change, feedback
+// rate change.
+static void mem_reset (CALCC a)
+{
+	a->mem.beta_re = 0.0;
+	a->mem.beta_im = 0.0;
+	a->mem.rx_scale = 0.0;
+	ps_memcorr_reset (&a->mem.acc);
+	mem_publish (a);
+}
+
+// Feedback-thread estimator over one block, after the amp-delay stage.
+static void mem_estimate (CALCC a, const double* tx, const double* rx)
+{
+	if (!InterlockedAnd (&a->mox, 1) || !_InterlockedAnd (&a->ctrl.running, 1) || a->mem.rx_scale <= 0.0)
+	{
+		// Unkeyed, or no correction applied yet: drop the window and the
+		// stream continuity, keep the learned coefficient (like the curves).
+		if (a->mem.acc.primed)
+			ps_memcorr_reset (&a->mem.acc);
+		return;
+	}
+	const double dscale = ps_memcorr_dscale ((double)a->rate);
+	const long window = ps_memcorr_window ((double)a->rate);
+	double pm = 1.0, pc = 1.0, ps = 0.0;	// prev_y hints, ignored by the EMA lookups
+	for (int i = 0; i < a->size; i++)
+	{
+		double x, d, dt_re, dt_im;
+		const double x_re = a->mem.rx_scale * rx[2 * i + 0];
+		const double x_im = a->mem.rx_scale * rx[2 * i + 1];
+		const double t_re = a->hw_scale * tx[2 * i + 0];
+		const double t_im = a->hw_scale * tx[2 * i + 1];
+		if (!ps_memcorr_advance (&a->mem.acc, dscale, x_re, x_im, t_re, t_im, &x, &d, &dt_re, &dt_im))
+			continue;
+		ps_memcorr_accumulate (&a->mem.acc, x_re, x_im, t_re, t_im, d, dt_re, dt_im,
+			get_mag_correction_ema   (&a->m_calavg, x, &pm),
+			get_phase_correction_ema (&a->c_calavg, x, &pc),
+			get_phase_correction_ema (&a->s_calavg, x, &ps));
+		if (a->mem.acc.n >= window)
+		{
+			double c_re[PS_MEMCORR_NREG], c_im[PS_MEMCORR_NREG];
+			if (ps_memcorr_solve (&a->mem.acc, c_re, c_im))
+			{
+				ps_memcorr_learn (&a->mem.beta_re, &a->mem.beta_im, c_re[0], c_im[0]);
+				mem_publish (a);
+			}
+			ps_memcorr_clear_sums (&a->mem.acc);
+		}
+	}
+}
+
 PORT
 void pscc (int channel, int size, double* tx, double* rx)
 {
@@ -1902,11 +2036,19 @@ void pscc (int channel, int size, double* tx, double* rx)
 			xdelay (a->txdelay);
 		}
 		a->info[15] = a->ctrl.state;
+		if (a->mem.run && !a->mem.hold)
+			mem_estimate (a, tx, rx);
 
 		switch (a->ctrl.state)
 		{
 			case LRESET:
 				InterlockedExchange (&a->ctrl.current_state, LRESET);
+				if (a->mem.run)
+					mem_reset (a);
+				// Zeus: calibration restarts from calcc's own fits, unless this
+				// reset leads straight into turn-on.
+				if (!a->ctrl.turnon)
+					a->mem.hold = 0;
 				if (!a->ctrl.calcinprogress)
 				{
 					ns_free(a->m_spline); a->m_spline = NULL;
@@ -1917,9 +2059,12 @@ void pscc (int channel, int size, double* tx, double* rx)
 					nf_curve_free(a->s_nurb); a->s_nurb = NULL;
 				}
 				a->m_prev_y = 1.0; a->c_prev_y = 1.0; a->s_prev_y = 0.0;
-				curve_ema_init2(&a->m_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND,  0.1, 2.0);
-				curve_ema_init2(&a->c_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
-				curve_ema_init2(&a->s_calavg, PS_NS_EMA_ALPHA, PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
+				curve_ema_init2(&a->m_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+					a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND,  0.1, 2.0);
+				curve_ema_init2(&a->c_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+					a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
+				curve_ema_init2(&a->s_calavg, a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA,
+					a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO, PS_NS_EMA_X_BND, -1.1, 1.1);
 				a->m_fold_prev      = 0;
 				a->m_ctrl_ema_valid = 0;
 				a->c_ctrl_ema_valid = 0;
@@ -2085,6 +2230,10 @@ void pscc (int channel, int size, double* tx, double* rx)
 				break;
 			case LTURNON:
 				InterlockedExchange (&a->ctrl.current_state, LTURNON);
+				// Zeus: stay-on after turn-on runs curves calcc did not fit.
+				a->mem.hold = 1;
+				if (a->mem.run)
+					mem_reset (a);
 				a->ctrl.turnon = 0;
 				a->ctrl.automode = 0;
 				a->info[14] = 1;
@@ -2149,6 +2298,12 @@ void PSRestoreCorr (int channel, char* filename)
 	// Zeus: with hold the restored correction runs while calibration continues;
 	// turnon would park calcc in LSTAYON with automode cleared.
 	if (!a->ctrl.hold) a->ctrl.turnon = 1;
+	// Zeus: the restored curves replace calcc's, so the learned memory
+	// coefficient no longer matches them. Zero it now and hold the estimator
+	// off until the next calibration reset (see mem.hold).
+	a->mem.hold = 1;
+	if (a->mem.run)
+		mem_reset (a);
 	ReleaseSemaphore(a->SemsPSCorr[2], 1, 0);
 	LeaveCriticalSection (&txa[channel].calcc.cs_update);
 }
@@ -2287,6 +2442,70 @@ double SetPSTXDelay (int channel, double delay)
 }
 
 PORT
+void SetPSFastTracking (int channel, int fast)
+{
+	EnterCriticalSection(&txa[channel].calcc.cs_update);
+	CALCC a = txa[channel].calcc.p;
+	a->fast_tracking = fast != 0;
+	double alpha = a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA;
+	double alpha_lo = a->fast_tracking ? PS_NS_EMA_ALPHA_FAST : PS_NS_EMA_ALPHA_LO;
+	a->m_calavg.alpha = a->c_calavg.alpha = a->s_calavg.alpha = alpha;
+	a->m_calavg.alpha_lo = a->c_calavg.alpha_lo = a->s_calavg.alpha_lo = alpha_lo;
+	LeaveCriticalSection(&txa[channel].calcc.cs_update);
+}
+
+PORT
+int GetPSFastTracking (int channel)
+{
+	EnterCriticalSection(&txa[channel].calcc.cs_update);
+	int fast = txa[channel].calcc.p->fast_tracking;
+	LeaveCriticalSection(&txa[channel].calcc.cs_update);
+	return fast;
+}
+
+// Zeus: opt-in memory correction (ps_memcorr.h). Off at create; any change
+// forgets the learned coefficient. With run = 0 neither pscc nor xiqc does
+// any extra work and the corrected output is unchanged.
+PORT
+void SetPSMemoryCorrection (int channel, int run)
+{
+	EnterCriticalSection(&txa[channel].calcc.cs_update);
+	CALCC a = txa[channel].calcc.p;
+	run = run != 0;
+	if (a->mem.run != run)
+	{
+		mem_reset (a);
+		a->mem.run = run;
+	}
+	LeaveCriticalSection(&txa[channel].calcc.cs_update);
+}
+
+PORT
+void GetPSMemoryCorrection (int channel, double* beta_re, double* beta_im)
+{
+	EnterCriticalSection(&txa[channel].calcc.cs_update);
+	CALCC a = txa[channel].calcc.p;
+	*beta_re = a->mem.beta_re;
+	*beta_im = a->mem.beta_im;
+	LeaveCriticalSection(&txa[channel].calcc.cs_update);
+}
+
+#ifdef WDSP_PS_FAST_TRACKING_TEST
+// Test-only inspection of the actual running calibrator, never a model.
+PORT
+void GetPSFastTrackingAlphasForTest (int channel, double* values)
+{
+	EnterCriticalSection(&txa[channel].calcc.cs_update);
+	CALCC a = txa[channel].calcc.p;
+	values[0] = control_point_alpha(a);
+	values[1] = a->m_calavg.alpha; values[2] = a->m_calavg.alpha_lo;
+	values[3] = a->c_calavg.alpha; values[4] = a->c_calavg.alpha_lo;
+	values[5] = a->s_calavg.alpha; values[6] = a->s_calavg.alpha_lo;
+	LeaveCriticalSection(&txa[channel].calcc.cs_update);
+}
+#endif
+
+PORT
 void SetPSHWPeak (int channel, double peak)
 {
 	CALCC a;
@@ -2360,6 +2579,9 @@ void SetPSFeedbackRate (int channel, int rate)
 		a->rate,
 		20.0e-09,
 		a->txdel);
+	// Zeus: the memory window and derivative scale follow the rate.
+	if (a->mem.run)
+		mem_reset (a);
 	LeaveCriticalSection (&txa[channel].calcc.cs_update);
 }
 

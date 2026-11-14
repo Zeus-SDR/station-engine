@@ -66,6 +66,7 @@ public sealed class PsSettingsStore : IDisposable
         _entries.EnsureIndex(x => x.ProfileId, unique: true);
 
         MigrateTxAttnPoison();
+        MigrateTwoToneMagnitude();
 
         _log.LogInformation("PsSettingsStore initialized at {Path}", dbPath);
     }
@@ -120,6 +121,24 @@ public sealed class PsSettingsStore : IDisposable
         }
     }
 
+    // Raw BSON preserves unrelated fields, including legacy arm fields. Only
+    // the old shipped magnitude and this migration's marker may change.
+    private void MigrateTwoToneMagnitude()
+    {
+        const double oldDefault = 0.49;
+        var entries = _db.GetCollection("ps_settings");
+        foreach (var entry in entries.FindAll().ToList())
+        {
+            if (entry[nameof(PsSettingsEntry.TwoToneMagnitudeMigrated)].IsBoolean
+                && entry[nameof(PsSettingsEntry.TwoToneMagnitudeMigrated)].AsBoolean) continue;
+            if (entry[nameof(PsSettingsEntry.TwoToneMag)].IsNumber
+                && entry[nameof(PsSettingsEntry.TwoToneMag)].AsDouble == oldDefault)
+                entry[nameof(PsSettingsEntry.TwoToneMag)] = PsTwoToneDefaults.Magnitude;
+            entry[nameof(PsSettingsEntry.TwoToneMagnitudeMigrated)] = true;
+            entries.Update(entry);
+        }
+    }
+
     private static int RemoveTxAttnBoardKeys(
         PsSettingsEntry entry,
         HpsdrBoardKind board,
@@ -144,6 +163,7 @@ public sealed class PsSettingsStore : IDisposable
 
     public void Upsert(PsSettingsEntry entry, string profileId = "default")
     {
+        entry.TwoToneMagnitudeMigrated = true;
         entry.ProfileId = profileId;
         entry.UpdatedUtc = DateTime.UtcNow;
         var existing = _entries.FindOne(x => x.ProfileId == profileId);
@@ -176,6 +196,9 @@ public sealed class PsSettingsEntry
     // selection to stick across sessions.
     public bool Auto { get; set; } = true;
     public bool AutoAttenuate { get; set; } = true;
+    // Opt-in memory correction. Additive field: stores written
+    // before it existed have no value and read back false (off).
+    public bool MemoryCorrection { get; set; } = false;
     public double MoxDelaySec { get; set; } = 0.2;
     public double LoopDelaySec { get; set; } = 0.0;
     public double AmpDelayNs { get; set; } = 150.0;
@@ -189,10 +212,13 @@ public sealed class PsSettingsEntry
     // PsEnabled and TwoToneEnabled are intentionally NOT stored here; the
     // distinct ArmIntent above carries only the operator's PS arm decision,
     // while the dialled-in frequencies/magnitude persist below.
-    // Defaults match tx-store.ts (700/1900/0.49) and pihpsdr.
+    // Defaults match tx-store.ts and Thetis Console/setup.cs:11095.
     public double TwoToneFreq1 { get; set; } = 700.0;
     public double TwoToneFreq2 { get; set; } = 1900.0;
-    public double TwoToneMag { get; set; } = 0.49;
+    public double TwoToneMag { get; set; } = PsTwoToneDefaults.Magnitude;
+    // Missing/false identifies an old install. Current writes stamp this true
+    // even for a deliberate 0.49, so that choice survives the next startup.
+    public bool TwoToneMagnitudeMigrated { get; set; }
     // Per-board HW peak overrides. Keyed by `{p1|p2}:{board}[:variant]` —
     // e.g. "p2:OrionMkII:G2", "p1:HermesLite2", "p1:Hermes". Populated by
     // RadioService.PersistPsState whenever the operator (or auto-cal)

@@ -33,6 +33,8 @@
     { "lowHz": 28000000, "highHz": 28300000, "label": "10M CW/Data",                   "allocation": "Amateur",  "modeRestriction": "CwAndDigital", "maxPowerW": null, "notes": null },
     { "lowHz": 28300000, "highHz": 29700000, "label": "10M Phone",                     "allocation": "Amateur",  "modeRestriction": "PhoneOnly",    "maxPowerW": null, "notes": null },
     { "lowHz": 50000000, "highHz": 50100000, "label": "6M CW",                         "allocation": "Amateur",  "modeRestriction": "CwOnly",       "maxPowerW": null, "notes": null },
-    { "lowHz": 50100000, "highHz": 54000000, "label": "6M",                            "allocation": "Amateur",  "modeRestriction": "Any",          "maxPowerW": null, "notes": null }
+    { "lowHz": 50100000, "highHz": 54000000, "label": "6M",                            "allocation": "Amateur",  "modeRestriction": "Any",          "maxPowerW": null, "notes": null },
+    { "lowHz": 144000000, "highHz": 148000000, "label": "2M", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "47 CFR 97.301: 144-148 MHz, all license classes. Reachable only through a source that declares native VHF transmit (FT-991A)." },
+    { "lowHz": 420000000, "highHz": 450000000, "label": "70CM", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "47 CFR 97.301: 420-450 MHz (secondary allocation; 97.303 geographic limits apply). Reachable only through a source that declares native UHF transmit." }
   ]
 }

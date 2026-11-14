@@ -31,6 +31,7 @@ project(wdsp
 
 option(WDSP_WITH_NR3 "Build with RNNoise (NR3) support — xiph/rnnoise vendored under native/rnnoise/" ON)
 option(WDSP_WITH_NR4 "Build with libspecbleach (NR4 / SBNR) support — vendored under native/libspecbleach/" ON)
+option(WDSP_BUILD_PS_FAST_TRACKING_TESTS "Build running PureSignal tracking tests" OFF)
 option(WDSP_BUILD_OSCTRL_TESTS "Build deterministic CESSB overshoot-controller tests" OFF)
 option(WDSP_BUILD_FM_TESTS "Build deterministic FM tone (CTCSS / DCS) encoder/decoder tests" OFF)
 option(WDSP_BUILD_FFTW_TESTS "Verify FFTW measured planning and transform correctness" OFF)
@@ -55,7 +56,8 @@ set(WDSP_SOURCES
     icfir.c iir.c impulse_cache.c iobuffs.c iqc.c linux_port.c lmath.c main.c
     matchedCW.c meter.c meterlog10.c nbp.c nnet.c nnio.c nnr.c nnr_model_0.c nnr_model_1.c
     nnr_model_2.c nnr_model_3.c nnrbypass.c nob.c nobII.c nurbs.c nurbs_fit.c
-    nurbs_spline.c osctrl.c patchpanel.c phrot.c resample.c reshb.c rmatch.c
+    nurbs_spline.c osctrl.c patchpanel.c phrot.c ps_memcorr.c ps_scheck.c resample.c
+    reshb.c rmatch.c
     RXA.c sender.c shift.c sip_cursor.c siphon.c slew.c snb.c snoop.c ssql.c syncbuffs.c
     TXA.c utilities.c varsamp.c version.c wbfm.c wcpAGC.c wisdom.c zetaHat.c
 )
@@ -459,6 +461,27 @@ if(WDSP_BUILD_FM_TESTS OR WDSP_BUILD_OSCTRL_TESTS)
         target_compile_options(wdsp_sip_cursor_tests PRIVATE -UNDEBUG)
     endif()
     add_test(NAME wdsp_sip_cursor_tests COMMAND wdsp_sip_cursor_tests)
+
+    # Zeus PureSignal helpers: the scheck tolerance (ps_scheck.c) and the
+    # memory-correction estimator (ps_memcorr.c). WDSP-free.
+    add_executable(wdsp_ps_scheck_tests
+        ps_scheck.c
+        tests/ps_scheck_tests.c
+    )
+    add_executable(wdsp_ps_memcorr_tests
+        ps_memcorr.c
+        tests/ps_memcorr_tests.c
+    )
+    foreach(ps_test wdsp_ps_scheck_tests wdsp_ps_memcorr_tests)
+        target_include_directories(${ps_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(MSVC)
+            target_compile_options(${ps_test} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${ps_test} PRIVATE -UNDEBUG)
+            target_link_libraries(${ps_test} PRIVATE m)
+        endif()
+        add_test(NAME ${ps_test} COMMAND ${ps_test})
+    endforeach()
 endif()
 
 if(WDSP_BUILD_FFTW_TESTS)
@@ -484,3 +507,17 @@ endif()
 message(STATUS "wdsp: build type = ${CMAKE_BUILD_TYPE}")
 message(STATUS "wdsp: NR3 (RNNoise) enabled = ${WDSP_WITH_NR3}")
 message(STATUS "wdsp: NR4 (libspecbleach / SBNR) enabled = ${WDSP_WITH_NR4}")
+
+if(WDSP_BUILD_PS_FAST_TRACKING_TESTS)
+    enable_testing()
+    target_compile_definitions(wdsp PRIVATE WDSP_PS_FAST_TRACKING_TEST)
+    add_executable(wdsp_ps_fast_tracking_tests tests/ps_fast_tracking_tests.c)
+    target_include_directories(wdsp_ps_fast_tracking_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wdsp_ps_fast_tracking_tests PRIVATE wdsp)
+    if(MSVC)
+        target_compile_options(wdsp_ps_fast_tracking_tests PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(wdsp_ps_fast_tracking_tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME wdsp_ps_fast_tracking_tests COMMAND wdsp_ps_fast_tracking_tests)
+endif()

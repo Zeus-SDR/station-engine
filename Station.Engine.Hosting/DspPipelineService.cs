@@ -1695,6 +1695,7 @@ public partial class DspPipelineService : BackgroundService,
     private double _appliedPsLoopDelaySec;
     private double _appliedPsAmpDelayNs = 150.0;
     private double _appliedPsHwPeak = 0.4072;
+    private bool _appliedPsMemoryCorrection;
     private PsFeedbackSource _appliedPsFeedbackSource = PsFeedbackSource.Internal;
     private int _appliedExternalPsFeedbackAttenuationDb = -1;
     private int _appliedExternalPsCorrectionMode = -1;
@@ -1728,7 +1729,7 @@ public partial class DspPipelineService : BackgroundService,
     private bool _appliedTwoToneEnabled;
     private double _appliedTwoToneFreq1 = 700.0;
     private double _appliedTwoToneFreq2 = 1900.0;
-    private double _appliedTwoToneMag = 0.49;
+    private double _appliedTwoToneMag = PsTwoToneDefaults.Magnitude;
     // CFC (Continuous Frequency Compressor) — issue #123. Default-OFF so a
     // fresh state-change push (no Cfc field on the wire) doesn't flip the
     // engine into a partial config. _psResyncRequired piggybacks: when a P2
@@ -6931,6 +6932,17 @@ public partial class DspPipelineService : BackgroundService,
             _appliedPsLoopDelaySec = s.PsLoopDelaySec;
             _appliedPsAmpDelayNs = s.PsAmpDelayNs;
         }
+        // Memory correction is applied even while keyed: changing it only
+        // forgets the learned coefficient (calcc is not reset), and turning it
+        // off mid-over must take effect at once. Re-asserted on arm and after a
+        // reconnect so a fresh engine never runs on its default.
+        if (resync
+            || (!psApplyDeferred && psArmRising)
+            || s.PsMemoryCorrection != _appliedPsMemoryCorrection)
+        {
+            engine.SetPsMemoryCorrection(s.PsMemoryCorrection);
+            _appliedPsMemoryCorrection = s.PsMemoryCorrection;
+        }
         if (!psApplyDeferred && (resync || psArmRising || s.PsAuto != _appliedPsAuto || s.PsSingle != _appliedPsSingle))
         {
             engine.SetPsControl(s.PsAuto, s.PsSingle);
@@ -11236,6 +11248,10 @@ public partial class DspPipelineService : BackgroundService,
                         operatorSMeterOffsetDb));
             }
             if (!double.IsFinite(dbm)) dbm = -160.0;
+            // A radio behind Zeus Interface reports its own S-meter. Follow it, so Zeus agrees with the radio's display
+            // rather than with a level measured from the IF copy. The operator S-meter offset still applies on top.
+            bool haveExternalLevel = _radio.TryGetExternalRxLevelDbm(out double externalDbm);
+            if (haveExternalLevel) dbm = externalDbm + operatorSMeterOffsetDb;
             _hub.Broadcast(new RxMeterFrame((float)dbm));
             NotePublicOperatorDbm(dbm);
             RxMeterUpdated?.Invoke(channel, dbm);
@@ -11248,6 +11264,7 @@ public partial class DspPipelineService : BackgroundService,
             long chatSampleBegin = Environment.TickCount64;
             var rx = engine.GetRxStageMeters(channel);
             var v2 = BuildRxMetersV2(rx, rxCalOffsetDb);
+            if (haveExternalLevel) v2 = v2 with { SignalPk = (float)dbm, SignalAv = (float)dbm };
             // Feed Auto-AGC the Thetis-faithful tracked noise floor (#806):
             // a gated quiet-bin mean with 2 s attack + fast-attack, ported from
             // Thetis display.cs processNoiseFloor. NaN = no settled floor this

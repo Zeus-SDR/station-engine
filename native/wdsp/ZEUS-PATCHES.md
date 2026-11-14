@@ -70,6 +70,59 @@ change, because no IQ is flowing then.
 
 ## Integration patches to preserve
 
+- `calcc.{c,h}`, `wdsp.h`: `SetPSFastTracking` / `GetPSFastTracking` select
+  two-tone-only control-point EMA 0.50 and curve EMA 0.60/0.60. Stock remains
+  0.10 and 0.30/0.30 at create/recreate. Preserve selection through LRESET
+  and workspace initialization, live alpha updates under `cs_update`, and
+  fitter snapshots/EMA synchronization without holding that lock through
+  fitting or IQC handoff waits. Pin/anchor EMAs are unchanged. Preserve
+  `WDSP_BUILD_PS_FAST_TRACKING_TESTS` and its running-calibrator test.
+  The host selects it only while the two-tone generator runs. #3698 briefly
+  turned it off because `scheck` rejected about half the fast-tracked fits
+  on a G2 into an external amplifier; the envelope-weighted magnitude
+  tolerance below removed those rejections.
+
+- `ps_scheck.{c,h}`, `calcc.c` `scheck()`, `tests/ps_scheck_tests.c`: the
+  magnitude curve's fit-to-fit tolerance is output-referred below x = 0.20
+  (`SCHECK_TOL * 0.20 / max(x, 0.04)`, 0.50 at the bottom), because a gain
+  change at envelope x moves the output by x times as much and an amplifier
+  with memory makes the low-envelope gain two-valued. Stock `SCHECK_TOL`
+  rejected fits every ~2 s on a warm amplifier and reset calibration. Phase
+  curves and every point at x >= 0.20 keep `SCHECK_TOL`. Preserve the
+  standalone helper and its ctest (built with `WDSP_BUILD_OSCTRL_TESTS`).
+
+- `ps_memcorr.{c,h}`, `calcc.{c,h}`, `iqc.{c,h}`, `wdsp.h`,
+  `tests/ps_memcorr_tests.c`: opt-in PureSignal memory correction,
+  `SetPSMemoryCorrection` / `GetPSMemoryCorrection`, off at create. iqc adds
+  `in * beta * d|in|^2/dt` (normalised to a 1 kHz beat) in the RUN state only;
+  `pscc` learns the complex `beta` by a joint least-squares fit of the
+  memoryless residual on the memory term, the TX/feedback timing skew and a
+  gain trim, once per 0.5 s of accepted feedback, at rate 0.08, clamped to
+  |beta| <= 0.02. The coefficient is zeroed on LRESET, on any enable change,
+  on a feedback-rate change, on a correction restore (`PSRestoreCorr`) and on
+  entering LTURNON; MOX drop clears only the window. `mem.hold`, set by a
+  restore or LTURNON and cleared only by the next LRESET, keeps the
+  estimator off while iqc may run curves calcc did not fit: calcc's worker
+  takes the lowest signalled semaphore first, so a fit queued with a restore
+  can land after it and must not re-arm the estimator. State lives
+  in `CALCC.mem` under `cs_update`; the coefficient reaches iqc through
+  `SetTXAiqcMemoryBeta` under the channel's `csDSP` (lock order
+  `cs_update` then `csDSP`, never the reverse). With the feature off, `pscc`
+  and `xiqc` do no extra work and the corrected output is bit-identical.
+  `PSSaveCorr` / `PSRestoreCorr` formats are unchanged (beta is not saved).
+
+- `calcc.c` corr-change worker and `destroy_calcc`: curve ownership and
+  teardown. The worker clears calcc's spline pointers (`util.*_spline_restore`
+  for a restore, `m/c/s_spline` for a fit) before handing them to
+  `SetTXAiqcStart`/`Swap`, because iqc owns them from the store and the call
+  then waits for the TX DSP thread. `destroy_calcc` keeps clearing iqc.busy
+  until the worker has exited (it used to clear it once and wait 500 ms) and
+  frees the restore/save buffers only after that. Upstream freed a restored
+  curve twice (and could free workspace a running fit still used) when the TX
+  channel closed while a restore or fit was waiting on iqc: reproduced under
+  AddressSanitizer with develop's library. Preserve both orderings and
+  `ClosingTheTxChannel_MidRestoreOrMidFit_IsSafe`.
+
 - `cfcomp.c`, `wdsp.h`: selectable CFC FFT sizes via `SetTXACFCOMPFftSize`.
   Preserve the 16384-point default, operator profiles through workspace rebuilds,
   and the display getter's DSP lock through its complete array read. See

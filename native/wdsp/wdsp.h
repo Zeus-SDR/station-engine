@@ -275,6 +275,10 @@ extern void SetPSControl (int channel, int reset, int mancal, int automode, int 
 extern void SetPSLoopDelay (int channel, double delay);
 extern void SetPSMoxDelay (int channel, double delay);
 extern double SetPSTXDelay (int channel, double delay);
+extern void SetPSFastTracking (int channel, int fast);
+extern int GetPSFastTracking (int channel);
+extern void SetPSMemoryCorrection (int channel, int run);
+extern void GetPSMemoryCorrection (int channel, double* beta_re, double* beta_im);
 extern void SetPSHWPeak (int channel, double peak);
 extern void GetPSHWPeak (int channel, double* peak);
 extern void GetPSMaxTX (int channel, double* maxtx);

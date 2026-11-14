@@ -25,6 +25,8 @@
     { "lowHz": 28000000, "highHz": 28050000, "label": "10M CW",          "allocation": "Amateur", "modeRestriction": "CwOnly",      "maxPowerW": null, "notes": null },
     { "lowHz": 28050000, "highHz": 28300000, "label": "10M Mixed",       "allocation": "Amateur", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
     { "lowHz": 28300000, "highHz": 29700000, "label": "10M Phone",       "allocation": "Amateur", "modeRestriction": "PhoneOnly",   "maxPowerW": null, "notes": null },
-    { "lowHz": 50000000, "highHz": 54000000, "label": "6M",              "allocation": "Amateur", "modeRestriction": "Any",         "maxPowerW": null, "notes": null }
+    { "lowHz": 50000000, "highHz": 54000000, "label": "6M",              "allocation": "Amateur", "modeRestriction": "Any",         "maxPowerW": null, "notes": null },
+    { "lowHz": 144000000, "highHz": 148000000, "label": "2M", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "IARU Region 2: 144-148 MHz. Reachable only through a source that declares native VHF transmit (FT-991A)." },
+    { "lowHz": 430000000, "highHz": 440000000, "label": "70CM", "allocation": "Amateur", "modeRestriction": "Any", "maxPowerW": null, "notes": "IARU Region 2 band plan: 430-440 MHz. Reachable only through a source that declares native UHF transmit." }
   ]
 }

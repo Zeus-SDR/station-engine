@@ -4,6 +4,10 @@ namespace Zeus.Dsp.Wdsp;
 
 internal interface IWdspTxControlNative
 {
+    void SetPSFastTracking(int channel, int fast);
+    void SetPSMemoryCorrection(int channel, int run);
+    void SetTXAPostGenTTFreq(int channel, double freq1, double freq2);
+    void SetTXAPostGenTTMag(int channel, double mag1, double mag2);
     void SetTXAPanelGain1(int channel, double gain);
     void SetTXAEQRun(int channel, int run) { }
     void SetTXAEQProfile(int channel, int nfreqs, double[] frequencies, double[] gains) { }
@@ -49,6 +53,10 @@ internal interface IWdspTxControlNative
 
 internal sealed class WdspTxControlNative : IWdspTxControlNative
 {
+    public void SetPSFastTracking(int channel, int fast) => NativeMethods.SetPSFastTracking(channel, fast);
+    public void SetPSMemoryCorrection(int channel, int run) => NativeMethods.SetPSMemoryCorrection(channel, run);
+    public void SetTXAPostGenTTFreq(int channel, double freq1, double freq2) => NativeMethods.SetTXAPostGenTTFreq(channel, freq1, freq2);
+    public void SetTXAPostGenTTMag(int channel, double mag1, double mag2) => NativeMethods.SetTXAPostGenTTMag(channel, mag1, mag2);
     public void SetTXAEQRun(int channel, int run) => NativeMethods.SetTXAEQRun(channel, run);
     public unsafe void SetTXAEQProfile(int channel, int nfreqs, double[] frequencies, double[] gains)
     {

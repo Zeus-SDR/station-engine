@@ -564,6 +564,14 @@ public interface IDspEngine : IDisposable
     /// operator arms PS.</summary>
     void SetPsHwPeak(double hwPeak);
 
+    /// <summary>Opt-in PureSignal memory correction (off by default): calcc
+    /// learns one memory coefficient from the live feedback and iqc applies
+    /// it, cancelling the uneven IMD3 an amplifier with memory leaves behind.
+    /// Changing it forgets the learned coefficient; it never resets
+    /// calibration and never arms PureSignal. Engines without PureSignal
+    /// ignore it.</summary>
+    void SetPsMemoryCorrection(bool enabled) { }
+
     /// <summary>Push one paired TX-mod-IQ + RX-feedback-IQ block into the
     /// WDSP <c>psccF</c> entry. Block size must match the value pihpsdr
     /// uses (1024 complex samples at 192 kHz). Caller owns the buffers; the

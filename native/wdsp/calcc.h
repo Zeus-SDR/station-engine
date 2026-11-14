@@ -32,6 +32,12 @@ typedef struct _calcc* CALCC;
 extern CALCC create_calcc(int channel, int runcal, int size, int rate, double hw_scale,
 	double moxdelay, double loopdelay, int mox);
 
+extern __declspec(dllexport) void SetPSFastTracking (int channel, int fast);
+extern __declspec(dllexport) int GetPSFastTracking (int channel);
+
+extern __declspec(dllexport) void SetPSMemoryCorrection (int channel, int run);
+extern __declspec(dllexport) void GetPSMemoryCorrection (int channel, double* beta_re, double* beta_im);
+
 extern void destroy_calcc (CALCC a);
 
 extern void flush_calcc (CALCC a);

@@ -34,6 +34,41 @@ public static class RadioTuningEndpoints
             return Results.Ok(r.SetReceiverVfo(req.Receiver, req.Hz));
         });
 
+        // The native receive range of the active source. Zeus holds a Hermes-class
+        // radio to 0-60 MHz; a receive-only source that tunes much further (an
+        // RTL-SDR) declares its range here for as long as it is the source, and
+        // clears it (maxHz: null) when it stops. Widening only: transmit is
+        // untouched and still needs a transverter profile above 60 MHz.
+        endpoints.MapGet("/api/radio/native-tuning-range", (RadioService r) =>
+            Results.Ok(NativeTuningRangeDto.From(r)));
+
+        endpoints.MapPost("/api/radio/native-tuning-range", (NativeTuningRangeRequest req, RadioService r) =>
+        {
+            if (!r.TrySetNativeTuningMaximumHz(req.MaxHz, out var error))
+            {
+                log.LogInformation("api.radio.native-tuning-range rejected maxHz={MaxHz}", req.MaxHz);
+                return Results.BadRequest(new { error });
+            }
+            // Each request replaces the declared transmit ranges: absent or empty clears them.
+            var transmit = req.TransmitRanges?.Select(range => (range.LowHz, range.HighHz)).ToArray();
+            if (!r.TrySetNativeTransmitRanges(transmit, out error))
+            {
+                log.LogInformation("api.radio.native-tuning-range rejected transmitRanges");
+                return Results.BadRequest(new { error });
+            }
+            log.LogInformation("api.radio.native-tuning-range maxHz={MaxHz} transmitRanges={Count}",
+                req.MaxHz, transmit?.Length ?? 0);
+            return Results.Ok(NativeTuningRangeDto.From(r));
+        });
+
+        // The radio's own S-meter, for a source behind Zeus Interface: the RX meters follow it while it is fresh.
+        endpoints.MapPost("/api/radio/external-rx-level", (ExternalRxLevelRequest req, RadioService r) =>
+        {
+            if (!r.TrySetExternalRxLevelDbm(req.Dbm, out var error))
+                return Results.BadRequest(new { error });
+            return Results.Ok(new { accepted = true });
+        });
+
         endpoints.MapPost("/api/vfo/swap", (RadioService r) =>
         {
             log.LogInformation("api.vfo.swap");
@@ -278,4 +313,29 @@ public static class RadioTuningEndpoints
 
         return endpoints;
     }
+}
+
+/// <summary>
+/// Body of <c>POST /api/radio/native-tuning-range</c>; a null <c>MaxHz</c> clears the widening. <c>TransmitRanges</c>
+/// are the frequencies above 60 MHz the source can transmit on without a transverter; absent or empty clears them.
+/// </summary>
+public sealed record NativeTuningRangeRequest(long? MaxHz, IReadOnlyList<NativeTransmitRangeDto>? TransmitRanges = null);
+
+/// <summary>Body of <c>POST /api/radio/external-rx-level</c>: the source's own RX level in dBm; null clears it.</summary>
+public sealed record ExternalRxLevelRequest(double? Dbm);
+
+/// <summary>An inclusive frequency range, in Hz, that a source transmits on natively.</summary>
+public sealed record NativeTransmitRangeDto(long LowHz, long HighHz);
+
+/// <summary>The receive range the dial may currently use without a transverter profile, and the native transmit ranges.</summary>
+public sealed record NativeTuningRangeDto(
+    long MinHz, long MaxHz, long DefaultMaxHz, bool Widened,
+    IReadOnlyList<NativeTransmitRangeDto>? TransmitRanges = null)
+{
+    internal static NativeTuningRangeDto From(RadioService radio) => new(
+        0,
+        radio.NativeTuningMaximumHz,
+        TransverterFrequencyConverter.MaximumRadioFrequencyHz,
+        radio.NativeTuningRangeWidened,
+        radio.NativeTransmitRanges.Select(range => new NativeTransmitRangeDto(range.LowHz, range.HighHz)).ToArray());
 }

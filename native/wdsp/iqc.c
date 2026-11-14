@@ -25,6 +25,7 @@ warren@pratt.one
 */
 
 #include "comm.h"
+#include "ps_memcorr.h"
 
 void calc_iqc (IQC a)
 {
@@ -74,7 +75,7 @@ void destroy_iqc (IQC a)
 
 void flush_iqc (IQC a)
 {
-
+	a->mem_prev_x2 = 0.0;
 }
 
 enum _iqcstate
@@ -94,11 +95,20 @@ void xiqc (IQC a)
 	{
 		int cset, altset;
 		double  I, Q, env, ym, yc, ys, PRE0, PRE1;
+		// Zeus memory term. The caller holds csDSP for the whole buffer, the
+		// same lock SetTXAiqcMemoryBeta writes under, so the pair is read once
+		// and consistently here.
+		const double mem_br = a->mem_beta_re;
+		const double mem_bi = a->mem_beta_im;
+		const int mem_on = (mem_br != 0.0 || mem_bi != 0.0);
+		const double mem_dscale = ps_memcorr_dscale (a->rate);
 		for (int i = 0; i < a->size; i++)
 		{
+			double x2;
 			I = a->in[2 * i + 0];
 			Q = a->in[2 * i + 1];
-			env = sqrt (I * I + Q * Q);
+			x2 = I * I + Q * Q;
+			env = sqrt (x2);
 			cset = a->cset;
 			ym = get_mag_correction_ema  (&a->m_calavg[cset], env, &a->m_prev_y[cset]);
 			yc = get_phase_correction_ema(&a->c_calavg[cset], env, &a->c_prev_y[cset]);
@@ -151,6 +161,15 @@ void xiqc (IQC a)
 				PRE1 = Q;
 				break;
 			}
+
+			if (mem_on && a->state == RUN)
+			{
+				// in * beta * D(in), D(in) = d|in|^2/dt per radian of 1 kHz
+				const double d = (x2 - a->mem_prev_x2) * mem_dscale;
+				PRE0 += d * (I * mem_br - Q * mem_bi);
+				PRE1 += d * (I * mem_bi + Q * mem_br);
+			}
+			a->mem_prev_x2 = x2;
 
 			{
 				double omag2 = PRE0 * PRE0 + PRE1 * PRE1;
@@ -278,6 +297,20 @@ void SetTXAiqcStart (int channel, NS_Spline* m_spline, CurveEMA* m_calavg, doubl
 	LeaveCriticalSection (&ch[channel].csDSP);
 	InterlockedBitTestAndSet   (&txa[channel].iqc.p->run, 0);
 	while (_InterlockedAnd (&a->busy, 1)) Sleep(1);
+}
+
+// Zeus: memory-correction hand-off from calcc (feedback thread, holding
+// calcc.cs_update). xiqc runs inside the channel's csDSP (wdspmain holds it
+// around xtxa), so writing both halves under csDSP means a TX buffer always
+// sees a matched re/im pair, the same idiom SetTXAiqcSwap/Start use. Nothing
+// takes calcc.cs_update while holding csDSP, so the order cannot deadlock.
+void SetTXAiqcMemoryBeta (int channel, double beta_re, double beta_im)
+{
+	IQC a = txa[channel].iqc.p;
+	EnterCriticalSection (&ch[channel].csDSP);
+	a->mem_beta_re = beta_re;
+	a->mem_beta_im = beta_im;
+	LeaveCriticalSection (&ch[channel].csDSP);
 }
 
 void SetTXAiqcEnd (int channel)
