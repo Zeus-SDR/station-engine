@@ -206,8 +206,9 @@ public static class RadioHardwareEndpoints
 
         // ANAN-G2 / Saturn-class ADC options. Dither/random write Protocol-2
         // CmdRx bytes 5/6 when the connected/effective board advertises
-        // SupportsG2AdcOptions; non-G2 boards still persist the preference but
-        // report Supported=false and receive zeroed wire bits.
+        // SupportsG2AdcOptions (G2 / G2-1K / 7000DLE / 8000DLE); other boards
+        // still persist the preference but report Supported=false and receive
+        // zeroed wire bits.
         endpoints.MapGet("/api/radio/g2-options", (RadioService radio) =>
         {
             return Results.Ok(radio.GetG2Options());

@@ -108,11 +108,13 @@ public sealed record BoardCapabilities(
     /// SDR ships HL2-class firmware so it inherits via the same enum value.
     /// Issue #279.</summary>
     bool HasHl2OptionalToggles = false,
-    /// <summary>True when the board exposes the ANAN-G2/Saturn ADC dither
-    /// and digital-output randomizer controls in Protocol-2 CmdRx bytes 5/6.
-    /// The frontend gates the G2 radio-options panel on this flag so the
-    /// controls appear only for verified G2-class variants that use the
-    /// Thetis-compatible Saturn receive-specific packet layout.</summary>
+    /// <summary>True when the board exposes the ADC dither and digital-output
+    /// randomizer controls in Protocol-2 CmdRx bytes 5/6 (and, with
+    /// <see cref="HasSteppedAttenuationRx2"/>, the RX2 / ADC1 stepped
+    /// attenuator). The frontend gates the G2 radio-options panel on this flag
+    /// so the controls appear only for verified variants that use the
+    /// Thetis-compatible receive-specific packet layout: ANAN-G2 / G2-1K and
+    /// ANAN-7000DLE / 8000DLE.</summary>
     bool SupportsG2AdcOptions = false,
     /// <summary>True when the board exposes the Anvelina-PRO3 DX Open-
     /// Collector extension (USEROUT7..10) defined by EU2AV's
