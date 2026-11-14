@@ -45,6 +45,12 @@ typedef struct _iqc
 	int count;
 	int ntup;
 	int state;
+	// Zeus: memory correction term (ps_memcorr.h), out += in * beta * D(in).
+	// beta is written by calcc through SetTXAiqcMemoryBeta under the
+	// channel's csDSP; exactly zero (the default) adds nothing.
+	double mem_beta_re;
+	double mem_beta_im;
+	double mem_prev_x2;			// |in|^2 of the previous sample, every state
 	
 } iqc, *IQC;
 
@@ -80,5 +86,7 @@ extern void SetTXAiqcStart(int channel,
 	NS_Spline* s_spline, CurveEMA* s_calavg, double s_prev_y);
 
 extern void SetTXAiqcEnd (int channel);
+
+extern void SetTXAiqcMemoryBeta (int channel, double beta_re, double beta_im);
 
 #endif

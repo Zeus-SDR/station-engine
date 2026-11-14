@@ -144,6 +144,14 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private enum P2AutoAttState { Monitor, SetNewValues, RestoreOperation }
     private P2AutoAttState _p2State = P2AutoAttState.Monitor;
     private int _p2DeltaDb;
+    // When the last dance re-enabled calcc. A fit counted before calcc has
+    // waited out its MOX delay again was collected at the OLD attenuation:
+    // calcc finishes a fit already in flight before it honours the reset, and
+    // bumps info[5] for it. Stepping on that fit applies the same correction
+    // twice (measured on a G2, #3698: 22->28->23->18->22->26->23->20->22 for
+    // a 6 dB error).
+    private long? _p2RestoredAtMs;
+    private static readonly TimeSpan PostRestoreSettleFloor = TimeSpan.FromMilliseconds(200);
     private bool _p2SavedAuto;
     private bool _p2SavedSingle;
     private int _hl2DeltaDb;
@@ -185,6 +193,8 @@ public sealed class PsAutoAttenuateService : BackgroundService
     private long _stallStartTickMs;
     private long _stallStartFeedbackBlocks;
     private bool _stallWarned;
+    private int _lastTopBinCal = -1;
+    private long? _topBinStallStartMs;
     private static readonly TimeSpan StallThreshold = TimeSpan.FromSeconds(5);
 
     // Only LCALC waits for a calculation to finish. COLLECT can wait for
@@ -316,14 +326,16 @@ public sealed class PsAutoAttenuateService : BackgroundService
         return (int)Math.Round(ddB, MidpointRounding.AwayFromZero);
     }
 
-    private void ClearStallFlag()
+    private void ClearStallFlag(bool clearWedge = true)
     {
         _stallStartTickMs = 0;
         _stallStartFeedbackBlocks = 0;
+        _lastTopBinCal = -1;
+        _topBinStallStartMs = null;
         // Clear wedge-watchdog tracking on every idle/disarm/unkey exit so the
         // freeze clock starts fresh on the next key-up — a frozen info5 from a
         // prior over must not count toward a wedge against the new transmission.
-        _lastWedgeCal = -1;
+        if (clearWedge) _lastWedgeCal = -1;
         if (_stallWarned)
         {
             _stallWarned = false;
@@ -526,12 +538,15 @@ public sealed class PsAutoAttenuateService : BackgroundService
             _lastPersistedAttnDb = int.MinValue;
             _hl2State = Hl2AutoAttState.Monitor;
             _p2State = P2AutoAttState.Monitor;
+            _p2RestoredAtMs = null;
             _c10State = P2AutoAttState.Monitor;
             ResetC10CollectStall();
             ResetHermesIISingleCalRecovery();
             _stallStartTickMs = 0;
             _stallStartFeedbackBlocks = 0;
             _stallWarned = false;
+            _lastTopBinCal = -1;
+            _topBinStallStartMs = null;
             _lastAutoCalTickMs = 0;
             // Fresh arm → re-converge then lock. SetPsEnabled(true) set runcal=1.
             _psHeld = false;
@@ -617,6 +632,8 @@ public sealed class PsAutoAttenuateService : BackgroundService
         // operator that hw_peak is almost certainly miscalibrated. Surface
         // a flag on RadioService so the frontend can show a banner.
         var stallPsm = engine.GetPsStageMeters();
+        if (stallPsm.CalibrationAttempts == 0 && _lastTopBinCal >= 0)
+            ClearStallFlag(clearWedge: false);
         if (stallPsm.CalibrationAttempts == 0)
         {
             long now = nowMs;
@@ -642,6 +659,43 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 _radio.SetPsCalibrationStalled(false);
                 _log.LogInformation("psAutoAttn.stall.cleared info5={Cal}", stallPsm.CalibrationAttempts);
             }
+        }
+
+        // A completed fit followed by COLLECT alone is normal (voice/silence).
+        // Diagnose only a steady two-tone reference that continuously misses the top bin;
+        // never reset calcc or alter attenuation here. HL2 owns its classifier.
+        if (stallPsm.CalibrationAttempts > 0)
+        {
+            bool starved = s.TwoToneEnabled && s.PsAuto && !s.PsSingle && !_psHeld
+                && _radio.ConnectedBoardKind != HpsdrBoardKind.HermesLite2
+                && stallPsm.CalState == 4
+                && stallPsm.MaxTxEnvelope >= 0.5 * s.PsHwPeak
+                && stallPsm.MaxTxEnvelope < CalccTopBinRatio * s.PsHwPeak;
+            bool newFit = stallPsm.CalibrationAttempts != _lastTopBinCal;
+            if (!starved || newFit)
+            {
+                ClearStallFlag(clearWedge: false);
+                _lastTopBinCal = stallPsm.CalibrationAttempts;
+                if (starved) _topBinStallStartMs = nowMs;
+            }
+            else if (_topBinStallStartMs is not long start)
+            {
+                _topBinStallStartMs = nowMs;
+            }
+            else if (!_stallWarned && nowMs - start >= (long)StallThreshold.TotalMilliseconds)
+            {
+                _stallWarned = true;
+                _radio.SetPsCalibrationStalled(true);
+                _log.LogWarning(
+                    "psAutoAttn.stall info5={Cal} stopped fitting for {ElapsedMs}ms: observedPeak={Observed:F4} hwPeak={HwPeak:F4} bar={Bar:F4} suggestedHwPeak={Suggested:F4} — TX reference cannot fill calcc bin 15; set HW peak just above the observed peak (within about 2%).",
+                    stallPsm.CalibrationAttempts, nowMs - start, stallPsm.MaxTxEnvelope,
+                    s.PsHwPeak, CalccTopBinRatio * s.PsHwPeak, stallPsm.MaxTxEnvelope / 0.98);
+            }
+        }
+        else
+        {
+            _lastTopBinCal = -1;
+            _topBinStallStartMs = null;
         }
 
         // WDSP calcc.c: COLLECT (4) fills envelope buckets, MOXCHECK (5)
@@ -713,7 +767,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
         // and the Protocol2Client wire write.
         var p2 = _pipe.CurrentP2Client;
         if (p2 is null) { LogGate("skip=p2-null"); return; }
-        Tick1P2(s, engine, p2);
+        Tick1P2(s, engine, p2, nowMs);
     }
 
     // Converge-then-hold supervisor (P2 automode only). Lock the correction once
@@ -962,7 +1016,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
     // Once we're past Monitor we MUST complete the cycle so PS gets re-enabled —
     // the early gates at the top of Tick1 honour that by only running while
     // in Monitor.
-    private void Tick1P2(StateDto s, IDspEngine engine, Zeus.Protocol2.Protocol2Client p2)
+    private void Tick1P2(StateDto s, IDspEngine engine, Zeus.Protocol2.Protocol2Client p2, long nowMs)
     {
         switch (_p2State)
         {
@@ -997,6 +1051,23 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 var psm = engine.GetPsStageMeters();
                 int feedback = (int)Math.Round(psm.FeedbackLevel);
 
+                // Fits counted this soon after a dance predate the new
+                // attenuation (see _p2RestoredAtMs). Absorb them so the next
+                // step waits for a fit collected at the value just written.
+                if (_p2RestoredAtMs is long restoredAt)
+                {
+                    long settleMs = Math.Max(
+                        (long)(s.PsMoxDelaySec * 1000.0),
+                        (long)PostRestoreSettleFloor.TotalMilliseconds);
+                    if (nowMs - restoredAt < settleMs)
+                    {
+                        _lastCalibrationAttempts = psm.CalibrationAttempts;
+                        LogGate($"p2.skip=post-step-settle info5={psm.CalibrationAttempts}");
+                        return;
+                    }
+                    _p2RestoredAtMs = null;
+                }
+
                 // mi0bot PSForm.cs:1097-1099 CalibrationAttemptsChanged:
                 // gate every step on a freshly-completed calcc fit so we
                 // never write a new attenuator mid-fit.
@@ -1007,6 +1078,12 @@ public sealed class PsAutoAttenuateService : BackgroundService
                     return;
                 }
                 _lastCalibrationAttempts = psm.CalibrationAttempts;
+
+                // Step from what the radio holds, not from the arm-edge
+                // baseline: the operator can change the attenuation by hand
+                // while PS stays armed, and a step computed from the stale
+                // model lands on the wrong value (#3698).
+                _currentAttnDb = ReadRadioTxAttnDb();
 
                 // info[4] == 0 → usually calcc hasn't completed a fit yet.
                 // EXCEPT on the G2E: a very cold tap COMPLETES fits whose
@@ -1146,6 +1223,7 @@ public sealed class PsAutoAttenuateService : BackgroundService
                 _log.LogInformation(
                     "psAutoAttn.p2.restoreOperation auto={Auto} single={Single}",
                     _p2SavedAuto, _p2SavedSingle);
+                _p2RestoredAtMs = nowMs;
                 _p2State = P2AutoAttState.Monitor;
                 return;
             }

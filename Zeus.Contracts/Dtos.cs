@@ -1672,6 +1672,11 @@ public sealed record StateDto(
     bool PsAuto = true,             // continuous adapt by default once armed
     bool PsSingle = false,          // one-shot SetPSControl(1,1,0,0)
     bool PsAutoAttenuate = true,
+    // Opt-in PureSignal memory correction (default off): calcc
+    // learns one memory coefficient from the feedback and iqc applies it,
+    // cancelling the uneven IMD3 an amplifier with memory leaves. Persisted
+    // with the other PS settings; it never arms PS and never resets the fit.
+    bool PsMemoryCorrection = false,
     double PsMoxDelaySec = 0.2,
     double PsLoopDelaySec = 0.0,
     double PsAmpDelayNs = 150.0,
@@ -1702,20 +1707,20 @@ public sealed record StateDto(
     double PsFeedbackLevel = 0.0,   // info[4] read-back, 0..256
     byte PsCalState = 0,            // info[15] enum
     bool PsCorrecting = false,      // info[14]
-    // Set by PsAutoAttenuateService when calcc has been alive (PS armed +
-    // keyed) for >5 s without producing a fit (CalibrationAttempts pinned
-    // at 0). Almost always means hw_peak is set higher than the actual TX
-    // envelope peak — calcc bin 15 never fills so COLLECT never advances.
+    // Set by PsAutoAttenuateService when calcc never fits, or completed fits
+    // stop for 5 s in COLLECT during two-tone with a live TX reference below
+    // the top-bin bar. Stale completed fits during voice do not raise this flag.
+    // An HW peak above the observed TX envelope can starve calcc bin 15.
     // Frontend shows a banner pointing the operator at HW peak. See
     // PsAutoAttenuateService stall detection + project_hl2_ps_hwpeak_calibration.
     bool PsCalibrationStalled = false,
     // ---- TwoTone test generator (TXA PostGen mode=1; protocol-agnostic) ----
-    // Standard PureSignal calibration excitation. Defaults match pihpsdr's
-    // TwoTone defaults — 700/1900 Hz, 0.49 linear amplitude per tone.
+    // Standard PureSignal calibration excitation — 700/1900 Hz, with the
+    // per-tone magnitude from Thetis Console/setup.cs:11095 (0 dB).
     bool TwoToneEnabled = false,
     double TwoToneFreq1 = 700.0,
     double TwoToneFreq2 = 1900.0,
-    double TwoToneMag = 0.49,
+    double TwoToneMag = PsTwoToneDefaults.Magnitude,
 
     // ---- CFC (Continuous Frequency Compressor) — issue #123 ----
     // Nullable so legacy state frames (no Cfc field) deserialize unchanged;
@@ -3563,7 +3568,8 @@ public sealed record PsAdvancedSetRequest(
     double? MoxDelaySec = null,
     double? LoopDelaySec = null,
     double? AmpDelayNs = null,
-    double? HwPeak = null);
+    double? HwPeak = null,
+    bool? MemoryCorrection = null);
 
 public sealed record PsResetRequest();
 

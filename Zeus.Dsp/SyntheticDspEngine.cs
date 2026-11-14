@@ -254,6 +254,7 @@ public sealed class SyntheticDspEngine : IDspEngine
     public void SetPsAdvanced(double moxDelaySec, double loopDelaySec,
                               double ampDelayNs, double hwPeak) { }
     public void SetPsHwPeak(double hwPeak) { }
+    public void SetPsMemoryCorrection(bool enabled) { }
     public void FeedPsFeedbackBlock(ReadOnlySpan<float> txI, ReadOnlySpan<float> txQ,
                                     ReadOnlySpan<float> rxI, ReadOnlySpan<float> rxQ) { }
     public PsStageMeters GetPsStageMeters() => PsStageMeters.Silent;

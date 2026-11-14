@@ -300,6 +300,8 @@ public sealed class OfflinePreviewDspEngine : IDspEngine, ITxAudioPluginHost, IT
 
     public void SetPsHwPeak(double hwPeak) => _tx.SetPsHwPeak(hwPeak);
 
+    public void SetPsMemoryCorrection(bool enabled) => _tx.SetPsMemoryCorrection(enabled);
+
     public void FeedPsFeedbackBlock(
         ReadOnlySpan<float> txI,
         ReadOnlySpan<float> txQ,

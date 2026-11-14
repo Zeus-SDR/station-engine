@@ -133,9 +133,8 @@ public static class StationMemoryCapabilityResolver
     {
         bool connected = radio?.IsConnected == true;
         var live = connected ? MemoryCapabilityState.Supported : MemoryCapabilityState.Unknown;
-        long maxHz = radio?.ReceiveOnly == true
-            ? StationReceiveOnlyPolicy.MaximumFrequencyHz
-            : TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        long maxHz = radio?.NativeTuningMaximumHz
+            ?? TransverterFrequencyConverter.MaximumRadioFrequencyHz;
         var settings = connected ? radio!.ActiveTransverterSettingsForMemory : null;
         StationMemoryFrequencySpan[] extra = settings is { Enabled: true, Bands: { } bands }
             ? bands

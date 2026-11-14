@@ -956,15 +956,16 @@ public sealed partial class RadioService : IDisposable
             PsEnabled: false, // runtime arm starts off; persisted intent is sanitized and applied after connect
             PsAuto: ps?.Auto ?? true,
             PsAutoAttenuate: ps?.AutoAttenuate ?? true,
+            PsMemoryCorrection: ps?.MemoryCorrection ?? false,
             PsMoxDelaySec: PsTimingLimits.ClampMoxDelaySec(ps?.MoxDelaySec ?? PsTimingLimits.DefaultMoxDelaySec),
             PsLoopDelaySec: PsTimingLimits.ClampLoopDelaySec(ps?.LoopDelaySec ?? PsTimingLimits.DefaultLoopDelaySec),
             PsAmpDelayNs: PsTimingLimits.ClampAmpDelayNs(ps?.AmpDelayNs ?? PsTimingLimits.DefaultAmpDelayNs),
             PsFeedbackSource: ps?.Source ?? PsFeedbackSource.Internal,
             // Two-tone test generator dial-in. Defaults match pihpsdr / Thetis
-            // (700/1900 Hz, 0.49 each — peak ~0.98 just under WDSP IQ clip).
+            // (700/1900 Hz, Thetis default magnitude just under WDSP IQ clip).
             TwoToneFreq1: ps?.TwoToneFreq1 ?? 700.0,
             TwoToneFreq2: ps?.TwoToneFreq2 ?? 1900.0,
-            TwoToneMag: ps?.TwoToneMag ?? 0.49,
+            TwoToneMag: ps?.TwoToneMag ?? PsTwoToneDefaults.Magnitude,
             Cfc: persistedCfc,
             // Hydrate drive sliders from RadioStateStore so a fresh frontend
             // connect lands on the operator's last-set values. The private
@@ -1234,6 +1235,7 @@ public sealed partial class RadioService : IDisposable
             ArmIntent = armIntent,
             Auto = snap.PsAuto,
             AutoAttenuate = snap.PsAutoAttenuate,
+            MemoryCorrection = snap.PsMemoryCorrection,
             MoxDelaySec = snap.PsMoxDelaySec,
             LoopDelaySec = snap.PsLoopDelaySec,
             AmpDelayNs = snap.PsAmpDelayNs,
@@ -2073,11 +2075,11 @@ public sealed partial class RadioService : IDisposable
             return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
         var settings = ActiveTransverterSettings();
         if (!settings.Enabled)
-            return Math.Clamp(rfHz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
+            return Math.Clamp(rfHz, 0L, NativeTuningMaximumHz);
         TransverterBandDto? band = null;
         if (TransverterFrequencyConverter.TryResolveBandByRfHz(rfHz, settings, out var byRange))
             band = byRange;
-        else if (rfHz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz)
+        else if (rfHz <= NativeTuningMaximumHz)
             return Math.Max(0, rfHz);
         else if (TransverterFrequencyConverter.TryResolveActiveBand(settings, out var active))
             band = active;
@@ -2103,6 +2105,176 @@ public sealed partial class RadioService : IDisposable
             ? $"xvtr:{band.Id}"
             : BandUtils.FreqToBand(rfHz);
 
+    // Highest receive frequency the active hardware path can tune natively.
+    // Zero means "not widened": the Hermes-class 60 MHz default applies. A
+    // receive-only source that tunes far beyond a Hermes ADC span (an RTL-SDR
+    // behind Zeus Interface) widens it for as long as it is the source, so the
+    // dial is not held to a radio that is not there. This governs RECEIVE
+    // tuning only: transmit keeps its own rule (TxService still requires a
+    // transverter profile for any carrier above MaximumRadioFrequencyHz).
+    private long _nativeTuningMaximumHz;
+
+    /// <summary>The wire carries the VFO as an unsigned 32-bit Hz word.</summary>
+    internal const long NativeTuningMaximumLimitHz = uint.MaxValue;
+
+    internal long NativeTuningMaximumHz
+    {
+        get
+        {
+            if (ReceiveOnly) return StationReceiveOnlyPolicy.MaximumFrequencyHz;
+            long widened = Interlocked.Read(ref _nativeTuningMaximumHz);
+            return widened > TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                ? widened
+                : TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        }
+    }
+
+    internal bool NativeTuningRangeWidened =>
+        NativeTuningMaximumHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+
+    // The signal level a radio behind Zeus Interface reports from its own S-meter (an FT-991A over CAT). With an IF-tap
+    // source the IQ is only a copy of the radio's IF, so a level measured from it follows the dongle's gain and not the
+    // radio's, and it will not match the radio's display. While a fresh value is held the RX meters use it instead.
+    private readonly object _externalRxLevelGate = new();
+    private double _externalRxLevelDbm;
+    private long _externalRxLevelAtMs;
+
+    /// <summary>How long a reported level stays current. The product refreshes it several times a second.</summary>
+    internal const long ExternalRxLevelFreshMs = 1_500;
+
+    /// <summary>
+    /// Accept (or clear, with null) the source's own RX level in dBm. Only a source that has declared a native range may
+    /// report one, a receive-only engine process has no such radio, and the value must be a plausible level.
+    /// </summary>
+    internal bool TrySetExternalRxLevelDbm(double? dbm, out string? error, long? nowMs = null)
+    {
+        error = null;
+        if (dbm is null)
+        {
+            lock (_externalRxLevelGate) _externalRxLevelAtMs = 0;
+            return true;
+        }
+        if (ReceiveOnly || !NativeTuningRangeWidened)
+        {
+            error = "an external RX level is accepted only from a source that has declared a native tuning range";
+            return false;
+        }
+        if (!double.IsFinite(dbm.Value) || dbm.Value is < -200.0 or > 30.0)
+        {
+            error = "dbm must be a finite level between -200 and 30 dBm";
+            return false;
+        }
+        lock (_externalRxLevelGate)
+        {
+            _externalRxLevelDbm = dbm.Value;
+            _externalRxLevelAtMs = nowMs ?? Environment.TickCount64;
+        }
+        return true;
+    }
+
+    /// <summary>The source's own RX level in dBm while a fresh one is held.</summary>
+    internal bool TryGetExternalRxLevelDbm(out double dbm, long? nowMs = null)
+    {
+        lock (_externalRxLevelGate)
+        {
+            long age = (nowMs ?? Environment.TickCount64) - _externalRxLevelAtMs;
+            dbm = _externalRxLevelDbm;
+            return _externalRxLevelAtMs != 0 && age >= 0 && age <= ExternalRxLevelFreshMs;
+        }
+    }
+
+    /// <summary>
+    /// Declare (or clear, with <c>null</c>) the native receive range of the
+    /// active source. Only a widening above the 60 MHz default is accepted;
+    /// anything else is rejected rather than silently narrowing the radio.
+    /// Narrowing again pulls a dial that is now out of range back inside it.
+    /// </summary>
+    internal bool TrySetNativeTuningMaximumHz(long? maximumHz, out string? error)
+    {
+        error = null;
+        if (maximumHz is long hz
+            && (hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                || hz > NativeTuningMaximumLimitHz))
+        {
+            error = $"maxHz must be null or between {TransverterFrequencyConverter.MaximumRadioFrequencyHz + 1} and {NativeTuningMaximumLimitHz}";
+            return false;
+        }
+        long before = NativeTuningMaximumHz;
+        Interlocked.Exchange(ref _nativeTuningMaximumHz, maximumHz ?? 0);
+        // A transmit range is only valid inside the receive range it was declared with.
+        long ceiling = NativeTuningMaximumHz;
+        Volatile.Write(ref _nativeTransmitRanges,
+            Volatile.Read(ref _nativeTransmitRanges).Where(range => range.HighHz <= ceiling).ToArray());
+        if (NativeTuningMaximumHz < before)
+        {
+            var current = Snapshot();
+            if (!IsExternalFrequencyAvailable(current.VfoHz, allowZero: true))
+                SetVfo(current.VfoHz, fromExternal: true);
+        }
+        if (!NativeTuningRangeWidened) lock (_externalRxLevelGate) _externalRxLevelAtMs = 0;
+        return true;
+    }
+
+    // Frequencies above 60 MHz that the active source can TRANSMIT on natively, with no transverter: an FT-991A behind
+    // Zeus Interface keys its own 144 and 430 MHz transmitters. The product declares them next to the receive range;
+    // they are cleared with it, and a receive-only source can never hold any. This lifts only the "transverter profile
+    // required" rule in TxService. The regulatory band plan still has to allow the emission.
+    private (long LowHz, long HighHz)[] _nativeTransmitRanges = [];
+
+    internal const int MaxNativeTransmitRanges = 8;
+
+    internal IReadOnlyList<(long LowHz, long HighHz)> NativeTransmitRanges
+        => ReceiveOnly ? [] : Volatile.Read(ref _nativeTransmitRanges);
+
+    internal bool NativeTransmitRangeContains(long hz)
+    {
+        if (ReceiveOnly) return false;
+        long ceiling = NativeTuningMaximumHz;
+        foreach (var (low, high) in Volatile.Read(ref _nativeTransmitRanges))
+            if (hz >= low && hz <= high && hz <= ceiling) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Declare (or clear, with null or empty) the native transmit ranges. Each range must lie above 60 MHz and inside the
+    /// native receive range that is currently declared; a receive-only source is refused.
+    /// </summary>
+    internal bool TrySetNativeTransmitRanges(IReadOnlyList<(long LowHz, long HighHz)>? ranges, out string? error)
+    {
+        error = null;
+        if (ranges is null || ranges.Count == 0)
+        {
+            Volatile.Write(ref _nativeTransmitRanges, []);
+            return true;
+        }
+        if (ReceiveOnly)
+        {
+            error = "a receive-only source cannot declare transmit ranges";
+            return false;
+        }
+        if (!NativeTuningRangeWidened)
+        {
+            error = "declare the native tuning range before its transmit ranges";
+            return false;
+        }
+        if (ranges.Count > MaxNativeTransmitRanges)
+        {
+            error = $"at most {MaxNativeTransmitRanges} transmit ranges may be declared";
+            return false;
+        }
+        long ceiling = NativeTuningMaximumHz;
+        foreach (var (low, high) in ranges)
+        {
+            if (low <= TransverterFrequencyConverter.MaximumRadioFrequencyHz || high < low || high > ceiling)
+            {
+                error = $"transmit range {low}-{high} must lie above {TransverterFrequencyConverter.MaximumRadioFrequencyHz} Hz and inside the native tuning range";
+                return false;
+            }
+        }
+        Volatile.Write(ref _nativeTransmitRanges, ranges.ToArray());
+        return true;
+    }
+
     internal bool IsExternalFrequencyAvailable(long hz, bool allowZero = false)
     {
         if (hz < (allowZero ? 0 : 1)) return false;
@@ -2111,20 +2283,21 @@ public sealed partial class RadioService : IDisposable
         if (settings.Enabled
             && TransverterFrequencyConverter.TryResolveBandByRfHz(hz, settings, out _))
             return true;
-        return hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        return hz <= NativeTuningMaximumHz;
     }
 
     internal long ClampTuningFrequency(long hz)
     {
         if (ReceiveOnly) return Math.Clamp(hz, 0L, StationReceiveOnlyPolicy.MaximumFrequencyHz);
         var settings = ActiveTransverterSettings();
-        if (!settings.Enabled || hz <= TransverterFrequencyConverter.MaximumRadioFrequencyHz)
-            return Math.Clamp(hz, 0L, TransverterFrequencyConverter.MaximumRadioFrequencyHz);
+        long nativeMaximumHz = NativeTuningMaximumHz;
+        if (!settings.Enabled || hz <= nativeMaximumHz)
+            return Math.Clamp(hz, 0L, nativeMaximumHz);
         if (TransverterFrequencyConverter.TryResolveBandByRfHz(hz, settings, out _))
             return hz;
         if (TransverterFrequencyConverter.TryResolveActiveBand(settings, out var active))
             return Math.Clamp(hz, active.BeginFrequencyHz, active.EndFrequencyHz);
-        return TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+        return nativeMaximumHz;
     }
 
     private void OnTransverterSettingsChanged()
@@ -7228,6 +7401,7 @@ public sealed partial class RadioService : IDisposable
         Mutate(s => s with
         {
             PsAutoAttenuate = req.AutoAttenuate ?? s.PsAutoAttenuate,
+            PsMemoryCorrection = req.MemoryCorrection ?? s.PsMemoryCorrection,
             PsMoxDelaySec = req.MoxDelaySec is double moxDelaySec
                 ? PsTimingLimits.ClampMoxDelaySec(moxDelaySec)
                 : s.PsMoxDelaySec,

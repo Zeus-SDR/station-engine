@@ -583,8 +583,11 @@ public sealed class TxService
         TransverterBandDto? profile = _radio.TryResolveTransverterBand(txHz, out var resolved)
             ? resolved
             : null;
+        // Above 60 MHz a transverter profile is required, unless the active source declared that it transmits on this
+        // frequency natively (an FT-991A on 144 / 430 MHz). The regulatory band plan is still checked afterwards.
         bool profileRequired = profile is not null
-            || txHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz;
+            || (txHz > TransverterFrequencyConverter.MaximumRadioFrequencyHz
+                && !_radio.NativeTransmitRangeContains(txHz));
         return new TransmitSafetySnapshot(
             state,
             _radio.IsConnected,

@@ -227,6 +227,7 @@ internal sealed class ExternalProtocol3TxDspEngine : IDspEngine, ITxWaveformSour
     public void SetPsAdvanced(double moxDelaySec, double loopDelaySec, double ampDelayNs, double hwPeak)
     { if (PureSignalEnabled) _inner.SetPsAdvanced(moxDelaySec, loopDelaySec, ampDelayNs, hwPeak); }
     public void SetPsHwPeak(double hwPeak) { if (PureSignalEnabled) _inner.SetPsHwPeak(hwPeak); }
+    public void SetPsMemoryCorrection(bool enabled) { if (PureSignalEnabled) _inner.SetPsMemoryCorrection(enabled); }
     public void FeedPsFeedbackBlock(
         ReadOnlySpan<float> txI,
         ReadOnlySpan<float> txQ,

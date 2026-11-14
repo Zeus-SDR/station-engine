@@ -515,7 +515,20 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
     // (chkInvertTones, gated behind a checkbox there; we auto-sign per mode).
     private double _twoToneF1Hz;
     private double _twoToneF2Hz;
+    // True only while the two-tone PostGen is actually running: set by
+    // SetTwoTone(true), cleared by SetTwoTone(false), by TUN (TUN-on replaces
+    // the two-tone with a single tone, TUN-off stops PostGen altogether) and
+    // at TXA open. PS fast tracking follows it, so voice never gets it.
     private bool _twoToneArmed;
+    // Older platform bundles lack this optional export. All calls are serialized
+    // by _txaLock; probe once per engine and keep two-tone usable without it.
+    private bool _psFastTrackingUnavailable;
+    // Opt-in PureSignal memory correction (calcc/iqc memory term), the
+    // operator's setting latched so TXA open re-applies it. Off by default.
+    // Both fields are read and written under _txaLock; older platform
+    // bundles lack the export, so probe once and keep PS usable without it.
+    private bool _psMemoryCorrection;
+    private bool _psMemoryCorrectionUnavailable;
     // Latest per-stage TX peak meters, published atomically at the end of each
     // ProcessTxBlock. The reader (TxMetersService, 10 Hz during MOX) sees a
     // consistent snapshot without blocking the DSP thread. null until first TX
@@ -2976,6 +2989,10 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 NativeMethods.SetPSLoopDelay(id, _psLoopDelaySec);
                 _psAmpDelayNs = ClampPsAmpDelayNs(_psAmpDelayNs, _psFeedbackRateHz);
                 _ = NativeMethods.SetPSTXDelay(id, _psAmpDelayNs * 1e-9);
+                // A fresh TXA has no generator running.
+                _twoToneArmed = false;
+                SetPsFastTrackingLocked(id, false);
+                ApplyPsMemoryCorrectionLocked(id);
                 NativeMethods.SetPSHWPeak(id, _psHwPeak);
                 NativeMethods.SetPSControl(id, 1, 0, 0, 0);   // RESET state
                                                               // SetPSRunCal stays 0 until the operator arms PS.
@@ -3716,6 +3733,12 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         lock (_txaLock)
         {
             if (_txaChannelId is not int txa) return;
+            // Either edge ends any two-tone: TUN-on replaces it with a single
+            // tone and TUN-off stops PostGen, after which the TX carries mic
+            // audio. So both select stock smoothing; fast tracking returns only
+            // when SetTwoTone(true) restarts the two-tone.
+            _twoToneArmed = false;
+            SetPsFastTrackingLocked(txa, false);
             // Thetis console.cs:31806-31829 (chkTUN_CheckedChanged, non-pulse
             // branch): mode=0 single tone at ±cw_pitch offset, mag=MAX_TONE_MAG.
             // wdsp/gen.c:221-241: mode 0 = tone, mode 1 = two-tone (summed).
@@ -4513,6 +4536,52 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
         _ => RxMode.USB,
     };
 
+    private void SetPsFastTrackingLocked(int txa, bool fast)
+    {
+        if (_psFastTrackingUnavailable) return;
+        try
+        {
+            _txControlNative.SetPSFastTracking(txa, fast ? 1 : 0);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _psFastTrackingUnavailable = true;
+            _log.LogInformation("wdsp.psFastTracking unavailable in this native runtime; two-tone uses stock smoothing.");
+        }
+    }
+
+    // Caller holds _txaLock.
+    private void ApplyPsMemoryCorrectionLocked(int txa)
+    {
+        if (_psMemoryCorrectionUnavailable) return;
+        try
+        {
+            _txControlNative.SetPSMemoryCorrection(txa, _psMemoryCorrection ? 1 : 0);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _psMemoryCorrectionUnavailable = true;
+            _log.LogInformation("wdsp.psMemoryCorrection unavailable in this native runtime; PureSignal runs without it.");
+        }
+    }
+
+    public void SetPsMemoryCorrection(bool enabled)
+    {
+        if (_disposed != 0) return;
+        lock (_psLock)
+        {
+            // Under _txaLock so a concurrent TXA open cannot apply a stale value
+            // after this one. Native SetPSMemoryCorrection only forgets the
+            // learned coefficient; it never resets calcc or arms PureSignal.
+            lock (_txaLock)
+            {
+                _psMemoryCorrection = enabled;
+                if (_txaChannelId is int txa) ApplyPsMemoryCorrectionLocked(txa);
+            }
+        }
+        _log.LogInformation("wdsp.setPsMemoryCorrection enabled={Enabled}", enabled);
+    }
+
     public void SetTwoTone(bool on, double freq1, double freq2, double mag)
     {
         if (_disposed != 0) return;
@@ -4544,11 +4613,18 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
                 _twoToneF1Hz = freq1;
                 _twoToneF2Hz = freq2;
                 _twoToneArmed = true;
+                // Two-tone only: calcc's faster control-point/curve smoothing
+                // settles the IMD reading in ~6 s instead of 20+ s. Voice keeps
+                // stock smoothing (TXA open, two-tone off and TUN restore it).
+                // It is stable since calcc's solution check weights the gain
+                // tolerance by envelope (#3698); before that it reset
+                // calibration every ~2 s on a warm amplifier.
+                SetPsFastTrackingLocked(txa, true);
                 // PostGen mode=1 = two-tone summed (gen.c:221-241).
-                NativeMethods.SetTXAPostGenMode(txa, 1);
-                NativeMethods.SetTXAPostGenTTFreq(txa, signedF1, signedF2);
-                NativeMethods.SetTXAPostGenTTMag(txa, mag, mag);
-                NativeMethods.SetTXAPostGenRun(txa, 1);
+                _txControlNative.SetTXAPostGenMode(txa, 1);
+                _txControlNative.SetTXAPostGenTTFreq(txa, signedF1, signedF2);
+                _txControlNative.SetTXAPostGenTTMag(txa, mag, mag);
+                _txControlNative.SetTXAPostGenRun(txa, 1);
                 // Same Leveler-off pattern SetTxTune uses; the test signal
                 // doesn't need voice-energy AGC and Leveler can pump on the
                 // discrete tones.
@@ -4562,7 +4638,8 @@ public sealed partial class WdspDspEngine : IDspEngine, ITxAudioPluginHost
             else
             {
                 _twoToneArmed = false;
-                NativeMethods.SetTXAPostGenRun(txa, 0);
+                SetPsFastTrackingLocked(txa, false);
+                _txControlNative.SetTXAPostGenRun(txa, 0);
                 // Restore the Leveler to the operator's setting (see SetTxTune)
                 // rather than hardcoding "on".
                 _txLevelerForcedOff = false;
