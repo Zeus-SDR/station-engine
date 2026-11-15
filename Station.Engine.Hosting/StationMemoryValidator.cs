@@ -125,6 +125,32 @@ public static class StationMemoryValidator
         if (write.SourceMode is { } sourceMode
             && (sourceMode.Length > StationMemorySchema.MaxSourceModeLength || HasControl(sourceMode)))
             Fail("sourceMode", "sourceMode must be at most 16 characters");
+        if (write.P25 is { } p25)
+        {
+            if (write.Mode is not null || !string.Equals(write.SourceMode, "P25", StringComparison.Ordinal))
+                Fail("p25", "P25 memories must use sourceMode P25 and no station mode");
+            if (p25.ControlFrequenciesHz is not { Count: >= 1 and <= 32 }
+                || p25.ControlFrequenciesHz.Any(static hz => hz is < 100_000 or > 6_000_000_000L))
+                Fail("p25.controlFrequenciesHz", "P25 needs 1 to 32 valid control frequencies");
+            if (p25.Phase is not (1 or 2) || p25.Modulation is not ("C4FM" or "LSM"))
+                Fail("p25", "P25 phase or modulation is invalid");
+            if (p25.SystemName is { Length: > 128 } || p25.SystemName is { } n && HasControl(n))
+                Fail("p25.systemName", "P25 system name is invalid");
+            if (p25.RadioReferenceSystemId is { } rr && (rr.Length is < 1 or > 9 || !rr.All(char.IsAsciiDigit)))
+                Fail("p25.radioReferenceSystemId", "RadioReference system ID is invalid");
+            if (!P25Hex(p25.Wacn, 5) || !P25Hex(p25.SystemId, 3) || !P25Hex(p25.Nac, 3))
+                Fail("p25", "P25 identifiers must be hexadecimal");
+            int identifiers = (p25.Wacn is null ? 0 : 1) + (p25.SystemId is null ? 0 : 1) + (p25.Nac is null ? 0 : 1);
+            if (identifiers is not (0 or 3)) Fail("p25", "P25 identifiers must be all present or all absent");
+            if (!p25.Trunked && p25.ControlFrequenciesHz?.Count != 1)
+                Fail("p25.controlFrequenciesHz", "Conventional P25 needs one frequency");
+            if (p25.ControlFrequenciesHz is { Count: > 0 } && write.FrequencyHz != p25.ControlFrequenciesHz[0])
+                Fail("frequencyHz", "frequencyHz must match the first P25 control frequency");
+            if (p25.Talkgroups is { Count: > 1000 } || p25.SelectedTalkgroups is { Count: > 1000 }
+                || p25.Talkgroups?.Any(static t => t is null || t.Id is < 1 or > 65535 || t.Name is { Length: > 128 } || t.Description is { Length: > 256 } || t.Category is { Length: > 128 } || t.Name is { } name && HasControl(name) || t.Description is { } description && HasControl(description) || t.Category is { } category && HasControl(category)) == true
+                || p25.SelectedTalkgroups?.Any(static id => id is < 1 or > 65535) == true)
+                Fail("p25.talkgroups", "P25 talkgroups are invalid");
+        }
         if (!IsFilterPair(write.FilterLowHz, write.FilterHighHz))
             Fail("filterLowHz", "filterLowHz must be less than filterHighHz, or both must be empty");
         if (write.TuneStepHz is { } step && step is < 1 or > StationMemorySchema.MaxTuneStepHz)
@@ -315,7 +341,8 @@ public static class StationMemoryValidator
             memory.Squelch,
             memory.Fm,
             memory.CatChannel,
-            memory.ShortcutSlot);
+            memory.ShortcutSlot,
+            memory.P25);
     }
 
     internal static bool IsSafeFrequency(long hz) => hz is >= 1 and <= StationMemorySchema.MaxFrequencyHz;
@@ -335,6 +362,9 @@ public static class StationMemoryValidator
     }
 
     internal static bool HasControl(string value) => value.Any(char.IsControl);
+
+    private static bool P25Hex(string? value, int maxLength) => value is null
+        || value.Length is > 0 && value.Length <= maxLength && value.All(Uri.IsHexDigit);
 
     private static bool IsStoredOffset(long offsetHz) =>
         offsetHz is >= -StationMemorySchema.MaxStoredOffsetHz and <= StationMemorySchema.MaxStoredOffsetHz;

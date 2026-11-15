@@ -103,6 +103,7 @@ internal static class EnginePrefsDbMigration
             StationMemoryStore.CollectionName,
             StationMemoryStore.LinksCollectionName,
             StationMemoryStore.MigrationCollectionName,
+            StationMemoryFolderStore.CollectionName,
         ]);
 
     /// <summary>
