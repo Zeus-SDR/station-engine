@@ -22,6 +22,7 @@ public sealed class StationMemoryStore : IDisposable
     internal const string CollectionName = "station_memories";
     internal const string LinksCollectionName = "station_memory_links";
     internal const string MigrationCollectionName = "station_memory_migration";
+    internal const string FolderCollectionName = "station_memory_folders";
     internal const string MigrationMarkerId = "station-memory-v1";
 
     // One row beside the migration marker, written when a favorite or a
@@ -247,12 +248,22 @@ public sealed class StationMemoryStore : IDisposable
             var members = _memories.FindAll()
                 .Where(memory => string.Equals(memory.Group, from, StringComparison.Ordinal))
                 .ToList();
-            if (members.Count == 0)
+            var folders = _db.GetCollection<StationMemoryFolderStore.Folder>(FolderCollectionName);
+            var explicitFolder = from is not null && folders.FindById(from) is not null;
+            if (members.Count == 0 && !explicitFolder)
                 throw new StationMemoryNotFoundException("group", from ?? string.Empty);
             if (string.Equals(from, to, StringComparison.Ordinal))
                 return new StationMemoryGroupOperationResponse("renameGroup", 0, [], [], GroupCounts(_memories.FindAll()));
 
-            return Write(() => Regroup("renameGroup", members, to));
+            return Write(() =>
+            {
+                if (explicitFolder)
+                {
+                    folders.Delete(from!);
+                    if (to is not null) folders.Upsert(new StationMemoryFolderStore.Folder { Name = to });
+                }
+                return Regroup("renameGroup", members, to);
+            });
         }
     }
 
@@ -827,6 +838,7 @@ public sealed class StationMemoryStore : IDisposable
         memory.DigitalJson = StationMemoryJson.Write(write.Digital);
         memory.SquelchJson = StationMemoryJson.Write(write.Squelch);
         memory.FmJson = StationMemoryJson.Write(write.Fm);
+        memory.P25Json = StationMemoryJson.Write(write.P25);
     }
 
     private static IOrderedEnumerable<StationMemoryDocument> Ordered(IEnumerable<StationMemoryDocument> memories) =>
@@ -903,7 +915,8 @@ public sealed class StationMemoryStore : IDisposable
         links
             .OrderBy(link => link.Key, StringComparer.Ordinal)
             .Select(link => new StationMemoryExternalLink(link.RadioSerial, link.MemoryIndex, link.Owner))
-            .ToArray());
+            .ToArray(),
+        ReadColumn<StationMemoryP25>(memory, memory.P25Json, nameof(memory.P25Json)));
 
     private T? ReadColumn<T>(StationMemoryDocument memory, string? json, string column) where T : class
     {
@@ -948,6 +961,7 @@ public sealed class StationMemoryDocument
     public string? DigitalJson { get; set; }
     public string? SquelchJson { get; set; }
     public string? FmJson { get; set; }
+    public string? P25Json { get; set; }
 }
 
 public sealed class StationMemoryLinkDocument

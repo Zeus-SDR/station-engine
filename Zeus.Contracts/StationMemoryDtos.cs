@@ -46,7 +46,8 @@ public static class StationMemorySources
     public const string ZeusCsv = "zeusCsv";
     public const string Chirp = "chirp";
     public const string FlexRadio = "flexRadio";
-    public static readonly IReadOnlyList<string> All = [User, Favorite, BandStack, ZeusCsv, Chirp, FlexRadio];
+    public const string RadioReference = "radioReference";
+    public static readonly IReadOnlyList<string> All = [User, Favorite, BandStack, ZeusCsv, Chirp, FlexRadio, RadioReference];
 }
 
 /// <summary>Stable <c>code</c> values of <see cref="StationMemoryError"/>.</summary>
@@ -92,6 +93,22 @@ public sealed record StationMemoryLegacy(int? FavoriteSlot = null, int? BandStac
 
 public sealed record StationMemoryExternalLink(string RadioSerial, int MemoryIndex, string? Owner = null);
 
+/// <summary>A P25 system belongs to the separate USB receiver, not the station VFO.</summary>
+public sealed record StationMemoryP25Talkgroup(int Id, string? Name = null, string? Description = null, string? Category = null);
+public sealed record StationMemoryP25(
+    IReadOnlyList<long> ControlFrequenciesHz,
+    int Phase,
+    string Modulation,
+    string? SystemName = null,
+    string? Wacn = null,
+    string? SystemId = null,
+    string? Nac = null,
+    bool MonitorSelected = false,
+    IReadOnlyList<StationMemoryP25Talkgroup>? Talkgroups = null,
+    IReadOnlyList<int>? SelectedTalkgroups = null,
+    bool Trunked = true,
+    string? RadioReferenceSystemId = null);
+
 // ---- the memory ------------------------------------------------------------
 
 public sealed record StationMemoryDto(
@@ -123,7 +140,8 @@ public sealed record StationMemoryDto(
     int? CatChannel,
     int? ShortcutSlot,
     StationMemoryLegacy? Legacy,
-    IReadOnlyList<StationMemoryExternalLink> ExternalLinks);
+    IReadOnlyList<StationMemoryExternalLink> ExternalLinks,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] StationMemoryP25? P25 = null);
 
 /// <summary>The fields a client may set. Identity, source, timestamps, revision,
 /// legacy mapping and external links are owned by the server.</summary>
@@ -147,7 +165,8 @@ public sealed record StationMemoryWrite(
     StationMemorySquelch? Squelch = null,
     FmMemory? Fm = null,
     int? CatChannel = null,
-    int? ShortcutSlot = null);
+    int? ShortcutSlot = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] StationMemoryP25? P25 = null);
 
 // ---- capabilities (spec 7) -------------------------------------------------
 
@@ -232,7 +251,7 @@ public sealed record StationMemoryListResponse(
 /// <summary>Answer of GET {id}, POST, PUT.</summary>
 public sealed record StationMemoryResponse(StationMemoryDto Memory, StationMemoryCapabilities Capabilities);
 
-public sealed record StationMemoryCreateRequest(StationMemoryWrite Memory);
+public sealed record StationMemoryCreateRequest(StationMemoryWrite Memory, string? Source = null);
 
 public sealed record StationMemoryUpdateRequest(int ExpectedRevision, StationMemoryWrite Memory);
 

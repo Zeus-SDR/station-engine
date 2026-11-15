@@ -31,6 +31,32 @@ public static class StationMemoryEndpoints
             endpoints.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(StationMemoryEndpoints)),
             endpoints.ServiceProvider.GetService<MemoryOperationHistory>());
 
+        endpoints.MapGet("/api/station/memory-folders", (StationMemoryStore store) =>
+        {
+            using var folders = new StationMemoryFolderStore(store.DatabasePath);
+            return Results.Ok(folders.List());
+        });
+        endpoints.MapPost("/api/station/memory-folders", (StationMemoryFolderRequest request, StationMemoryStore store) =>
+        {
+            try
+            {
+                using var folders = new StationMemoryFolderStore(store.DatabasePath);
+                return Results.Ok(new { name = folders.Create(request.Name) });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
+        });
+        endpoints.MapDelete("/api/station/memory-folders", (string name, StationMemoryStore store) =>
+        {
+            try
+            {
+                using var folders = new StationMemoryFolderStore(store.DatabasePath);
+                folders.Delete(name);
+                return Results.NoContent();
+            }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
+        });
+
         endpoints.MapGet("/api/station/memories", (
             HttpRequest request,
             StationMemoryStore store,
@@ -57,7 +83,9 @@ public static class StationMemoryEndpoints
             if (malformed is not null) return malformed;
             return Guard(journal, "create", null, () =>
             {
-                var memory = store.Create(Required(body!.Memory, "memory"));
+                if (body!.Source is not null && body.Source != StationMemorySources.RadioReference)
+                    throw new StationMemoryValidationException([new StationMemoryFieldError("source", "source must be radioReference or omitted")]);
+                var memory = store.Create(Required(body.Memory, "memory"), body.Source ?? StationMemorySources.User);
                 return new Outcome(Ok(new StationMemoryResponse(memory, recall.Capabilities())), memory.Id, memory.Revision);
             });
         });

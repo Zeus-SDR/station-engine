@@ -554,7 +554,8 @@ public sealed class StationMemoryImportExport
 
     // Content is every client-settable field plus the link set.
     private static bool SameContent(StationMemoryDto candidate, StationMemoryDto existing) =>
-        StationMemoryValidator.ToWrite(candidate) == StationMemoryValidator.ToWrite(existing)
+        StationMemoryValidator.ToWrite(candidate) with { P25 = null } == StationMemoryValidator.ToWrite(existing) with { P25 = null }
+        && StationMemoryJson.Write(candidate.P25) == StationMemoryJson.Write(existing.P25)
         && LinkSet(candidate).SequenceEqual(LinkSet(existing));
 
     private static IEnumerable<(string Key, string? Owner)> LinkSet(StationMemoryDto memory) =>
@@ -584,6 +585,7 @@ public sealed class StationMemoryImportExport
         TxAntenna = write.TxAntenna,
         Squelch = write.Squelch,
         Fm = write.Fm,
+        P25 = write.P25,
         CatChannel = write.CatChannel,
         ShortcutSlot = write.ShortcutSlot,
     };
@@ -1009,12 +1011,13 @@ internal static class ZeusCsvFormat
         Whole("lastRecalledUtcMs", memory => memory.LastRecalledUtcMs, optional: true),
         Whole("revision", memory => memory.Revision, optional: true),
         Text("sourceMode", memory => memory.SourceMode),
+        new("p25Json", false, memory => memory.P25 is null ? null : JsonSerializer.Serialize(memory.P25, StationMemoryJson.Options), Optional: true),
     ];
 
     private static readonly HashSet<string> ColumnNames =
         Columns.Select(column => column.Name).ToHashSet(StringComparer.Ordinal);
 
-    internal static IReadOnlyList<string> Header { get; } = Columns.Select(column => column.Name).ToArray();
+    internal static IReadOnlyList<string> Header { get; } = Columns.Where(column => column.Name != "p25Json").Select(column => column.Name).ToArray();
 
     /// <summary>Every column a file must have. The others are the ones a
     /// hand-authored file may leave out.</summary>
@@ -1023,14 +1026,18 @@ internal static class ZeusCsvFormat
 
     /// <summary>Header and one row per memory, LF line ends, a final LF, no
     /// byte order mark.</summary>
-    public static string Write(IEnumerable<StationMemoryDto> memories) =>
-        Rfc4180.Write(memories
-            .Select(memory => Columns.Select(column =>
+    public static string Write(IEnumerable<StationMemoryDto> memories)
+    {
+        var rows = memories.ToArray();
+        var columns = rows.Any(memory => memory.P25 is not null) ? Columns : Columns.Where(column => column.Name != "p25Json").ToArray();
+        return Rfc4180.Write(rows
+            .Select(memory => columns.Select(column =>
             {
                 string cell = column.Read(memory) ?? string.Empty;
                 return column.Text ? Protect(cell) : cell;
             }))
-            .Prepend(Header));
+            .Prepend(columns.Select(column => column.Name)));
+    }
 
     public static List<MemoryImportRow> Read(Rfc4180.Table table, List<string> fileWarnings, bool restoreRevisions)
     {
@@ -1154,7 +1161,8 @@ internal static class ZeusCsvFormat
             cells.Int32("catChannel"),
             cells.Int32("shortcutSlot"),
             legacy,
-            ReadLinks(cells.Typed("externalLinksJson"), row));
+            ReadLinks(cells.Typed("externalLinksJson"), row),
+            ReadP25(cells.Typed("p25Json"), row));
 
         // Without a name or a frequency there is nothing to show as a candidate.
         if (name.Length > 0 && frequencyHz is not null)
@@ -1165,6 +1173,13 @@ internal static class ZeusCsvFormat
         cells.Any(name + ".enabled", name + ".offsetHz")
             ? new StationMemoryOffset(cells.RequiredFlag(name + ".enabled"), cells.RequiredInt64(name + ".offsetHz"))
             : null;
+
+    private static StationMemoryP25? ReadP25(string json, MemoryImportRow row)
+    {
+        if (json.Length == 0) return null;
+        try { return JsonSerializer.Deserialize<StationMemoryP25>(json, StationMemoryJson.Options) ?? throw new JsonException(); }
+        catch (JsonException) { row.Errors.Add("p25Json is invalid."); return null; }
+    }
 
     private static string? Links(StationMemoryDto memory) =>
         memory.ExternalLinks.Count == 0
