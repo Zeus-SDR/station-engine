@@ -92,6 +92,15 @@ public static class PureSignalEndpoints
             return Results.Ok(new { reset = true });
         });
 
+        // "Run now": one fresh calibration pass in the operator's current
+        // mode. Unlike POST /api/tx/ps it never rewrites Auto / Single.
+        endpoints.MapPost("/api/tx/ps/run-now", (DspPipelineService pipe) =>
+        {
+            bool started = pipe.RunPsCalibrationNow();
+            log.LogInformation("api.tx.ps.runNow started={Started}", started);
+            return Results.Ok(new { started });
+        });
+
         endpoints.MapPost("/api/tx/ps/save", (PsSaveRequest req, DspPipelineService pipe) =>
         {
             if (string.IsNullOrWhiteSpace(req.Filename))
