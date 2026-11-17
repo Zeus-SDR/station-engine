@@ -6140,6 +6140,32 @@ public partial class DspPipelineService : BackgroundService,
         }
     }
 
+    /// <summary>
+    /// "Run now": start one fresh PureSignal calibration pass without changing
+    /// the operator's saved Auto / Single choice. In Auto this restarts the
+    /// measurement and calcc keeps refining. Otherwise it issues the one-shot
+    /// trigger, which arms a pass from every calcc state: a locked curve
+    /// (LSTAYON), an idle calibrator (LRESET) or one already waiting for the
+    /// next keying (LWAIT). Returns false when PureSignal is not armed.
+    /// </summary>
+    public bool RunPsCalibrationNow()
+    {
+        var engine = CurrentEngine;
+        var s = _radio.Snapshot();
+        if (engine is null || !s.PsEnabled) return false;
+        if (s.PsAuto && !s.PsSingle)
+        {
+            engine.ResetPs();
+            return true;
+        }
+        engine.SetPsControl(false, true);
+        // Record what the engine now holds, so a later mode change in the
+        // state is still pushed (matters only for the neither-mode state).
+        _appliedPsAuto = false;
+        _appliedPsSingle = true;
+        return true;
+    }
+
     private void OpenSynthetic()
     {
         var engine = CreateDisconnectedEngine(out int channelId);
