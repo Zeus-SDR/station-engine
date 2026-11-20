@@ -11,7 +11,8 @@ namespace Zeus.Server;
 /// </summary>
 internal static class TimeboxedNativeOpen
 {
-    public static T? Run<T>(Func<T> open, Action<T> dispose, TimeSpan timeout, out Exception? error)
+    public static T? Run<T>(Func<T> open, Action<T> dispose, TimeSpan timeout, out Exception? error,
+        Action<Thread>? onTimeout = null)
         where T : class
     {
         var gate = new object();
@@ -75,6 +76,7 @@ internal static class TimeboxedNativeOpen
             orphaned = true;
         }
 
+        onTimeout?.Invoke(worker);
         error = null;
         return null;
     }
