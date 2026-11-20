@@ -107,11 +107,6 @@ public static class RadioTuningEndpoints
             LayoutStore layouts,
             TxService tx) =>
         {
-            if (tx.IsMoxOn || tx.IsTunOn || tx.IsTwoToneOn)
-                return Results.Conflict(new
-                {
-                    error = "transverter settings cannot change while the transmitter is active",
-                });
             var settings = new TransverterSettingsDto(
                 req.Enabled,
                 req.IfFrequencyHz,
@@ -123,16 +118,19 @@ public static class RadioTuningEndpoints
 
             // Suppress intermediate notifications so TCI never observes the new
             // workspace flag with the old IF/RF anchors (or vice versa).
-            if (!layouts.SetTransverterSelection(
-                    req.RadioKey,
-                    req.LayoutId,
-                    req.Enabled,
-                    settings.ActiveBandId,
-                    notifyChanged: false))
+            bool workspaceFound = false;
+            if (!tx.TryRunWithTransmitIdle(() =>
+            {
+                workspaceFound = layouts.SetTransverterSelection(
+                    req.RadioKey, req.LayoutId, req.Enabled, settings.ActiveBandId,
+                    notifyChanged: false);
+                if (!workspaceFound) return;
+                store.Set(settings, notifyChanged: false);
+                store.NotifyChanged();
+            }, out var idleError))
+                return Results.Conflict(new { error = idleError });
+            if (!workspaceFound)
                 return Results.BadRequest(new { error = "radio/layout workspace not found" });
-
-            store.Set(settings, notifyChanged: false);
-            store.NotifyChanged();
             var effective = store.GetForLayout(layouts, req.RadioKey, req.LayoutId);
             log.LogInformation(
                 "api.radio.transverter radio={Radio} layout={Layout} enabled={Enabled} activeBand={ActiveBand} bands={BandCount} ifHz={IfHz} rfHz={RfHz}",

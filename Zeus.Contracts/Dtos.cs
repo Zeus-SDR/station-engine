@@ -3209,7 +3209,11 @@ public sealed record RfFilterSettingsDto(
     IReadOnlyList<string> Warnings,
     bool Rx6mLnaControlSupported = false,
     bool? Adc0Rx6mLnaDisabled = null,
-    bool? Adc1Rx6mLnaDisabled = null);
+    bool? Adc1Rx6mLnaDisabled = null,
+    bool GroundBpf2OnTx = true,
+    bool GroundBpf2OnTxSupported = false,
+    bool Adc0Tx6mLnaDisabled = false,
+    bool Tx6mLnaControlSupported = false);
 
 public sealed record RfFilterSettingsSetRequest(
     bool CustomMatrixEnabled,
@@ -3218,7 +3222,9 @@ public sealed record RfFilterSettingsSetRequest(
     bool RxBypassOnPureSignal,
     IReadOnlyList<RfFilterProfileDto> Profiles,
     bool? Adc0Rx6mLnaDisabled = null,
-    bool? Adc1Rx6mLnaDisabled = null);
+    bool? Adc1Rx6mLnaDisabled = null,
+    bool GroundBpf2OnTx = true,
+    bool Adc0Tx6mLnaDisabled = false);
 
 // Compact runtime shape pushed from RadioService to Protocol2Client. It keeps
 // Protocol2 free of LiteDB/store concerns while letting tests exercise the same
@@ -3233,7 +3239,9 @@ public sealed record RfFilterRuntimeSettings(
     IReadOnlyList<RfFilterRangeDto> ClassicAlexRxFilters,
     IReadOnlyList<RfFilterRangeDto> TxFilters,
     bool? Adc0Rx6mLnaDisabled = null,
-    bool? Adc1Rx6mLnaDisabled = null);
+    bool? Adc1Rx6mLnaDisabled = null,
+    bool GroundBpf2OnTx = true,
+    bool Adc0Tx6mLnaDisabled = false);
 
 // Panadapter background settings — Mode is one of "basic" | "beam-map" |
 // "image"; Fit is one of "fit" | "fill" | "stretch". Image bytes are NOT
