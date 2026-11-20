@@ -266,6 +266,80 @@ public sealed class TxService : IDisposable
 
     public bool IsMoxOn { get { lock (_sync) return _moxOn; } }
     public bool IsTunOn { get { lock (_sync) return _tunOn; } }
+    private readonly object _psCwBlockSync = new();
+    private long _psCwBlockGeneration;
+
+    private long BeginPsCwTransition(bool block)
+    {
+        lock (_psCwBlockSync)
+        {
+            long generation = ++_psCwBlockGeneration;
+            if (block) _radio.SetPsTransitionCwBlocked(true);
+            return generation;
+        }
+    }
+
+    private void ReleasePsCwBlockAfterTransition(long generation)
+    {
+        Task work = _pipeline.WaitForPsArmTransitionsAsync();
+        _ = work.ContinueWith(_ =>
+        {
+            lock (_psCwBlockSync)
+            {
+                if (_psCwBlockGeneration == generation && _pipeline.IsPsTransitionReady
+                    && (!_radio.Snapshot().PsEnabled || _pipeline.IsPsArmApplied))
+                    _radio.SetPsTransitionCwBlocked(false);
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    internal bool TrySetPureSignal(PsControlSetRequest request, out StateDto? state, out string? error)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (!request.Enabled)
+        {
+            bool blockCw = !_radio.IsTxActive() && !IsMoxOn && !IsTunOn && !IsTwoToneOn;
+            long generation = BeginPsCwTransition(block: blockCw);
+            try { state = PureSignalEndpoints.SetPsForStation(_radio, _pipeline, request); }
+            finally { ReleasePsCwBlockAfterTransition(generation); }
+            error = null;
+            return true;
+        }
+        if (!Monitor.TryEnter(_transitionSync))
+        {
+            state = null;
+            error = RadioService.PsArmDuringTransmitError;
+            return false;
+        }
+        try
+        {
+            bool alreadyArmed = _radio.Snapshot().PsEnabled;
+            lock (_sync)
+            {
+                if (!alreadyArmed && (_activeIntent is not null || _moxOn || _tunOn || IsTwoToneOn))
+                {
+                    state = null;
+                    error = RadioService.PsArmDuringTransmitError;
+                    return false;
+                }
+            }
+            try
+            {
+                long generation = BeginPsCwTransition(block: !alreadyArmed);
+                try { state = PureSignalEndpoints.SetPsForStation(_radio, _pipeline, request); }
+                finally { ReleasePsCwBlockAfterTransition(generation); }
+                error = null;
+                return true;
+            }
+            catch (InvalidOperationException ex) when (ex.Message == RadioService.PsArmDuringTransmitError)
+            {
+                state = null;
+                error = ex.Message;
+                return false;
+            }
+        }
+        finally { Monitor.Exit(_transitionSync); }
+    }
     public bool MonitorOnTransmit => Volatile.Read(ref _monitorOnTransmit) != 0;
 
     private void SetMonitorOnTransmitUnsafe(bool enabled) =>
@@ -679,6 +753,11 @@ public sealed class TxService : IDisposable
             }
         }
         var state = _radio.Snapshot();
+        if (!_pipeline.IsPsTransitionReady || (state.PsEnabled && !_pipeline.IsPsArmApplied))
+        {
+            error = "PureSignal is still preparing or could not arm. Wait for it to finish or disarm PureSignal before transmitting.";
+            return false;
+        }
         ExternalReceiverContext? external = intent == TransmitIntent.TwoTone &&
             _pipeline.TryGetExternalTransmitContext(out var context) ? context : null;
         var channel = Volatile.Read(ref _productPluginTxChannelConstraint);
@@ -769,7 +848,10 @@ public sealed class TxService : IDisposable
         // Hardware-owned MOX is the FPGA keyer's own transmission, not a
         // competing intent. Mirror TrySetMox's source-aware block exemption so
         // a settings re-push cannot disarm the keyer that currently owns TX.
-        if (active == TransmitIntent.Mox && owner == MoxSource.Hardware)
+        bool hardwareActive = active == TransmitIntent.Mox && owner == MoxSource.Hardware;
+        if (!hardwareActive && (!_pipeline.IsPsTransitionReady || (state.PsEnabled && !_pipeline.IsPsArmApplied)))
+            return false;
+        if (hardwareActive)
             active = null;
         return _safety.EvaluateHardwareCwArm(
             CaptureSafetySnapshot(state, active)).Allowed;
@@ -824,6 +906,8 @@ public sealed class TxService : IDisposable
                 source = active == TransmitIntent.Tun ? _tunOwner : _moxOwner;
             }
             if (active is null) return;
+            if (_radio.IsProtocol2Active && _radio.WouldChangeProtocol2TxLowPassFilter(current, proposed))
+                throw new TransmitSafetyRejectedException("Unkey before changing to a frequency that uses a different TX low-pass filter.");
             var decision = _safety.RevalidateActive(
                 active.Value,
                 CaptureSafetySnapshot(proposed, active, source));
@@ -898,6 +982,7 @@ public sealed class TxService : IDisposable
         || current.TwoToneFreq2 != proposed.TwoToneFreq2
         || current.TxReceiverIndex != proposed.TxReceiverIndex
         || current.TxVfo != proposed.TxVfo
+        || RadioFrequencyResolver.TxFrequencyHz(current) != RadioFrequencyResolver.TxFrequencyHz(proposed)
         || !ReceiverTxStateEqual(current, proposed);
 
     private static bool ReceiverTxStateEqual(StateDto left, StateDto right)

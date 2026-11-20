@@ -28,12 +28,14 @@ public static class PureSignalEndpoints
         // PureSignal master arm + cal-mode. RadioService.SetPs sets the
         // StateDto bit; DspPipelineService then sequences the active P1 or P2
         // feedback wire path before arming the WDSP engine.
-        endpoints.MapPost("/api/tx/ps", (PsControlSetRequest req, RadioService r, DspPipelineService pipe) =>
+        endpoints.MapPost("/api/tx/ps", (PsControlSetRequest req, TxService tx) =>
         {
             log.LogInformation(
                 "api.tx.ps enabled={On} auto={Auto} single={Single}",
                 req.Enabled, req.Auto, req.Single);
-            return Results.Ok(SetPsForStation(r, pipe, req));
+            return tx.TrySetPureSignal(req, out var state, out var error)
+                ? Results.Ok(state)
+                : Results.Conflict(new { error });
         });
 
         endpoints.MapPost("/api/tx/ps/advanced", (PsAdvancedSetRequest req, RadioService r) =>

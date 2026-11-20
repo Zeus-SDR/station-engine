@@ -473,6 +473,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private int _txAntenna = 1;
     private int _rxAntenna = 1;
     private int _pendingTxAntenna = -1;
+    private int _pendingHasTxAntennaRelays = -1;
+    private int _pendingMkiiBpfRxSelect = -1;
     private int _pendingRxAntenna = -1;
     private bool _hasTxAntennaRelays;
     // RX auxiliary input select (external-ports plan — antenna slice, #804).
@@ -610,6 +612,12 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private uint _seqCmdRx;
     private uint _seqCmdTx;
     private uint _seqCmdHp;
+    private readonly object _cmdHighPrioritySendLock = new();
+    private int _cmdHighPriorityStopping;
+    private bool _transitionGroundBpf2;
+    private bool _transitionTxBpf1;
+    private bool _transitionTxLpf;
+    private bool? _txBpfPsLatch;
     private uint _seqCmdTxIq;
     private readonly CmdHighPriorityTxLogGate _cmdHpTxLogGate = new();
 
@@ -1180,6 +1188,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Already started.");
 
         _sampleRateKhz = sampleRateKhz;
+        Volatile.Write(ref _cmdHighPriorityStopping, 0);
         Interlocked.Exchange(ref _disconnectSignaled, 0);
         Interlocked.Exchange(ref _streamYielded, 0);
 
@@ -1259,18 +1268,25 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         return preclearTicks;
     }
 
-    internal void SendStartCommandSequenceForTest(CancellationToken ct) =>
+    internal void SendStartCommandSequenceForTest(CancellationToken ct)
+    {
+        Volatile.Write(ref _cmdHighPriorityStopping, 0);
         SendStartCommandSequence(ct, settleDelayMs: 0);
+    }
 
     public async Task StopAsync(CancellationToken ct)
     {
         if (_rxTask is null) return;
 
-        _moxOn = false;
-        _tuneActive = false;
+        Volatile.Write(ref _cmdHighPriorityStopping, 1);
         try
         {
-            SendCmdHighPriority(run: false);
+            lock (_cmdHighPrioritySendLock)
+            {
+                _moxOn = false;
+                _tuneActive = false;
+                SendCmdHighPriority(run: false);
+            }
         }
         catch (SocketException ex)
         {
@@ -1346,6 +1362,16 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             _txDucIndependent = true;
         }
         if (CanSendCmdHighPriority) SendCmdHighPriority(run: true);
+    }
+
+    /// <summary>Whether two hardware frequencies select different applied TX LPF relays.</summary>
+    public bool WouldChangeTxLowPassFilter(long currentHz, long proposedHz)
+    {
+        double factor = BitConverter.Int64BitsToDouble(Interlocked.Read(ref _freqCorrectionBits));
+        uint Correct(long hz) => (uint)Math.Clamp(
+            (long)Math.Round(hz * factor, MidpointRounding.AwayFromZero), 0L, uint.MaxValue);
+        lock (_cmdHighPrioritySendLock)
+            return LpfBits(Correct(currentHz), _rfFilters) != LpfBits(Correct(proposedHz), _rfFilters);
     }
 
     /// <summary>
@@ -1959,6 +1985,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetOrionMkIIVariant(OrionMkIIVariant variant)
     {
+        lock (_cmdHighPrioritySendLock) SetOrionMkIIVariantCore(variant);
+    }
+
+    private void SetOrionMkIIVariantCore(OrionMkIIVariant variant)
+    {
         // Variant changes can enable different external control outputs.
         // Apply them with the filter/antenna edits once fully unkeyed.
         if (_moxOn || _tuneActive)
@@ -2090,6 +2121,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     /// </summary>
     public void SetXvtrEnabled(bool enabled)
     {
+        lock (_cmdHighPrioritySendLock) SetXvtrEnabledCore(enabled);
+    }
+
+    private void SetXvtrEnabledCore(bool enabled)
+    {
         if (_moxOn || _tuneActive)
         {
             Interlocked.Exchange(ref _pendingXvtrEnabled, enabled ? 1 : 0);
@@ -2204,29 +2240,40 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         bool mkiiBpfRxSelect,
         bool hasXvtrTxRelay)
     {
+        lock (_cmdHighPrioritySendLock)
+            SetAntennasCore(txAntWire, rxAntWire, hasTxAntennaRelays, rxAuxInput, mkiiBpfRxSelect, hasXvtrTxRelay);
+    }
+
+    private void SetAntennasCore(int txAntWire, int rxAntWire, bool hasTxAntennaRelays,
+        int rxAuxInput, bool mkiiBpfRxSelect, bool hasXvtrTxRelay)
+    {
         _ = hasXvtrTxRelay;
         int tx = (txAntWire is 1 or 2 or 3) ? txAntWire : 1;
         int rx = (rxAntWire is 1 or 2 or 3) ? rxAntWire : 1;
         int aux = (rxAuxInput is >= 0 and <= 4) ? rxAuxInput : 0;
-        _hasTxAntennaRelays = hasTxAntennaRelays;
-        _mkiiBpfRxSelect = mkiiBpfRxSelect;
-
         if (_moxOn || _tuneActive)
         {
             // Keyed: stash the desired state, leave the live relay bits alone.
             _pendingTxAntenna = tx;
             _pendingRxAntenna = rx;
             _pendingRxAuxInput = aux;
+            _pendingHasTxAntennaRelays = hasTxAntennaRelays ? 1 : 0;
+            _pendingMkiiBpfRxSelect = mkiiBpfRxSelect ? 1 : 0;
             return;
         }
 
-        bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux;
+        bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux
+            || _hasTxAntennaRelays != hasTxAntennaRelays || _mkiiBpfRxSelect != mkiiBpfRxSelect;
+        _hasTxAntennaRelays = hasTxAntennaRelays;
+        _mkiiBpfRxSelect = mkiiBpfRxSelect;
         _txAntenna = tx;
         _rxAntenna = rx;
         _rxAuxInput = aux;
         _pendingTxAntenna = -1;
         _pendingRxAntenna = -1;
         _pendingRxAuxInput = -1;
+        _pendingHasTxAntennaRelays = -1;
+        _pendingMkiiBpfRxSelect = -1;
         if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
     }
 
@@ -2239,6 +2286,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     /// changing the discovered transport board; null follows discovery.
     /// </summary>
     public void SetRfFilters(RfFilterRuntimeSettings? settings, HpsdrBoardKind? filterBoardKind = null)
+    {
+        lock (_cmdHighPrioritySendLock) SetRfFiltersCore(settings, filterBoardKind);
+    }
+
+    private void SetRfFiltersCore(RfFilterRuntimeSettings? settings, HpsdrBoardKind? filterBoardKind)
     {
         if (_moxOn || _tuneActive)
         {
@@ -2254,7 +2306,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         _pendingRfFilters = null;
         _pendingRfFilterBoardKind = null;
         _hasPendingRfFilters = false;
-        if (changed && _rxTask is not null) SendCmdHighPriority(run: true);
+        if (changed && CanSendCmdHighPriority) SendCmdHighPriority(run: true);
     }
 
     // Apply any antenna selection deferred while keyed. Called on the unkey edge
@@ -2273,18 +2325,24 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         int tx = _pendingTxAntenna >= 0 ? _pendingTxAntenna : _txAntenna;
         int rx = _pendingRxAntenna >= 0 ? _pendingRxAntenna : _rxAntenna;
         int aux = _pendingRxAuxInput >= 0 ? _pendingRxAuxInput : _rxAuxInput;
+        bool hasRelays = _pendingHasTxAntennaRelays >= 0 ? _pendingHasTxAntennaRelays != 0 : _hasTxAntennaRelays;
+        bool mkiiSelect = _pendingMkiiBpfRxSelect >= 0 ? _pendingMkiiBpfRxSelect != 0 : _mkiiBpfRxSelect;
         int pendingXvtr = Interlocked.Exchange(ref _pendingXvtrEnabled, -1);
         bool xvtrEnabled = pendingXvtr >= 0 ? pendingXvtr != 0 : _xvtrEnabled;
         bool changed = _txAntenna != tx || _rxAntenna != rx || _rxAuxInput != aux
-            || _xvtrEnabled != xvtrEnabled;
+            || _xvtrEnabled != xvtrEnabled || _hasTxAntennaRelays != hasRelays || _mkiiBpfRxSelect != mkiiSelect;
         _txAntenna = tx;
         _rxAntenna = rx;
         _rxAuxInput = aux;
+        _hasTxAntennaRelays = hasRelays;
+        _mkiiBpfRxSelect = mkiiSelect;
         _xvtrEnabled = xvtrEnabled;
         UpdateXvtrOutput();
         _pendingTxAntenna = -1;
         _pendingRxAntenna = -1;
         _pendingRxAuxInput = -1;
+        _pendingHasTxAntennaRelays = -1;
+        _pendingMkiiBpfRxSelect = -1;
         if (_hasPendingRfFilters)
         {
             changed |= !Equals(_rfFilters, _pendingRfFilters)
@@ -2322,22 +2380,102 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     public void SetMox(bool on)
     {
-        _moxOn = on;
-        ResetTxIq();
-        // Unkey edge: apply any antenna selection deferred while keyed before the
-        // HighPriority re-push, so the relay matrix switches at idle and the very
-        // next HP frame carries the operator's new antenna. Only flush when fully
-        // unkeyed (a TUNE could still be active).
-        if (!on && !_tuneActive) FlushPendingAntennas();
-        if (CanSendCmdHighPriority) PushTransmitEdge(on);
+        lock (_cmdHighPrioritySendLock)
+        {
+            if (Volatile.Read(ref _cmdHighPriorityStopping) != 0) return;
+            bool wasActive = _moxOn || _tuneActive;
+            bool willBeActive = on || _tuneActive;
+            if (!wasActive && willBeActive)
+                _txBpfPsLatch = ComposesPsFeedbackWire(_psFeedbackEnabled, _boardKind);
+            bool stageGround = CanSendCmdHighPriority && wasActive != willBeActive
+                && (_rfFilterBoardKind ?? _boardKind) == HpsdrBoardKind.OrionMkII
+                && _rfFilters?.GroundBpf2OnTx != false;
+            bool stageBpf = CanSendCmdHighPriority && wasActive != willBeActive
+                && SupportsRx6mLnaControl && _rfFilters is { } rf
+                && (rf.Adc0Tx6mLnaDisabled || rf.RxBypassOnTx || (rf.RxBypassOnPureSignal && _txBpfPsLatch == true));
+            bool stageLpf = CanSendCmdHighPriority && wasActive != willBeActive
+                && NeedsG2TxLpfTransition();
+            try
+            {
+                if ((stageGround || stageBpf || stageLpf) && !wasActive)
+                {
+                    _transitionGroundBpf2 = stageGround;
+                    _transitionTxBpf1 = stageBpf;
+                    _transitionTxLpf = stageLpf;
+                    SendCmdHighPriority(run: true);
+                }
+                if (stageGround && wasActive) _transitionGroundBpf2 = true;
+                if (stageBpf && wasActive) _transitionTxBpf1 = true;
+                if (stageLpf && wasActive) _transitionTxLpf = true;
+                _moxOn = on;
+                ResetTxIq();
+                if (CanSendCmdHighPriority) PushTransmitEdge(on);
+                if (!on && !_tuneActive && FlushPendingAntennas() && CanSendCmdHighPriority)
+                    SendCmdHighPriority(run: true);
+            }
+            finally
+            {
+                _transitionGroundBpf2 = false;
+                _transitionTxBpf1 = false;
+                _transitionTxLpf = false;
+                if (!_moxOn && !_tuneActive) _txBpfPsLatch = null;
+            }
+            if ((stageGround || stageBpf || stageLpf) && !willBeActive) SendCmdHighPriority(run: true);
+        }
     }
 
     public void SetTune(bool on)
     {
-        _tuneActive = on;
-        ResetTxIq();
-        if (!on && !_moxOn) FlushPendingAntennas();
-        if (CanSendCmdHighPriority) PushTransmitEdge(on);
+        lock (_cmdHighPrioritySendLock)
+        {
+            if (Volatile.Read(ref _cmdHighPriorityStopping) != 0) return;
+            bool wasActive = _moxOn || _tuneActive;
+            bool willBeActive = _moxOn || on;
+            if (!wasActive && willBeActive)
+                _txBpfPsLatch = ComposesPsFeedbackWire(_psFeedbackEnabled, _boardKind);
+            bool stageGround = CanSendCmdHighPriority && wasActive != willBeActive
+                && (_rfFilterBoardKind ?? _boardKind) == HpsdrBoardKind.OrionMkII
+                && _rfFilters?.GroundBpf2OnTx != false;
+            bool stageBpf = CanSendCmdHighPriority && wasActive != willBeActive
+                && SupportsRx6mLnaControl && _rfFilters is { } rf
+                && (rf.Adc0Tx6mLnaDisabled || rf.RxBypassOnTx || (rf.RxBypassOnPureSignal && _txBpfPsLatch == true));
+            bool stageLpf = CanSendCmdHighPriority && wasActive != willBeActive
+                && NeedsG2TxLpfTransition();
+            try
+            {
+                if ((stageGround || stageBpf || stageLpf) && !wasActive)
+                {
+                    _transitionGroundBpf2 = stageGround;
+                    _transitionTxBpf1 = stageBpf;
+                    _transitionTxLpf = stageLpf;
+                    SendCmdHighPriority(run: true);
+                }
+                if (stageGround && wasActive) _transitionGroundBpf2 = true;
+                if (stageBpf && wasActive) _transitionTxBpf1 = true;
+                if (stageLpf && wasActive) _transitionTxLpf = true;
+                _tuneActive = on;
+                ResetTxIq();
+                if (CanSendCmdHighPriority) PushTransmitEdge(on);
+                if (!on && !_moxOn && FlushPendingAntennas() && CanSendCmdHighPriority)
+                    SendCmdHighPriority(run: true);
+            }
+            finally
+            {
+                _transitionGroundBpf2 = false;
+                _transitionTxBpf1 = false;
+                _transitionTxLpf = false;
+                if (!_moxOn && !_tuneActive) _txBpfPsLatch = null;
+            }
+            if ((stageGround || stageBpf || stageLpf) && !willBeActive) SendCmdHighPriority(run: true);
+        }
+    }
+
+    private bool NeedsG2TxLpfTransition()
+    {
+        if (!SupportsRx6mLnaControl) return false;
+        uint tx = LpfBits(_txDucFreqHz, _rfFilters);
+        uint rx2Hz = Volatile.Read(ref _rx2Enabled) != 0 ? _rx2FreqHz : _rxFreqHz;
+        return tx != LpfBits(_rxFreqHz, _rfFilters) || tx != LpfBits(rx2Hz, _rfFilters);
     }
 
     /// <summary>
@@ -2411,6 +2549,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     /// prior value, and any in-flight paired packets are discarded.
     /// </summary>
     public void SetPsFeedbackEnabled(bool on)
+    {
+        lock (_cmdHighPrioritySendLock) SetPsFeedbackEnabledCore(on);
+    }
+
+    private void SetPsFeedbackEnabledCore(bool on)
     {
         if (_psFeedbackEnabled == on) return;
         _psFeedbackEnabled = on;
@@ -4650,6 +4793,12 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     private void SendCmdHighPriority(bool run)
     {
+        lock (_cmdHighPrioritySendLock) SendCmdHighPriorityCore(run);
+    }
+
+    private void SendCmdHighPriorityCore(bool run)
+    {
+        if (run && Volatile.Read(ref _cmdHighPriorityStopping) != 0) return;
         var p = new byte[BufLen];
         WriteBeU32(p, 0, _seqCmdHp++);
         bool moxOn = _moxOn;
@@ -4838,12 +4987,14 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         // dual-RX split TX — where _rxFreqHz stays on VFO A while the DUC moves to
         // VFO B — left the TX LPF on the RX1 band and the filter board rejected
         // the VFO-B carrier, so there was NO RF output on a different band.
-        uint txLpfFreqHz = xmit ? _txDucFreqHz : _rxFreqHz;
+        uint txLpfFreqHz = xmit || _transitionTxLpf ? _txDucFreqHz : _rxFreqHz;
         // alex0 BPF follows RX1 (_rxFreqHz); LPF follows the TX freq.
         // A DIY radio can retain OrionMkII gateware while driving a classic
         // ANAN-200D filter board. Honor the operator's filter profile without
         // changing the discovered transport's DDC or feedback layout.
         var filterBoard = _rfFilterBoardKind ?? _boardKind;
+        bool bpfPsWire = SupportsRx6mLnaControl && (xmit || _transitionTxBpf1)
+            ? _txBpfPsLatch ?? psWire : psWire;
         uint alex0RxCenterHz = _rxFreqHz;
         uint alex0Common = ComputeAlexWord(
             alex0RxCenterHz,
@@ -4852,7 +5003,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             board: filterBoard,
             rfFilters: _rfFilters,
             xmit: xmit,
-            psEnabled: psWire);
+            psEnabled: bpfPsWire,
+            tx6mLnaControlSupported: SupportsRx6mLnaControl);
         // alex1 keeps the TX antenna from txAntWire; alex0 swaps in the
         // state-correct antenna (clear [26:24], re-OR via the shared encoder).
         uint alex0 = (alex0Common & ~ALEX_TX_ANTENNA_MASK) | EncodeTxAntennaBits(alex0AntWire)
@@ -4868,7 +5020,11 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             psWire,          // board-gated PS arm (#960): no ALEX_PS on single-ADC
             filterBoard,
             txAntWire,
-            _rfFilters);
+            _rfFilters,
+            g2PrimaryOnlyBypass: filterBoard == HpsdrBoardKind.OrionMkII
+                && _variant is OrionMkIIVariant.G2 or OrionMkIIVariant.G2_1K,
+            stageTxLpf: _transitionTxLpf);
+        if (_transitionGroundBpf2) alex1 |= ALEX1_ANAN7000_RX_GNDonTX;
         // Receive-bank arbitration operates on allocated, corrected NCO centers.
         // Feedback and keyed packets retain their existing relay composition.
         var rfDemands = CollectReceiveRfDemands(diversityPair);
@@ -4878,6 +5034,13 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         string? receiveAdc1Reason = null;
         if (!xmit && !psEnabled)
             (receiveAdc0FallbackHz, receiveAdc1FallbackHz, receiveAdc0Reason, receiveAdc1Reason) = ApplyReceiveRfBanks(filterBoard, rfDemands, ref alex0, ref alex1);
+        if (_transitionTxBpf1)
+        {
+            uint staged = ComputeAlexWord(alex0RxCenterHz, txLpfFreqHz, txAntWire,
+                filterBoard, _rfFilters, xmit: true, psEnabled: bpfPsWire,
+                tx6mLnaControlSupported: SupportsRx6mLnaControl);
+            alex0 = (alex0 & ~ReceiveFilterMask) | (staged & ReceiveFilterMask);
+        }
 
         // RX auxiliary input select (external-ports plan — antenna slice, #804).
         // Emitted on alex0 — XVTR/EXT1/EXT2/BYPASS bits 8..11 (+ Saturn RX_SELECT
@@ -5109,7 +5272,9 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         bool psEnabled,
         HpsdrBoardKind board = HpsdrBoardKind.OrionMkII,
         int txAntWire = 1,
-        RfFilterRuntimeSettings? rfFilters = null)
+        RfFilterRuntimeSettings? rfFilters = null,
+        bool g2PrimaryOnlyBypass = false,
+        bool stageTxLpf = false)
     {
         // The alex1 word carries TWO independent filter selections that must NOT
         // share a frequency when RX2 / the TX VFO sit on different bands:
@@ -5130,19 +5295,29 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         // During RX the LPF is inert (TX relay open); the caller passes RX1's
         // freq then so the alex1 word stays byte-identical outside of transmit.
         uint rx2BpfFreqHz = rx2Enabled ? rx2FreqHz : rxFreqHz;
-        uint lpfFreqHz = moxOn ? txLpfFreqHz : rx2BpfFreqHz;
+        uint lpfFreqHz = moxOn || stageTxLpf ? txLpfFreqHz : rx2BpfFreqHz;
         // alex1 ALWAYS reflects the TX antenna (external-ports plan — antenna
         // slice, #804) — it never carries the RX antenna, so the TX-antenna
         // selector is threaded straight through here.
+        // The G2 TX and PureSignal bypass policies control BPF1 only.
+        // BPF2 retains its own band and All RX bypass selection.
+        var secondaryFilters = g2PrimaryOnlyBypass && rfFilters is not null
+            ? rfFilters with { RxBypassOnTx = false, RxBypassOnPureSignal = false }
+            : rfFilters;
         uint alex1 = ComputeAlexWord(
             rx2BpfFreqHz,
             lpfFreqHz,
             txAnt: txAntWire,
             board: board,
-            rfFilters: rfFilters,
+            rfFilters: secondaryFilters,
             xmit: moxOn,
             psEnabled: psEnabled);
-        if (moxOn) alex1 |= ALEX_TX_RELAY | ALEX1_ANAN7000_RX_GNDonTX;
+        if (moxOn)
+        {
+            alex1 |= ALEX_TX_RELAY;
+            if (board != HpsdrBoardKind.OrionMkII || rfFilters?.GroundBpf2OnTx != false)
+                alex1 |= ALEX1_ANAN7000_RX_GNDonTX;
+        }
         if (psEnabled) alex1 |= AlexPsBit;
         return alex1;
     }
@@ -5278,7 +5453,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         HpsdrBoardKind board = HpsdrBoardKind.OrionMkII,
         RfFilterRuntimeSettings? rfFilters = null,
         bool xmit = false,
-        bool psEnabled = false)
+        bool psEnabled = false,
+        bool tx6mLnaControlSupported = false)
     {
         uint word = 0;
         bool forceRxBypass = rfFilters is not null
@@ -5286,9 +5462,15 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
                 || (xmit && rfFilters.RxBypassOnTx)
                 || (xmit && psEnabled && rfFilters.RxBypassOnPureSignal));
 
-        word |= IsClassicAlexBoard(board)
+        uint rxBits = IsClassicAlexBoard(board)
             ? BpfBitsClassicAlex(rxFreqHz, rfFilters, forceRxBypass)
             : BpfBitsAnan7000(rxFreqHz, rfFilters, forceRxBypass);
+        // On verified G2 BPF1 hardware, disabling the 6m LNA while keyed
+        // selects the receive bypass path, leaving LPF and BPF2 untouched.
+        if (xmit && tx6mLnaControlSupported && board == HpsdrBoardKind.OrionMkII
+            && rfFilters?.Adc0Tx6mLnaDisabled == true && rxBits == ALEX_ANAN7000_RX_6_PRE_BPF)
+            rxBits = ALEX_ANAN7000_RX_BYPASS_BPF;
+        word |= rxBits;
         // LPF bit positions and band thresholds are identical across both
         // filter-board generations (classic Alex on Hermes/ANAN-100 vs
         // ANAN-7000/Saturn BPF board) — confirmed against pihpsdr alex.h

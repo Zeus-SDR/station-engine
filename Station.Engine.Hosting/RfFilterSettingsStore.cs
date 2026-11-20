@@ -45,7 +45,7 @@ public sealed class RfFilterSettingsStore : IDisposable
         _log.LogInformation("RfFilterSettingsStore initialized at {Path}", dbPath);
     }
 
-    public RfFilterSettingsDto GetDto(HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled, bool protocolSupported = true, ReceiveRfSnapshot? hardware = null, bool rx6mLnaControlSupported = false)
+    public RfFilterSettingsDto GetDto(HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled, bool protocolSupported = true, ReceiveRfSnapshot? hardware = null, bool rx6mLnaControlSupported = false, bool groundBpf2OnTxSupported = false)
     {
         var settings = GetSettings();
         string activeKey = ProfileKeyFor(board);
@@ -116,7 +116,11 @@ public sealed class RfFilterSettingsStore : IDisposable
             Warnings: Validate(settings.Profiles),
             Rx6mLnaControlSupported: protocolSupported && rx6mLnaControlSupported,
             Adc0Rx6mLnaDisabled: settings.Adc0Rx6mLnaDisabled,
-            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled);
+            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled,
+            GroundBpf2OnTx: settings.GroundBpf2OnTx,
+            GroundBpf2OnTxSupported: groundBpf2OnTxSupported,
+            Adc0Tx6mLnaDisabled: settings.Adc0Tx6mLnaDisabled,
+            Tx6mLnaControlSupported: protocolSupported && rx6mLnaControlSupported);
     }
 
     public RfFilterRuntimeSettings GetRuntime(HpsdrBoardKind board)
@@ -134,7 +138,9 @@ public sealed class RfFilterSettingsStore : IDisposable
             ClassicAlexRxFilters: classic.RxFilters,
             TxFilters: active.TxFilters,
             Adc0Rx6mLnaDisabled: settings.Adc0Rx6mLnaDisabled,
-            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled);
+            Adc1Rx6mLnaDisabled: settings.Adc1Rx6mLnaDisabled,
+            GroundBpf2OnTx: settings.GroundBpf2OnTx,
+            Adc0Tx6mLnaDisabled: settings.Adc0Tx6mLnaDisabled);
     }
 
     public RfFilterSettingsDto Set(RfFilterSettingsSetRequest req, HpsdrBoardKind board, StateDto state, bool txActive, bool psEnabled)
@@ -178,6 +184,8 @@ public sealed class RfFilterSettingsStore : IDisposable
             RxBypassOnPureSignal: req.RxBypassOnPureSignal,
             Adc0Rx6mLnaDisabled: req.Adc0Rx6mLnaDisabled,
             Adc1Rx6mLnaDisabled: req.Adc1Rx6mLnaDisabled,
+            GroundBpf2OnTx: req.GroundBpf2OnTx,
+            Adc0Tx6mLnaDisabled: req.Adc0Tx6mLnaDisabled,
             Profiles: new[]
             {
                 MergeProfile(DefaultAnanProfile(), incoming.FirstOrDefault(p => p.Key == AnanProfileKey)),
@@ -341,6 +349,8 @@ public sealed class RfFilterSettingsStore : IDisposable
         RxBypassOnPureSignal = s.RxBypassOnPureSignal,
         Adc0Rx6mLnaDisabled = s.Adc0Rx6mLnaDisabled,
         Adc1Rx6mLnaDisabled = s.Adc1Rx6mLnaDisabled,
+        GroundBpf2OnTx = s.GroundBpf2OnTx,
+        Adc0Tx6mLnaDisabled = s.Adc0Tx6mLnaDisabled,
         Profiles = s.Profiles.Select(ToProfileEntry).ToList(),
         UpdatedUtc = DateTime.UtcNow,
     };
@@ -369,6 +379,8 @@ public sealed class RfFilterSettingsStore : IDisposable
         RxBypassOnPureSignal: e.RxBypassOnPureSignal,
         Adc0Rx6mLnaDisabled: e.Adc0Rx6mLnaDisabled,
         Adc1Rx6mLnaDisabled: e.Adc1Rx6mLnaDisabled,
+        GroundBpf2OnTx: e.GroundBpf2OnTx ?? true,
+        Adc0Tx6mLnaDisabled: e.Adc0Tx6mLnaDisabled,
         Profiles: (e.Profiles ?? new()).Select(FromProfileEntry).ToArray());
 
     private static RfFilterProfileDto FromProfileEntry(RfFilterProfileEntry p) => new(
@@ -392,6 +404,8 @@ public sealed class RfFilterSettingsEntry
     public bool RxBypassOnPureSignal { get; set; }
     public bool? Adc0Rx6mLnaDisabled { get; set; }
     public bool? Adc1Rx6mLnaDisabled { get; set; }
+    public bool? GroundBpf2OnTx { get; set; }
+    public bool Adc0Tx6mLnaDisabled { get; set; }
     public List<RfFilterProfileEntry> Profiles { get; set; } = new();
     public DateTime UpdatedUtc { get; set; }
 }

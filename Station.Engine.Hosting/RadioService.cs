@@ -2699,33 +2699,60 @@ public sealed partial class RadioService : IDisposable
                 nameof(index), index, $"receiver index out of range (0..{_extraReceivers.Length - 1})");
 
         bool enabling = enabled == true;
-        lock (_sync)
+        try
         {
-            // Do not expose a receiver without a reachable hardware DDC.
-            // Disabling or pre-configuring a hidden slot remains safe; saved
-            // configuration can be used after reconnecting a higher-capacity board.
-            if (enabling && index >= EffectiveMaxReceivers)
-                return Snapshot();
-
-            var e = _extraReceivers[index];
-            if (vfoHz is long v) e.VfoHz = ClampTuningFrequency(v);
-            if (adcSource is byte a) e.AdcSource = a;
-            if (mode is RxMode m) e.Mode = m;
-            if (filterLowHz is int fl) e.FilterLowHz = fl;
-            if (filterHighHz is int fh) e.FilterHighHz = fh;
-            if (filterPresetName is string fp) e.FilterPresetName = fp;
-            if (afGainDb is double af) e.AfGainDb = Math.Clamp(af, -50.0, 20.0);
-            if (zoomLevel is int z)
-                e.ZoomLevel = Math.Clamp(z, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
-            if (nrMode is NrMode nm) e.NrMode = NormalizeNrMode(nm);
-            if (enabled is bool en)
+            lock (_sync)
             {
-                e.Enabled = en;
-                if (en)
-                    for (int j = 2; j < index; j++) _extraReceivers[j].Enabled = true;       // contiguity below
-                else
-                    for (int j = index + 1; j < _extraReceivers.Length; j++) _extraReceivers[j].Enabled = false; // cascade above
+                // Do not expose a receiver without a reachable hardware DDC.
+                // Disabling or pre-configuring a hidden slot remains safe; saved
+                // configuration can be used after reconnecting a higher-capacity board.
+                if (enabling && index >= EffectiveMaxReceivers)
+                    return Snapshot();
+
+                // Extra receiver fields live outside StateDto. Validate a proposed
+                // TX-target edit before touching them so a rejected keyed retune
+                // cannot leak into later snapshots or hardware commands.
+                if ((_mox || _tunActive) && _state.TxReceiverIndex >= 2
+                    && (_state.TxReceiverIndex == index || (enabled == false && _state.TxReceiverIndex >= index)))
+                {
+                    var before = ProjectedStateUnderLock();
+                    var proposed = before;
+                    if (enabled == false && before.TxReceiverIndex >= index)
+                        proposed = proposed with { TxReceiverIndex = 0, TxVfo = TxVfo.A };
+                    else if (before.Receivers is { } receivers)
+                        proposed = proposed with { Receivers = receivers.Select(r => r.Index != index ? r : r with
+                        {
+                            VfoHz = vfoHz is long nextHz ? ClampTuningFrequency(nextHz) : r.VfoHz,
+                            Mode = mode ?? r.Mode,
+                        }).ToArray() };
+                    TransmitSafetyStateChanging?.Invoke(before, proposed);
+                }
+
+                var e = _extraReceivers[index];
+                if (vfoHz is long v) e.VfoHz = ClampTuningFrequency(v);
+                if (adcSource is byte a) e.AdcSource = a;
+                if (mode is RxMode m) e.Mode = m;
+                if (filterLowHz is int fl) e.FilterLowHz = fl;
+                if (filterHighHz is int fh) e.FilterHighHz = fh;
+                if (filterPresetName is string fp) e.FilterPresetName = fp;
+                if (afGainDb is double af) e.AfGainDb = Math.Clamp(af, -50.0, 20.0);
+                if (zoomLevel is int z)
+                    e.ZoomLevel = Math.Clamp(z, SyntheticDspEngine.MinZoomLevel, SyntheticDspEngine.MaxZoomLevel);
+                if (nrMode is NrMode nm) e.NrMode = NormalizeNrMode(nm);
+                if (enabled is bool en)
+                {
+                    e.Enabled = en;
+                    if (en)
+                        for (int j = 2; j < index; j++) _extraReceivers[j].Enabled = true;       // contiguity below
+                    else
+                        for (int j = index + 1; j < _extraReceivers.Length; j++) _extraReceivers[j].Enabled = false; // cascade above
+                }
             }
+        }
+        catch (TransmitSafetyRejectedException ex)
+        {
+            CompleteRejectedStateChange(ex);
+            throw;
         }
         // Re-project + broadcast (StateChanged → DspPipelineService opens channels
         // and pushes SetExtraReceivers/SetExtraReceiverFreqHz to the radio).
@@ -3018,6 +3045,11 @@ public sealed partial class RadioService : IDisposable
 
     internal long TxHardwareLoHz(StateDto state) =>
         HardwareCwOwnsCarrier(state) ? TxCarrierHz(state) : TxEffectiveLoHz(state);
+
+    internal bool WouldChangeProtocol2TxLowPassFilter(StateDto current, StateDto proposed) =>
+        _p2Client is { } p2 && p2.WouldChangeTxLowPassFilter(
+            ToHardwareFrequencyHz(TxHardwareLoHz(current)),
+            ToHardwareFrequencyHz(TxHardwareLoHz(proposed)));
 
     private void PushHardwareCwTxFrequency(bool includeProtocol2 = true)
     {
@@ -5761,6 +5793,7 @@ public sealed partial class RadioService : IDisposable
     private readonly object _cwPushSync = new();
     private Func<StateDto, bool>? _hardwareCwArmEvaluator;
     private int _hardwareCwSafetyBlocked;
+    private int _psTransitionCwBlocked;
     // Socketless observer of the exact config handed to the P2 client.
     internal Action<Zeus.Protocol2.CwKeyerWireConfig>? HardwareCwConfigSinkForTests { get; set; }
 
@@ -5771,7 +5804,15 @@ public sealed partial class RadioService : IDisposable
     // why P1 keeps its historic frequency-independent paddle.
     private bool HardwareCwHostIdleAndUnblocked() =>
         Volatile.Read(ref _hostCwKeying) == 0
-        && Volatile.Read(ref _hardwareCwSafetyBlocked) == 0;
+        && Volatile.Read(ref _hardwareCwSafetyBlocked) == 0
+        && Volatile.Read(ref _psTransitionCwBlocked) == 0;
+
+    internal void SetPsTransitionCwBlocked(bool blocked)
+    {
+        Volatile.Write(ref _psTransitionCwBlocked, blocked ? 1 : 0);
+        PushCwToP2();
+        PushCwKeyerEnabledToP1OnEdge();
+    }
 
     internal void ConfigureHardwareCwArmSafety(Func<StateDto, bool> evaluator)
     {
@@ -6010,6 +6051,24 @@ public sealed partial class RadioService : IDisposable
     public void ReplayPaSnapshot() => RecomputePaAndPush();
     internal void ApplyTxSafetyInhibit() => RecomputePaAndPushCore(safetyInhibit: true);
 
+    // Use the same physical filter board as the P2 packet composer. Only the
+    // Anvelina hybrid profile overrides the board detected by the transport.
+    internal static HpsdrBoardKind ResolveProtocol2FilterBoard(
+        HpsdrBoardKind discovered, HpsdrBoardKind connected, OrionMkIIVariant variant) =>
+        discovered == HpsdrBoardKind.OrionMkII && variant == OrionMkIIVariant.AnvelinaPro3
+            && connected != HpsdrBoardKind.Unknown ? connected : discovered;
+
+    internal static bool SupportsGroundBpf2OnTxFor(string? protocol, HpsdrBoardKind discovered,
+        HpsdrBoardKind connected, OrionMkIIVariant variant) => protocol switch
+    {
+        "P2" => ResolveProtocol2FilterBoard(discovered, connected, variant) == HpsdrBoardKind.OrionMkII,
+        "P3" => true, // The P3 composer always uses the Saturn register layout.
+        _ => false,
+    };
+
+    private bool SupportsGroundBpf2OnTx(string? protocol) => SupportsGroundBpf2OnTxFor(
+        protocol, DiscoveredBoardKind, ConnectedBoardKind, EffectiveOrionMkIIVariant);
+
     public RfFilterSettingsDto GetRfFilterSettings()
     {
         if (_rfFilterStore is null)
@@ -6018,7 +6077,8 @@ public sealed partial class RadioService : IDisposable
         return _rfFilterStore.GetDto(EffectiveBoardKind, snap, IsTxActive(), snap.PsEnabled,
             protocolSupported: snap.ConnectedProtocol is null or "P2",
             hardware: _p2Client?.ReceiveFilters,
-            rx6mLnaControlSupported: _p2Client?.SupportsRx6mLnaControl == true);
+            rx6mLnaControlSupported: _p2Client?.SupportsRx6mLnaControl == true,
+            groundBpf2OnTxSupported: SupportsGroundBpf2OnTx(snap.ConnectedProtocol));
     }
 
     public RfFilterSettingsDto SetRfFilterSettings(RfFilterSettingsSetRequest req)
@@ -7378,6 +7438,7 @@ public sealed partial class RadioService : IDisposable
     }
 
     // ---------------- PureSignal ----------------
+    internal const string PsArmDuringTransmitError = "Stop transmitting before arming PureSignal.";
     // SetPs flips master arm and cal-mode in a single mutate so the engine
     // sees a consistent state when DspPipelineService.OnRadioStateChanged
     // fires.
@@ -7396,6 +7457,8 @@ public sealed partial class RadioService : IDisposable
         bool psDisarmed = false;
         Mutate(s =>
         {
+            if (req.Enabled && !s.PsEnabled && (_mox || _tunActive || s.TwoToneEnabled))
+                throw new InvalidOperationException(PsArmDuringTransmitError);
             if (req.Enabled)
                 ThrowIfPaCalibrationInvariantMutation("PureSignal");
             // This is the sole writer of persisted arm intent. Runtime safety

@@ -7010,7 +7010,8 @@ public partial class DspPipelineService : BackgroundService,
             } externalArmEngine
             && externalArmEngine.PureSignalArmed != s.PsEnabled
             && IsPsArmWorkComplete();
-        if (resync || s.PsEnabled != _appliedPsEnabled || p1ArmMismatch || externalArmMismatch)
+        if (resync || s.PsEnabled != _appliedPsEnabled || p1ArmMismatch || externalArmMismatch
+            || (IsPsArmWorkComplete() && !IsPsTransitionReady))
         {
             if (s.PsEnabled && _keyed)
             {
@@ -7258,6 +7259,22 @@ public partial class DspPipelineService : BackgroundService,
     private bool IsPsArmWorkComplete()
     {
         lock (_psArmWorkSync) return _psArmWork.IsCompleted;
+    }
+
+    // A queued PS transition must finish before TX, even if a later disarm
+    // already changed the requested state while an earlier arm is still queued.
+    internal virtual bool IsPsTransitionReady
+    {
+        get
+        {
+            lock (_psArmWorkSync)
+                return _psArmWork.IsCompletedSuccessfully && _psArmWork.Result;
+        }
+    }
+
+    internal virtual bool IsPsArmApplied
+    {
+        get { lock (_engineLock) return _engine is not null && _appliedPsEnabled; }
     }
 
     internal void ReconcileExternalPureSignalStatusForTick(IDspEngine engine, StateDto state)
@@ -8389,13 +8406,9 @@ public partial class DspPipelineService : BackgroundService,
         // discovered transport. Other profiles retain their existing encoding;
         // an incomplete connection must not replace discovery with Unknown.
         var connectedBoard = _radio.ConnectedBoardKind;
-        HpsdrBoardKind? filterBoard =
-            _radio.DiscoveredBoardKind == HpsdrBoardKind.OrionMkII
-            && variant == OrionMkIIVariant.AnvelinaPro3
-            && connectedBoard != HpsdrBoardKind.Unknown
-                ? connectedBoard
-                : null;
-        p2.SetRfFilters(snap.RfFilters, filterBoard);
+        var discoveredBoard = _radio.DiscoveredBoardKind;
+        var filterBoard = RadioService.ResolveProtocol2FilterBoard(discoveredBoard, connectedBoard, variant);
+        p2.SetRfFilters(snap.RfFilters, filterBoard == HpsdrBoardKind.Unknown ? null : filterBoard);
         // External antenna (antenna slice — #804). HpsdrAntenna.Ant1=0 → wire 1
         // → ALEX_TX_ANTENNA_1, so the +1 maps the 0-based enum to the 1-based
         // wire selector. SetAntennas gates the TX-antenna emission on
