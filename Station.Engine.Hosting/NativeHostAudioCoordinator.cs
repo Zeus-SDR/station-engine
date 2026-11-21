@@ -64,6 +64,8 @@ internal sealed class SystemHostAudioController(
 internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
 {
     private static readonly TimeSpan OpenTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan StartupRecoveryWindow = TimeSpan.FromMinutes(25);
+    private static readonly TimeSpan ExclusiveProbeInterval = TimeSpan.FromMinutes(8);
     private static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(5);
     private readonly AudioDeviceSettingsStore _settingsStore;
     private readonly NativeAudioSink? _sink;
@@ -73,6 +75,17 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
     private readonly ILogger<NativeHostAudioCoordinator> _log;
     private readonly TimeSpan _probeTimeout;
     private readonly bool _receiveOnly;
+    private readonly Func<bool> _isTransmitting;
+    private readonly Func<TimeSpan, CancellationToken, Task> _retryDelay;
+    private readonly CancellationTokenSource _startupRetryStop = new();
+    internal Task StartupRecovery { get; private set; } = Task.CompletedTask;
+    private Thread? _timedOutAsioWorker;
+    private readonly TimeProvider _clock;
+    private long? _savedAsioStartup;
+    private long? _lastExclusiveRetry;
+    private bool _probeFailedWithSystemActive;
+    private int _startupAttempts;
+
     private readonly Dictionary<string, AsioDriverProbe> _probeCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _probeFailures = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _changeGate = new(1, 1);
@@ -100,7 +113,8 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             asioFactory,
             log,
             system: null,
-            receiveOnly: (services.GetService(typeof(StationReceiveOnlyPolicy)) as StationReceiveOnlyPolicy)?.Enabled == true)
+            receiveOnly: (services.GetService(typeof(StationReceiveOnlyPolicy)) as StationReceiveOnlyPolicy)?.Enabled == true,
+            isTransmitting: () => (services.GetService(typeof(RadioService)) as RadioService)?.IsTxActive() == true)
     {
     }
 
@@ -112,9 +126,15 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         ILogger<NativeHostAudioCoordinator> log,
         ISystemHostAudioController? system = null,
         TimeSpan? probeTimeout = null,
-        bool receiveOnly = false)
+        bool receiveOnly = false,
+        Func<bool>? isTransmitting = null,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
+        TimeProvider? clock = null)
     {
         _receiveOnly = receiveOnly;
+        _isTransmitting = isTransmitting ?? (() => false);
+        _retryDelay = retryDelay ?? Task.Delay;
+        _clock = clock ?? TimeProvider.System;
         _settingsStore = settingsStore;
         _sink = sink;
         _mic = mic;
@@ -168,22 +188,10 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             _started = true;
             _activeSettings = _settingsStore.Get();
             if (_activeSettings.Backend != AudioHostApi.Asio) return;
-            try
-            {
-                Volatile.Write(ref _lastAsioAttemptDriverId, _activeSettings.AsioDriverId);
-                StopSystem();
-                _activeSettings = PrepareAsioSettings(_activeSettings, forceRefresh: true);
-                StartAsio(_activeSettings);
-                _settingsStore.Set(_activeSettings);
-            }
-            catch (Exception ex)
-            {
-                CleanupAttempt(AudioHostApi.Asio);
-                Volatile.Write(ref _asioError, ex.Message);
-                _log.LogWarning(ex,
-                    "audio.asio startup failed; System audio remains active until ASIO is retried");
-                StartSystem(_activeSettings);
-            }
+            _savedAsioStartup = _clock.GetTimestamp();
+            Volatile.Write(ref _lastAsioAttemptDriverId, _activeSettings.AsioDriverId);
+            if (OpenSavedAsioOrUseSystem())
+                ScheduleStartupRecovery();
         }
         finally
         {
@@ -191,9 +199,114 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         }
     }
 
+    // A booting interface can reject a call or briefly report incomplete channel
+    // geometry. Host policy, missing interop and preference-store errors are terminal.
+    private bool OpenSavedAsioOrUseSystem(bool probeWithSystemActive = false)
+    {
+        var tryingDriver = false;
+        var systemStillActive = probeWithSystemActive;
+        if (!systemStillActive) Interlocked.Increment(ref _pendingOutputChanges);
+        try
+        {
+            if (!systemStillActive) StopSystem();
+            var driverId = ValidateAsioDriver(_activeSettings);
+            if (_mic is null && !WantsAsioOutput(_activeSettings))
+                throw new InvalidOperationException("No native ASIO input or output route is enabled in this host mode.");
+            tryingDriver = true;
+            _probeFailedWithSystemActive = systemStillActive;
+            var probe = ProbeAsioDriverCore(driverId, forceRefresh: true);
+            _probeFailedWithSystemActive = false;
+            var prepared = PrepareAsioSettings(_activeSettings, probe);
+            if (systemStillActive)
+            {
+                if (_isTransmitting()) return true;
+                Interlocked.Increment(ref _pendingOutputChanges);
+                systemStillActive = false;
+                StopSystem();
+            }
+            StartAsio(prepared);
+            tryingDriver = false;
+            _settingsStore.Set(prepared);
+            _activeSettings = prepared;
+            Volatile.Write(ref _asioError, null);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _asioError, ex.Message);
+            _log.LogWarning(ex, "audio.asio startup failed for {DriverId}; using System audio",
+                _activeSettings.AsioDriverId);
+            if (!systemStillActive)
+            {
+                CleanupAttempt(AudioHostApi.Asio);
+                StartSystem(_activeSettings);
+            }
+            return OperatingSystem.IsWindows() && tryingDriver && ex is (InvalidOperationException or TimeoutException);
+        }
+        finally
+        {
+            if (!systemStillActive) Interlocked.Decrement(ref _pendingOutputChanges);
+        }
+    }
+
+    // Called under the route gate. An early reset and the initial open share one
+    // retry budget, even if the driver repeatedly opens and immediately resets.
+    private bool InStartupWindow => _savedAsioStartup is long start
+        && _clock.GetElapsedTime(start) <= StartupRecoveryWindow;
+
+    private void ScheduleStartupRecovery()
+    {
+        if (InStartupWindow && !_startupRetryStop.IsCancellationRequested)
+            StartupRecovery = RetrySavedAsioAsync(_startupRetryStop.Token);
+    }
+
+    private async Task RetrySavedAsioAsync(CancellationToken token)
+    {
+        try
+        {
+            bool deferred = false;
+            while (InStartupWindow)
+            {
+                int seconds = deferred ? 3 : _startupAttempts switch { 0 => 3, 1 => 12, 2 => 45, _ => 60 };
+                await _retryDelay(TimeSpan.FromSeconds(seconds), token).ConfigureAwait(false);
+                await _changeGate.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    token.ThrowIfCancellationRequested();
+                    // The timed-out native call can still own the exclusive driver
+                    // until its worker finishes late-session cleanup.
+                    if (!InStartupWindow) return;
+                    deferred = _timedOutAsioWorker?.IsAlive == true || _isTransmitting();
+                    if (deferred) continue;
+
+                    // Probe with fallback running. Some drivers cannot answer while
+                    // System owns the device, so occasionally release it after a failed probe.
+                    bool releaseSystem = _lastExclusiveRetry is not long last
+                        || (_probeFailedWithSystemActive && _clock.GetElapsedTime(last) >= ExclusiveProbeInterval);
+                    if (releaseSystem) _lastExclusiveRetry = _clock.GetTimestamp();
+                    _startupAttempts++;
+                    if (!OpenSavedAsioOrUseSystem(probeWithSystemActive: !releaseSystem))
+                    {
+                        if (_activeBackend == AudioHostApi.Asio)
+                            _log.LogInformation("audio.asio startup recovered driver={DriverId}", _activeSettings.AsioDriverId);
+                        return;
+                    }
+                }
+                finally { _changeGate.Release(); }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "audio.asio startup recovery stopped");
+        }
+    }
+
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _stopping = true;
+        _startupRetryStop.Cancel();
+        await StartupRecovery.WaitAsync(cancellationToken).ConfigureAwait(false);
         await _changeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -275,6 +388,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             {
                 _settingsStore.Set(proposed);
                 _activeSettings = proposed;
+                _startupRetryStop.Cancel();
                 return State with { OutputTransitioning = Volatile.Read(ref _pendingOutputChanges) > 1 };
             }
             if (proposed.Backend == AudioHostApi.Asio)
@@ -292,11 +406,12 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
             try
             {
                 var prepared = proposed.Backend == AudioHostApi.Asio
-                    ? PrepareAsioSettings(proposed, forceRefresh: true)
+                    ? PrepareAsioSettings(proposed, ProbeAsioDriverCore(ValidateAsioDriver(proposed), forceRefresh: true))
                     : proposed;
                 Start(prepared);
                 _settingsStore.Set(prepared);
                 _activeSettings = prepared;
+                _startupRetryStop.Cancel();
                 Volatile.Write(ref _asioError, null);
                 return State with { OutputTransitioning = Volatile.Read(ref _pendingOutputChanges) > 1 };
             }
@@ -361,12 +476,16 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         else StartSystem(settings);
     }
 
-    private AudioDeviceSettings PrepareAsioSettings(AudioDeviceSettings settings, bool forceRefresh)
+    private string ValidateAsioDriver(AudioDeviceSettings settings)
     {
         ValidateDirectAsioMonitoring(settings);
         if (string.IsNullOrWhiteSpace(settings.AsioDriverId))
             throw new InvalidOperationException("Select an ASIO driver before enabling ASIO.");
-        var probe = ProbeAsioDriverCore(settings.AsioDriverId, forceRefresh);
+        return settings.AsioDriverId;
+    }
+
+    private AudioDeviceSettings PrepareAsioSettings(AudioDeviceSettings settings, AsioDriverProbe probe)
+    {
         if (!probe.Supports48000)
             throw new InvalidOperationException("The ASIO driver does not support the required 48000 Hz sample rate.");
 
@@ -408,7 +527,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 () => _asioFactory.Probe(driverId),
                 static _ => { },
                 _probeTimeout,
-                out var failure);
+                out var failure, worker => _timedOutAsioWorker = worker);
             if (probe is null)
             {
                 if (failure is not null) throw failure;
@@ -546,7 +665,7 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                 opened.Dispose();
             },
             OpenTimeout,
-            out var failure);
+            out var failure, worker => _timedOutAsioWorker = worker);
         if (session is null)
         {
             if (failure is not null) throw EnrichInstantiationFailure(failure, settings.AsioDriverId);
@@ -661,13 +780,13 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
                         _log.LogError(ex, "audio.asio driver recovery failed");
                         // A reset/error callback cannot trigger another retry after the
                         // failed session has been torn down. Fail over immediately to
-                        // System audio so RX/TX is not stranded. Keep _activeSettings
-                        // and the persisted row on ASIO: the operator's preference is
-                        // retained and a later explicit apply/restart retries it.
+                        // System audio so RX/TX is not stranded. Preserve the saved
+                        // route and resume startup retries if the interface is settling.
                         try
                         {
                             CleanupAttempt(AudioHostApi.Asio);
                             StartSystem(_activeSettings);
+                            ScheduleStartupRecovery();
                         }
                         catch (Exception fallbackError)
                         {
@@ -711,6 +830,9 @@ internal sealed class NativeHostAudioCoordinator : IHostedService, IDisposable
         if (_disposed) return;
         _disposed = true;
         _stopping = true;
+        _startupRetryStop.Cancel();
+        StartupRecovery.GetAwaiter().GetResult();
+        _startupRetryStop.Dispose();
         try { StopActive(); } catch { /* best effort */ }
         _changeGate.Dispose();
     }
