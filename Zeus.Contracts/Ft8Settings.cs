@@ -100,13 +100,23 @@ public sealed record Ft8Settings(
     /// </summary>
     bool ArmTxOnClick = false,
     /// <summary>Restrict automatic FT8/FT4 contact selection to a new state or country.</summary>
-    bool OnlyNewStateOrCountry = false)
+    bool OnlyNewStateOrCountry = false,
+    /// <summary>
+    /// How many FT8 contacts the sequencer may run at once (1..6). 1 is the
+    /// classic one-contact-at-a-time behaviour and the default. Above 1 the
+    /// frontend answers each caller as they call and sends one signal per
+    /// contact in every transmit slot. FT4 always runs one contact. Appended
+    /// last so evolving this positional record never shifts existing parameters.
+    /// </summary>
+    int MaxSimultaneousQsos = 1)
 {
     public const int MinOffsetHz = 200;
     public const int MaxTxOffsetHz = 4000;
     public const int MaxMacroLength = 13;     // FT8 free-text is 13 chars
     public const int MinPasses = 1;
     public const int MaxPasses = 4;
+    public const int MinSimultaneousQsosValue = 1;
+    public const int MaxSimultaneousQsosValue = 6;
 
     // Waterfall/display defaults + bounds. WfDbMin/Max mirror the main console's
     // FIXED_DB_MIN/MAX (-140..-50). The dB window is bounded to ±200 with a
@@ -133,7 +143,7 @@ public sealed record Ft8Settings(
     /// <summary>
     /// Clamp/trim so a hand-crafted POST or stale row can't push out-of-range
     /// values: offset bounded, passes 1..4, slot 0/1, macros trimmed/capped,
-    /// retries non-negative, and the waterfall/display block bounded (dB window
+    /// retries non-negative, simultaneous QSOs 1..6, and the waterfall/display block bounded (dB window
     /// sanitised, palette whitelisted, zoom/span/smoothing clamped).
     /// </summary>
     public Ft8Settings Normalized()
@@ -146,6 +156,7 @@ public sealed record Ft8Settings(
             DefaultTxOffsetHz = Math.Clamp(DefaultTxOffsetHz, MinOffsetHz, MaxTxOffsetHz),
             CallerMaxRetries = Math.Max(0, CallerMaxRetries),
             DecodePasses = Math.Clamp(DecodePasses, MinPasses, MaxPasses),
+            MaxSimultaneousQsos = Math.Clamp(MaxSimultaneousQsos, MinSimultaneousQsosValue, MaxSimultaneousQsosValue),
             WorkedScope = workedScope is "band" or "mode" or "band-mode" ? workedScope : "all",
             CqMessage = Cap(CqMessage, 32),
             CqDxMessage = Cap(CqDxMessage, 32),

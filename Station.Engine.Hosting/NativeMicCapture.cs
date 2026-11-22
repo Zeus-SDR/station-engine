@@ -963,11 +963,11 @@ internal sealed class NativeMicCapture : IHostedService, IDisposable
         var clock = _radioClock;
         if (clock is null || _rateMatcherUnavailable) return false;
         long now = System.Diagnostics.Stopwatch.GetTimestamp();
-        var state = clock.Take(now);
+        var state = clock.Take();
         var source = _ingest.ActiveSource;
         long sourceEpoch = _ingest.ActiveSourceEpoch;
         long currentGeneration = Volatile.Read(ref _captureGeneration);
-        if (!state.Connected || source != MicBlockSource.Host)
+        if (!state.Connected || state.UseCaptureClock || source != MicBlockSource.Host)
         {
             ResetRateMatcher();
             return false;

@@ -158,7 +158,8 @@ public sealed class Ft8SettingsStore : IDisposable
         Smoothing: e.Smoothing,
         Zoom: e.Zoom,
         SpanHz: e.SpanHz,
-        ArmTxOnClick: e.ArmTxOnClick);
+        ArmTxOnClick: e.ArmTxOnClick,
+        MaxSimultaneousQsos: e.MaxSimultaneousQsos);
 
     private static Ft8SettingsEntry FromSettings(Ft8SettingsEntry e, Ft8Settings s, DateTime nowUtc)
     {
@@ -194,6 +195,7 @@ public sealed class Ft8SettingsStore : IDisposable
         e.Zoom = s.Zoom;
         e.SpanHz = s.SpanHz;
         e.ArmTxOnClick = s.ArmTxOnClick;
+        e.MaxSimultaneousQsos = s.MaxSimultaneousQsos;
         e.UpdatedUtc = nowUtc;
         return e;
     }
@@ -248,5 +250,7 @@ public sealed class Ft8SettingsEntry
     public int SpanHz { get; set; } = Ft8Settings.DefaultSpanHz;
     /// <summary>Opt-in decode-row click-to-arm. Missing on legacy rows → false.</summary>
     public bool ArmTxOnClick { get; set; }
+    /// <summary>Simultaneous FT8 contacts (1..6). Missing on legacy rows → 1.</summary>
+    public int MaxSimultaneousQsos { get; set; } = 1;
     public DateTime UpdatedUtc { get; set; }
 }
