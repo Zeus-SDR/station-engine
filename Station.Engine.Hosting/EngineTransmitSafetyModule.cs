@@ -536,7 +536,7 @@ internal static class TxEmissionEnvelopeResolver
         int loAbs = Math.Min(Math.Abs(state.TxFilterLowHz), Math.Abs(state.TxFilterHighHz));
         int hiAbs = Math.Max(Math.Abs(state.TxFilterLowHz), Math.Abs(state.TxFilterHighHz));
         var txMode = RadioFrequencyResolver.TxMode(state);
-        var effectiveMode = RadioService.EffectiveEngineMode(txMode, baseCarrier);
+        var effectiveMode = RadioService.EffectiveEngineMode(txMode, baseCarrier, state.FreeDvForcesUsb);
         var (low, high) = RadioService.SignedFilterForMode(effectiveMode, loAbs, hiAbs);
 
         if (intent == TransmitIntent.TwoTone)

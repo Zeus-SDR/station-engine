@@ -5,11 +5,12 @@
 //                         Christian Suarez (N9WAR), and contributors.
 //
 // P/Invoke bindings for the zeus_rade shim (native/radae/shim/zeus_rade.h) — a
-// thin single-entry wrapper over RADE V1 (radae_c) + the Opus DNN/FARGAN
+// thin single-entry wrapper over RADE V1 + V2 (radae_c) + the Opus DNN/FARGAN
 // vocoder that hides RADE's two-stage decode behind one streaming "complex IQ
-// in -> 16 kHz PCM out" surface. Loaded dynamically as a shared library —
-// zeus_rade.dll on
-// Windows, libzeus_rade.so / libzeus_rade.dylib elsewhere — resolved by
+// in -> 16 kHz PCM out" surface. Each context is opened for one protocol and
+// keeps it; every buffer size below is per-context (re-query after opening).
+// Loaded dynamically as a shared library — zeus_rade.dll on Windows,
+// libzeus_rade.so / libzeus_rade.dylib elsewhere — resolved by
 // RadeNativeLoader (same once-per-assembly resolver as engine miniaudio).
 //
 // The native binary is built separately by CI and may be absent; every call
@@ -38,10 +39,27 @@ internal static partial class RadeNativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void zeus_rade_global_shutdown();
 
-    // Open/close a decoder context. Returns IntPtr.Zero on failure.
+    // Shim ABI revision: 2 = RADE V1 + V2 (zeus_rade_open_protocol /
+    // zeus_rade_protocol). A V1-only library has no such export at all.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int zeus_rade_abi_version();
+
+    // Open/close a context. zeus_rade_open() opens RADE V1. Returns IntPtr.Zero on failure.
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial IntPtr zeus_rade_open();
+
+    // Open a context for protocol 1 (V1) or 2 (V2). Any other value, or a
+    // library that cannot honour the request, returns IntPtr.Zero.
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial IntPtr zeus_rade_open_protocol(int protocol);
+
+    // The protocol a context was opened with: 1 or 2 (0 for IntPtr.Zero).
+    [LibraryImport(LibraryName)]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    internal static partial int zeus_rade_protocol(IntPtr z);
 
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -93,6 +111,7 @@ internal static partial class RadeNativeMethods
     // Last decoded End-of-Over callsign. Copies into callsign_out (>= 9 bytes);
     // returns chars written, 0 if none since the last over. Decoded with the
     // FreeDV reliable-text LDPC (rade_text) — CRC-checked, FreeDV-GUI compatible.
+    // V2 contexts always return 0 (the V2 End-of-Over carries no data).
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int zeus_rade_get_eoo_callsign(IntPtr z, byte[] callsign_out);
@@ -119,7 +138,8 @@ internal static partial class RadeNativeMethods
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial int zeus_rade_tx(IntPtr z, short[] pcm_in, float[] tx_out);
 
-    // Flush the End-of-Over frame (carries the callsign). Call once on un-key.
+    // Flush the End-of-Over frame (V1: carries the callsign; V2: detection-only).
+    // Call once on un-key.
     //   tx_eoo_out : >= zeus_rade_n_tx_eoo_out(z) interleaved complex floats @8k
     // Returns the number of RADE_COMP samples written.
     [LibraryImport(LibraryName)]
@@ -127,7 +147,8 @@ internal static partial class RadeNativeMethods
     internal static partial int zeus_rade_tx_eoo(IntPtr z, float[] tx_eoo_out);
 
     // Set the EOO callsign (<= 8 chars), encoded with the FreeDV reliable-text
-    // LDPC so it interoperates with FreeDV-GUI. Empty/null clears it.
+    // LDPC so it interoperates with FreeDV-GUI. Empty/null clears it. A safe
+    // no-op on V2 contexts.
     [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     internal static partial void zeus_rade_set_tx_callsign(IntPtr z, string callsign);

@@ -253,6 +253,11 @@ public sealed class TxAudioIngest : IDisposable
     // flipped the server's IsMoxOn, and the pre-flip frames were wiping the
     // ring of IQ Protocol1Client had just produced.
     private bool _lastSeenMox;
+    // True once the audio modem has encoded a block since its last FlushTx.
+    // TX monitor with MOX off feeds the modem without ever setting
+    // _lastSeenMox, so without this the modem kept that preview "over" open
+    // (RADE: its encoder latch) until some later MOX release. Guarded by _sync.
+    private bool _modemFedSinceFlush;
     // TCI-source recency: set on every OnMicPcmBytesFromTci call. If a frame
     // from the mic source arrives within TciHysteresisMs of the last TCI feed,
     // it is silently dropped — only the TCI source is authoritative for that
@@ -1013,6 +1018,7 @@ public sealed class TxAudioIngest : IDisposable
                 _accumulatorFill = 0;
                 SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
+                _modemFedSinceFlush = false;
             }
             _audioModem.FlushTx();
             Volatile.Write(ref _tailDraining, 0);
@@ -2271,7 +2277,15 @@ public sealed class TxAudioIngest : IDisposable
                     // next keyed TX starts clean, without the tail of this one.
                     _ring.Clear();
                     _audioModem.FlushTx();
+                    _modemFedSinceFlush = false;
                     _lastSeenMox = false;
+                }
+                else if (_modemFedSinceFlush)
+                {
+                    // TX monitor stopped with MOX off: end the preview "over" on
+                    // the modem too, once, so the next real over starts fresh.
+                    _audioModem.FlushTx();
+                    _modemFedSinceFlush = false;
                 }
             }
             return;
@@ -2285,6 +2299,7 @@ public sealed class TxAudioIngest : IDisposable
             {
                 _ring.Clear();
                 _audioModem.FlushTx();
+                _modemFedSinceFlush = false;
                 CancelFmToneBurstLocked(engine);
                 SetRecordingBypassLocked(null, false);
                 _lastSeenMox = false;
@@ -2293,7 +2308,22 @@ public sealed class TxAudioIngest : IDisposable
         // Latch the MOX rising edge so the next falling edge will drain the
         // ring. Monitor-only operation never sets _lastSeenMox so it's a true
         // edge tracker for keyed TX.
-        if (moxNow && !_lastSeenMox) { lock (_sync) _lastSeenMox = true; }
+        if (moxNow && !_lastSeenMox)
+        {
+            lock (_sync)
+            {
+                _lastSeenMox = true;
+                // A TX-monitor preview fed the modem with MOX off: end that
+                // preview "over" before the first keyed block, so the real over
+                // starts clean (RADE latches its encoder afresh) even when MOX
+                // rose before any idle mic frame could flush it.
+                if (_modemFedSinceFlush)
+                {
+                    _audioModem.FlushTx();
+                    _modemFedSinceFlush = false;
+                }
+            }
+        }
 
         int blockSize = engine?.TxBlockSamples ?? 0;
         int iqOut = engine?.TxOutputSamples ?? 0;
@@ -2540,7 +2570,10 @@ public sealed class TxAudioIngest : IDisposable
                 // buffered). WDSP's USB TXA then SSB-modulates the modem audio.
                 // No-op unless FreeDV is the active mode.
                 if (_audioModem.Active)
+                {
                     _audioModem.ProcessTx(new Span<float>(_scratchMic, 0, blockSize));
+                    _modemFedSinceFlush = true;
+                }
                 // FM access tone burst: replaces (mutes) the mic for its
                 // duration, with the speech processors bypassed like the
                 // roger beep. Held off during the pre-key mute so the whole

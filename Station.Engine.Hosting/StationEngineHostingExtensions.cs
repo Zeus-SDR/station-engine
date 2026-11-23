@@ -89,7 +89,15 @@ public static class StationEngineHostingExtensions
                 sp.GetRequiredService<ILogger<ModeModemLeasePort>>(),
                 () => sp.GetService<TxService>()));
         services.AddSingleton<RadeModemService>();
-        services.AddSingleton<CompositeAudioModemPort>();
+        // RADE selections apply only while the transmitter is idle; the same
+        // lazy TxService lookup avoids the construction cycle noted above.
+        services.AddSingleton<CompositeAudioModemPort>(sp =>
+            new CompositeAudioModemPort(
+                sp.GetRequiredService<RadioService>(),
+                sp.GetRequiredService<RadeModemService>(),
+                sp.GetRequiredService<ModeModemLeasePort>(),
+                () => sp.GetService<TxService>(),
+                sp.GetRequiredService<ILogger<CompositeAudioModemPort>>()));
         services.AddSingleton<IAudioModemPort>(sp =>
             sp.GetRequiredService<CompositeAudioModemPort>());
         services.AddSingleton<ProductAudioRingPort>();

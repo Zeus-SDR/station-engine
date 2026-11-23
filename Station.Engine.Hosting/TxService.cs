@@ -227,7 +227,7 @@ public sealed class TxService
         _radio.P2Disconnected += OnRadioDisconnected;
         _hub.LastClientDisconnected += OnLastClientDisconnected;
         _radio.TransmitSafetyStateChanging = OnTransmitSafetyStateChanging;
-        _radio.ConfigureHardwareCwArmSafety(EvaluateHardwareCwArm);
+        _radio.ConfigureHardwareCwArmSafety(EvaluateHardwareCwArm, IsPsStateUnsettled);
         _radio.ConfigureTxDriveSafety(EvaluateDriveRequest);
         _radio.SetTxSafetyAuthority(false);
         _radio.ApplyTxSafetyInhibit();
@@ -326,6 +326,10 @@ public sealed class TxService
     /// not call <see cref="TrySetMox"/> — that lock is already held.
     /// </summary>
     internal Action? MoxRiseLockHeldForTest { get; set; }
+    // Runs after the final key-on admission and before the radio is keyed,
+    // with the transition lock held: the window a concurrent state change
+    // must not be able to enter.
+    internal Action? MoxAdmittedLockHeldForTest { get; set; }
 
     internal TxMonitorPreviewState ApplyTxMonitorPreview(
         bool enabled,
@@ -792,12 +796,66 @@ public sealed class TxService
         // competing intent. Mirror TrySetMox's source-aware block exemption so
         // a settings re-push cannot disarm the keyer that currently owns TX.
         bool hardwareActive = active == TransmitIntent.Mox && owner == MoxSource.Hardware;
-        if (!hardwareActive && (!_pipeline.IsPsTransitionReady || (state.PsEnabled && !_pipeline.IsPsArmApplied)))
+        if (!hardwareActive && IsPsStateUnsettled(state))
+        {
+            ReevaluateHardwareCwArmWhenPsSettles();
             return false;
+        }
         if (hardwareActive)
             active = null;
         return _safety.EvaluateHardwareCwArm(
             CaptureSafetySnapshot(state, active)).Allowed;
+    }
+
+    // PureSignal work is queued or failed, or an arm is published but not yet
+    // applied. Also handed to RadioService as the after-state-change recheck,
+    // so a PS arm published while the keyer is armed is vetoed and its settle
+    // re-evaluation is scheduled behind the work the arm queued. Cheap on every
+    // state change: one short pipeline lock, the engine lock only while PS is
+    // enabled, and no allocation.
+    private bool IsPsStateUnsettled(StateDto state) =>
+        !_pipeline.IsPsTransitionReady || (state.PsEnabled && !_pipeline.IsPsArmApplied);
+
+    // The PS arm/disarm work item a hardware CW re-evaluation is already
+    // scheduled behind. Taken inside RadioService.PushCwToP2 and under
+    // _psCwBlockSync; the only lock taken while it is held is the pipeline's
+    // _psArmWorkSync (reading the tail), which never takes another lock.
+    private readonly object _hardwareCwPsSettleSync = new();
+    private Task? _hardwareCwPsSettleWork;
+
+    // RadioService evaluates the PS veto above once per keyer push, and a PS
+    // transition settling is not itself a push. The P2 connect pushes the
+    // keyer while its connect-time PS replay is still running, so without a
+    // re-evaluation the radio's keyer stays disarmed (a paddle keys like a
+    // straight key) until an unrelated mode or CW settings change re-pushes.
+    // Schedule one re-push per PS work item. When it settles the veto runs
+    // again; if newer work has been queued by then, that evaluation schedules
+    // behind the newer work. Work that has settled and still vetoes (a failed
+    // transition) gets exactly one re-push and no more, so this cannot spin.
+    private void ReevaluateHardwareCwArmWhenPsSettles()
+    {
+        Task work;
+        lock (_hardwareCwPsSettleSync)
+        {
+            // Read the tail under this lock so two concurrent vetoes cannot
+            // record an older tail over a newer one, or register one work item
+            // twice. Tails are only ever replaced by newer work.
+            work = _pipeline.WaitForPsArmTransitionsAsync();
+            if (ReferenceEquals(_hardwareCwPsSettleWork, work)) return;
+            _hardwareCwPsSettleWork = work;
+        }
+        // Not ExecuteSynchronously: this runs inside PushCwToP2 before it
+        // writes the config, and already-settled work would otherwise run the
+        // re-push re-entrantly inside that push (or on the PS worker thread).
+        // PushCwToP2's sequence guard keeps the outer vetoed push from
+        // overwriting the re-push when the two race.
+        _ = work.ContinueWith(_ =>
+        {
+            // After a disconnect the re-push is a no-op (no P2 client), and
+            // after RadioService teardown it is skipped.
+            try { _radio.RefreshHardwareCwArmPermission(); }
+            catch (Exception ex) { _log.LogWarning(ex, "tx.cw.arm re-evaluation after PS transition failed"); }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
     private void OnTransmitSafetyStateChanging(StateDto current, StateDto proposed)
@@ -1489,6 +1547,7 @@ public sealed class TxService
                     throw new InvalidOperationException("Protocol 2 pre-key TX-IQ sanitization failed");
                 if (!EvaluateAdmission(TransmitIntent.Mox, source, out error))
                     throw new TransmitSafetyRejectedException(error ?? "TX safety revalidation failed");
+                MoxAdmittedLockHeldForTest?.Invoke();
                 _log.LogInformation("tx.mox.on.recv ts={Ts}",
                     _stopwatchTicks());
                 _radio.SetMox(true);

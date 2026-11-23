@@ -1,8 +1,8 @@
-# native/radae/vendor — RADE V1 vendored source provenance
+# native/radae/vendor — RADE V1 + V2 vendored source provenance
 
-Zeus builds its RADE V1 decoder (`libzeus_rade`, see `../CMakeLists.txt`) from three
+Zeus builds its RADE V1 + V2 modem (`libzeus_rade`, see `../CMakeLists.txt`) from three
 upstream C slices. They are **not committed to the private Zeus git tree** — together
-they are ~95 MB, almost all of it compiled-in neural-network weight tables. The shared
+they are ~160 MB, almost all of it compiled-in neural-network weight tables. The shared
 `fetch-sources.sh` path vendors and integrity-checks them before native builds and
 materializes them into every corresponding-source export. The machine-readable pins
 and content hashes are in `SOURCE-SLICES.json`; this file explains what is vendored,
@@ -15,12 +15,15 @@ All three slices are vendored from a single upstream repository:
 | field        | value |
 |--------------|-------|
 | Upstream     | https://github.com/sv1eia/Thetis-RADE |
-| Pinned SHA   | `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` |
-| HEAD subject | *"Remove vendored radae_nopy; build rade.lib from in-repo radae_c and update credits/docs"* |
+| Pinned SHA   | `408f2b5232ff0a2aec9b538a40d4cb1b02627b17` (2026-06-27) |
+| HEAD subject | *"RADE V2: per-RX V1/V2 protocol selection and refresh radae_c to V1+V2"* |
+| Previous pin | `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` (V1 only; see the [2026-11-22 pin move](#pin-move-to-408f2b5-rade-v1--v2-2026-11-22)) |
 
-(That HEAD commit is the one that switched Thetis-RADE itself from `radae_nopy` to the
-in-repo `radae_c` + co-vendored `opus_dnn` model — i.e. exactly the composition Zeus
-adopts here.)
+The previous pin, `f7605a4` (*"Remove vendored radae_nopy; build rade.lib from in-repo
+radae_c and update credits/docs"*), is the commit that switched Thetis-RADE itself from
+`radae_nopy` to the in-repo `radae_c` + co-vendored `opus_dnn` model, i.e. the
+composition Zeus adopts here. The current pin keeps that composition and adds the RADE
+V2 protocol to `radae_c`; `opus_dnn` and `freedv_text` are unchanged between the two.
 
 ## Slices to vendor
 
@@ -34,11 +37,17 @@ preserving the directory name (drop the `Project Files/lib/` prefix):
 | `freedv_text/` | `Project Files/lib/freedv_text/`           | mixed: see below |
 
 ### `radae_c/` — BSD-2-Clause (David Rowe & Jean-Marc Valin, © 2024; C port by Christos Nikolaou SV1EIA, © 2026)
-Pure-C, Python-free RADE modem. IQ → 36-float feature frames; encoder/decoder weights
-compiled in (`src/rade_enc_data.c`, `src/rade_dec_data.c`, ~24 MB each). The public API
-(`src/rade_api.h`, implemented by `src/radc_api.c`) is byte-for-byte compatible with the
-reference `rade_api.h`. Zeus uses both the decode and transmit paths; the whole
-`src/` tree is vendored and the compiled-in data tables are shared.
+Pure-C, Python-free RADE modem, V1 and V2. IQ → 36-float feature frames; encoder/decoder
+weights compiled in (V1: `src/rade_enc_data.c`, `src/rade_dec_data.c`, ~24 MB each; V2:
+`src/rade_enc_v2_data.c` ~24 MB, `src/rade_dec_v2_data.c` ~39 MB, and the V2 frame-sync
+net `src/rade_sync_data.c` ~0.2 MB). The public API (`src/rade_api.h`, implemented by
+`src/radc_api.c`) stays compatible with the reference `rade_api.h`; the `RADE_PROTOCOL_V2`
+open flag selects V2 per handle and `rade_protocol()` reports it. Zeus uses both the
+decode and transmit paths of both protocols; the whole `src/` tree is vendored and the
+compiled-in data tables are shared. The slice also carries a `NOTICE` file (added at the
+current pin) listing the third-party notices radae_c's neural code reuses: Opus/Xiph
+(BSD-3-Clause), KISS FFT (BSD-3-Clause), and the Opus DNN kernels and weight-export
+tooling (BSD-2-Clause, © 2022-2023 Amazon, written by Jan Buethe; © 2018 Mozilla).
 
 ### `opus_dnn/` — BSD-3-Clause (Xiph.Org / Skype / Jean-Marc Valin et al.)
 Xiph Opus pinned at upstream `xiph/opus` commit
@@ -80,7 +89,7 @@ codec2 sources hardcode the glibc/BSD header). Licenses within the slice:
 
 | component   | license      | copyright holders | copyleft? |
 |-------------|--------------|-------------------|-----------|
-| radae_c     | BSD-2-Clause | © 2024 David Rowe & Jean-Marc Valin (RADE authors); © 2026 Christos Nikolaou SV1EIA (C port) | no |
+| radae_c (V1 + V2) | BSD-2-Clause | © 2024 David Rowe & Jean-Marc Valin (RADE authors); © 2026 Christos Nikolaou SV1EIA (C port); bundled notices in `radae_c/NOTICE` | no |
 | opus_dnn    | BSD-3-Clause | © Xiph.Org / Skype / Jean-Marc Valin et al. | no |
 | freedv_text/src (rade_text) | BSD | © Mooneer Salem | no |
 | freedv_text/codec2 (LDPC) | mixed per-file; composite LGPL-2.1-only | © David Rowe / Codec2; Iterative Solutions authors retained in `mpdecode_core.c` | section 3 election for the conveyed copies |
@@ -183,6 +192,9 @@ archive. Both build fixes are constrained to Apple in `../CMakeLists.txt`.
 
 ## Proven build + ABI export validation (all supported RIDs, 2026-08-07)
 
+Superseded by the [2026-11-22 binary record](#binary-record-build-rade-run-45074017012-2026-11-22).
+These V1-only binaries from the previous pin are no longer conveyed.
+
 The `build-rade` workflow for PR #1121, run
 [`31221276828`](https://github.com/Zeus-SDR/zeussdr/actions/runs/31221276828),
 rebuilt all four runtime artifacts from the pinned vendor slices and validated
@@ -208,3 +220,128 @@ all 26 managed-probe exports on each artifact.
   - SHA-256: `a593e230c3e6e8c3d98f71d5a447c6de244f16f6e5692bea1753ea23e2cfcda7`
   - ABI: all 26 managed-probe exports present
   - Execution: not exercised against the RADE fidelity/loopback suite in this workflow run
+
+## Pin move to `408f2b5`: RADE V1 + V2 (2026-11-22)
+
+The maintainer (KB2UKA) authorised moving the Thetis-RADE pin from `f7605a4` to
+`408f2b5232ff0a2aec9b538a40d4cb1b02627b17` (2026-06-27, *"RADE V2: per-RX V1/V2 protocol
+selection and refresh radae_c to V1+V2"*) so `zeus_rade` can carry the RADE V2 protocol.
+Three upstream commits separate the pins; only the last touches `Project Files/lib`.
+
+**What changed.** Only the `radae_c` slice. Verified by `fetch-sources.sh` against the
+fetched commit (the Git tree IDs are the trust anchor) and re-hashed with
+`source-slices.mjs`:
+
+| slice | Git tree at `408f2b5` | files | content SHA-256 | vs. previous pin |
+|---|---|---|---|---|
+| `radae_c` | `8df56be6ea66b698acc6d4cd4b8ce0c2a4ab7950` | 60 | `c374bc00299b349f76989c32f2fc05af9811a1677a3500f1faa8a911e05dac17` | changed (was tree `fcb4a88d…`, 31 files) |
+| `opus_dnn` | `f44426488357dd209a046021e4bb5ec1a9dd5be2` | 636 | `ed9327e4cce6b5ed8a8fc8c12ee1139ad2ea20b38e2a02d97207e62cc87e53c3` | unchanged |
+| `freedv_text` | `71c6810a72d5f4c459fe2612bd30898c844a6fda` | 17 | `49723f26e81de9f00d179fc5b4cf1bc1062bf876d492b37665ffbdfa4c9f6dea` | unchanged |
+
+**New `radae_c` files (29).** `NOTICE`; V2 modem/codec sources `src/radc_acq_v2.{c,h}`,
+`radc_dec_v2.{c,h}`, `radc_demod_v2.{c,h}`, `radc_enc_v2.{c,h}`, `radc_mod_v2.{c,h}`,
+`radc_modem_v2.{c,h}`, `radc_rx_v2.{c,h}`, `radc_sync_v2.{c,h}`, `radc_tx_v2.{c,h}`,
+`radc_const_v2.h`, `radc_internal.h`, `rade_v2_core.h`; generated V2 weight tables
+`src/rade_dec_v2_data.{c,h}` (~39 MB), `src/rade_enc_v2_data.{c,h}` (~24 MB),
+`src/rade_sync_data.{c,h}` (~0.2 MB), and `src/rade_v2_constants.h`. The compiled set
+matches upstream's own `msvc/radae_c.vcxproj` at the pin (nine V2 `.c` units plus the
+three V2 tables).
+
+**Changed V1 files.** `src/radc_api.c` now dispatches every API call on the protocol
+chosen at `rade_open()`; the V1 branch calls the same V1 internals as before. `rade_api.h`
+makes `struct rade` opaque (layout moved to `radc_internal.h`) and adds
+`RADE_PROTOCOL_V2` / `rade_protocol()`. `radc_rx.c` gains `#include <stdlib.h>`. Every
+other modified V1 file changes only its copyright header (adding the SV1EIA C-port
+line). The V1 weight tables, `LICENSE`, and `msvc/build_radae_c.bat` are unchanged.
+
+**Authorship and licence, read from the files.** Every new V2 source and header carries
+the same header: *"Copyright (C) 2024 David Rowe (original RADE reference
+implementation)"* (2025 for `radc_acq_v2`, `radc_demod_v2`, `radc_rx_v2`, `radc_sync_v2`),
+*"Copyright (C) 2026 Christos Nikolaou (SV1EIA) <sv1eia@gmail.com> - C port"*,
+*"BSD-2-Clause (see LICENSE)"*. `radae_c/LICENSE` is the BSD 2-Clause License,
+*"Copyright (c) 2024, David Rowe and Jean-Marc Valin (RADE authors)"* and *"Copyright (c)
+2026, Christos Nikolaou (SV1EIA) — C port"*, unchanged from the previous pin. The new
+`NOTICE` states radae_c is BSD-2-Clause, and that radae_c *"links against - and reuses
+neural network code from"* Opus/Xiph (BSD-3-Clause), KISS FFT (BSD-3-Clause), and the
+Opus DNN kernels and weight-export tooling (BSD-2-Clause, *"Copyright (c) 2022-2023
+Amazon (written by Jan Buethe)"*, *"Copyright (c) 2018 Mozilla (LPCNet / lpcnet_demo)"*),
+whose notices *"MUST accompany source and binary redistributions of any build that
+includes them"*.
+
+**Open provenance points for a maintainer.**
+- The generated V2 tables (`rade_enc_v2_data.{c,h}`, `rade_dec_v2_data.{c,h}`,
+  `rade_sync_data.{c,h}`, `rade_v2_constants.h`) carry no copyright or licence header,
+  only *"Auto generated from checkpoint checkpoint_epoch_200.pth"*. They fall under the
+  slice-level BSD-2-Clause `LICENSE` only. Nothing in the slice identifies which
+  upstream RADE V2 training run produced that checkpoint or its training corpus. This is
+  the same posture as the V1 tables (*"checkpoint_epoch_100.pth"*) and the FARGAN
+  weights, but it is a new generated weight table, which
+  `docs/designs/rade-clearance-engine-hosted.md` lists as requiring a new inventory.
+- The new `radae_c/NOTICE` asks that its bundled notices accompany binary
+  redistributions. It is now conveyed byte-for-byte as
+  `packaging/station-engine/THIRD-PARTY-LICENSES/RADE-radae_c-NOTICE` (copied from the
+  verified fetch, SHA-256 `8a808952b43f8e9c9d30e57ed4956e601add1179a59ad796a831feed599dfda3`),
+  checked by `tools/check-station-engine-notices.mjs`, and compared against the freshly
+  fetched slice by `tools/export-station-engine.sh`.
+
+**Build.** `../CMakeLists.txt` adds the nine V2 units and pins all five generated tables
+to `-O1`. The shim gains `zeus_rade_open_protocol`, `zeus_rade_protocol`, and
+`zeus_rade_abi_version` (= 2); `zeus_rade_open()` remains V1 with unchanged behaviour.
+The conveyed binaries were rebuilt from this pin by `build-rade.yml`; see the binary
+record below.
+
+**Shim-set upstream switch: V2 timing correction.** The C port leaves the V2 receiver's
+sample-clock timing correction off (`radc_rx_v2.c`: `rx->timing_adj_enable = 0;`,
+*"enable for long-run / clock-drift operation"*); the official RADE V2 receiver runs its
+equivalent on by default. The shim sets `timing_adj_enable = 1` on every V2 handle right
+after `rade_open` (field access by name through `radc_internal.h` / `radc_rx_v2.h`,
+compile-time checked; the vendored files stay byte-exact). Why: in a reference comparison
+against the official receiver (AWGN only), the port's feature error at a +100 ppm clock
+offset fell from 0.734 (3 re-syncs) to 0.059 with it on, while the clean, noisy and
++/-20 Hz baselines stayed within 0.001 of off. The Zeus self-test reproduces the effect
+on a 120 s V2 over at +100 ppm: one sync run with it on, a sync loss at about 97 s with it
+off. At -100 ppm the upstream V2 End-of-Over detector false-triggers about every 10 s
+(11 to 12 re-acquisitions per 120 s, about 97% of the audio still decoded) with the switch
+on or off; that is an upstream limitation the switch does not address.
+
+**Native proof (macOS arm64 dev build, not a conveyed artifact).** AppleClang with
+CMake 4.4.2 and Unix Makefiles on Apple Silicon, `OPUS_DISABLE_INTRINSICS=ON`,
+`ZEUS_RADE_BUILD_TEST=ON`. `zeus_rade_test selftest` passed every check for both
+protocols; the legacy `zeus_rade_test loopback N9WAR` reproduced the 2026-06-24 V1 numbers
+exactly (`ticks=60 synced=48 last_snr=35dB pcm=89440 callsign=N9WAR`). The V1 + V2
+library is about 23.5 MB, compared with about 11 MB for V1 alone.
+
+### Binary record: build-rade run 45074017012 (2026-11-22)
+
+The five conveyed libraries are the artifacts of
+[`build-rade` run 45074017012](https://github.com/Zeus-SDR/zeussdr/actions/runs/45074017012),
+built from commit `6c3e79aa0ffd003f24cc61dd15c82615a901d309` (pin `408f2b5`, shim with the
+V2 timing correction) with `-DCMAKE_BUILD_TYPE=Release -DOPUS_DISABLE_INTRINSICS=ON
+-DZEUS_RADE_BUILD_TEST=OFF`. The committed files were checked byte-for-byte against the
+downloaded run artifacts. CMake 4.5.1 and Ninja come from `lukka/get-cmake` on every job
+(the Ninja version is not printed in the log).
+
+| RID | file | SHA-256 | bytes | runner image | compiler | executed? |
+|---|---|---|---|---|---|---|
+| linux-x64 | `libzeus_rade.so` | `ccd70ca1ffd4d3da9fbf8e27e6a11c1f2accede1ed713d5ee6434fb3ab1a901c` | 23530520 | ubuntu-22.04 20261116.365.1 | GCC 11.4.0 | yes: self-test PASS (57 checks), `loopback N9WAR` PASS |
+| linux-arm64 | `libzeus_rade.so` | `88a9ffb92c2a95ac46cba067863e0adf58d0a4ea91887bb643bd56aba9f5a040` | 23463424 | ubuntu-22.04 20261116.365.1 | aarch64-linux-gnu-gcc 11.4.0 (cross) | **no**: exports checked only; this library has never been executed |
+| win-x64 | `zeus_rade.dll` | `3de93e80993dfdaea93ad29dd149dc9cef997a379a644e602e4b5ed9805f5c35` | 23569433 | windows-2022 20261116.370.1 | MinGW-w64 GCC 14.2.0 (runner-preinstalled `C:/mingw64`) | yes: self-test PASS (57 checks), `loopback N9WAR` PASS |
+| osx-arm64 | `libzeus_rade.dylib` | `ec418df481e961800a50607d918531159be6d3b4ae723564c283a9f7f652be45` | 23498520 | macos-15-arm64 20261118.0550.1 | AppleClang 17.0.0.17000013, arm64, minos 14.0 | yes: self-test PASS (57 checks), `loopback N9WAR` PASS |
+| osx-x64 | `libzeus_rade.dylib` | `36b13deed8575790745fe37ec9e01612a2970f1953cc3dddbc76acfb6410b65f` | 23373712 | macos-15-arm64 20261118.0550.1 | AppleClang 17.0.0.17000013, x86_64, minos 12.0 (cross) | **no**: Mach-O arch, deployment target, and exports checked only; this library has never been executed |
+
+- Every RID passed the workflow's check that the library exports all 29 symbols the
+  managed binding calls, including `zeus_rade_abi_version`, `zeus_rade_open_protocol`,
+  and `zeus_rade_protocol`.
+- On the three executing RIDs the self-test ran against the exact staged bytes (the
+  workflow compares the build-tree library with the staged artifact first). Results
+  matched across RIDs: V2 held one sync run through the 120 s +100 ppm over, the V1
+  legacy loopback reproduced `ticks=60 synced=48 last_snr=35dB pcm=89440 callsign=N9WAR`,
+  and both known WARN lines appeared (V2 at -100 ppm re-acquires 12 times; a V1 receiver
+  falsely locks on a V2 signal for 0.96 s). RX real-time factor on the hosted runners:
+  linux-x64 V1 0.044 / V2 0.057, win-x64 V1 0.061 / V2 0.105, osx-arm64 V1 0.023 / V2 0.022.
+- win-x64 toolchain note: the workflow installs MSYS2 UCRT64 GCC 16.2.0, but the build
+  step runs in Git Bash, where CMake selected the runner's preinstalled
+  `C:/mingw64/bin/cc.exe` (GCC 14.2.0). The DLL imports only `KERNEL32.dll` and the UCRT
+  `api-ms-win-crt-*` DLLs (no libgcc or libwinpthread). The earlier records' "MSYS2
+  UCRT64" toolchain description may have had the same gap; it was not re-checked.
+- No Raspberry Pi or other arm64 Linux host and no Intel Mac has run these binaries.

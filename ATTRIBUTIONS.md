@@ -382,19 +382,19 @@ ZeusProduct Winlink feature. The licence notices ship as
 build notes: `ZeusProduct/Plugins/Ardop/SOURCE.md` and
 [`native/ardop/README.md`](native/ardop/README.md).
 
-## RADE V1 (Radio Autoencoder — radae_c, opus_dnn, freedv_text)
+## RADE V1 + V2 (Radio Autoencoder — radae_c, opus_dnn, freedv_text)
 
-Zeus's RADE V1 (Radio Autoencoder) digital-voice mode builds a single shared
-library, `libzeus_rade.{so,dll,dylib}`, from three upstream C slices. The
-slices are vendored at build time into
+Zeus's RADE (Radio Autoencoder) digital-voice mode, both the V1 and V2
+protocols, builds a single shared library, `libzeus_rade.{so,dll,dylib}`, from
+three upstream C slices. The slices are vendored at build time into
 [`native/radae/vendor/`](native/radae/vendor/) by CI and are **not** committed
-to the Zeus tree (~95 MB, almost all of it compiled-in neural-network weight
+to the Zeus tree (~160 MB, almost all of it compiled-in neural-network weight
 tables). All three slices are taken from a single upstream composition:
 
 | field | value |
 |---|---|
 | Upstream | <https://github.com/sv1eia/Thetis-RADE> |
-| Pinned SHA | `f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8` |
+| Pinned SHA | `408f2b5232ff0a2aec9b538a40d4cb1b02627b17` |
 
 The composition itself — selecting `radae_c` as the Python-free RADE modem,
 pairing it with the `opus_dnn` FARGAN vocoder, and wiring the FreeDV-GUI
@@ -407,13 +407,19 @@ trace directly to it.
 
 ### `radae_c` — BSD-2-Clause
 
-The pure-C, Python-free RADE modem (IQ → 36-float feature frames; encoder /
-decoder weights compiled in). **Copyright © 2024 David Rowe (VK5DGR,
-[drowe67](https://github.com/drowe67))** and distributed under the **BSD
-2-Clause License**. Zeus uses the decode path on RX and the encode path on
-TX; the source tree is vendored unmodified except for compilation flags set
-in [`native/radae/CMakeLists.txt`](native/radae/CMakeLists.txt). Upstream
-reference: <https://github.com/drowe67/radae>.
+The pure-C, Python-free RADE modem, V1 and V2 (IQ → 36-float feature frames;
+encoder / decoder weights for both protocols compiled in). **Copyright © 2024
+David Rowe (VK5DGR, [drowe67](https://github.com/drowe67)) and Jean-Marc Valin
+(RADE authors); © 2026 Christos Nikolaou (SV1EIA), C port**, distributed under
+the **BSD 2-Clause License**. Its bundled `NOTICE` (Opus/Xiph and KISS FFT,
+BSD-3-Clause; Opus DNN kernels and weight-export tooling, BSD-2-Clause, © Amazon
+and Mozilla) is conveyed with the Station Engine as `RADE-radae_c-NOTICE`. Zeus
+uses the decode path on RX and the encode path on TX; the source tree is
+vendored unmodified except for compilation flags set in
+[`native/radae/CMakeLists.txt`](native/radae/CMakeLists.txt), and the shim
+switches on the V2 receiver's timing correction at open time (see
+[`native/radae/vendor/PROVENANCE.md`](native/radae/vendor/PROVENANCE.md)).
+Upstream reference: <https://github.com/drowe67/radae>.
 
 ### `opus_dnn` — BSD-3-Clause
 
@@ -437,20 +443,22 @@ RADE stations on the air. **Copyright © Mooneer Salem** and distributed
 under a permissive **BSD** licence. Upstream reference:
 <https://github.com/drowe67/freedv-gui>.
 
-### `freedv_text/codec2/*` (LDPC primitives) — LGPL-2.1-or-later
+### `freedv_text/codec2/*` (LDPC primitives) — mixed per-file, composite LGPL-2.1-only
 
-The LDPC primitives the reliable-text path links against
-(`mpdecode_core.c`, `gp_interleaver.c`, `ldpc_codes.c`, `HRA_56_56.c`,
-`phi0.c`) come from the **codec2** project. **Copyright © David Rowe and
-the codec2 contributors** and distributed under the **GNU Lesser General
-Public License, version 2.1 or (at your option) any later version**
-(LGPL-2.1-or-later). Upstream: <https://github.com/drowe67/codec2>.
+The LDPC primitives the reliable-text path uses (`mpdecode_core.c`,
+`gp_interleaver.c`, `ldpc_codes.c`, `HRA_56_56.c`, `phi0.c`) come from the
+**codec2** project. **Copyright © David Rowe and the codec2 contributors**
+(the Iterative Solutions authors are retained in `mpdecode_core.c`). The
+per-file record is mixed: `gp_interleaver.c` is LGPL-2.1-only, the Iterative
+Solutions portion of `mpdecode_core.c` is LGPL-2.1-or-later, and the other
+three inherit Codec2 1.2.0's LGPL-2.1, so the composite disposition is
+**LGPL-2.1-only**. Upstream: <https://github.com/drowe67/codec2>.
 
-`libzeus_rade` is a shared library; Zeus's managed code reaches it through
-P/Invoke. Dynamic linking against LGPL-2.1-or-later code from Zeus's
-GPL-2.0-or-later distribution is consistent with both licences (LGPL §6's
-permissive linking clause is preserved, and the combined work remains
-distributable under Zeus's licence terms).
+These five units are compiled into the `libzeus_rade` shared library itself.
+For the conveyed copies, the maintainers elect LGPL-2.1 section 3 and apply
+GPL-2.0-or-later; the combined Station Engine is conveyed under
+GPL-3.0-or-later. The election and the units' original provenance are recorded
+in [`packaging/station-engine/RADE-LGPL-SECTION-3-NOTICE.md`](packaging/station-engine/RADE-LGPL-SECTION-3-NOTICE.md).
 
 ### License roll-up
 
@@ -459,10 +467,11 @@ distributable under Zeus's licence terms).
 | `radae_c` | BSD-2-Clause | no |
 | `opus_dnn` | BSD-3-Clause | no |
 | `freedv_text/src` (rade_text) | BSD | no |
-| `freedv_text/codec2` (LDPC) | LGPL-2.1-or-later | weak (dynamic-link OK) |
+| `freedv_text/codec2` (LDPC) | mixed per-file; composite LGPL-2.1-only, section 3 election to GPL-2.0-or-later for the conveyed copies | yes, via the election |
 
-BSD-2-Clause, BSD-3-Clause, and LGPL-2.1-or-later are all one-way
-licence-compatible with Zeus's GPL-2.0-or-later distribution. The vendored
+BSD-2-Clause, BSD-3-Clause, and (through the section 3 election)
+LGPL-2.1-only are all one-way licence-compatible with Zeus's
+GPL-2.0-or-later distribution. The vendored
 sources retain their upstream per-file headers and copyright notices as
 received and must remain so on re-vendor. The `CMakeLists.txt` glue under
 [`native/radae/`](native/radae/) is original Zeus work under GPL-2.0-or-later,

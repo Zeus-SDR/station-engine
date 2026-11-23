@@ -1,16 +1,37 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * zeus_rade — a thin single-entry shim over RADE V1 (radae_c) + the Opus DNN
- * FARGAN vocoder + LPCNet feature analyzer, packaged for Zeus. It hides RADE's
- * two-stage RX/TX behind one streaming surface so the .NET side P/Invokes a
- * single library instead of binding rade_api.h AND the Opus DNN APIs.
+ * zeus_rade — a thin single-entry shim over RADE V1 + V2 (radae_c) + the Opus
+ * DNN FARGAN vocoder + LPCNet feature analyzer, packaged for Zeus. It hides
+ * RADE's two-stage RX/TX behind one streaming surface so the .NET side
+ * P/Invokes a single library instead of binding rade_api.h AND the Opus DNN APIs.
  *
  * RX: rade_rx(IQ@8kHz) -> feature frames (36 floats) -> FARGAN -> 16 kHz PCM
  *     (prime with the first 5 frames, then 160 PCM/frame).
  * TX: 16 kHz PCM -> LPCNet analyzer -> feature frames -> rade_tx -> modem IQ@8kHz
- *     (transmit the real part). The EOO callsign uses the FreeDV reliable-text
- *     LDPC (rade_text), interoperable with FreeDV-GUI.
+ *     (transmit the real part). The V1 EOO callsign uses the FreeDV
+ *     reliable-text LDPC (rade_text), interoperable with FreeDV-GUI.
  * RADE + FARGAN weights and the LPCNet analyzer are compiled in — no model files.
+ *
+ * Protocol: each context is opened for ONE RADE protocol and keeps it for its
+ * lifetime (zeus_rade_open() = V1; zeus_rade_open_protocol(2) = V2). To switch
+ * protocol, close the context and open a new one. Every size below is
+ * per-context and must be re-queried after opening:
+ *
+ *                               V1      V2
+ *   speech samples per tx call  1920    640    (16 kHz; 120 ms / 40 ms)
+ *   modem samples per tx call   960     320    (8 kHz)
+ *   EOO modem samples           1152    960
+ *   nin_max                     1120    200
+ *   feature frames per rx call  0 or 12 0 or 4
+ *   EOO callsign                yes     no (V2's EOO carries no data bits)
+ *
+ * V2 has no EOO text: the callsign setter is a no-op and the callsign getter
+ * always returns 0. A V2 end-of-over drops sync (zeus_rade_sync() -> 0) on the
+ * rx call that detects it, exactly like V1, and re-primes the vocoder.
+ *
+ * V2 receivers open with radae_c's sample-clock timing correction switched ON
+ * (the C port defaults it off; the official RADE V2 receiver runs with it on),
+ * so a sender/receiver sample-clock offset does not break sync mid-over.
  *
  * All sample rates / buffer sizes come from the underlying rade_api.h:
  *   modem IQ  = RADE_MODEM_SAMPLE_RATE  (8000)
@@ -37,9 +58,21 @@ typedef struct zeus_rade zeus_rade;
 ZEUS_RADE_EXPORT void        zeus_rade_global_init(void);
 ZEUS_RADE_EXPORT void        zeus_rade_global_shutdown(void);
 
-/* Open/close a decoder context. Returns NULL on failure. */
+/* Shim ABI revision. 1 = the original V1-only surface (which has no
+ * zeus_rade_abi_version export at all); 2 = adds zeus_rade_open_protocol and
+ * zeus_rade_protocol (RADE V1 + V2). */
+#define ZEUS_RADE_ABI_VERSION 2
+ZEUS_RADE_EXPORT int         zeus_rade_abi_version(void);
+
+/* Open/close a context. zeus_rade_open() opens RADE V1 (unchanged behaviour).
+ * zeus_rade_open_protocol(protocol) opens 1 = V1 or 2 = V2; any other value,
+ * or a library that cannot honour the request, returns NULL. */
 ZEUS_RADE_EXPORT zeus_rade  *zeus_rade_open(void);
+ZEUS_RADE_EXPORT zeus_rade  *zeus_rade_open_protocol(int protocol);
 ZEUS_RADE_EXPORT void        zeus_rade_close(zeus_rade *z);
+
+/* The RADE protocol this context was opened with: 1 or 2 (0 for NULL). */
+ZEUS_RADE_EXPORT int         zeus_rade_protocol(zeus_rade *z);
 
 /* Buffer-sizing helpers (call after open). */
 ZEUS_RADE_EXPORT int  zeus_rade_nin(zeus_rade *z);       /* IQ samples for the NEXT rx call (varies) */
@@ -72,7 +105,8 @@ ZEUS_RADE_EXPORT int  zeus_rade_n_tx_eoo_out(zeus_rade *z);     /* RADE_COMP in 
  * Returns the number of RADE_COMP samples written. */
 ZEUS_RADE_EXPORT int  zeus_rade_tx(zeus_rade *z, const short *pcm_in, RADE_COMP *tx_out);
 
-/* Flush the End-of-Over frame (carries the callsign set via set_tx_callsign).
+/* Flush the End-of-Over frame (on V1 it carries the callsign set via
+ * set_tx_callsign; on V2 it is a detection-only frame with no data).
  * Call once on un-key, after the last zeus_rade_tx.
  *   tx_eoo_out : caller buffer, >= zeus_rade_n_tx_eoo_out(z) RADE_COMP @ 8 kHz
  * Returns the number of RADE_COMP samples written. */
@@ -80,7 +114,8 @@ ZEUS_RADE_EXPORT int  zeus_rade_tx_eoo(zeus_rade *z, RADE_COMP *tx_eoo_out);
 
 /* Set the callsign embedded in the EOO frame (<= 8 chars). Encoded with the
  * FreeDV reliable-text LDPC (rade_text) so it interoperates with FreeDV-GUI RADE
- * stations — NOT radae_c's internal 7-bit packing. Empty/NULL clears it. */
+ * stations — NOT radae_c's internal 7-bit packing. Empty/NULL clears it.
+ * V2 contexts: a safe no-op (the V2 EOO carries no data bits). */
 ZEUS_RADE_EXPORT void zeus_rade_set_tx_callsign(zeus_rade *z, const char *callsign);
 
 /* Telemetry (valid when synced). */
@@ -118,7 +153,7 @@ ZEUS_RADE_EXPORT void zeus_rade_set_mic_eq_treble_db(zeus_rade *z, float gain_db
  * frame). Decoded with the FreeDV reliable-text LDPC (rade_text) — CRC-checked,
  * so it interoperates with FreeDV-GUI RADE stations. Copies into callsign_out
  * (>= 9 bytes); returns chars written, 0 if none since the last over. Maps to
- * the existing FreeDV RX-text UI. */
+ * the existing FreeDV RX-text UI. V2 contexts: always 0 (no EOO text). */
 ZEUS_RADE_EXPORT int   zeus_rade_get_eoo_callsign(zeus_rade *z, char *callsign_out);
 
 #ifdef __cplusplus

@@ -191,9 +191,19 @@ public static class StationProtocolEndpoints
             if (port is null) return Results.NotFound();
             var request = await ReadRequestAsync<RadeSelectRequest>(context).ConfigureAwait(false);
             if (request is null) return Results.BadRequest(new { error = "RADE selection is required" });
-            return port.SelectRade(request.Active, request.TxText)
-                ? Results.Ok(port.RadeStatus())
-                : Results.Conflict(new { error = "RADE is unavailable for this station-engine RID/build" });
+            // An absent protocol (an older product) is V1, exactly what it
+            // always got. An unknown one is refused, never guessed.
+            if (!RadeProtocols.TryParseSelection(request.Protocol, out var selection))
+                return Results.BadRequest(new { error = "RADE protocol must be V1, V2 or Auto" });
+            var preferred = RadeProtocols.ParsePreferred(request.PreferredProtocol);
+            if (port.SelectRade(request.Active, request.TxText, selection, preferred))
+                return Results.Ok(port.RadeStatus());
+            return Results.Conflict(new
+            {
+                error = selection == RadeProtocolSelection.V2
+                    ? "RADE V2 is unavailable for this station-engine RID/build"
+                    : "RADE is unavailable for this station-engine RID/build",
+            });
         });
 
         endpoints.MapPost("/api/station/rade/mic", async (HttpContext context) =>

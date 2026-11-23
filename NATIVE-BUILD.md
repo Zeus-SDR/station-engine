@@ -194,7 +194,8 @@ bridge or a compatible driver is unavailable.
 
 ## RADE on each supported RID
 
-RADE has conveyed binaries for linux-x64, linux-arm64, win-x64, and osx-arm64.
+RADE (one library carrying both the V1 and V2 protocols) has conveyed binaries
+for linux-x64, linux-arm64, win-x64, osx-arm64, and osx-x64.
 The matching source release already contains the three exact pinned upstream
 slices. To re-fetch and integrity-check them independently, run:
 
@@ -220,10 +221,20 @@ For linux-arm64 add
 `-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_SYSTEM_NAME=Linux
 -DCMAKE_SYSTEM_PROCESSOR=aarch64`. Run the Windows command in an MSYS2 UCRT64
 MinGW shell. `native/radae/CMakeLists.txt` supplies the Windows static-runtime
-link options and artifact naming. The osx-arm64 artifact was produced by the
-same scalar recipe using AppleClang 21.0.0, CMake 4.3.2, and Ninja 1.13.0; the
-Apple-only CMake path supplies the upstream `abs()` declaration and the Opus
-archive build-order dependency required by Ninja.
+link options and artifact naming. For osx-x64 on Apple Silicon add
+`-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0`; the
+osx-arm64 artifact uses `-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0`. The Apple-only
+CMake path supplies the Opus archive build-order dependency required by Ninja.
+
+The conveyed artifacts were built by `build-rade` run 45074017012 with CMake
+4.5.1: GCC 11.4.0 on Ubuntu 22.04 for linux-x64, the aarch64-linux-gnu-gcc
+11.4.0 cross compiler for linux-arm64, MinGW-w64 GCC 14.2.0 on Windows Server
+2022 for win-x64, and AppleClang 17.0.0 on macOS 15 for both macOS RIDs. The
+per-RID hashes, runner images, and which RIDs were executed (linux-x64,
+win-x64, osx-arm64) or only export-checked (linux-arm64, osx-x64) are recorded
+in the 2026-11-22 binary record in `native/radae/vendor/PROVENANCE.md`. Add
+`-DZEUS_RADE_BUILD_TEST=ON` to also build `zeus_rade_test` and run
+`zeus_rade_test selftest` on a host that can execute the result.
 
 ## FFTW provenance and source
 

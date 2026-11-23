@@ -94,6 +94,28 @@ internal sealed class EngineNativeLibraryProbe
             : IntPtr.Zero;
     }
 
+    /// <summary>
+    /// True when the library at <paramref name="path"/> loads and exports every
+    /// name in <paramref name="exports"/>. Used to detect an OPTIONAL capability
+    /// (e.g. RADE V2) on an already-selected library without making it a hard
+    /// requirement: a library without the exports is still selected, it simply
+    /// lacks the capability.
+    /// </summary>
+    internal static bool LibraryHasExports(string path, IReadOnlyList<string> exports)
+    {
+        if (!NativeLibrary.TryLoad(path, out var handle)) return false;
+        try
+        {
+            foreach (var export in exports)
+                if (!NativeLibrary.TryGetExport(handle, export, out _)) return false;
+            return true;
+        }
+        finally
+        {
+            NativeLibrary.Free(handle);
+        }
+    }
+
     private void ProbeLocked(Assembly assembly)
     {
         _loadable = false;

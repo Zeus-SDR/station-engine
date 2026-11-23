@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "upstream": {
     "repository": "https://github.com/sv1eia/Thetis-RADE.git",
-    "commit": "f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8",
+    "commit": "408f2b5232ff0a2aec9b538a40d4cb1b02627b17",
     "sparsePath": "Project Files/lib"
   },
   "opusCommit": "940d4e5af64351ca8ba8390df3f555484c567fbb",
@@ -10,9 +10,9 @@
     {
       "name": "radae_c",
       "upstreamPath": "Project Files/lib/radae_c",
-      "gitTree": "fcb4a88dc322c621b090bda323985155ab53a188",
-      "fileCount": 31,
-      "contentSha256": "1743f20b0a7000c11f4414489e62cec77a8bf41db62064945b37bdd8ac09eab4"
+      "gitTree": "8df56be6ea66b698acc6d4cd4b8ce0c2a4ab7950",
+      "fileCount": 60,
+      "contentSha256": "c374bc00299b349f76989c32f2fc05af9811a1677a3500f1faa8a911e05dac17"
     },
     {
       "name": "opus_dnn",
@@ -33,32 +33,32 @@
     {
       "rid": "linux-x64",
       "path": "Zeus.Dsp/runtimes/linux-x64/native/libzeus_rade.so",
-      "sha256": "ed569a070379c47c1e9583792b4d6f01eecdaacedceece90ad6379c5c66a8897",
-      "toolchain": "Ubuntu 22.04 runner with CMake and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+      "sha256": "ccd70ca1ffd4d3da9fbf8e27e6a11c1f2accede1ed713d5ee6434fb3ab1a901c",
+      "toolchain": "build-rade.yml run 45074017012 at 6c3e79aa0ffd003f24cc61dd15c82615a901d309: GitHub ubuntu-22.04 runner image 20261116.365.1, GCC 11.4.0, CMake 4.5.1 and Ninja from lukka/get-cmake; native V1 + V2 self-test executed on the runner; build and ABI export validation recorded in the 2026-11-22 binary record of native/radae/vendor/PROVENANCE.md"
     },
     {
       "rid": "linux-arm64",
       "path": "Zeus.Dsp/runtimes/linux-arm64/native/libzeus_rade.so",
-      "sha256": "0f411f4a3eb8419c6cf9a7d1f3a2ff396da03f826d4118c02b2512abef233baa",
-      "toolchain": "Ubuntu 22.04 runner with gcc-aarch64-linux-gnu and g++-aarch64-linux-gnu cross toolchains, CMake, and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+      "sha256": "88a9ffb92c2a95ac46cba067863e0adf58d0a4ea91887bb643bd56aba9f5a040",
+      "toolchain": "build-rade.yml run 45074017012 at 6c3e79aa0ffd003f24cc61dd15c82615a901d309: GitHub ubuntu-22.04 runner image 20261116.365.1, aarch64-linux-gnu-gcc 11.4.0 cross compiler, CMake 4.5.1 and Ninja from lukka/get-cmake; cross build, exports checked only, never executed; build and ABI export validation recorded in the 2026-11-22 binary record of native/radae/vendor/PROVENANCE.md"
     },
     {
       "rid": "win-x64",
       "path": "Zeus.Dsp/runtimes/win-x64/native/zeus_rade.dll",
-      "sha256": "79dfe2be219d9619758381307aea258007bd83775ee8f079b2613c69fee31867",
-      "toolchain": "Windows 2022 runner under MSYS2 UCRT64 with mingw-w64-ucrt-x86_64-gcc, mingw-w64-ucrt-x86_64-cmake, and mingw-w64-ucrt-x86_64-ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+      "sha256": "3de93e80993dfdaea93ad29dd149dc9cef997a379a644e602e4b5ed9805f5c35",
+      "toolchain": "build-rade.yml run 45074017012 at 6c3e79aa0ffd003f24cc61dd15c82615a901d309: GitHub windows-2022 runner image 20261116.370.1, the runner's preinstalled MinGW-w64 GCC 14.2.0 (C:/mingw64; the MSYS2 UCRT64 packages the workflow installs were not the compiler CMake selected), CMake 4.5.1 and Ninja from lukka/get-cmake, Git Bash shell; imports only KERNEL32 and the UCRT api-ms-win-crt DLLs; native V1 + V2 self-test executed on the runner; build and ABI export validation recorded in the 2026-11-22 binary record of native/radae/vendor/PROVENANCE.md"
     },
     {
       "rid": "osx-arm64",
       "path": "Zeus.Dsp/runtimes/osx-arm64/native/libzeus_rade.dylib",
-      "sha256": "a593e230c3e6e8c3d98f71d5a447c6de244f16f6e5692bea1753ea23e2cfcda7",
-      "toolchain": "macOS 14 runner with CMake and Ninja; build and ABI export validation recorded in the 2026-08-07 section of native/radae/vendor/PROVENANCE.md"
+      "sha256": "ec418df481e961800a50607d918531159be6d3b4ae723564c283a9f7f652be45",
+      "toolchain": "build-rade.yml run 45074017012 at 6c3e79aa0ffd003f24cc61dd15c82615a901d309: GitHub macos-15-arm64 runner image 20261118.0550.1, AppleClang 17.0.0.17000013, CMake 4.5.1 and Ninja from lukka/get-cmake, CMAKE_OSX_DEPLOYMENT_TARGET=14.0; native V1 + V2 self-test executed on the runner; build and ABI export validation recorded in the 2026-11-22 binary record of native/radae/vendor/PROVENANCE.md"
     },
     {
       "rid": "osx-x64",
       "path": "Zeus.Dsp/runtimes/osx-x64/native/libzeus_rade.dylib",
-      "sha256": "c2d27aa979876bf33ba643e58a479ac5893cc71a5a9cc1c61b125acfa9f4188d",
-      "toolchain": "AppleClang 21.0.0 and CMake 4.3.2 on Apple Silicon with CMAKE_OSX_ARCHITECTURES=x86_64 and CMAKE_OSX_DEPLOYMENT_TARGET=12.0; Mach-O architecture, deployment target, and ABI exports verified locally on 2026-08-23"
+      "sha256": "36b13deed8575790745fe37ec9e01612a2970f1953cc3dddbc76acfb6410b65f",
+      "toolchain": "build-rade.yml run 45074017012 at 6c3e79aa0ffd003f24cc61dd15c82615a901d309: GitHub macos-15-arm64 runner image 20261118.0550.1, AppleClang 17.0.0.17000013 with CMAKE_OSX_ARCHITECTURES=x86_64 and CMAKE_OSX_DEPLOYMENT_TARGET=12.0, CMake 4.5.1 and Ninja from lukka/get-cmake; cross build, Mach-O architecture, deployment target and exports checked only, never executed; build and ABI export validation recorded in the 2026-11-22 binary record of native/radae/vendor/PROVENANCE.md"
     }
   ],
   "buildInputs": [

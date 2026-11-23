@@ -5,11 +5,13 @@
 \*---------------------------------------------------------------------------*/
 
 /*
-  Copyright (C) 2024 David Rowe
+  Copyright (C) 2024 David Rowe (original RADE V1 reference implementation)
+  Copyright (C) 2026 Christos Nikolaou (SV1EIA) <sv1eia@gmail.com> - C port
   BSD-2-Clause (see LICENSE).
 */
 
 #include "rade_rx.h"
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 

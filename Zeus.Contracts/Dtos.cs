@@ -1998,7 +1998,14 @@ public sealed record StateDto(
     // Appended so older positional StateDto construction sites stay valid.
     // Null (older producer) resolves to FmConfig.Default.
     FmConfig? Fm = null,
-    LegacyTxEqConfig? LegacyTxEq = null);
+    LegacyTxEqConfig? LegacyTxEq = null,
+    // ---- FreeDV sideband override (session-only, never persisted) ----
+    // True while the station engine routes RADE V2 exactly: upstream FreeDV
+    // puts RADE V2 on USB on every band, so FreeDV then rides USB instead of
+    // the band convention (LSB below 10 MHz except 60 m). Every sideband
+    // resolution, engine and display, reads this. Appended last; an older
+    // producer omits it and means false (the band convention).
+    bool FreeDvForcesUsb = false);
 
 /// <summary>Canonical CW constants shared between backend and wire DTOs.
 /// Single source of truth — CwOffset (server-side) and StateDto both

@@ -1343,9 +1343,9 @@ public partial class DspPipelineService : BackgroundService,
         mode is RxMode.DIGU or RxMode.DIGL;
 
     internal static (RxMode engineMode, int low, int high) SecondaryEngineFilterFor(
-        RxMode mode, long vfoHz, int lowHz, int highHz)
+        RxMode mode, long vfoHz, int lowHz, int highHz, bool freeDvForcesUsb)
     {
-        var engineMode = RadioService.EffectiveEngineMode(mode, vfoHz);
+        var engineMode = RadioService.EffectiveEngineMode(mode, vfoHz, freeDvForcesUsb);
         if (mode == RxMode.FreeDv)
         {
             int loAbs = Math.Min(Math.Abs(lowHz), Math.Abs(highHz));
@@ -1404,6 +1404,11 @@ public partial class DspPipelineService : BackgroundService,
     // legacy API can leave more than one receiver in FreeDV — the UI moves
     // a single workspace instead of treating the others as decoded.
     private int _freeDvOwnerIndex = -1;
+
+    // The FreeDV USB override (RADE V2) as RadioService last COMMITTED it,
+    // not the copy in the snapshot being applied: a late state-changed
+    // delivery must not reverse the admitted TX sideband.
+    private bool FreeDvForcesUsb => _radio.FreeDvForcesUsbCommitted;
     // Written under OnRadioStateChanged. The TX audio thread reads it through
     // TxAudioModem and must not allocate a RadioFrequencyResolver fallback.
     private volatile bool _txReceiverIsFreeDv;
@@ -1517,6 +1522,16 @@ public partial class DspPipelineService : BackgroundService,
         }
 
         _freeDvOwnerIndex = owner;
+        // Tell the radio which receiver owns the modem and whether its dial
+        // rides LSB by band convention: the RADE status (AUTO's "RADE V2 on
+        // USB" slot) and Auto's TX choice follow the owner, not RX1.
+        long ownerDialHz = owner switch
+        {
+            < 0 => 0,
+            0 => state.VfoHz,
+            _ => state.Receivers![owner].VfoHz,
+        };
+        _radio.PublishFreeDvOwner(owner, owner >= 0 && RadioService.FreeDvConventionIsLsb(ownerDialHz));
     }
 
     private void DecodeFreeDvBlock(Span<float> block, double targetAfDb)
@@ -6375,9 +6390,11 @@ public partial class DspPipelineService : BackgroundService,
         // stored config stays untouched for automatic restore on exit.
         var txReceiver = RadioFrequencyResolver.TxReceiver(s);
         var txEngineMode = RadioService.EffectiveEngineMode(
-            txReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
+            txReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s), FreeDvForcesUsb);
         bool rxFreeDvMode = s.Mode == RxMode.FreeDv;
         bool txFreeDvMode = txReceiver.Mode == RxMode.FreeDv;
+        // The RADE encoder's Auto choice must match the sideband TXA gets.
+        _radio.PublishFreeDvTxSideband(txFreeDvMode && txEngineMode == RxMode.LSB);
         _txReceiverIsFreeDv = txFreeDvMode;
         var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, txEngineMode);
         bool txDigitalBypass = IsDigitalTxZeusMode(txReceiver.Mode);
@@ -6561,7 +6578,7 @@ public partial class DspPipelineService : BackgroundService,
         // this equals s.Mode, so the change-detection and pushes are byte-identical
         // to before. Tracked via _appliedEngineMode so a dial crossing 10 MHz while
         // staying in FreeDv re-flips the sideband. See RadioService.EffectiveEngineMode.
-        var engineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz);
+        var engineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz, FreeDvForcesUsb);
         if (s.Mode != _appliedMode || engineMode != _appliedEngineMode)
         {
             // The engine gates DIGU/DIGL RX DSP on its own; FreeDV reaches it
@@ -7397,11 +7414,12 @@ public partial class DspPipelineService : BackgroundService,
         var squelch = s.Squelch ?? new SquelchConfig();
         // FreeDV resolves to the band-convention sideband (LSB < 10 MHz, USB ≥);
         // every other mode passes through as itself. See RadioService.EffectiveEngineMode.
-        var openEngineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz);
+        var openEngineMode = RadioService.EffectiveEngineMode(s.Mode, s.VfoHz, FreeDvForcesUsb);
         var openTxReceiver = RadioFrequencyResolver.TxReceiver(s);
         var openTxEngineMode = RadioService.EffectiveEngineMode(
-            openTxReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s));
+            openTxReceiver.Mode, RadioFrequencyResolver.TxFrequencyHz(s), FreeDvForcesUsb);
         bool openTxFreeDvMode = openTxReceiver.Mode == RxMode.FreeDv;
+        _radio.PublishFreeDvTxSideband(openTxFreeDvMode && openTxEngineMode == RxMode.LSB);
         var effectiveTxAudio = ResolveEffectiveTxAudioProfile(s, openTxEngineMode);
         var txLeveling = openTxFreeDvMode
             ? FreeDvTxLevelingProfile
@@ -7787,7 +7805,7 @@ public partial class DspPipelineService : BackgroundService,
         // primary (LSB < 10 MHz, USB ≥). The helper also repairs legacy
         // symmetric DIGU/DIGL state before it reaches the secondary engine.
         var (secEngineMode, signedFilterLow, signedFilterHigh) = SecondaryEngineFilterFor(
-            mode, vfoHz, filterLow, filterHigh);
+            mode, vfoHz, filterLow, filterHigh, FreeDvForcesUsb);
         if (rx.AppliedMode != secEngineMode)
         {
             engine.SetMode(channelId, secEngineMode);
@@ -11307,7 +11325,7 @@ public partial class DspPipelineService : BackgroundService,
                 channel, _snrPowerBuf, out var snrInfo);
             if (snrFresh && snrInfo.IsValid)
                 Array.Reverse(_snrPowerBuf, 0, snrInfo.PixelCount);
-            var engineMode = RadioService.EffectiveEngineMode(state.Mode, state.VfoHz);
+            var engineMode = RadioService.EffectiveEngineMode(state.Mode, state.VfoHz, FreeDvForcesUsb);
             var (snrFilterLow, snrFilterHigh) = SignedRxFilterFor(state, engineMode);
             long effectiveVfoHz = CwOffset.EffectiveLoHz(state.Mode, state.VfoHz)
                 + (state.RitEnabled ? state.RitHz : 0L);
