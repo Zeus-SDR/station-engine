@@ -30,6 +30,12 @@ public partial class DspPipelineService
     private void OnExternalModemContextChanged()
     {
         bool freeDv = _externalReceiverPort?.TryGetContext(0, out var context) == true && context.Mode == RxMode.FreeDv;
+        // The external receiver owns the modem, not a local receiver, so the
+        // RADE status reports no LSB band convention (a value left by an
+        // earlier local radio would otherwise hold) and AUTO omits its RADE V2
+        // on USB step: on a Flex that step would re-command the slice from
+        // DIGL to DIGU and back on every scan pass.
+        if (freeDv) _radio.PublishFreeDvOwner(-1, conventionLsb: false);
         bool apply = freeDv || _externalModemConfigured;
         _externalModemConfigured = freeDv;
         if (apply) OnRadioStateChanged(_radio.Snapshot());

@@ -4,25 +4,36 @@
 // Copyright (C) 2025-2026 Douglas J. Cerrato (KB2UKA),
 //                         Christian Suarez (N9WAR), and contributors.
 //
-// RADE V1 (Radio Autoencoder) modem as a streaming, frame-synchronous insert in
-// the Zeus audio bus — the RADE twin of FreeDvModem, now full-duplex:
+// RADE (Radio Autoencoder) modem as a streaming, frame-synchronous insert in
+// the Zeus audio bus — the RADE twin of FreeDvModem, full-duplex, for RADE V1
+// and RADE V2 (upstream beta):
 //   RX: received SSB audio -> decoded 16 kHz speech (radae_c + opus_dnn/FARGAN).
 //   TX: mic speech -> RADE modem waveform (opus_dnn LPCNet analyzer + rade_tx),
 //       transmitted as the REAL part of the modem IQ (inverse of the RX feed).
 // Both directions absorb the 48 kHz <-> modem-rate and 48 kHz <-> 16 kHz speech
 // rate changes internally with resamplers + fixed lock-free SPSC rings,
-// silence-padded while starved. The End-of-Over callsign is carried by the
-// FreeDV reliable-text LDPC (rade_text), so it interoperates with FreeDV-GUI.
+// silence-padded while starved. The V1 End-of-Over callsign is carried by the
+// FreeDV reliable-text LDPC (rade_text), so it interoperates with FreeDV-GUI;
+// V2 carries no callsign.
+//
+// PROTOCOL SELECTION. Each native context is opened for ONE protocol. A
+// selection of V1 or V2 opens one RX decoder and one TX encoder of that
+// protocol. Auto opens a V1 AND a V2 decoder on the same input (about 1.3% of a
+// core each) plus both encoders: RadeRxArbiter picks whose speech is played
+// (V2 wins; a fresh V1 lock is muted through the V1 false-lock window), and
+// each over latches ONE encoder at its first block and keeps it until the over
+// ends (FlushTx), so a receive lock can never switch protocol mid-over.
 //
 // REALTIME DISCIPLINE — identical to FreeDvModem: the hot paths (ProcessRxInPlace
-// / ProcessTxInPlace) take NO lock and allocate NOTHING; all scratch and ring
-// storage is sized once when the modem opens (off the hot path). Reconfiguring
-// (open/close) runs on a control thread serialised by _reconfigGate, handing each
-// native handle off to its hot path through a Dekker-fenced seqlock: the control
-// thread publishes IntPtr.Zero, full-fences, then spins until the busy flag
-// clears before closing the old handle. When a handle is Zero, RX passes audio
-// through UNCHANGED; TX SILENCES the block (never transmits raw mic on a RADE
-// frequency).
+// / ProcessTxInPlace) take NO lock and allocate NOTHING; every channel, ring and
+// scratch buffer is built when a context opens (off the hot path), sized from
+// that context and, for shared TX scratch, for the larger of the open
+// protocols. Reconfiguring runs on a control thread serialised by
+// _reconfigGate, handing each immutable channel set to its hot path through a
+// Dekker-fenced seqlock: the control thread publishes null, full-fences, then
+// spins until the busy flag clears before closing any retired handle. When no
+// set is published, RX passes audio through UNCHANGED; TX SILENCES the block
+// (never transmits raw mic on a RADE frequency).
 
 using System.Threading;
 using Microsoft.Extensions.Logging;
@@ -34,6 +45,8 @@ internal sealed class RadeModem : IRadeModemCore
     private readonly ILogger? _log;
     private readonly object _reconfigGate = new();   // serialises control-thread reconfig only
     private readonly bool _nativeAvailable;
+    private readonly bool _v2Available;
+    private readonly bool _micExportsAvailable;   // optional mic conditioning + meter exports
 
     private const int CallsignMax = 8;               // RADE_EOO_CALLSIGN_MAX
 
@@ -45,50 +58,67 @@ internal sealed class RadeModem : IRadeModemCore
     // live latency ceiling: it is a finite PTT-held tail, not live backlog.
     private const int TxTailCapacity = 131_072;
     private const int MaxBlock = 8192;               // generous cap on a 48 kHz audio block
-    // SDR-VST3 attenuates RADE V1's near-full-scale modem waveform before the
-    // output interpolator.  Keep the same level for live, residual, and EOO
-    // frames so transitions at the end of an over do not jump in amplitude.
+    // SDR-VST3 attenuates RADE's near-full-scale modem waveform before the
+    // output interpolator. Both protocols peak near 1.0 (V2's RMS is ~2.3 dB
+    // lower, a higher crest factor), so the same peak-based level serves both.
+    // Kept identical for live, residual, and EOO frames so transitions at the
+    // end of an over do not jump in amplitude.
     internal const float TxOutputScale = 0.5f;
 
-    // Native handles — published to the hot paths via Volatile; IntPtr.Zero means
-    // "do not process" (closed / reconfiguring / native missing). RX and TX use
-    // independent rade contexts so the two hot paths never contend on one handle.
-    private IntPtr _rade = IntPtr.Zero;              // RX context
-    private IntPtr _txRade = IntPtr.Zero;            // TX context
-    private int _rxBusy;                             // 0/1 seqlock busy flag (hot path owns)
-    private int _txBusy;
+    // Selection (control thread writes under _reconfigGate; hot paths read).
+    private volatile RadeProtocolSelection _selection = RadeProtocolSelection.V1;
+    private volatile RadeProtocol _preferred = RadeProtocol.None;
+    // The protocol last locked on receive since this engine started — the
+    // Auto TX choice. Written by the RX hot path only.
+    private volatile RadeProtocol _lastLocked = RadeProtocol.None;
 
     private volatile bool _active;
 
-    // RX chain (touched only by the hot path, or during reconfig while gated out).
-    // 48k -> 8k decimation reuses the classic FreeDV decimator (6:1) for the
-    // narrowband OFDM modem input. 16k -> 48k uses the wideband 3:1 interpolator
-    // so FARGAN's full bandwidth survives.
+    // -------- RX --------
+    // The published decoder set (null = passthrough). Immutable once published.
+    private RxSet? _rxSet;
+    private int _rxBusy;                             // 0/1 seqlock busy flag (hot path owns)
+    // 48k -> 8k decimation reuses the classic FreeDV decimator (6:1), once per
+    // block, feeding every decoder in the set the same samples.
     private readonly FreeDvResampler.Decimator _rxDown = FreeDvResampler.NewDecimator();
-    private readonly RadeResampler.Interpolator _rxUp = RadeResampler.NewInterpolator();
-    private readonly FreeDvSampleRing _rx8In = new(8192);     // 8 kHz modem samples awaiting zeus_rade_rx
-    private readonly FreeDvSampleRing _rxOut48 = new(16384);  // decoded speech, 48 kHz, awaiting playout
     private readonly float[] _rxDecScratch = new float[FreeDvResampler.MaxDecimatedLength(MaxBlock)];
-    private float[] _rx8Block = new float[256];       // nin 8k real samples pulled from the ring
-    private float[] _rxIn = new float[512];            // interleaved complex IQ (2 * ninMax), imag stays 0
-    private short[] _rxPcm = new short[256];           // int16 PCM @16k from the decoder
-    private float[] _rxSpeechFloat = new float[256];   // PCM as float
-    private float[] _rxInterp = new float[256];        // 48k after wideband interpolation
     // Sync-driven output squelch. RADE has NO codec2-style SNR squelch, so this
     // is the ONLY thing that mutes the FARGAN decoder's noise-driven output when
     // the far station unkeys — without it you hear an R2D2 tail every un-key.
-    // Owned by the RX hot path; reset in RetireRx.
+    // Owned by the RX hot path; reset when the set changes.
     private readonly RxSquelchGate _rxGate = RxSquelchGate.Default(RadeResampler.FsHigh);
-    private int _ninMax;                               // cached at open
+    private readonly RadeRxArbiter _arbiter = new();
+    private RxChannel? _rxOutput;                    // sticky output decoder (hot path owned)
+    private long _rx8Clock;                          // 8 kHz samples fed (arbiter clock)
+    private volatile RadeProtocol _rxLocked = RadeProtocol.None;
     private readonly byte[] _eooScratch = new byte[CallsignMax + 1]; // hot-path EOO fetch buffer
 
-    // TX chain. Mic 48k -> 16k speech (wideband 3:1 decimate) -> zeus_rade_tx ->
+    // -------- TX --------
+    // Mic 48k -> 16k speech (wideband 3:1 decimate) -> zeus_rade_tx ->
     // modem IQ @8k (real lane) -> 8k -> 48k (6:1 interpolate) -> playout.
+    private TxSet? _txSet;
+    private int _txBusy;
+    // Set (before the gate-out fence) by every control path that CLEARS the
+    // TX rings: FlushTx and PublishTx/RetireTx. DrainTo raises _txBusy, fences,
+    // then checks this; the clearing path raises this, fences, then waits on
+    // _txBusy. Dekker ordering means one of them always sees the other, so the
+    // drain never reads a ring that is being cleared. Transient gate-outs that
+    // do not clear (SetTxText, SetMicConfig) leave it false, so a tail is never
+    // spliced with a silent block by an unrelated control change.
+    private volatile bool _txRingClearing;
+    // The encoder this over uses. Latched by the TX hot path at the over's
+    // first block, cleared only with TX gated out (FlushTx / set change).
+    private TxSlot? _txOverSlot;
+    // Whether the transmitter rides LSB (the TX carrier's effective sideband,
+    // supplied by the composite from the radio). Under Auto that forces V1 TX:
+    // V2 is USB-only. Read once per over latch.
+    private Func<bool>? _txRidesLsb;
     private readonly RadeResampler.Decimator _txDown = RadeResampler.NewDecimator();
     private readonly FreeDvResampler.Interpolator _txUp = FreeDvResampler.NewInterpolator();
     private readonly FreeDvSampleRing _tx16In = new(16384);   // 16 kHz speech awaiting zeus_rade_tx
     private readonly FreeDvSampleRing _txOut48 = new(TxTailCapacity); // modem audio, 48 kHz, awaiting playout
     private readonly float[] _txDecScratch = new float[RadeResampler.MaxDecimatedLength(MaxBlock)];
+    // Shared encoder scratch, grown (TX gated out) to the largest open slot.
     private float[] _tx16Float = new float[640];        // n_speech 16k samples pulled from the ring
     private short[] _tx16Short = new short[640];
     private float[] _txIqOut = new float[2 * 1024];     // interleaved complex modem IQ from the encoder
@@ -97,12 +127,9 @@ internal sealed class RadeModem : IRadeModemCore
     // Pre-vocoder mic noise gate: drives the mic to silence during pauses so
     // rade_tx emits clean silence frames, not vocoded hiss. Reset in RetireTx/FlushTx.
     private readonly MicNoiseGate _micGate = MicNoiseGate.Default(RadeResampler.FsHigh);
-    private int _txNSpeech;                             // cached at open: int16 @16k per tx call
-    private int _txNTxOut;                              // cached at open: modem samples per tx call
-    private int _txNEooOut;                             // cached at open: modem samples in the EOO frame
 
-    // EOO callsign to embed in the TX frame (control thread writes; applied at
-    // open and on change).
+    // EOO callsign to embed in the V1 TX frame (control thread writes; applied
+    // at open and on change). V2 contexts ignore it natively.
     private volatile string? _txCallsign;
 
     // Retained pre-encoder mic conditioning (control thread writes under
@@ -132,22 +159,33 @@ internal sealed class RadeModem : IRadeModemCore
     private string? _rxCallsign;
     private readonly object _rxCallsignLock = new();
 
-    public RadeModem(ILogger? log = null, bool? nativeAvailableOverride = null)
+    public RadeModem(ILogger? log = null, bool? nativeAvailableOverride = null, bool? v2AvailableOverride = null)
     {
         _log = log;
         _nativeAvailable = nativeAvailableOverride ?? RadeNativeLoader.TryProbeRade();
         if (_nativeAvailable)
         {
             RadeNativeMethods.zeus_rade_global_init();
+            // An override may only REMOVE V2 (to exercise the V1-only path on a
+            // V2-capable library); it can never claim V2 on a library without it.
+            _micExportsAvailable = RadeNativeLoader.TryProbeRadeMic();
+            if (!_micExportsAvailable)
+                _log?.LogInformation("RADE: library has no mic conditioning/meter exports; those controls are inactive.");
+            bool probed = RadeNativeLoader.TryProbeRadeV2();
+            _v2Available = probed && (v2AvailableOverride ?? true);
+            if (!probed)
+                _log?.LogInformation("RADE: library is V1-only (no ABI 2 exports); RADE V2 unavailable.");
         }
         else
         {
-            _log?.LogWarning("RADE: zeus_rade native library not found; RADE V1 will pass audio through unchanged.");
+            _log?.LogWarning("RADE: zeus_rade native library not found; RADE will pass audio through unchanged.");
         }
     }
 
     /// <summary>True when the native zeus_rade shim is loadable and RADE can decode.</summary>
     public bool RadeAvailable => _nativeAvailable;
+    /// <summary>True when the loaded shim can also run RADE V2 (ABI 2).</summary>
+    public bool V2Available => _v2Available;
     public bool Active => _active;
     public bool Synced => _synced;
     public double SnrDb => Volatile.Read(ref _snrDb);
@@ -157,17 +195,70 @@ internal sealed class RadeModem : IRadeModemCore
     public bool TxMicClip => _txMicClip;
     public int SpeechSampleRateHz => 16000;
     public int ModemSampleRateHz => 8000;
-    public string? LibraryVersion => _nativeAvailable ? "RADE V1 (radae_c)" : null;
+    public RadeProtocolSelection Selection => _selection;
+
+    public string? LibraryVersion => _nativeAvailable
+        ? RadeProtocols.LibraryDescription(_selection, _active, _v2Available)
+        : null;
+
+    /// <summary>
+    /// The protocol in force: the one currently locked on receive; else the one
+    /// the current over is transmitting; else the one the next over would use.
+    /// </summary>
+    public RadeProtocol ProtocolInForce
+    {
+        get
+        {
+            var locked = _rxLocked;
+            if (locked != RadeProtocol.None) return locked;
+            var over = Volatile.Read(ref _txOverSlot);
+            if (over is not null) return over.Protocol;
+            return ResolveTxProtocol();
+        }
+    }
+
+    /// <summary>The encoder protocol the NEXT over will latch (tests/telemetry).</summary>
+    internal RadeProtocol NextTxProtocol => ResolveTxProtocol();
+
+    /// <summary>The encoder protocol the CURRENT over latched, or None between overs.</summary>
+    internal RadeProtocol OverTxProtocol => Volatile.Read(ref _txOverSlot)?.Protocol ?? RadeProtocol.None;
+
+    private RadeProtocol ResolveTxProtocol() =>
+        RadeProtocols.ResolveTx(_selection, _lastLocked, _preferred, _v2Available, TxRidesLsb());
+
+    private bool TxRidesLsb()
+    {
+        var provider = Volatile.Read(ref _txRidesLsb);
+        if (provider is null) return false;
+        try { return provider(); }
+        catch { return false; }
+    }
+
+    /// <summary>Source of "the transmitter rides LSB".</summary>
+    public void SetTxRidesLsbProvider(Func<bool>? provider) =>
+        Volatile.Write(ref _txRidesLsb, provider);
 
     /// <summary>
     /// Last decoded End-of-Over callsign, or null if none decoded since the modem
     /// opened. Decoded by the native shim via the FreeDV reliable-text LDPC
-    /// (CRC-checked, FreeDV-GUI compatible). Drained on the status thread.
+    /// (CRC-checked, FreeDV-GUI compatible). Drained on the status thread. RADE
+    /// V2 carries no callsign: while V2 is in force this is null and any
+    /// earlier V1 callsign is dropped rather than shown as if V2 sent it.
     /// </summary>
     public string? RxText
     {
         get
         {
+            if (ProtocolInForce == RadeProtocol.V2)
+            {
+                lock (_rxCallsignLock)
+                {
+                    _rxCallsign = null;
+                    _rxEooSeenSeq = Volatile.Read(ref _rxEooSeq);
+                }
+                return null;
+            }
+
             long seq = Volatile.Read(ref _rxEooSeq);
             if (seq != _rxEooSeenSeq)
             {
@@ -199,7 +290,9 @@ internal sealed class RadeModem : IRadeModemCore
         if (!_nativeAvailable) { _active = true; return; }
         lock (_reconfigGate)
         {
-            OpenLocked();
+            RetireRx();
+            RetireTx();
+            ReconcileLocked(selectionChange: false);
             _active = true;
         }
     }
@@ -209,14 +302,39 @@ internal sealed class RadeModem : IRadeModemCore
         _active = false;
         lock (_reconfigGate)
         {
-            RetireRx(IntPtr.Zero);
-            RetireTx(IntPtr.Zero);
+            RetireRx();
+            RetireTx();
         }
     }
 
     /// <summary>
-    /// Set the End-of-Over callsign (&lt;= 8 chars) transmitted in the RADE EOO
-    /// frame. Control thread only. Applied to the live TX context immediately if
+    /// Choose the RADE protocol(s). Control thread only. While active, decoders
+    /// and encoders the new selection still needs are KEPT (so Auto -> V2 does
+    /// not drop an established V2 lock); only what it no longer needs closes.
+    /// <paramref name="preferred"/> is the operator's saved manual RADE
+    /// protocol, used only as the Auto TX fallback.
+    /// </summary>
+    /// <remarks>
+    /// The engine applies a selection only while the transmitter is idle (see
+    /// CompositeAudioModemPort), so this never runs during an over or its tail.
+    /// It can run while the TX monitor previews: a latched preview encoder
+    /// that the new selection drops or would not pick is released, so the
+    /// next block uses the new selection.
+    /// </remarks>
+    public void SetProtocol(RadeProtocolSelection selection, RadeProtocol preferred)
+    {
+        lock (_reconfigGate)
+        {
+            _preferred = preferred;
+            if (_selection == selection) return;
+            _selection = selection;
+            if (_active && _nativeAvailable) ReconcileLocked();
+        }
+    }
+
+    /// <summary>
+    /// Set the End-of-Over callsign (&lt;= 8 chars) transmitted in the RADE V1 EOO
+    /// frame. Control thread only. Applied to the live TX contexts immediately if
     /// open, and re-applied at the next open. Empty/null clears it.
     /// </summary>
     public void SetTxText(string? text)
@@ -225,15 +343,17 @@ internal sealed class RadeModem : IRadeModemCore
         _txCallsign = cs;
         lock (_reconfigGate)
         {
-            IntPtr tx = Volatile.Read(ref _txRade);
-            if (tx != IntPtr.Zero)
+            var set = GateOutTx();
+            if (set is null) return;
+            try
             {
-                // Gate TX out while we mutate the EOO bits on the native side.
-                Volatile.Write(ref _txRade, IntPtr.Zero);
-                Thread.MemoryBarrier();
-                SpinUntilIdle(ref _txBusy);
-                RadeNativeMethods.zeus_rade_set_tx_callsign(tx, cs ?? string.Empty);
-                Volatile.Write(ref _txRade, tx);
+                // V2 contexts treat this as a safe native no-op.
+                foreach (var slot in set.Slots)
+                    RadeNativeMethods.zeus_rade_set_tx_callsign(slot.Handle, cs ?? string.Empty);
+            }
+            finally
+            {
+                Volatile.Write(ref _txSet, set);
             }
         }
     }
@@ -244,12 +364,12 @@ internal sealed class RadeModem : IRadeModemCore
     /// of the native calls, mirroring <see cref="SetTxText"/>.
     /// <para>
     /// The settings are retained on the managed side and re-applied to every
-    /// fresh TX context, because <c>zeus_rade_open()</c> starts each context at
-    /// the native defaults (conditioning off, flat EQ). Without that,
-    /// conditioning silently reverted to bypass on any TX reopen — a
-    /// deactivate/activate cycle or a mode change — while the panel kept
-    /// showing it ON, since the wire is write-only and the panel is its own
-    /// display source of truth.
+    /// fresh TX context, because a native open starts each context at the
+    /// native defaults (conditioning off, flat EQ). Without that, conditioning
+    /// silently reverted to bypass on any TX reopen — a deactivate/activate
+    /// cycle, a protocol change or a mode change — while the panel kept showing
+    /// it ON, since the wire is write-only and the panel is its own display
+    /// source of truth. Every open encoder (V1 and V2 under Auto) gets it.
     /// </para>
     /// </summary>
     public void SetMicConfig(RadeMicConfig config)
@@ -266,18 +386,15 @@ internal sealed class RadeModem : IRadeModemCore
             if (config.EqMidDb is { } midDb) _micEqMidDb = midDb;
             if (config.EqTrebleDb is { } trebleDb) _micEqTrebleDb = trebleDb;
 
-            IntPtr tx = Volatile.Read(ref _txRade);
-            if (tx == IntPtr.Zero) return;
-            Volatile.Write(ref _txRade, IntPtr.Zero);
-            Thread.MemoryBarrier();
-            SpinUntilIdle(ref _txBusy);
+            var set = GateOutTx();
+            if (set is null) return;
             try
             {
-                ApplyMicConfigTo(tx);
+                foreach (var slot in set.Slots) ApplyMicConfigTo(slot.Handle);
             }
             finally
             {
-                Volatile.Write(ref _txRade, tx);
+                Volatile.Write(ref _txSet, set);
             }
         }
     }
@@ -289,6 +406,7 @@ internal sealed class RadeModem : IRadeModemCore
     /// </summary>
     private void ApplyMicConfigTo(IntPtr tx)
     {
+        if (!_micExportsAvailable) return;
         RadeNativeMethods.zeus_rade_set_mic_agc_enabled(tx, _micAgcEnabled ? 1 : 0);
         RadeNativeMethods.zeus_rade_set_mic_agc_target_db(tx, (float)_micAgcTargetDb);
         RadeNativeMethods.zeus_rade_set_mic_eq_enabled(tx, _micEqEnabled ? 1 : 0);
@@ -317,29 +435,99 @@ internal sealed class RadeModem : IRadeModemCore
         Thread.MemoryBarrier(); // StoreLoad fence vs. the reconfig handoff
         try
         {
-            IntPtr h = Volatile.Read(ref _rade);
-            if (h == IntPtr.Zero) return; // passthrough (native missing / reconfiguring) — leave block unchanged
+            var set = Volatile.Read(ref _rxSet);
+            if (set is null) return; // passthrough (native missing / reconfiguring) — leave block unchanged
 
-            // 1. decimate 48k -> 8k real into the 8k input ring.
+            // 1. decimate 48k -> 8k real once; every decoder sees the same samples.
             int n8 = _rxDown.Process(block48k, _rxDecScratch);
-            _rx8In.Write(_rxDecScratch.AsSpan(0, n8));
+            var in8 = _rxDecScratch.AsSpan(0, n8);
+            _rx8Clock += n8;
 
-            // 2. drain the 8k ring through the decoder, nin samples at a time.
-            int nin = RadeNativeMethods.zeus_rade_nin(h);
-            while (nin > 0 && nin <= _ninMax && _rx8In.Count >= nin)
+            var v1 = set.V1;
+            var v2 = set.V2;
+            if (v1 is not null) { v1.In8.Write(in8); Decode(v1); }
+            if (v2 is not null) { v2.In8.Write(in8); Decode(v2); }
+
+            // 2. arbitrate whose speech plays.
+            var locked = _arbiter.Arbitrate(
+                _rx8Clock,
+                v1 is not null, v1 is not null && v1.Synced,
+                v2 is not null, v2 is not null && v2.Synced);
+            _rxLocked = locked;
+            if (locked != RadeProtocol.None && _lastLocked != locked) _lastLocked = locked;
+
+            RxChannel? selected = locked switch
             {
-                _rx8In.Read(_rx8Block.AsSpan(0, nin));
-                // Pack as interleaved complex: real = sample, imag = 0. Odd indices
-                // were pre-zeroed at open and the decoder never writes rx_in, so
-                // they stay 0 across calls — only the real lanes need refreshing.
-                for (int i = 0; i < nin; i++) _rxIn[2 * i] = _rx8Block[i];
+                RadeProtocol.V1 => v1,
+                RadeProtocol.V2 => v2,
+                _ => null,
+            };
+            if (selected is not null) _rxOutput = selected;
+            // With nothing locked the last-played decoder keeps the output, so
+            // its residual drains through the squelch fade exactly as a single
+            // decoder always did.
+            RxChannel source = _rxOutput ?? (v2 ?? v1)!;
 
-                int npcm = RadeNativeMethods.zeus_rade_rx(h, _rxIn, _rxPcm);
-                _synced = RadeNativeMethods.zeus_rade_sync(h) != 0;
-                Volatile.Write(ref _snrDb, RadeNativeMethods.zeus_rade_snr_db(h));
+            // Speech from a decoder that is not playing is never heard; drop it
+            // every block so it cannot become a stale backlog when it takes over.
+            if (v1 is not null && !ReferenceEquals(v1, source)) v1.Out48.Clear();
+            if (v2 is not null && !ReferenceEquals(v2, source)) v2.Out48.Clear();
 
+            // 3. read decoded speech into the block; silence-pad the remainder
+            // (decoded speech replaces the demod audio, exactly like FreeDvModem).
+            // A decoder that claims sync but is not trusted (a V1 lock inside the
+            // false-lock window) is muted outright, never faded through.
+            int filled;
+            if (selected is null && source.Synced)
+            {
+                source.Out48.Clear();
+                filled = 0;
+            }
+            else
+            {
+                filled = source.Out48.Read(block48k);
+            }
+            if (filled < block48k.Length) block48k.Slice(filled).Clear();
+
+            bool synced = locked != RadeProtocol.None;
+            _synced = synced;
+            var telemetry = selected ?? source;
+            Volatile.Write(ref _snrDb, Volatile.Read(ref telemetry.SnrDb));
+
+            // Sync-gate the decoded speech (RADE's only squelch): smooth fade-out
+            // on loss of sync kills the end-of-over tail; flush the FIFO when fully
+            // closed so no stale-noise backlog plays at the head of the next over.
+            if (_rxGate.Process(block48k, synced))
+                source.Out48.Clear();
+        }
+        finally
+        {
+            Volatile.Write(ref _rxBusy, 0);
+        }
+    }
+
+    // Drain one decoder's 8k input through zeus_rade_rx, nin samples at a time.
+    private void Decode(RxChannel ch)
+    {
+        IntPtr h = ch.Handle;
+        int nin = RadeNativeMethods.zeus_rade_nin(h);
+        while (nin > 0 && nin <= ch.NinMax && ch.In8.Count >= nin)
+        {
+            ch.In8.Read(ch.Block8.AsSpan(0, nin));
+            // Pack as interleaved complex: real = sample, imag = 0. Odd indices
+            // were zeroed at allocation and the decoder never writes rx_in, so
+            // they stay 0 across calls — only the real lanes need refreshing.
+            for (int i = 0; i < nin; i++) ch.Iq[2 * i] = ch.Block8[i];
+
+            int npcm = RadeNativeMethods.zeus_rade_rx(h, ch.Iq, ch.Pcm);
+            ch.Synced = RadeNativeMethods.zeus_rade_sync(h) != 0;
+            Volatile.Write(ref ch.SnrDb, RadeNativeMethods.zeus_rade_snr_db(h));
+
+            if (ch.Protocol == RadeProtocol.V1)
+            {
                 // Pull any freshly-decoded EOO callsign (cheap — just returns the
                 // already-decoded string). Publish via the seqlock; no alloc.
+                // V2 has no EOO text, so its decoder is never asked.
                 int csn = RadeNativeMethods.zeus_rade_get_eoo_callsign(h, _eooScratch);
                 if (csn > 0)
                 {
@@ -348,30 +536,16 @@ internal sealed class RadeModem : IRadeModemCore
                     _rxEooLen = n;
                     Volatile.Write(ref _rxEooSeq, _rxEooSeq + 1);
                 }
-
-                if (npcm > 0)
-                {
-                    ShortToFloat(_rxPcm, _rxSpeechFloat, npcm);
-                    int up = _rxUp.Process(_rxSpeechFloat.AsSpan(0, npcm), _rxInterp);
-                    WriteBounded(_rxOut48, _rxInterp.AsSpan(0, up));
-                }
-                nin = RadeNativeMethods.zeus_rade_nin(h);
             }
 
-            // 3. read decoded speech into the block; silence-pad the remainder
-            // (decoded speech replaces the demod audio, exactly like FreeDvModem).
-            int filled = _rxOut48.Read(block48k);
-            if (filled < block48k.Length) block48k.Slice(filled).Clear();
-
-            // Sync-gate the decoded speech (RADE's only squelch): smooth fade-out
-            // on loss of sync kills the end-of-over tail; flush the FIFO when fully
-            // closed so no stale-noise backlog plays at the head of the next over.
-            if (_rxGate.Process(block48k, _synced))
-                _rxOut48.Clear();
-        }
-        finally
-        {
-            Volatile.Write(ref _rxBusy, 0);
+            if (npcm > 0)
+            {
+                if (npcm > ch.Pcm.Length) npcm = ch.Pcm.Length;
+                ShortToFloat(ch.Pcm, ch.Speech, npcm);
+                int up = ch.Up.Process(ch.Speech.AsSpan(0, npcm), ch.Interp);
+                WriteBounded(ch.Out48, ch.Interp.AsSpan(0, up));
+            }
+            nin = RadeNativeMethods.zeus_rade_nin(h);
         }
     }
 
@@ -384,14 +558,26 @@ internal sealed class RadeModem : IRadeModemCore
         Thread.MemoryBarrier();
         try
         {
-            IntPtr h = Volatile.Read(ref _txRade);
+            var set = Volatile.Read(ref _txSet);
             // RADE active but TX not open (native missing / reconfiguring): SILENCE
             // rather than transmit raw mic — raw SSB on a RADE frequency is worse
             // than dead air.
-            if (h == IntPtr.Zero) { block48k.Clear(); return; }
+            if (set is null) { block48k.Clear(); return; }
 
-            int nspeech = _txNSpeech, ntx = _txNTxOut;
+            // Latch this over's encoder at its first block. It stays latched
+            // until FlushTx ends the over, so a receive lock that changes the
+            // Auto choice mid-over only takes effect at the next over.
+            var slot = _txOverSlot;
+            if (slot is null)
+            {
+                slot = set.Select(ResolveTxProtocol());
+                Volatile.Write(ref _txOverSlot, slot);
+            }
+            if (slot is null) { block48k.Clear(); return; }
+
+            int nspeech = slot.NSpeech, ntx = slot.NTxOut;
             if (nspeech <= 0 || ntx <= 0) { block48k.Clear(); return; }
+            IntPtr h = slot.Handle;
 
             // Gate the mic to silence during pauses so rade_tx encodes clean
             // silence frames instead of vocoding background hiss into garble.
@@ -408,8 +594,11 @@ internal sealed class RadeModem : IRadeModemCore
                 _tx16In.Read(_tx16Float.AsSpan(0, nspeech));
                 FloatToShort(_tx16Float, _tx16Short, nspeech);
                 int n = RadeNativeMethods.zeus_rade_tx(h, _tx16Short, _txIqOut);
-                Volatile.Write(ref _txMicLevelDb, RadeNativeMethods.zeus_rade_tx_mic_level_db(h));
-                _txMicClip = RadeNativeMethods.zeus_rade_tx_mic_clip(h) != 0;
+                if (_micExportsAvailable)
+                {
+                    Volatile.Write(ref _txMicLevelDb, RadeNativeMethods.zeus_rade_tx_mic_level_db(h));
+                    _txMicClip = RadeNativeMethods.zeus_rade_tx_mic_clip(h) != 0;
+                }
                 if (n > ntx) n = ntx;
                 CopyScaledModemReal(_txIqOut, _txModemReal, n);
                 int up = _txUp.Process(_txModemReal.AsSpan(0, n), _txInterp);
@@ -429,25 +618,32 @@ internal sealed class RadeModem : IRadeModemCore
     }
 
     /// <summary>
-    /// Drop buffered TX audio on a MOX falling edge so the next over starts clean
-    /// (mirrors FreeDvModem.FlushTx). EOO generation belongs exclusively to
-    /// <see cref="FinishTx"/>, which retires the TX hot path before touching the
-    /// exact tail ring.
+    /// End the over on a MOX falling edge: drop buffered TX audio so the next
+    /// over starts clean (mirrors FreeDvModem.FlushTx) and release the latched
+    /// encoder, so the next over picks up any protocol change made meanwhile.
+    /// EOO generation belongs exclusively to <see cref="FinishTx"/>, which
+    /// retires the TX hot path before touching the exact tail ring.
     /// </summary>
     public void FlushTx()
     {
         if (!_nativeAvailable) return;
         lock (_reconfigGate)
         {
-            IntPtr tx = Volatile.Read(ref _txRade);
-            if (tx == IntPtr.Zero) return;
-            Volatile.Write(ref _txRade, IntPtr.Zero);
-            Thread.MemoryBarrier();
-            SpinUntilIdle(ref _txBusy);
-            _tx16In.Clear(); _txOut48.Clear();
-            _txDown.Reset(); _txUp.Reset();
-            _micGate.Reset();
-            Volatile.Write(ref _txRade, tx);
+            _txRingClearing = true;
+            try
+            {
+                var set = GateOutTx();
+                if (set is null) return;
+                _tx16In.Clear(); _txOut48.Clear();
+                _txDown.Reset(); _txUp.Reset();
+                _micGate.Reset();
+                Volatile.Write(ref _txOverSlot, null);
+                Volatile.Write(ref _txSet, set);
+            }
+            finally
+            {
+                _txRingClearing = false;
+            }
         }
     }
 
@@ -455,54 +651,58 @@ internal sealed class RadeModem : IRadeModemCore
     /// Drop buffered RX decode state on a MOX transition WITHOUT closing the
     /// modem, so the receiver resumes from an empty, unsynced state instead of
     /// dumping speech decoded from the operator's own transmission during the
-    /// over (heard as an end-of-over garble in Zeus's own RX audio). Clears the
-    /// input/output rings, resets the resamplers + sync squelch gate, and marks
-    /// unsynced. Control thread; gates the RX hot path out via the seqlock —
-    /// mirrors <see cref="FlushTx"/>. RADE has no codec2-style squelch, so this
-    /// is the only thing that stops the FARGAN decoder replaying a self-decoded
-    /// backlog at un-key.
+    /// over (heard as an end-of-over garble in Zeus's own RX audio). Clears every
+    /// decoder's input/output rings, resets the resamplers + sync squelch gate,
+    /// and marks unsynced. Control thread; gates the RX hot path out via the
+    /// seqlock — mirrors <see cref="FlushTx"/>. RADE has no codec2-style
+    /// squelch, so this is the only thing that stops the FARGAN decoder
+    /// replaying a self-decoded backlog at un-key.
     /// </summary>
     public void FlushRx()
     {
         if (!_nativeAvailable) return;
         lock (_reconfigGate)
         {
-            IntPtr rx = Volatile.Read(ref _rade);
-            if (rx == IntPtr.Zero) return;
-            Volatile.Write(ref _rade, IntPtr.Zero);
+            var set = Volatile.Read(ref _rxSet);
+            if (set is null) return;
+            Volatile.Write(ref _rxSet, null);
             Thread.MemoryBarrier();
             SpinUntilIdle(ref _rxBusy);
-            _rx8In.Clear(); _rxOut48.Clear();
-            _rxDown.Reset(); _rxUp.Reset();
-            _rxGate.Reset();
-            _synced = false;
-            Volatile.Write(ref _rade, rx);
+            foreach (var ch in set.Channels) ch.Reset();
+            _rxDown.Reset();
+            ResetRxSharedState();
+            Volatile.Write(ref _rxSet, set);
         }
     }
 
     /// <summary>
     /// End-of-over flush: encode the residual sub-frame of mic speech so a
-    /// COMPLETE final RADE frame exists, then append the End-of-Over frame (which
-    /// carries the configured callsign via the FreeDV reliable-text LDPC), and
-    /// report the 48 kHz output samples now pending. The TX tail drain clocks
-    /// those out before PTT drops, so the over ends on a whole frame AND the EOO
-    /// callsign actually reaches the air. Control-thread only; gates the TX hot
-    /// path out. Returns 0
-    /// when native is missing or TX isn't open.
+    /// COMPLETE final RADE frame exists, then append the End-of-Over frame (V1:
+    /// carries the configured callsign via the FreeDV reliable-text LDPC; V2:
+    /// detection only), and report the 48 kHz output samples now pending. The
+    /// TX tail drain clocks those out before PTT drops, so the over ends on a
+    /// whole frame AND the EOO actually reaches the air. Uses the encoder this
+    /// over latched (or, for an over with no audio yet, the one it would have
+    /// latched). Control-thread only; gates the TX hot path out. Returns 0 when
+    /// native is missing or TX isn't open.
     /// </summary>
     public int FinishTx()
     {
         if (!_nativeAvailable) return 0;
         lock (_reconfigGate)
         {
-            IntPtr h = Volatile.Read(ref _txRade);
-            if (h == IntPtr.Zero) return 0;
-            int nspeech = _txNSpeech, ntx = _txNTxOut;
+            var set = Volatile.Read(ref _txSet);
+            if (set is null) return 0;
+            var slot = Volatile.Read(ref _txOverSlot) ?? set.Select(ResolveTxProtocol());
+            if (slot is null) return 0;
+            int nspeech = slot.NSpeech, ntx = slot.NTxOut;
             if (nspeech <= 0 || ntx <= 0) return 0;
+            IntPtr h = slot.Handle;
 
-            Volatile.Write(ref _txRade, IntPtr.Zero);
+            Volatile.Write(ref _txSet, null);
             Thread.MemoryBarrier();
             SpinUntilIdle(ref _txBusy);
+            Volatile.Write(ref _txOverSlot, slot);
 
             try
             {
@@ -520,11 +720,11 @@ internal sealed class RadeModem : IRadeModemCore
                     WriteTailExact(_txInterp.AsSpan(0, up));
                 }
 
-                // Append the EOO (closing callsign) frame as the final modem audio.
-                if (_txNEooOut > 0)
+                // Append the EOO frame as the final modem audio.
+                if (slot.NEooOut > 0)
                 {
                     int n = RadeNativeMethods.zeus_rade_tx_eoo(h, _txIqOut);
-                    if (n > _txNEooOut) n = _txNEooOut;
+                    if (n > slot.NEooOut) n = slot.NEooOut;
                     CopyScaledModemReal(_txIqOut, _txModemReal, n);
                     int up = _txUp.Process(_txModemReal.AsSpan(0, n), _txInterp);
                     WriteTailExact(_txInterp.AsSpan(0, up));
@@ -532,10 +732,11 @@ internal sealed class RadeModem : IRadeModemCore
 
                 // radae_c detects EOO only after enough following modem samples
                 // have clocked the complete frame through its variable-nin receive
-                // state. The native proof harness uses ninMax * 8 zeros. Those
-                // samples must be part of PendingTxSamples so TxAudioIngest keeps
-                // PTT asserted until the callsign is actually decodable on air.
-                int padRemaining = checked(_ninMax * 8);
+                // state. The native proof harness uses ninMax * 8 zeros (of the
+                // protocol being sent). Those samples must be part of
+                // PendingTxSamples so TxAudioIngest keeps PTT asserted until the
+                // EOO is actually detectable on air.
+                int padRemaining = checked(slot.NinMax * 8);
                 while (padRemaining > 0)
                 {
                     int chunk = Math.Min(
@@ -555,7 +756,7 @@ internal sealed class RadeModem : IRadeModemCore
                 // WriteTailExact deliberately throws on capacity exhaustion; a
                 // failed tail build must not silence every later block until the
                 // modem is reactivated.
-                Volatile.Write(ref _txRade, h);
+                Volatile.Write(ref _txSet, set);
             }
         }
     }
@@ -568,12 +769,29 @@ internal sealed class RadeModem : IRadeModemCore
     /// new speech; silence-pads the remainder and returns the real (non-pad)
     /// count. Used by the end-of-over tail drain while the TX hot path is quiesced
     /// (the drain owns TX exclusively). Returns 0 when nothing is pending.
+    /// Holds the TX busy flag like the hot path, so a control-thread retire
+    /// (RADE released mid-tail) waits for the read before clearing the ring.
     /// </summary>
     public int DrainTo(Span<float> block48k)
     {
-        int filled = _txOut48.Read(block48k);
-        if (filled < block48k.Length) block48k.Slice(filled).Clear();
-        return filled;
+        Volatile.Write(ref _txBusy, 1);
+        Thread.MemoryBarrier();
+        try
+        {
+            // A clear is in progress (TX retired or flushed): the tail is gone.
+            if (_txRingClearing)
+            {
+                block48k.Clear();
+                return 0;
+            }
+            int filled = _txOut48.Read(block48k);
+            if (filled < block48k.Length) block48k.Slice(filled).Clear();
+            return filled;
+        }
+        finally
+        {
+            Volatile.Write(ref _txBusy, 0);
+        }
     }
 
     internal static void CopyScaledModemReal(float[] interleavedIq, float[] modemReal, int count)
@@ -624,94 +842,219 @@ internal sealed class RadeModem : IRadeModemCore
 
     // -------- reconfig helpers (control thread, under _reconfigGate) --------
 
-    private void OpenLocked()
+    /// <summary>
+    /// Bring the published decoder and encoder sets in line with the selection.
+    /// Contexts the selection still needs are kept; missing ones are opened;
+    /// unneeded ones are closed after the hot path is gated out.
+    /// </summary>
+    private void ReconcileLocked(bool selectionChange = true)
     {
         if (!_nativeAvailable)
         {
-            // Leave the handles Zero — RX passes through, TX silences.
-            RetireRx(IntPtr.Zero);
-            RetireTx(IntPtr.Zero);
+            // Leave the sets null — RX passes through, TX silences.
+            RetireRx();
+            RetireTx();
             return;
         }
 
-        IntPtr rx = RadeNativeMethods.zeus_rade_open();
-        IntPtr tx = RadeNativeMethods.zeus_rade_open();
-        if (rx == IntPtr.Zero || tx == IntPtr.Zero)
-        {
-            _log?.LogError("RADE: zeus_rade_open failed — passthrough (no decode/encode).");
-            if (rx != IntPtr.Zero) RadeNativeMethods.zeus_rade_close(rx);
-            if (tx != IntPtr.Zero) RadeNativeMethods.zeus_rade_close(tx);
-            RetireRx(IntPtr.Zero);
-            RetireTx(IntPtr.Zero);
-            return;
-        }
+        bool wantV1 = _selection != RadeProtocolSelection.V2;
+        bool wantV2 = _v2Available && _selection != RadeProtocolSelection.V1;
 
-        // RX scratch from the new context (off the hot path).
-        _ninMax = RadeNativeMethods.zeus_rade_nin_max(rx);
-        int maxPcm = RadeNativeMethods.zeus_rade_max_pcm_per_rx(rx);
-        EnsureFloat(ref _rx8Block, _ninMax);
-        EnsureFloatZeroed(ref _rxIn, 2 * _ninMax);
-        EnsureShort(ref _rxPcm, maxPcm);
-        EnsureFloat(ref _rxSpeechFloat, maxPcm);
-        EnsureFloat(ref _rxInterp, RadeResampler.InterpolatedLength(maxPcm));
+        var oldRx = Volatile.Read(ref _rxSet);
+        RxChannel? rx1 = wantV1 ? oldRx?.V1 ?? OpenRx(RadeProtocol.V1) : null;
+        RxChannel? rx2 = wantV2 ? oldRx?.V2 ?? OpenRx(RadeProtocol.V2) : null;
+        if (!ReferenceEquals(rx1, oldRx?.V1) || !ReferenceEquals(rx2, oldRx?.V2))
+            PublishRx(rx1 is null && rx2 is null ? null : new RxSet(rx1, rx2));
 
-        // TX scratch + sizes.
-        _txNSpeech = RadeNativeMethods.zeus_rade_n_speech_samples(tx);
-        _txNTxOut = RadeNativeMethods.zeus_rade_n_tx_out(tx);
-        _txNEooOut = RadeNativeMethods.zeus_rade_n_tx_eoo_out(tx);
-        int txMax = Math.Max(_txNTxOut, _txNEooOut);
-        EnsureFloat(ref _tx16Float, _txNSpeech);
-        EnsureShort(ref _tx16Short, _txNSpeech);
-        EnsureFloat(ref _txIqOut, 2 * txMax);
-        EnsureFloat(ref _txModemReal, txMax);
-        EnsureFloat(ref _txInterp, FreeDvResampler.InterpolatedLength(txMax));
-
-        // Apply the operator's EOO callsign to the fresh TX context before it goes
-        // live.
-        RadeNativeMethods.zeus_rade_set_tx_callsign(tx, _txCallsign ?? string.Empty);
-
-        // Same for mic conditioning: a fresh context opens at the native
-        // defaults (off / flat), so without this the operator's AGC and EQ
-        // silently revert to bypass on every TX reopen.
-        ApplyMicConfigTo(tx);
-
-        _synced = false;
-        Volatile.Write(ref _snrDb, 0d);
-
-        RetireRx(rx);
-        RetireTx(tx);
+        var oldTx = Volatile.Read(ref _txSet);
+        TxSlot? tx1 = wantV1 ? oldTx?.V1 ?? OpenTx(RadeProtocol.V1) : null;
+        TxSlot? tx2 = wantV2 ? oldTx?.V2 ?? OpenTx(RadeProtocol.V2) : null;
+        if (!ReferenceEquals(tx1, oldTx?.V1) || !ReferenceEquals(tx2, oldTx?.V2)
+            || (selectionChange && LatchedIsStale()))
+            PublishTx(tx1 is null && tx2 is null ? null : new TxSet(tx1, tx2), selectionChange);
 
         _log?.LogInformation(
-            "RADE: opened ninMax={NinMax} maxPcm={MaxPcm} txSpeech={TxSpeech} txOut={TxOut} eooOut={EooOut}",
-            _ninMax, maxPcm, _txNSpeech, _txNTxOut, _txNEooOut);
+            "RADE: selection={Selection} rx=[{RxV1}{RxV2}] tx=[{TxV1}{TxV2}] nextTx={NextTx}",
+            _selection,
+            rx1 is null ? "" : "V1 ", rx2 is null ? "" : "V2",
+            tx1 is null ? "" : "V1 ", tx2 is null ? "" : "V2",
+            ResolveTxProtocol());
     }
 
-    // Gate the RX hot path out, close the old handle, reset RX buffers, publish
-    // the replacement (IntPtr.Zero to leave RX disengaged / passthrough).
-    private void RetireRx(IntPtr replacement)
+    private RxChannel? OpenRx(RadeProtocol protocol)
     {
-        IntPtr old = Volatile.Read(ref _rade);
-        Volatile.Write(ref _rade, IntPtr.Zero);
+        IntPtr h = OpenContext(protocol);
+        if (h == IntPtr.Zero) return null;
+        int ninMax = RadeNativeMethods.zeus_rade_nin_max(h);
+        int maxPcm = RadeNativeMethods.zeus_rade_max_pcm_per_rx(h);
+        if (ninMax <= 0 || maxPcm <= 0)
+        {
+            _log?.LogError("RADE: {Protocol} RX context reported invalid sizes ninMax={NinMax} maxPcm={MaxPcm}", protocol, ninMax, maxPcm);
+            RadeNativeMethods.zeus_rade_close(h);
+            return null;
+        }
+        _log?.LogInformation("RADE: opened {Protocol} RX ninMax={NinMax} maxPcm={MaxPcm}", protocol, ninMax, maxPcm);
+        return new RxChannel(h, protocol, ninMax, maxPcm);
+    }
+
+    private TxSlot? OpenTx(RadeProtocol protocol)
+    {
+        IntPtr h = OpenContext(protocol);
+        if (h == IntPtr.Zero) return null;
+        var slot = new TxSlot(
+            h,
+            protocol,
+            RadeNativeMethods.zeus_rade_n_speech_samples(h),
+            RadeNativeMethods.zeus_rade_n_tx_out(h),
+            RadeNativeMethods.zeus_rade_n_tx_eoo_out(h),
+            RadeNativeMethods.zeus_rade_nin_max(h));
+        // Apply the operator's EOO callsign (a V2 no-op) and mic conditioning
+        // to the fresh context before it goes live: a fresh context opens at
+        // the native defaults (off / flat), so without this the operator's AGC
+        // and EQ silently revert to bypass on every TX reopen.
+        RadeNativeMethods.zeus_rade_set_tx_callsign(h, _txCallsign ?? string.Empty);
+        ApplyMicConfigTo(h);
+        _log?.LogInformation(
+            "RADE: opened {Protocol} TX speech={Speech} out={Out} eoo={Eoo} ninMax={NinMax}",
+            protocol, slot.NSpeech, slot.NTxOut, slot.NEooOut, slot.NinMax);
+        return slot;
+    }
+
+    private IntPtr OpenContext(RadeProtocol protocol)
+    {
+        IntPtr h;
+        if (protocol == RadeProtocol.V2)
+        {
+            if (!_v2Available) return IntPtr.Zero;
+            h = RadeNativeMethods.zeus_rade_open_protocol(2);
+            if (h != IntPtr.Zero && RadeNativeMethods.zeus_rade_protocol(h) != 2)
+            {
+                RadeNativeMethods.zeus_rade_close(h);
+                h = IntPtr.Zero;
+            }
+        }
+        else
+        {
+            // zeus_rade_open() is V1 on every shim revision, old or new.
+            h = RadeNativeMethods.zeus_rade_open();
+        }
+        if (h == IntPtr.Zero)
+            _log?.LogError("RADE: opening a {Protocol} context failed — that protocol stays unavailable this session.", protocol);
+        return h;
+    }
+
+    // Gate the RX hot path out, close every decoder the new set drops, reset
+    // the shared RX state, publish the replacement (null = passthrough).
+    private void PublishRx(RxSet? replacement)
+    {
+        var old = Volatile.Read(ref _rxSet);
+        Volatile.Write(ref _rxSet, null);
         Thread.MemoryBarrier();
         SpinUntilIdle(ref _rxBusy);
-        if (old != IntPtr.Zero) RadeNativeMethods.zeus_rade_close(old);
-        _rx8In.Clear(); _rxOut48.Clear();
-        _rxDown.Reset(); _rxUp.Reset();
-        _rxGate.Reset();
-        Volatile.Write(ref _rade, replacement);
+        bool kept = false;
+        if (old is not null)
+        {
+            foreach (var ch in old.Channels)
+            {
+                if (replacement is not null && replacement.Contains(ch)) { kept = true; continue; }
+                RadeNativeMethods.zeus_rade_close(ch.Handle);
+            }
+        }
+        // A kept decoder keeps its stream continuous (no decimator reset), so an
+        // established lock survives the change; a wholly new set starts clean.
+        if (!kept) _rxDown.Reset();
+        ResetRxSharedState();
+        Volatile.Write(ref _rxSet, replacement);
     }
 
-    private void RetireTx(IntPtr replacement)
+    private void ResetRxSharedState()
     {
-        IntPtr old = Volatile.Read(ref _txRade);
-        Volatile.Write(ref _txRade, IntPtr.Zero);
+        _rxGate.Reset();
+        _arbiter.Reset();
+        _rxOutput = null;
+        _rxLocked = RadeProtocol.None;
+        _synced = false;
+        Volatile.Write(ref _snrDb, 0d);
+    }
+
+    private void RetireRx() => PublishRx(null);
+
+    // Gate the TX hot path out, close every encoder the new set drops, size the
+    // shared scratch for the largest remaining encoder, publish the replacement.
+    // An over whose latched encoder is dropped (only an explicit operator
+    // selection change can do that) is abandoned cleanly.
+    // A latched encoder no longer matches what the selection would pick (e.g.
+    // V1 latched under monitor, then Auto chosen with a V2 preference).
+    private bool LatchedIsStale()
+    {
+        var latched = Volatile.Read(ref _txOverSlot);
+        return latched is not null && latched.Protocol != ResolveTxProtocol();
+    }
+
+    private void PublishTx(TxSet? replacement, bool selectionChange = false)
+    {
+        _txRingClearing = true;
+        try
+        {
+            PublishTxCore(replacement, selectionChange);
+        }
+        finally
+        {
+            _txRingClearing = false;
+        }
+    }
+
+    private void PublishTxCore(TxSet? replacement, bool selectionChange)
+    {
+        var old = GateOutTx();
+        var latched = Volatile.Read(ref _txOverSlot);
+        if (old is not null)
+        {
+            foreach (var slot in old.Slots)
+            {
+                if (replacement is not null && replacement.Contains(slot)) continue;
+                RadeNativeMethods.zeus_rade_close(slot.Handle);
+            }
+        }
+        bool latchLost = latched is not null
+            && (replacement is null || !replacement.Contains(latched)
+                || (selectionChange && latched.Protocol != ResolveTxProtocol()));
+        if (latched is null || latchLost)
+        {
+            Volatile.Write(ref _txOverSlot, null);
+            _tx16In.Clear(); _txOut48.Clear();
+            _txDown.Reset(); _txUp.Reset();
+            _micGate.Reset();
+        }
+        if (replacement is not null)
+        {
+            int nSpeech = 0, txMax = 0;
+            foreach (var slot in replacement.Slots)
+            {
+                nSpeech = Math.Max(nSpeech, slot.NSpeech);
+                txMax = Math.Max(txMax, Math.Max(slot.NTxOut, slot.NEooOut));
+            }
+            EnsureFloat(ref _tx16Float, nSpeech);
+            EnsureShort(ref _tx16Short, nSpeech);
+            EnsureFloat(ref _txIqOut, 2 * txMax);
+            EnsureFloat(ref _txModemReal, txMax);
+            EnsureFloat(ref _txInterp, FreeDvResampler.InterpolatedLength(txMax));
+        }
+        Volatile.Write(ref _txSet, replacement);
+    }
+
+    private void RetireTx() => PublishTx(null);
+
+    // Publish null on the TX hot path and wait for any in-flight block to
+    // finish. Returns the set that was published (null when TX is closed);
+    // the caller republishes it (or a replacement) when done.
+    private TxSet? GateOutTx()
+    {
+        var set = Volatile.Read(ref _txSet);
+        Volatile.Write(ref _txSet, null);
         Thread.MemoryBarrier();
         SpinUntilIdle(ref _txBusy);
-        if (old != IntPtr.Zero) RadeNativeMethods.zeus_rade_close(old);
-        _tx16In.Clear(); _txOut48.Clear();
-        _txDown.Reset(); _txUp.Reset();
-        _micGate.Reset();
-        Volatile.Write(ref _txRade, replacement);
+        return set;
     }
 
     private static void SpinUntilIdle(ref int busyFlag)
@@ -725,15 +1068,6 @@ internal sealed class RadeModem : IRadeModemCore
         if (buf.Length < n) buf = new float[Math.Max(n, buf.Length * 2)];
     }
 
-    // For the interleaved IQ buffer: a fresh allocation is zeroed by the runtime,
-    // so a grow leaves all lanes (including imag) at 0. When the existing buffer
-    // is large enough, re-zero it so a reopen can't leave a stale imag lane.
-    private static void EnsureFloatZeroed(ref float[] buf, int n)
-    {
-        if (buf.Length < n) buf = new float[Math.Max(n, buf.Length * 2)];
-        else Array.Clear(buf, 0, buf.Length);
-    }
-
     private static void EnsureShort(ref short[] buf, int n)
     {
         if (buf.Length < n) buf = new short[Math.Max(n, buf.Length * 2)];
@@ -744,8 +1078,104 @@ internal sealed class RadeModem : IRadeModemCore
         _active = false;
         lock (_reconfigGate)
         {
-            RetireRx(IntPtr.Zero);
-            RetireTx(IntPtr.Zero);
+            RetireRx();
+            RetireTx();
         }
+    }
+
+    // -------- per-protocol state (built off the hot path) --------
+
+    /// <summary>
+    /// One RX decoder with its own input/output rings and scratch, sized from
+    /// its own context. Fresh arrays are zeroed by the runtime, so the IQ
+    /// buffer's imaginary lanes start (and stay) at 0.
+    /// </summary>
+    private sealed class RxChannel
+    {
+        internal RxChannel(IntPtr handle, RadeProtocol protocol, int ninMax, int maxPcm)
+        {
+            Handle = handle;
+            Protocol = protocol;
+            NinMax = ninMax;
+            Block8 = new float[ninMax];
+            Iq = new float[2 * ninMax];
+            Pcm = new short[maxPcm];
+            Speech = new float[maxPcm];
+            Interp = new float[RadeResampler.InterpolatedLength(maxPcm)];
+        }
+
+        internal readonly IntPtr Handle;
+        internal readonly RadeProtocol Protocol;
+        internal readonly int NinMax;
+        internal readonly FreeDvSampleRing In8 = new(8192);     // 8 kHz modem samples awaiting zeus_rade_rx
+        internal readonly FreeDvSampleRing Out48 = new(16384);  // decoded speech, 48 kHz, awaiting playout
+        // 16k -> 48k uses the wideband 3:1 interpolator so FARGAN's full
+        // bandwidth survives.
+        internal readonly RadeResampler.Interpolator Up = RadeResampler.NewInterpolator();
+        internal readonly float[] Block8;
+        internal readonly float[] Iq;
+        internal readonly short[] Pcm;
+        internal readonly float[] Speech;
+        internal readonly float[] Interp;
+        internal volatile bool Synced;
+        internal double SnrDb;
+
+        internal void Reset()
+        {
+            In8.Clear();
+            Out48.Clear();
+            Up.Reset();
+            Synced = false;
+            Volatile.Write(ref SnrDb, 0d);
+        }
+    }
+
+    private sealed class RxSet(RxChannel? v1, RxChannel? v2)
+    {
+        internal RxChannel? V1 { get; } = v1;
+        internal RxChannel? V2 { get; } = v2;
+
+        internal IEnumerable<RxChannel> Channels
+        {
+            get
+            {
+                if (V1 is not null) yield return V1;
+                if (V2 is not null) yield return V2;
+            }
+        }
+
+        internal bool Contains(RxChannel ch) => ReferenceEquals(ch, V1) || ReferenceEquals(ch, V2);
+    }
+
+    private sealed record TxSlot(
+        IntPtr Handle,
+        RadeProtocol Protocol,
+        int NSpeech,
+        int NTxOut,
+        int NEooOut,
+        int NinMax);
+
+    private sealed class TxSet(TxSlot? v1, TxSlot? v2)
+    {
+        internal TxSlot? V1 { get; } = v1;
+        internal TxSlot? V2 { get; } = v2;
+
+        internal IEnumerable<TxSlot> Slots
+        {
+            get
+            {
+                if (V1 is not null) yield return V1;
+                if (V2 is not null) yield return V2;
+            }
+        }
+
+        internal bool Contains(TxSlot slot) => ReferenceEquals(slot, V1) || ReferenceEquals(slot, V2);
+
+        // Hot-path safe (no alloc). A V2 request may fall back to V1 if the V2
+        // encoder failed to open; a V1 request NEVER falls back to V2: V1 is
+        // what is asked for exactly when V2 would be wrong (an LSB
+        // transmitter under Auto, or a manual V1 pick). No encoder = silence.
+        internal TxSlot? Select(RadeProtocol protocol) =>
+            protocol == RadeProtocol.V2 ? V2 ?? V1 : V1;
     }
 }

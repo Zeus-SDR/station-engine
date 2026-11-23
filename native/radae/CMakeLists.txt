@@ -1,24 +1,28 @@
 # native/radae/CMakeLists.txt
 #
-# Builds ONE shared library, `zeus_rade`, the full-duplex RADE V1 (Radio
-# Autoencoder) modem — RX (IQ -> 16 kHz PCM) and TX (16 kHz PCM -> IQ) with an
-# LDPC End-of-Over callsign. Cross-platform native base for Zeus's RADE support,
-# P/Invoked from the .NET side as a single library.
+# Builds ONE shared library, `zeus_rade`, the full-duplex RADE V1 + V2 (Radio
+# Autoencoder) modem — RX (IQ -> 16 kHz PCM) and TX (16 kHz PCM -> IQ), with an
+# LDPC End-of-Over callsign on V1 (the V2 End-of-Over carries no data). The
+# protocol is chosen per context at open time. Cross-platform native base for
+# Zeus's RADE support, P/Invoked from the .NET side as a single library.
 #
 # Composition (all statically linked into the one .so/.dll/.dylib):
 #   1. opus_dnn    — Xiph Opus + DNN/FARGAN vocoder + LPCNet feature analyzer
 #                    (OPUS_DEEP_PLC=ON: fargan_synthesize / nnet /
 #                    lpcnet_compute_single_frame_features).
-#   2. radae_c     — David Rowe's pure-C, Python-free RADE modem (IQ <-> 36-float
-#                    feature frames). Weights compiled in (rade_enc_data.c /
-#                    rade_dec_data.c, ~24 MB each). No model files at runtime.
+#   2. radae_c     — the pure-C, Python-free RADE modem (IQ <-> 36-float
+#                    feature frames), V1 and V2. Weights compiled in (V1:
+#                    rade_enc_data.c / rade_dec_data.c, ~24 MB each; V2:
+#                    rade_enc_v2_data.c ~24 MB, rade_dec_v2_data.c ~39 MB, plus
+#                    the small rade_sync_data.c frame-sync net). No model files
+#                    at runtime.
 #   3. freedv_text — FreeDV reliable-text LDPC for the EOO callsign (FreeDV-GUI
 #                    on-air compatible). Mixed per-file Codec2 LDPC with an
 #                    LGPL-2.1 section 3 election for the conveyed copies.
 #   4. zeus_rade   — Zeus's thin shim (shim/zeus_rade.c): one streaming "complex
 #                    IQ <-> int16 PCM" RX/TX surface over the three above.
 #
-# The three upstream slices are NOT committed to the Zeus git tree (~95 MB of
+# The three upstream slices are NOT committed to the Zeus git tree (~160 MB of
 # weight sources). build-rade.yml and the source exporter share
 # vendor/fetch-sources.sh, whose pins and hashes live in SOURCE-SLICES.json.
 #
@@ -79,9 +83,19 @@ set(OPUS_INCLUDE_DIRS
 
 # ---------------------------------------------------------------------------
 # 2. radae_c — Python-free RADE modem (IQ -> features) + compiled-in weights.
-#    radc_api.c exposes the canonical rade_api.h surface the shim links against.
+#    radc_api.c exposes the canonical rade_api.h surface the shim links against
+#    and dispatches each call to the V1 or V2 pipeline chosen at rade_open().
+#    The file list matches upstream's own msvc/radae_c.vcxproj at the pin.
 # ---------------------------------------------------------------------------
+set(RADAE_C_WEIGHT_SOURCES
+    "${RADAE_C}/src/rade_dec_data.c"      # V1 decoder weights, ~24 MB
+    "${RADAE_C}/src/rade_enc_data.c"      # V1 encoder weights, ~24 MB
+    "${RADAE_C}/src/rade_dec_v2_data.c"   # V2 decoder weights, ~39 MB
+    "${RADAE_C}/src/rade_enc_v2_data.c"   # V2 encoder weights, ~24 MB
+    "${RADAE_C}/src/rade_sync_data.c")    # V2 frame-sync net weights, ~0.2 MB
+
 set(RADAE_C_SOURCES
+    # RADE V1
     "${RADAE_C}/src/radc_acq.c"
     "${RADAE_C}/src/radc_api.c"
     "${RADAE_C}/src/radc_bpf.c"
@@ -92,16 +106,25 @@ set(RADAE_C_SOURCES
     "${RADAE_C}/src/radc_modem.c"
     "${RADAE_C}/src/radc_rx.c"
     "${RADAE_C}/src/radc_tx.c"
-    "${RADAE_C}/src/rade_dec_data.c"   # ~24 MB compiled-in decoder weights
-    "${RADAE_C}/src/rade_enc_data.c")  # ~24 MB compiled-in encoder weights
+    # RADE V2
+    "${RADAE_C}/src/radc_acq_v2.c"
+    "${RADAE_C}/src/radc_dec_v2.c"
+    "${RADAE_C}/src/radc_demod_v2.c"
+    "${RADAE_C}/src/radc_enc_v2.c"
+    "${RADAE_C}/src/radc_mod_v2.c"
+    "${RADAE_C}/src/radc_modem_v2.c"
+    "${RADAE_C}/src/radc_rx_v2.c"
+    "${RADAE_C}/src/radc_sync_v2.c"
+    "${RADAE_C}/src/radc_tx_v2.c"
+    ${RADAE_C_WEIGHT_SOURCES})
 
-# The two compiled-in weight tables are ~24 MB each of generated data — at -O2/-O3
+# The compiled-in weight tables are tens of MB of generated data — at -O2/-O3
 # they cost minutes and gigabytes of RAM to compile for zero runtime benefit (they
-# are data, not hot code). Pin them to -O1. (GCC / Clang / MinGW; MSVC ignores.)
+# are data, not hot code). Pin them all to -O1, including the small V2 sync
+# table so every generated table builds the same way. (GCC / Clang / MinGW;
+# MSVC ignores.)
 if(NOT MSVC)
-  set_source_files_properties(
-    "${RADAE_C}/src/rade_enc_data.c"
-    "${RADAE_C}/src/rade_dec_data.c"
+  set_source_files_properties(${RADAE_C_WEIGHT_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-O1")
 endif()
 
@@ -132,9 +155,9 @@ set(SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/zeus_rade.c")
 # ---------------------------------------------------------------------------
 add_library(zeus_rade SHARED ${RADAE_C_SOURCES} ${FREEDV_TXT_SOURCES} ${SHIM_SOURCES})
 
-# AppleClang diagnoses the upstream radc_rx.c use of abs() because that file
-# does not include stdlib.h. Keep the upstream slice byte-exact and provide the
-# declaration at compile time. Ninja also needs an explicit target edge before
+# AppleClang diagnosed the upstream radc_rx.c use of abs() when that file did
+# not include stdlib.h (fixed upstream at the current pin; kept as a harmless
+# guard so the upstream slice stays byte-exact either way). Ninja also needs an explicit target edge before
 # force-loading $<TARGET_FILE:opus>; the generator expression alone does not
 # guarantee that the static archive exists before the zeus_rade link step.
 if(APPLE)

@@ -3769,6 +3769,104 @@ public sealed partial class RadioService : IDisposable
     public void SetModemAvailability(Func<bool>? provider)
         => Volatile.Write(ref _modemAvailable, provider);
 
+    // ---- FreeDV USB override (RADE V2) ----
+    // The RADE composite port owns the decision (RADE routed AND the selection
+    // is exactly V2) and publishes it through a lock-free provider, mirroring
+    // SetModemAvailability. RefreshFreeDvSideband reads the provider under
+    // _sync, so concurrent refreshes always land the latest decision. A
+    // sideband flip never happens while keyed (MOX, TUN, CW and two-tone all
+    // key through SetMoxCore): the change is deferred and applied on the MOX
+    // falling edge, after the over and its tail are off the air.
+    private Func<bool>? _freeDvForcesUsbProvider;
+    // The value last committed to _state (inside the transmit-idle section,
+    // or on the MOX falling edge). The DSP/TX path and the Protocol 3 sidecar
+    // read THIS, never a delivered snapshot's copy: state-changed deliveries
+    // can arrive late, and an old snapshot must not carry an old sideband
+    // back onto a transmitter that was admitted on the new one.
+    private volatile bool _freeDvForcesUsbCommitted;
+
+    /// <summary>The authoritative FreeDV USB override (see _freeDvForcesUsbCommitted).</summary>
+    internal bool FreeDvForcesUsbCommitted => _freeDvForcesUsbCommitted;
+
+    internal void SetFreeDvForcesUsbProvider(Func<bool>? provider)
+    {
+        Volatile.Write(ref _freeDvForcesUsbProvider, provider);
+        RefreshFreeDvSideband();
+    }
+
+    /// <summary>
+    /// Re-read the FreeDV USB override and apply it to the radio state unless
+    /// transmitting (then it waits for un-key). Returns true when the state
+    /// changed. Never call with a lock held that a StateChanged handler takes.
+    /// </summary>
+    internal bool RefreshFreeDvSideband()
+    {
+        lock (_sync)
+        {
+            if (!ApplyFreeDvForcesUsbLocked()) return false;
+        }
+        StateChanged?.Invoke(Snapshot());
+        return true;
+    }
+
+    // Caller holds _sync.
+    private bool ApplyFreeDvForcesUsbLocked()
+    {
+        if (_mox) return false;
+        bool desired = FreeDvForcesUsbDesired();
+        if (_state.FreeDvForcesUsb == desired) return false;
+        _state = _state with { FreeDvForcesUsb = desired };
+        _freeDvForcesUsbCommitted = desired;
+        _log.LogInformation("freedv.sideband forcesUsb={ForcesUsb}", desired);
+        return true;
+    }
+
+    private bool FreeDvForcesUsbDesired()
+    {
+        var provider = Volatile.Read(ref _freeDvForcesUsbProvider);
+        if (provider is null) return false;
+        try { return provider(); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "FreeDV USB override check failed.");
+            return false;
+        }
+    }
+
+    // The FreeDV modem's DSP owner and whether its dial rides LSB by band
+    // convention, published by the DSP pipeline each tick from the same
+    // sticky owner choice that routes the modem (an enabled local receiver;
+    // a second FreeDV receiver never steals it). -1 = no owner.
+    private int _freeDvOwnerIndex = -1;
+    private volatile bool _freeDvOwnerConventionLsb;
+
+    internal void PublishFreeDvOwner(int ownerIndex, bool conventionLsb)
+    {
+        Volatile.Write(ref _freeDvOwnerIndex, ownerIndex);
+        _freeDvOwnerConventionLsb = ownerIndex >= 0 && conventionLsb;
+    }
+
+    // Whether the transmitter rides LSB in FreeDV: the TX receiver is in
+    // FreeDV and the TX path resolved its carrier (TX frequency, split, USB
+    // override) to LSB. Published by the DSP pipeline from the same
+    // resolution it applies to TXA. Auto's RADE encoder choice reads it.
+    private volatile bool _freeDvTxRidesLsb;
+
+    internal void PublishFreeDvTxSideband(bool ridesLsb) => _freeDvTxRidesLsb = ridesLsb;
+
+    /// <summary>True when the FreeDV transmitter rides LSB (see _freeDvTxRidesLsb).</summary>
+    internal bool FreeDvTxRidesLsb => _freeDvTxRidesLsb;
+
+    /// <summary>The receiver index that owns the FreeDV modem, or -1.</summary>
+    internal int FreeDvOwnerIndex => Volatile.Read(ref _freeDvOwnerIndex);
+
+    /// <summary>
+    /// Whether the FreeDV modem's owner rides LSB by band convention (ignoring
+    /// the RADE V2 override). False when no receiver owns the modem.
+    /// Lock-free: read by the RADE status poll and once per RADE over.
+    /// </summary>
+    internal bool FreeDvOwnerRidesLsbByConvention => _freeDvOwnerConventionLsb;
+
     private bool FreeDvModemAvailable()
     {
         var provider = Volatile.Read(ref _modemAvailable);
@@ -4667,15 +4765,27 @@ public sealed partial class RadioService : IDisposable
     // allocation (IARU R1 5,351.5–5,366.5 kHz, FCC channels 5,330.5–5,403.5 kHz,
     // Ofcom 5,258.5–5,406.5 kHz) with a small cushion. Outside the window the
     // 10 MHz rule still applies.
+    // RADE V2 is the exception to the band convention: upstream FreeDV puts it
+    // on USB on every band. While the RADE composite routes RADE V2 exactly,
+    // StateDto.FreeDvForcesUsb is true and every FreeDV sideband resolution
+    // (RX/TX demod, bandpass sign, TX emission envelope, secondary receivers,
+    // the Protocol 3 sidecar and the frontend overlays) returns USB. Callers
+    // pass the flag from the StateDto they already hold, so a flip reaches the
+    // DSP through the same StateChanged re-apply that a 10 MHz crossing uses.
     internal const long FreeDvUsbThresholdHz = 10_000_000;
     internal const long FreeDvSixtyMeterLowHz = 5_250_000;
     internal const long FreeDvSixtyMeterHighHz = 5_450_000;
-    internal static RxMode EffectiveEngineMode(RxMode mode, long dialHz)
+    internal static RxMode EffectiveEngineMode(RxMode mode, long dialHz, bool freeDvForcesUsb)
     {
         if (mode != RxMode.FreeDv) return mode;
+        if (freeDvForcesUsb) return RxMode.USB;
         if (dialHz >= FreeDvSixtyMeterLowHz && dialHz <= FreeDvSixtyMeterHighHz) return RxMode.USB;
         return dialHz < FreeDvUsbThresholdHz ? RxMode.LSB : RxMode.USB;
     }
+
+    /// <summary>True when FreeDV rides LSB at this dial by band convention (no override).</summary>
+    internal static bool FreeDvConventionIsLsb(long dialHz) =>
+        EffectiveEngineMode(RxMode.FreeDv, dialHz, freeDvForcesUsb: false) == RxMode.LSB;
 
     internal static (int low, int high) SignedFilterForMode(RxMode mode, int loAbs, int hiAbs)
     {
@@ -5355,6 +5465,7 @@ public sealed partial class RadioService : IDisposable
         // Latch _mox before AlignLoForTx so a concurrent guarded SetRadioLo
         // (the frontend LO heartbeat) cannot slip between the snap and guard.
         bool moxFell = false;
+        bool freeDvSidebandApplied = false;
         long chatMoxSequence = 0;
         lock (_sync)
         {
@@ -5363,6 +5474,8 @@ public sealed partial class RadioService : IDisposable
                 moxFell = _mox && !on;
                 chatMoxSequence = ++_chatMoxSequence;
                 _mox = on;
+                // A FreeDV sideband change requested during the over lands now.
+                if (moxFell) freeDvSidebandApplied = ApplyFreeDvForcesUsbLocked();
                 // Telemetry arriving around a TX/RX transition can describe
                 // the old signal path. Start a fresh sample window on both
                 // MOX edges so it can neither attack nor release RX S-ATT.
@@ -5400,6 +5513,7 @@ public sealed partial class RadioService : IDisposable
                 chatMoxMode, chatMoxContext));
         if (!on) RestoreLoAfterTx();
         if (moxFell) ApplyBoardKindToActiveClientIfSafe();
+        if (freeDvSidebandApplied) StateChanged?.Invoke(Snapshot());
     }
 
     // Drive is transient like MOX — latched on the Protocol1Client so the
@@ -5792,10 +5906,23 @@ public sealed partial class RadioService : IDisposable
     private int _hostCwKeying;
     private readonly object _cwPushSync = new();
     private Func<StateDto, bool>? _hardwareCwArmEvaluator;
+    private Func<StateDto, bool>? _hardwareCwArmRecheck;
+    // PsEnabled (0/1) as last seen by RecheckHardwareCwArmAfterStateChange.
+    private int _hardwareCwRecheckPsEnabled;
     private int _hardwareCwSafetyBlocked;
     private int _psTransitionCwBlocked;
     // Socketless observer of the exact config handed to the P2 client.
     internal Action<Zeus.Protocol2.CwKeyerWireConfig>? HardwareCwConfigSinkForTests { get; set; }
+    // P2 keyer push ordering, separate from the P1 counters above so neither
+    // protocol's pushes can drop the other's. Accounted only under _cwPushSync.
+    private long _cwP2PushSequence;
+    private long _cwP2PushAccounted;
+    // Test hooks for the P2 push ordering races, run on every pass of a push:
+    // before-read after the sequence is taken and before any input is read;
+    // before-write after the arm decision is computed and before the
+    // serialized write. Never set in production.
+    internal Action? CwP2PushBeforeReadForTests { get; set; }
+    internal Action? CwP2PushBeforeWriteForTests { get; set; }
 
     // The shared P1/P2 standing "no competing host transmission" gate: host CW
     // sender idle and no hardware-CW safety block latched. Lock-free volatile
@@ -5814,10 +5941,46 @@ public sealed partial class RadioService : IDisposable
         PushCwKeyerEnabledToP1OnEdge();
     }
 
-    internal void ConfigureHardwareCwArmSafety(Func<StateDto, bool> evaluator)
+    // recheckAfterStateChange: true when a state change has left the arm
+    // permission depending on work that has not settled (PureSignal), so the
+    // keyer must be re-pushed against the new state. Optional: isolated
+    // RadioService tests leave it unset and get no after-state-change pushes.
+    internal void ConfigureHardwareCwArmSafety(
+        Func<StateDto, bool> evaluator,
+        Func<StateDto, bool>? recheckAfterStateChange = null)
     {
         _hardwareCwArmEvaluator = evaluator ?? throw new ArgumentNullException(nameof(evaluator));
+        _hardwareCwArmRecheck = recheckAfterStateChange;
         PushCwToP2();
+    }
+
+    // Runs after every StateChanged subscriber has returned, so DspPipelineService
+    // has already queued whatever PureSignal work this change requires. That
+    // ordering does not depend on subscription order: the pipeline subscribes
+    // when its hosted service starts, after TxService and the other singletons
+    // were constructed. A PS arm published here (the connect-tail re-arm of a
+    // saved intent, or an operator arm) is otherwise invisible to the keyer: it
+    // stays armed while the PS work runs, and if the vetoed re-push from an
+    // earlier transition already ran, nothing re-arms it once the work settles.
+    // A PsEnabled edge always re-pushes, even when PS already looks settled:
+    // the arm work can complete before this (delayed) thread gets here, after
+    // a re-push that ran in the gap between the arm being published and the
+    // work being queued was vetoed and found nothing newer to wait on. Without
+    // the edge, nothing would re-arm the keyer after a successful arm. Other
+    // state changes push only while PS is unsettled, so tuning stays cheap.
+    private void RecheckHardwareCwArmAfterStateChange(StateDto state)
+    {
+        // Track the last published arm on every change, connected or not, so
+        // an arm/disconnect/re-arm sequence is still seen as an edge. Starts
+        // at 0 because PsEnabled always initialises false. With concurrent
+        // Mutate callers, whichever thread first records the new value pushes,
+        // after its own StateChanged dispatch, where the pipeline has already
+        // acted on that arm state; a spurious extra edge only costs a push.
+        int psEnabled = state.PsEnabled ? 1 : 0;
+        bool psEdge = Interlocked.Exchange(ref _hardwareCwRecheckPsEnabled, psEnabled) != psEnabled;
+        if (_disposed || _p2Client is null || _hardwareCwArmRecheck is not { } recheck) return;
+        if (psEdge || recheck(state))
+            PushCwToP2();
     }
 
     internal void SetHardwareCwSafetyBlocked(bool blocked)
@@ -5828,7 +5991,14 @@ public sealed partial class RadioService : IDisposable
         PushCwKeyerEnabledToP1OnEdge();
     }
 
-    internal void RefreshHardwareCwArmPermission() => PushCwToP2();
+    // Deferred callers (a settled PureSignal transition) can arrive after
+    // teardown. Dispose does not clear the P2 client, so skip the push rather
+    // than write a keyer config to a radio this service no longer owns.
+    internal void RefreshHardwareCwArmPermission()
+    {
+        if (_disposed) return;
+        PushCwToP2();
+    }
 
     /// <summary>
     /// Mark the host CW sender (CwEngine, <see cref="MoxSource.Cwx"/>) as
@@ -5870,8 +6040,30 @@ public sealed partial class RadioService : IDisposable
     /// </summary>
     private void PushCwToP2()
     {
+        // The arm decision is computed outside _cwPushSync, so two pushes can
+        // reach the write in either order. Each pass takes a sequence before
+        // reading any input (the client included) and writes only if no pass
+        // that started later has already written; otherwise it starts over
+        // with a fresh sequence instead of dropping its decision, because its
+        // inputs may be newer than the writer's (it may have read them after
+        // that writer did, following an edit that pushed nothing). So the
+        // final write always comes from a pass that started after every
+        // earlier write, and nothing is discarded without being recomputed.
+        // A pass repeats only when another push wrote in between, so this
+        // terminates as soon as the competing pushes stop. Without the order
+        // check, a push vetoed while a PS transition was pending could land
+        // after the re-push scheduled on settling and leave the keyer disarmed.
+        while (!TryPushCwToP2Once()) { }
+    }
+
+    // One evaluate-and-write pass. False when a pass that started later has
+    // already written, so the caller must evaluate again from the top.
+    private bool TryPushCwToP2Once()
+    {
+        long sequence = Interlocked.Increment(ref _cwP2PushSequence);
         var p2 = _p2Client;
-        if (p2 is null) return;
+        if (p2 is null) return true;
+        CwP2PushBeforeReadForTests?.Invoke();
         // Capture every RadioService-owned value before taking the transport
         // serialization lock. State mutations can call back through TxService
         // while holding _sync, so the reverse _cwPushSync -> _sync ordering
@@ -5890,9 +6082,12 @@ public sealed partial class RadioService : IDisposable
         bool active = mode is RxMode.CWU or RxMode.CWL
             && HardwareCwHostIdleAndUnblocked()
             && (_hardwareCwArmEvaluator?.Invoke(state) ?? true);
+        CwP2PushBeforeWriteForTests?.Invoke();
 
         lock (_cwPushSync)
         {
+            if (sequence <= _cwP2PushAccounted) return false;
+            _cwP2PushAccounted = sequence;
             // Arm only in CW mode AND when the host CW sender is idle (see
             // SetHostCwKeying) — never two T/R masters at once. Production
             // additionally routes the standing permission through the engine
@@ -5913,6 +6108,7 @@ public sealed partial class RadioService : IDisposable
             p2.SetCwKeyerConfig(config);
             HardwareCwConfigSinkForTests?.Invoke(config);
         }
+        return true;
     }
 
     // Independent TUN drive %. Applies on the very next frame if TUN is already
@@ -8004,6 +8200,7 @@ public sealed partial class RadioService : IDisposable
         if (arsChanged) PersistLiveFmConfig();
         PushHardwareCwTxFrequency(includeProtocol2: false);
         StateChanged?.Invoke(next);
+        RecheckHardwareCwArmAfterStateChange(next);
     }
 
     private void CompleteRejectedStateChange(TransmitSafetyRejectedException rejection)

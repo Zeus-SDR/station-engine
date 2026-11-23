@@ -1,15 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 
-# RADE V1 native source and rebuild procedure
+# RADE V1 + V2 native source and rebuild procedure
 
-`zeus_rade` is one shared library containing the Python-free RADE C modem,
-Opus DNN/FARGAN, FreeDV reliable text and its five Codec2 LDPC units, and the
-Zeus BSD-2-Clause shim. `CMakeLists.txt` is the authoritative composition.
+`zeus_rade` is one shared library containing the Python-free RADE C modem
+(both the V1 and V2 protocols, selected per context at open time), Opus
+DNN/FARGAN, FreeDV reliable text and its five Codec2 LDPC units, and the Zeus
+BSD-2-Clause shim. `CMakeLists.txt` is the authoritative composition.
 
 ## Obtain and verify the exact upstream source
 
 The private development repository intentionally does not commit the roughly
-95 MB upstream slices. Native CI and the corresponding-source exporter use the
+160 MB upstream slices. Native CI and the corresponding-source exporter use the
 same fail-closed command:
 
 ```sh
@@ -17,7 +18,7 @@ bash native/radae/vendor/fetch-sources.sh native/radae/vendor
 ```
 
 That command fetches Thetis-RADE commit
-`f7605a46bd21275ab8b9edd00d4a1b6fae6eabe8`, verifies the fetched commit and
+`408f2b5232ff0a2aec9b538a40d4cb1b02627b17`, verifies the fetched commit and
 the three recorded Git tree IDs, materializes `radae_c`, `opus_dnn`, and
 `freedv_text`, then verifies deterministic SHA-256 content hashes and Opus pin
 `940d4e5af64351ca8ba8390df3f555484c567fbb`. All machine-readable pins are in
@@ -82,6 +83,33 @@ scalar recipe; its conveyed arm64 dylib was built locally with AppleClang
 The result is `libzeus_rade.so` on Linux, `zeus_rade.dll` on Windows, or
 `libzeus_rade.dylib` on macOS. Stage only a library built and validated for its
 matching RID.
+
+## Native self-test
+
+Configure with `-DZEUS_RADE_BUILD_TEST=ON` to also build `zeus_rade_test`
+(the harness adds an executable only; the library is built identically).
+On a host that can execute the binary, run:
+
+```sh
+native/build-rade/zeus_rade_test selftest
+native/build-rade/zeus_rade_test loopback N9WAR
+```
+
+`selftest` proves both protocols end to end: synthetic speech through TX, the
+real part of the modem signal into a fresh receiver, sync, decoded PCM,
+End-of-Over detection and vocoder re-priming, the V1 callsign round trip, the
+empty V2 callsign, and that each protocol's receiver rejects the other's
+signal. It also prints TX peak levels and the receive real-time factor. It
+exits non-zero on any failed check. `build-rade.yml` runs both commands on
+linux-x64, win-x64, and osx-arm64.
+
+The shim switches on one upstream setting that radae_c leaves off: the RADE V2
+receiver's sample-clock timing correction (`timing_adj_enable`), set on every
+V2 handle at open without modifying the vendored sources. The official V2
+receiver runs with it on; in a reference comparison (AWGN only) it cut the
+feature error at a +100 ppm clock offset from 0.734 (3 re-syncs) to 0.059 with
+no measurable change to the clean, noisy, or +/-20 Hz baselines. See the
+2026-11-22 section of `vendor/PROVENANCE.md`.
 
 ## Binary/source binding and license disposition
 
