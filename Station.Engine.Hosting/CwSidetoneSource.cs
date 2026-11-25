@@ -80,6 +80,7 @@ public sealed class CwSidetoneSource
     // Pitch is a single 4-byte field — volatile read/write is atomic on
     // every platform we ship to.
     private volatile int _pitchHz = 600;
+    private volatile bool _enabled = true;
 
     // Gain is read on the hot path and written from REST/UI thread. Wrap
     // in a lock so DSP can't grab a half-updated float, even though the
@@ -176,6 +177,10 @@ public sealed class CwSidetoneSource
     /// (200..1200 Hz — narrower than WDSP's CW bandpass even at extremes
     /// so the sidetone always sits where the receiver expects it).</summary>
     public void SetPitchHz(int hz) => _pitchHz = Math.Clamp(hz, MinPitchHz, MaxPitchHz);
+
+    /// <summary>Mute the monitor without changing the saved gain or
+    /// freezing the paddle keyer's timing state.</summary>
+    public void SetEnabled(bool enabled) => _enabled = enabled;
 
     /// <summary>Set sidetone gain. -60..0 dB. Above 0 risks clipping the
     /// mix with band RX; below -60 is effectively silent.</summary>
@@ -334,7 +339,7 @@ public sealed class CwSidetoneSource
     {
         AdvanceEnvelope(wantKeyed);
         double env = _envelopeLevel;
-        if (env > 0.0)
+        if (_enabled && env > 0.0)
         {
             dst += (float)(gain * env * Math.Sin(_phase));
             wroteNonZero = true;

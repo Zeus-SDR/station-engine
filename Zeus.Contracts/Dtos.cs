@@ -2680,7 +2680,12 @@ public sealed record CwSettingsDto(
     // GET, the PUT response, and the settings push all carry it. 0 means
     // unset and is left off the wire. Older clients ignore the extra field.
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    long SettingsVersion = 0);
+    long SettingsVersion = 0,
+    // Minimum inter-character gap enforced by the radio's paddle keyer.
+    bool StrictSpacing = false,
+    // -1 preserves the protocol default: P1 0 ms, P2 8 ms. Otherwise 0..255 ms.
+    int RfDelayMs = -1,
+    bool SidetoneEnabled = true);
 
 // PATCH-shaped: every field nullable so the frontend can save one slider
 // (or one macro) without re-sending the whole record. Server merges on top
@@ -2717,7 +2722,10 @@ public sealed record CwSettingsSetRequest(
     string? SeqReport = null,
     string? SeqConfirm = null,
     string? RstToSend = null,
-    string? Rev = null);
+    string? Rev = null,
+    bool? StrictSpacing = null,
+    int? RfDelayMs = null,
+    bool? SidetoneEnabled = null);
 
 // CW station ID timer (/api/cwid). The ID is mixed into the operator's own
 // voice transmission; the interval timer never keys the radio by itself. The

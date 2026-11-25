@@ -16,7 +16,8 @@ public readonly record struct HostIambicKeyerConfig(
     int SpeedWpm,
     CwKeyerMode Mode,
     int Weight,
-    bool PaddleReverse);
+    bool PaddleReverse,
+    bool StrictSpacing = false);
 
 /// <summary>
 /// Host-side port of the Orion Protocol-2 FPGA iambic keyer
@@ -40,10 +41,7 @@ public sealed class HostIambicKeyer
     /// <see cref="CwSidetoneSource.OutputRateHz"/> / 1000.</summary>
     public const int ClockKhz = CwSidetoneSource.OutputRateHz / 1000;
 
-    // iambic.v localparam — LETTERSPACE is kept for fidelity but is
-    // unreachable: Zeus pins strict spacing OFF on the wire
-    // (Protocol2Client.CwKeyerSpacing = false), so DOTHELD/DASHHELD
-    // always take the `else key_state <= LOOP` arm.
+    // iambic.v localparam; LETTERSPACE enforces the configured character gap.
     private const int Loop = 0;
     private const int Predot = 1;
     private const int Predash = 2;
@@ -257,10 +255,12 @@ public sealed class HostIambicKeyer
                     nextState = Predot;
                 else if (dash)
                     nextState = Predash;
-                // letter_space is always false (CwKeyerSpacing pin).
-                // LETTERSPACE is therefore unreachable; the arm is kept
-                // so a future wire-pin flip cannot silently drop the
-                // state. See case LetterSpace below.
+                else if (config.StrictSpacing)
+                {
+                    nextDotMem = false;
+                    nextDashMem = false;
+                    nextState = LetterSpace;
+                }
                 else
                     nextState = Loop;
                 break;
@@ -270,14 +270,19 @@ public sealed class HostIambicKeyer
                     nextState = Predash;
                 else if (dot)
                     nextState = Predot;
+                else if (config.StrictSpacing)
+                {
+                    nextDotMem = false;
+                    nextDashMem = false;
+                    nextState = LetterSpace;
+                }
                 else
                     nextState = Loop;
                 break;
 
             case LetterSpace:
-                // Unreachable while letter_space is false. Port kept
-                // byte-for-byte with iambic.v (2 × dot_delay, paddle
-                // event memory during the pause).
+                // Match iambic.v: two additional dits of gap, retaining
+                // a paddle tap made during the pause.
                 if (_delay >= 2 * _dotDelay)
                 {
                     nextDelay = 0;

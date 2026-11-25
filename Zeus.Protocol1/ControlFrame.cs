@@ -286,8 +286,7 @@ internal static class ControlFrame
         // On-board CW keyer config (C&C 0x0B / wire 0x16). Speed is the
         // operator's WPM (clamped 0-60 to fit the 6-bit gateware field);
         // mode selects straight vs iambic A/B. Weight and paddle direction
-        // are trailing operator fields below; strict spacing remains fixed
-        // off in WriteCwKeyerConfigPayload. Default mode Straight makes the write a
+        // are trailing operator fields below. Default mode Straight makes the write a
         // no-op until the operator opts into iambic. See zeus-bks.
         int CwKeyerSpeedWpm = 0,
         CwKeyerMode CwKeyerMode = CwKeyerMode.Straight,
@@ -408,7 +407,9 @@ internal static class ControlFrame
         // to before. ControlFrame only applies the decision; it never makes it.
         KeyerIqGuard KeyerIqGuard = KeyerIqGuard.None,
         // Independent hardware-CW TX NCO; zero keeps the shared host-IQ LO.
-        long HardwareCwTxHz = 0);
+        long HardwareCwTxHz = 0,
+        bool CwKeyerStrictSpacing = false,
+        int CwRfDelayMs = 0);
 
     /// <summary>
     /// Write the 5 C&amp;C bytes for <paramref name="register"/> given the current
@@ -525,11 +526,11 @@ internal static class ControlFrame
                 // C2 = sidetone_level (0-100), C3 = RF_delay. Zeus carries the
                 // operator's hardware sidetone level in C2 so the FPGA routes the
                 // raised-cosine tone to the headphone codec (Angelia.v:1209) with
-                // no host-audio latency; RF_delay stays 0 because Zeus owns the
-                // key-to-RF timing host-side. Issue #1783.
+                // no host-audio latency. C3 carries the hardware paddle's
+                // key-down to RF delay; host-generated CW uses its own timing.
                 cc[1] = state.CwKeyerEnabled ? (byte)0x01 : (byte)0x00;
                 cc[2] = state.CwSidetoneLevel;
-                cc[3] = 0;
+                cc[3] = (byte)Math.Clamp(state.CwRfDelayMs, 0, 255);
                 cc[4] = 0;
                 break;
 
@@ -770,9 +771,8 @@ internal static class ControlFrame
         c14[3] = 0;                                     // C4
     }
 
-    // Strict letter spacing remains fixed off. Weight and paddle direction
+    // Weight, spacing, and paddle direction
     // are operator values in CcState and are defensively clamped here.
-    private const bool CwKeyerDefaultSpacing = false;
     // Gateware speed field is 6 bits; iambic.v documents 1-60 WPM.
     private const int CwKeyerMaxWpm = 60;
 
@@ -794,7 +794,7 @@ internal static class ControlFrame
         c14[0] = adc1Db == 0 ? (byte)0 : (byte)(0x20 | adc1Db);  // C1 ADC1 ATT
         c14[1] = (byte)(s.CwKeyerPaddleReverse ? 1 << 6 : 0);    // C2[6] reverse
         c14[2] = (byte)((mode << 6) | (speed & 0x3F));           // C3[7:6] mode | [5:0] speed
-        c14[3] = (byte)((CwKeyerDefaultSpacing ? 1 << 7 : 0)
+        c14[3] = (byte)((s.CwKeyerStrictSpacing ? 1 << 7 : 0)
                         | (weight & 0x7F));                      // C4[7] spacing | [6:0] weight
     }
 

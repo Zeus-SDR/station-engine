@@ -228,6 +228,9 @@ public sealed partial class RadioService : IDisposable
     private int _cwHangMs = CwSettingsStore.DefaultHangMs;
     private int _cwWeight = CwSettingsStore.DefaultWeight;
     private int _cwPaddleReverse = CwSettingsStore.DefaultPaddleReverse ? 1 : 0;
+    private int _cwStrictSpacing;
+    private int _cwRfDelayMs = CwSettingsStore.DefaultRfDelayMs;
+    private int _cwSidetoneEnabled = CwSettingsStore.DefaultSidetoneEnabled ? 1 : 0;
     // Independent TUN drive %. When TUN is keyed, the recompute uses this in
     // place of _drivePct so the operator can pre-set a lower tune level (and
     // the same per-band PA gain gives equal watts at equal percentages). piHPSDR
@@ -664,6 +667,9 @@ public sealed partial class RadioService : IDisposable
             Volatile.Write(ref _cwHangMs, cw.HangMs);
             Volatile.Write(ref _cwWeight, cw.Weight);
             Volatile.Write(ref _cwPaddleReverse, cw.PaddleReverse ? 1 : 0);
+            Volatile.Write(ref _cwStrictSpacing, cw.StrictSpacing ? 1 : 0);
+            Volatile.Write(ref _cwRfDelayMs, cw.RfDelayMs);
+            Volatile.Write(ref _cwSidetoneEnabled, cw.SidetoneEnabled ? 1 : 0);
         }
 
         // Load persisted DSP settings from the store, or use defaults if not found
@@ -1448,7 +1454,8 @@ public sealed partial class RadioService : IDisposable
         Volatile.Read(ref _cwKeyerWpm),
         (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
         Volatile.Read(ref _cwWeight),
-        Volatile.Read(ref _cwPaddleReverse) != 0);
+        Volatile.Read(ref _cwPaddleReverse) != 0,
+        Volatile.Read(ref _cwStrictSpacing) != 0);
 
     /// <summary>Current operator preamp toggle. PreampOn isn't on the
     /// StateDto wire format, so DspPipelineService reads it directly when
@@ -1792,10 +1799,13 @@ public sealed partial class RadioService : IDisposable
                 (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
                 Volatile.Read(ref _cwWeight),
                 Volatile.Read(ref _cwPaddleReverse) != 0);
+            client.SetCwKeyerTiming(
+                Volatile.Read(ref _cwStrictSpacing) != 0,
+                Math.Max(0, Volatile.Read(ref _cwRfDelayMs)));
             int connectSidetoneHz;
             double connectSidetoneGainDb;
             lock (_sync) { connectSidetoneHz = _cwSidetoneHz; connectSidetoneGainDb = _cwSidetoneGainDb; }
-            client.SetCwSidetone(HardwareSidetoneLevel(connectSidetoneGainDb), connectSidetoneHz);
+            client.SetCwSidetone(Volatile.Read(ref _cwSidetoneEnabled) != 0 ? HardwareSidetoneLevel(connectSidetoneGainDb) : 0, connectSidetoneHz);
             PushCwKeyerEnabledToP1(client, unconditional: true);
             int restoredHz = ResolveConnectSampleRateHz(client.BoardKind, hpsdrRate.SampleRateHz(), protocol2: false);
             if (restoredHz != hpsdrRate.SampleRateHz())
@@ -5767,7 +5777,10 @@ public sealed partial class RadioService : IDisposable
         bool breakIn,
         int hangMs,
         int weight,
-        bool paddleReverse)
+        bool paddleReverse,
+        bool strictSpacing = false,
+        int rfDelayMs = CwSettingsStore.DefaultRfDelayMs,
+        bool sidetoneEnabled = CwSettingsStore.DefaultSidetoneEnabled)
     {
         Volatile.Write(ref _cwKeyerWpm, wpm);
         Volatile.Write(ref _cwKeyerMode, (int)mode);
@@ -5776,8 +5789,12 @@ public sealed partial class RadioService : IDisposable
         Volatile.Write(ref _cwHangMs, hangMs);
         Volatile.Write(ref _cwWeight, weight);
         Volatile.Write(ref _cwPaddleReverse, paddleReverse ? 1 : 0);
+        Volatile.Write(ref _cwStrictSpacing, strictSpacing ? 1 : 0);
+        Volatile.Write(ref _cwRfDelayMs, rfDelayMs);
+        Volatile.Write(ref _cwSidetoneEnabled, sidetoneEnabled ? 1 : 0);
         ActiveClient?.SetCwKeyerConfig(wpm, mode, weight, paddleReverse);
-        ActiveClient?.SetCwSidetone(HardwareSidetoneLevel(sidetoneGainDb), sidetoneHz);
+        ActiveClient?.SetCwKeyerTiming(strictSpacing, Math.Max(0, rfDelayMs));
+        ActiveClient?.SetCwSidetone(sidetoneEnabled ? HardwareSidetoneLevel(sidetoneGainDb) : 0, sidetoneHz);
         PushCwKeyerEnabledToP1();
         PushCwToP2();
     }
@@ -6063,11 +6080,13 @@ public sealed partial class RadioService : IDisposable
                 Mode = (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
                 SpeedWpm = Volatile.Read(ref _cwKeyerWpm),
                 SidetoneHz = sidetoneHz,
-                SidetoneLevel = CwSidetoneLevelFromGainDb(sidetoneGainDb),
+                SidetoneLevel = Volatile.Read(ref _cwSidetoneEnabled) != 0 ? CwSidetoneLevelFromGainDb(sidetoneGainDb) : (byte)0,
                 BreakIn = Volatile.Read(ref _cwBreakIn) != 0,
                 HangMs = Volatile.Read(ref _cwHangMs),
                 Weight = Volatile.Read(ref _cwWeight),
                 PaddleReverse = Volatile.Read(ref _cwPaddleReverse) != 0,
+                StrictSpacing = Volatile.Read(ref _cwStrictSpacing) != 0,
+                RfDelayMs = Volatile.Read(ref _cwRfDelayMs) is var delay && delay >= 0 ? delay : null,
             };
             p2.SetCwKeyerConfig(config);
             HardwareCwConfigSinkForTests?.Invoke(config);

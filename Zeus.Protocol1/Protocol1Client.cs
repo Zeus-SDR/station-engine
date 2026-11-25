@@ -241,6 +241,8 @@ public sealed class Protocol1Client : IProtocol1Client
     private int _cwKeyerMode; // CwKeyerMode as int for Interlocked
     private int _cwKeyerWeight = 50;
     private int _cwKeyerPaddleReverse;
+    private int _cwKeyerStrictSpacing;
+    private int _cwRfDelayMs;
     private int _cwKeyerEnabled;
     private int _cwSidetoneLevel;   // firmware sidetone_level 0..100 (issue #1783)
     private int _cwSidetoneFreqHz;  // firmware tone_freq in Hz, 12-bit (issue #1783)
@@ -2435,6 +2437,12 @@ public sealed class Protocol1Client : IProtocol1Client
         Interlocked.Exchange(ref _cwKeyerPaddleReverse, paddleReverse ? 1 : 0);
     }
 
+    public void SetCwKeyerTiming(bool strictSpacing, int rfDelayMs)
+    {
+        Interlocked.Exchange(ref _cwKeyerStrictSpacing, strictSpacing ? 1 : 0);
+        Interlocked.Exchange(ref _cwRfDelayMs, Math.Clamp(rfDelayMs, 0, 255));
+    }
+
     public void SetCwKeyerEnabled(bool enabled) =>
         Interlocked.Exchange(ref _cwKeyerEnabled, enabled ? 1 : 0);
 
@@ -2747,6 +2755,8 @@ public sealed class Protocol1Client : IProtocol1Client
             CwKeyerMode: (CwKeyerMode)Volatile.Read(ref _cwKeyerMode),
             CwKeyerWeight: Volatile.Read(ref _cwKeyerWeight),
             CwKeyerPaddleReverse: Volatile.Read(ref _cwKeyerPaddleReverse) != 0,
+            CwKeyerStrictSpacing: Volatile.Read(ref _cwKeyerStrictSpacing) != 0,
+            CwRfDelayMs: Volatile.Read(ref _cwRfDelayMs),
             CwKeyerEnabled: Volatile.Read(ref _cwKeyerEnabled) != 0,
             // Only emit a nonzero hardware sidetone level while the internal
             // keyer is enabled (CW mode); every other mode keeps the 0x1E frame

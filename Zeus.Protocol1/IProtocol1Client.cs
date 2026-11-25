@@ -421,6 +421,9 @@ public interface IProtocol1Client : IDisposable
     /// </summary>
     void SetCwKeyerConfig(int wpm, CwKeyerMode mode, int weight, bool paddleReverse);
 
+    /// <summary>Set paddle letter spacing and key-down to RF delay (0..255 ms).</summary>
+    void SetCwKeyerTiming(bool strictSpacing, int rfDelayMs);
+
     /// <summary>
     /// Enable the Protocol-1 firmware CW generator through C&amp;C register
     /// 0x0F (wire C0=0x1E, C1[0]). RadioService keeps this true only while

@@ -81,6 +81,7 @@ public static class TxControlEndpoints
                 var snapshot = write.Settings;
                 sidetone.SetPitchHz(snapshot.SidetoneHz);
                 sidetone.SetGainDb(snapshot.SidetoneGainDb);
+                sidetone.SetEnabled(snapshot.SidetoneEnabled);
                 // Forward keyer speed (WPM) + mode + sidetone to the radio's
                 // on-board iambic keyer so a paddle keys at the panel speed:
                 // P1 → C&C 0x0B; P2 → TxSpecific internal-keyer arm (#1032). No-op
@@ -209,7 +210,10 @@ public static class TxControlEndpoints
                     snapshot.BreakIn,
                     snapshot.HangMs,
                     snapshot.Weight,
-                    snapshot.PaddleReverse),
+                    snapshot.PaddleReverse,
+                    snapshot.StrictSpacing,
+                    snapshot.RfDelayMs,
+                    snapshot.SidetoneEnabled),
                 hub.BroadcastCwSettings);
             return Results.Ok(saved);
         });

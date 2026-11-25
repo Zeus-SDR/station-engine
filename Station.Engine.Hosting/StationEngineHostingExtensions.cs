@@ -295,6 +295,7 @@ public static class StationEngineHostingExtensions
             var settings = sp.GetRequiredService<CwSettingsStore>().Get();
             source.SetPitchHz(settings.SidetoneHz);
             source.SetGainDb(settings.SidetoneGainDb);
+            source.SetEnabled(settings.SidetoneEnabled);
             return source;
         });
         services.AddSingleton<CwEngine>();

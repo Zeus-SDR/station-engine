@@ -34,6 +34,9 @@ public sealed class CwSettingsStore : IDisposable
     public const int DefaultHangMs = 300;
     public const int DefaultWeight = 50;
     public const bool DefaultPaddleReverse = false;
+    public const bool DefaultStrictSpacing = false;
+    public const int DefaultRfDelayMs = -1;
+    public const bool DefaultSidetoneEnabled = true;
     public const bool DefaultAutoCq = false;
     public const bool DefaultAutoLog = false;
     public const bool DefaultClickToArm = false;
@@ -166,6 +169,12 @@ public sealed class CwSettingsStore : IDisposable
                 entry.Weight = Math.Clamp(weight, 33, 66);
             if (req.PaddleReverse is bool paddleReverse && Take(CwRevField.PaddleReverse))
                 entry.PaddleReverse = paddleReverse;
+            if (req.StrictSpacing is bool strictSpacing && Take(CwRevField.StrictSpacing))
+                entry.StrictSpacing = strictSpacing;
+            if (req.RfDelayMs is int rfDelayMs && Take(CwRevField.RfDelayMs))
+                entry.RfDelayMs = Math.Clamp(rfDelayMs, -1, 255);
+            if (req.SidetoneEnabled is bool sidetoneEnabled && Take(CwRevField.SidetoneEnabled))
+                entry.SidetoneEnabled = sidetoneEnabled;
             if (req.AutoCq is bool autoCq && Take(CwRevField.AutoCq))
                 entry.AutoCq = autoCq;
             if (req.AutoLog is bool autoLog && Take(CwRevField.AutoLog))
@@ -228,6 +237,9 @@ public sealed class CwSettingsStore : IDisposable
         HangMs: e.HangMs,
         Weight: e.Weight,
         PaddleReverse: e.PaddleReverse,
+        StrictSpacing: e.StrictSpacing,
+        RfDelayMs: Math.Clamp(e.RfDelayMs, -1, 255),
+        SidetoneEnabled: e.SidetoneEnabled,
         AutoCq: e.AutoCq,
         AutoLog: e.AutoLog,
         ClickToArm: e.ClickToArm,
@@ -255,6 +267,9 @@ public sealed class CwSettingsStore : IDisposable
         HangMs,
         Weight,
         PaddleReverse,
+        StrictSpacing,
+        RfDelayMs,
+        SidetoneEnabled,
         AutoCq,
         AutoLog,
         ClickToArm,
@@ -308,6 +323,9 @@ public sealed class CwSettingsStore : IDisposable
         HangMs = DefaultHangMs,
         Weight = DefaultWeight,
         PaddleReverse = DefaultPaddleReverse,
+        StrictSpacing = DefaultStrictSpacing,
+        RfDelayMs = DefaultRfDelayMs,
+        SidetoneEnabled = DefaultSidetoneEnabled,
         AutoCq = DefaultAutoCq,
         AutoLog = DefaultAutoLog,
         ClickToArm = DefaultClickToArm,
@@ -385,6 +403,9 @@ public sealed class CwSettingsEntry
     public int HangMs { get; set; } = CwSettingsStore.DefaultHangMs;
     public int Weight { get; set; } = CwSettingsStore.DefaultWeight;
     public bool PaddleReverse { get; set; } = CwSettingsStore.DefaultPaddleReverse;
+    public bool StrictSpacing { get; set; } = CwSettingsStore.DefaultStrictSpacing;
+    public int RfDelayMs { get; set; } = CwSettingsStore.DefaultRfDelayMs;
+    public bool SidetoneEnabled { get; set; } = CwSettingsStore.DefaultSidetoneEnabled;
     public bool AutoCq { get; set; } = CwSettingsStore.DefaultAutoCq;
     public bool AutoLog { get; set; } = CwSettingsStore.DefaultAutoLog;
     public bool ClickToArm { get; set; } = CwSettingsStore.DefaultClickToArm;
