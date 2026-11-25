@@ -519,8 +519,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     // Internal (FPGA) CW keyer config — issue #1032. Wire-encoded into the
     // TxSpecific (CmdTx, port 1026) packet bytes 5-13/17. These are the
     // operator-driven values (CW-mode active, keyer mode, speed, sidetone,
-    // break-in, hang, weight, and paddle direction). Strict spacing, RF delay,
-    // and ramp remain pinned below. Latched by SetCwKeyerConfig and re-pushed on the next
+    // break-in, hang, weight, paddle direction, spacing, and RF delay).
+    // Ramp remains pinned below. Latched by SetCwKeyerConfig and re-pushed on the next
     // CmdTx, exactly like the audio front-end bytes. All-default (Inactive)
     // leaves byte 5 = 0, so a non-CW transmit is byte-identical to today.
     private bool _cwActive;
@@ -532,6 +532,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
     private int _cwHangMs = 300; // Pre-change pin; TxSpecific bytes 11-12.
     private int _cwWeight = 50; // Pre-change pin; TxSpecific byte 10.
     private bool _cwPaddleReverse; // Pre-change pin false; TxSpecific byte 5 bit 2.
+    private bool _cwStrictSpacing;
+    private int _cwRfDelayMs = -1;
 
     // TxSpecific byte-5 CW mode_control bit layout — pihpsdr new_protocol.c
     // new_protocol_tx_specific (transmit_specific_buffer[5]) and OpenHPSDR
@@ -547,11 +549,9 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
 
     // Gateware keyer parameters that remain fixed and are sent on every CW
     // transmit.
-    //   Spacing : strict letter spacing off (bug/keyer pass-through).
     //   RfDelayMs: PTT-to-RF (key-down) delay; gateware-clamped to 900/WPM
     //             (pihpsdr "FPGA iambic keyer bug" workaround, byte 13).
     //   RampMs  : CW envelope rise/fall; Thetis forces 9 (setup.cs:29327).
-    private const bool CwKeyerSpacing   = false;
     private const int  CwKeyerRfDelayMs = 8;
     private const byte CwKeyerRampMs    = 9;
 
@@ -4586,6 +4586,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             HangMs = Volatile.Read(ref _cwHangMs),
             Weight = Volatile.Read(ref _cwWeight),
             PaddleReverse = Volatile.Read(ref _cwPaddleReverse),
+            StrictSpacing = Volatile.Read(ref _cwStrictSpacing),
+            RfDelayMs = Volatile.Read(ref _cwRfDelayMs) is var delay && delay >= 0 ? delay : null,
         };
         // Board-gate the PS-armed TxSpecific shape (p[57..59] PA-protection /
         // step-att for the TX-DAC reference) the same way every other PS wire
@@ -4621,6 +4623,8 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
         Volatile.Write(ref _cwHangMs, cw.HangMs);
         Volatile.Write(ref _cwWeight, cw.Weight);
         Volatile.Write(ref _cwPaddleReverse, cw.PaddleReverse);
+        Volatile.Write(ref _cwStrictSpacing, cw.StrictSpacing);
+        Volatile.Write(ref _cwRfDelayMs, cw.RfDelayMs ?? -1);
         if (_rxTask is not null) SendCmdTx();
     }
 
@@ -4691,7 +4695,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             if (cw.Mode == CwKeyerMode.IambicA) mode |= CwModeIambic;
             else if (cw.Mode == CwKeyerMode.IambicB) mode |= (byte)(CwModeIambic | CwModeModeB);
             mode |= cw.SidetoneLevel != 0 ? CwModeSidetone : (byte)0;
-            mode |= CwKeyerSpacing ? CwModeStrictSpacing : (byte)0;
+            mode |= cw.StrictSpacing ? CwModeStrictSpacing : (byte)0;
             mode |= cw.BreakIn ? CwModeBreakIn : (byte)0;
             p[5] = mode;
 
@@ -4703,7 +4707,7 @@ public sealed partial class Protocol2Client : IDisposable, IAsyncDisposable
             WriteBeU16(p, 11, (ushort)Math.Clamp(cw.HangMs, 0, 1023));
             // RF (key-down) delay, clamped to 900/WPM — pihpsdr's documented
             // FPGA iambic-keyer-bug workaround (new_protocol.c:1500-1503).
-            int rfDelay = Math.Min(CwKeyerRfDelayMs, 900 / wpm);
+            int rfDelay = Math.Min(cw.RfDelayMs ?? CwKeyerRfDelayMs, 900 / wpm);
             p[13] = (byte)Math.Clamp(rfDelay, 0, 255);
             p[17] = CwKeyerRampMs;
         }

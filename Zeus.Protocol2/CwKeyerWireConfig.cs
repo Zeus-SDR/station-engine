@@ -35,7 +35,7 @@ namespace Zeus.Protocol2;
 /// <para>
 /// Fields here are the values an operator changes (CW mode active, keyer
 /// mode, speed, sidetone, break-in, hang, weight, and paddle direction).
-/// Strict spacing, RF delay, and ramp remain pinned inside
+/// The envelope ramp remains pinned inside
 /// <see cref="Protocol2Client.ComposeCmdTxBuffer"/>.
 /// </para>
 /// </summary>
@@ -86,6 +86,13 @@ public readonly record struct CwKeyerWireConfig
 
     /// <summary>Swap dit/dah paddles. TxSpecific byte 5 bit 2.</summary>
     public bool PaddleReverse { get; init; }
+
+    /// <summary>Enforce a three-dit minimum letter gap. TxSpecific byte 5 bit 6.</summary>
+    public bool StrictSpacing { get; init; }
+
+    /// <summary>Key-down to RF delay in milliseconds. Null preserves the
+    /// historical 8 ms default. The encoder caps it at 900/WPM.</summary>
+    public int? RfDelayMs { get; init; }
 
     /// <summary>A neutral, inactive config (no CW) — the default for every
     /// non-CW transmit and for callers/tests that don't drive CW. Its new
